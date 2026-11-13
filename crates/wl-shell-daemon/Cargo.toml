@@ -1,0 +1,12 @@
+[package]
+name = "wl-shell-daemon"
+description = "Daemon and client for wl-shell programs: a Unix socket protocol and the daemon loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wl-shell-core.workspace = true
+wl-shell-log.workspace = true
+

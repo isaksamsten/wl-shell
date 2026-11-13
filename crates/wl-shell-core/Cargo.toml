@@ -1,0 +1,20 @@
+[package]
+name = "wl-shell-core"
+description = "Wayland runtime shared by wl-shell programs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wl-shell-log.workspace = true
+
+calloop.workspace = true
+calloop-wayland-source.workspace = true
+drm-fourcc.workspace = true
+gbm.workspace = true
+rustix.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+

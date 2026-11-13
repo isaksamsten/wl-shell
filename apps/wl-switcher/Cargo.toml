@@ -1,0 +1,20 @@
+[package]
+name = "wl-switcher"
+description = "Alt+Tab application and window switcher for Wayland compositors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wl-shell-config.workspace = true
+wl-shell-core.workspace = true
+wl-shell-daemon.workspace = true
+wl-shell-log.workspace = true
+wl-shell-render.workspace = true
+
+clap.workspace = true
+serde.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true

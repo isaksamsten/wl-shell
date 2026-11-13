@@ -1,0 +1,17 @@
+[package]
+name = "wl-shell-render"
+description = "Software rendering for wl-shell programs: images, text, shadows, icons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wl-shell-log.workspace = true
+calloop.workspace = true
+cosmic-text.workspace = true
+freedesktop-desktop-entry.workspace = true
+freedesktop-icons.workspace = true
+image.workspace = true
+resvg.workspace = true
+

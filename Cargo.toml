@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+# Versions are pinned here once; members use `foo.workspace = true`.
+[workspace.dependencies]
+wl-shell-config = { path = "crates/wl-shell-config", version = "0.1.0" }
+wl-shell-core = { path = "crates/wl-shell-core", version = "0.1.0" }
+wl-shell-daemon = { path = "crates/wl-shell-daemon", version = "0.1.0" }
+wl-shell-log = { path = "crates/wl-shell-log", version = "0.1.0" }
+wl-shell-render = { path = "crates/wl-shell-render", version = "0.1.0" }
+
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+clap = { version = "4", features = ["derive"] }
+cosmic-text = "0.17"
+drm-fourcc = "2"
+freedesktop-desktop-entry = { version = "0.8", default-features = false }
+freedesktop-icons = "0.4"
+gbm = { version = "0.18", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+resvg = { version = "0.50", default-features = false }
+rustix = { version = "1", features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+smithay-client-toolkit = "0.21"
+toml = "1"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# The randomized layout tests run thousands of layouts.
+[profile.test]
+opt-level = 2
+
