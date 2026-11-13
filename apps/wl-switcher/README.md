@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/59e6de0d-d955-4d72-9f5a-35dd99643159
+
 # wl-switcher
 
 An Alt+Tab switcher for Wayland. Apps appear as a row of icons; Alt+grave
