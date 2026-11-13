@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/852dbf5b-8bfb-4da7-adcb-e5ed236289c5
+
 # wl-expose
 
 A window overview (like macOS Exposé) for Wayland. It shows your windows side by
