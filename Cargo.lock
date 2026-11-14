@@ -1511,6 +1511,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
+name = "wl-dock"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "smithay-client-toolkit",
+ "wayland-client",
+ "wayland-protocols",
+ "wl-shell-config",
+ "wl-shell-core",
+ "wl-shell-log",
+ "wl-shell-render",
+ "wl-shell-ui",
+]
+
+[[package]]
 name = "wl-expose"
 version = "0.1.0"
 dependencies = [
@@ -1578,6 +1594,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wl-shell-ui"
+version = "0.1.0"
+dependencies = [
+ "smithay-client-toolkit",
+ "wayland-client",
+ "wayland-protocols",
+ "wl-shell-core",
+ "wl-shell-log",
+ "wl-shell-render",
+]
+
+[[package]]
 name = "wl-switcher"
 version = "0.1.0"
 dependencies = [
@@ -1591,6 +1619,7 @@ dependencies = [
  "wl-shell-daemon",
  "wl-shell-log",
  "wl-shell-render",
+ "wl-shell-ui",
 ]
 
 [[package]]

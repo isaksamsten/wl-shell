@@ -5,6 +5,7 @@ own:
 
 - [`wl-expose`](apps/wl-expose): a window overview (exposé)
 - [`wl-switcher`](apps/wl-switcher): an Alt+Tab app and window switcher
+- [`wl-dock`](apps/wl-dock): a dock
 
 ```sh
 cargo build --release -p wl-expose      # just one program
