@@ -57,6 +57,8 @@ pub struct Config {
     pub labels: bool,
     /// What marks running apps.
     pub indicator: Indicator,
+    /// Mark the focused app (needs `mru-event-stream`).
+    pub active_indicator: bool,
     /// Spring response for movement, in milliseconds.
     #[serde(deserialize_with = "response")]
     pub response: u32,
@@ -64,6 +66,27 @@ pub struct Config {
     pub font: String,
     #[serde(deserialize_with = "de::font_size")]
     pub font_size: u32,
+    /// Focuses a window: `{id}` is its ext toplevel identifier.
+    pub activate_command: Option<String>,
+    /// Launches apps instead of their desktop entry's `Exec=`: `{exec}`,
+    /// `{desktop-id}`, `{app-id}`.
+    pub launch_command: Option<String>,
+    /// Runs `Terminal=true` entries: their command is appended.
+    pub terminal: String,
+    /// Milliseconds a launched app's icon bounces at most.
+    #[serde(deserialize_with = "launch_timeout")]
+    pub launch_timeout: u32,
+    /// Prints the ID of each window that gains focus, one per line.
+    pub mru_event_stream: Option<String>,
+    /// Prints `<output> <id>` whenever a window opens on or moves to an
+    /// output.
+    pub output_event_stream: Option<String>,
+    /// Which windows a dock shows.
+    pub windows: Windows,
+    /// Milliseconds a new window the output stream hasn't placed yet is
+    /// held back.
+    #[serde(deserialize_with = "de::duration")]
+    pub output_grace: u32,
     /// Per-output overrides, by output name.
     pub output: BTreeMap<String, OutputOverride>,
     pub appearance: Appearance,
@@ -85,9 +108,18 @@ impl Default for Config {
             hover_delay: 300,
             labels: true,
             indicator: Indicator::default(),
+            active_indicator: true,
             response: 150,
             font: "sans-serif".into(),
             font_size: 13,
+            activate_command: None,
+            launch_command: None,
+            terminal: "foot".into(),
+            launch_timeout: 10_000,
+            mru_event_stream: None,
+            output_event_stream: None,
+            windows: Windows::default(),
+            output_grace: 250,
             output: BTreeMap::new(),
             appearance: Appearance::default(),
         }
@@ -123,6 +155,17 @@ pub enum Indicator {
     /// One dot per window, at most three.
     Dots,
     None,
+}
+
+/// Which windows a dock shows.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Windows {
+    /// Every window.
+    #[default]
+    All,
+    /// The windows on its output, as `output-event-stream` reports them.
+    Output,
 }
 
 /// The outputs that get a dock: `"all"`, or a list of output names.
@@ -178,6 +221,7 @@ pub struct OutputOverride {
     pub reserve: Option<bool>,
     #[serde(deserialize_with = "some_px")]
     pub margin: Option<u32>,
+    pub windows: Option<Windows>,
 }
 
 /// The layout of one output's dock: the global keys with its
@@ -189,6 +233,7 @@ pub struct DockLayout {
     pub magnification: f64,
     pub reserve: bool,
     pub margin: u32,
+    pub windows: Windows,
 }
 
 /// Colors: the keys of `[appearance]`, and of its `dark` and `light`
@@ -205,6 +250,9 @@ pub struct Theme {
     /// The dots under running apps.
     #[serde(deserialize_with = "de::color")]
     pub indicator_color: u32,
+    /// The focused app's indicator.
+    #[serde(deserialize_with = "de::color")]
+    pub active_indicator_color: u32,
     /// The hovered app's name.
     #[serde(deserialize_with = "de::color")]
     pub label_color: u32,
@@ -242,6 +290,7 @@ impl Default for Theme {
             panel_color: 0x262626b3,
             panel_radius: 16,
             indicator_color: 0xffffffb3,
+            active_indicator_color: 0xffffffff,
             label_color: 0xffffffff,
             label_background: 0x262626e6,
             shadow_color: 0x00000066,
@@ -279,6 +328,7 @@ impl Config {
             magnification: o.magnification.unwrap_or(self.magnification),
             reserve: o.reserve.unwrap_or(self.reserve),
             margin: o.margin.unwrap_or(self.margin),
+            windows: o.windows.unwrap_or(self.windows),
         })
     }
 
@@ -362,6 +412,11 @@ fn ranged<'de, D: Deserializer<'de>>(d: D, min: f64, max: f64) -> Result<f64, D:
     }
 }
 
+/// Bouncing at most, in milliseconds.
+fn launch_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 0, 60_000)
+}
+
 /// Spring response, in milliseconds.
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 10_000)
@@ -400,6 +455,15 @@ mod tests {
             response = 200
             font = "Inter"
             font-size = 12
+            active-indicator = false
+            activate-command = "niri msg action focus-window --id {id}"
+            launch-command = "uwsm app -- {desktop-id}"
+            terminal = "alacritty -e"
+            launch-timeout = 5000
+            mru-event-stream = "focus.sh"
+            output-event-stream = "outputs.sh"
+            windows = "output"
+            output-grace = 100
 
             [appearance]
             panel-color = "00000080"
@@ -425,6 +489,22 @@ mod tests {
         assert_eq!((c.hover_delay, c.response), (100, 200));
         assert_eq!(c.indicator, Indicator::Dots);
         assert_eq!((c.font.as_str(), c.font_size), ("Inter", 12));
+        assert!(!c.active_indicator);
+        assert_eq!(
+            c.activate_command.as_deref(),
+            Some("niri msg action focus-window --id {id}")
+        );
+        assert_eq!(
+            c.launch_command.as_deref(),
+            Some("uwsm app -- {desktop-id}")
+        );
+        assert_eq!(
+            (c.terminal.as_str(), c.launch_timeout),
+            ("alacritty -e", 5000)
+        );
+        assert_eq!(c.mru_event_stream.as_deref(), Some("focus.sh"));
+        assert_eq!(c.output_event_stream.as_deref(), Some("outputs.sh"));
+        assert_eq!((c.windows, c.output_grace), (Windows::Output, 100));
         let t = c.theme();
         assert_eq!((t.panel_color, t.indicator_color), (0x00000080, 0xffffffff));
         assert_eq!(
@@ -446,6 +526,7 @@ mod tests {
             position = "left"
             magnification = 1
             margin = 2
+            windows = "output"
 
             [output.HDMI-A-1]
             enabled = false
@@ -459,6 +540,10 @@ mod tests {
         assert_eq!(edp.position, Position::Left);
         assert_eq!((edp.icon_size, edp.magnification, edp.margin), (40, 1.0, 2));
         assert!(edp.reserve);
+        assert_eq!(
+            (global.windows, edp.windows),
+            (Windows::All, Windows::Output)
+        );
         assert!(c.dock("HDMI-A-1").is_none());
     }
 
@@ -491,6 +576,8 @@ mod tests {
         assert!(err("magnification = 4"));
         assert!(err("magnification-range = 0"));
         assert!(err("indicator = \"bar\""));
+        assert!(err("windows = \"some\""));
+        assert!(err("launch-timeout = 100000"));
         assert!(err("outputs = \"some\""));
         assert!(err("outputs = 1"));
         assert!(err("unknown = 1"));

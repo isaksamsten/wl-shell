@@ -15,8 +15,13 @@
 //! Movement runs on springs, advanced on frame callbacks by the time
 //! measured since the last one: `hover` (magnification growing in and
 //! out), each slot's presence (items appearing and disappearing), and the
-//! label's fade. The pointer's position along the dock is used as is
-//! (zoom.rs). Once everything has settled, no more frames are requested.
+//! label's fade, and launching apps' bounce. The pointer's position along
+//! the dock is used as is (zoom.rs). Once everything has settled, no more
+//! frames are requested.
+//!
+//! Indicators: a dot (or one per window) under apps with windows on this
+//! dock, brighter for the focused app, and a ring under pinned apps whose
+//! windows are all on other outputs.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -62,6 +67,8 @@ type Qh = QueueHandle<Shell<WlDock>>;
 const MAX_DOTS: usize = 3;
 /// The label's fade, ms.
 const LABEL_RESPONSE: f64 = 100.0;
+/// How high a launching app's icon hops, in icon sizes.
+const BOUNCE: f64 = 0.4;
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +87,8 @@ pub struct Style {
     panel_color: u32,
     panel_radius: u32,
     indicator_color: u32,
+    /// None: the focused app isn't marked.
+    active_indicator_color: Option<u32>,
     shadow: Option<shadow::Settings>,
     icon_theme: Option<String>,
     icon_shadow: Option<shadow::IconShadow>,
@@ -103,6 +112,8 @@ impl Style {
             panel_color: theme.panel_color,
             panel_radius: theme.panel_radius,
             indicator_color: theme.indicator_color,
+            active_indicator_color: (config.active_indicator)
+                .then_some(theme.active_indicator_color),
             shadow: config.shadow(),
             icon_theme: theme.icon_theme.clone(),
             icon_shadow: config.icon_shadow(),
@@ -170,6 +181,8 @@ pub struct DockView {
     transparent: WlBuffer,
 
     pub output: WlOutput,
+    /// The output's name.
+    pub name: String,
     style: Style,
     cache: Rc<RefCell<Cache>>,
     assets: Rc<Assets>,
@@ -185,8 +198,13 @@ pub struct DockView {
     panel_shape: Option<Shape>,
     /// The panel size the shape was rendered for, in surface orientation.
     panel_rendered: (f64, f64),
-    /// Indicator rows of 1 to `MAX_DOTS` dots.
+    /// Indicator rows of 1 to `MAX_DOTS` dots, and in the active color.
     dot_shapes: Vec<Option<Shape>>,
+    active_dot_shapes: Vec<Option<Shape>>,
+    /// The hollow indicator: windows only on other outputs.
+    ring_shape: Option<Shape>,
+    /// The apps launching: their icons bounce.
+    launching: Vec<String>,
     /// The input region last set.
     input: Vec<IRect>,
 
@@ -212,14 +230,13 @@ pub struct DockView {
 }
 
 impl DockView {
-    /// A dock on `output` at `scale`, showing `items`.
-    #[allow(clippy::too_many_arguments)]
+    /// An empty dock on `output` (named `name`) at `scale`.
     pub fn new(
         core: &Core<WlDock>,
         output: WlOutput,
+        name: String,
         scale: i32,
         style: Style,
-        items: &[Item],
         cache: Rc<RefCell<Cache>>,
         assets: Rc<Assets>,
     ) -> std::io::Result<Self> {
@@ -265,6 +282,7 @@ impl DockView {
             layer,
             transparent,
             output,
+            name,
             style,
             cache,
             assets,
@@ -279,6 +297,9 @@ impl DockView {
             panel_shape: None,
             panel_rendered: (1.0, 1.0),
             dot_shapes: Vec::new(),
+            active_dot_shapes: Vec::new(),
+            ring_shape: None,
+            launching: Vec::new(),
             input: Vec::new(),
             pointer: 0.0,
             hover: Spring::new(0.0, response),
@@ -292,7 +313,7 @@ impl DockView {
             last_frame: None,
         };
         dock.apply_size();
-        dock.set_items(items);
+        dock.relayout();
         // Initial commit without a buffer; mapped on configure.
         dock.layer.commit();
         Ok(dock)
@@ -367,6 +388,7 @@ impl DockView {
     /// Show `items`; changes animate once the dock is on screen.
     pub fn set_items(&mut self, items: &[Item]) {
         row::merge(&mut self.slots, items, self.style.response, self.configured);
+        row::set_launching(&mut self.slots, &self.launching);
         let qh = &self.qh;
         let parent = self.layer.wl_surface();
         while self.slot_subs.len() < self.slots.len() {
@@ -393,6 +415,24 @@ impl DockView {
         }
         self.request_assets(false);
         self.kick();
+    }
+
+    /// Bounce the icons of `apps`; the others land.
+    pub fn set_launching(&mut self, apps: &[String]) {
+        if apps == self.launching {
+            return;
+        }
+        self.launching = apps.to_vec();
+        row::set_launching(&mut self.slots, &self.launching);
+        self.kick();
+    }
+
+    /// The item under the pointer.
+    pub fn hovered_item(&self) -> Option<&Item> {
+        let app_id = self.hovered.as_ref()?;
+        (self.slots.iter())
+            .find(|s| !s.leaving && s.item.app_id == *app_id)
+            .map(|s| &s.item)
     }
 
     fn frame(&self) -> Frame {
@@ -483,17 +523,31 @@ impl DockView {
             },
             &self.qh,
         );
-        self.dot_shapes = (1..=MAX_DOTS)
-            .map(|count| {
-                let key = ShapeKey::Dots {
-                    count: count as u32,
-                    size: m.dot() as i32,
-                    color: self.style.indicator_color,
-                    scale,
-                };
-                cache.shape(&self.g, key, &self.qh)
-            })
-            .collect();
+        let mut dots = |color: Option<u32>| -> Vec<Option<Shape>> {
+            let Some(color) = color else {
+                return Vec::new();
+            };
+            (1..=MAX_DOTS)
+                .map(|count| {
+                    let key = ShapeKey::Dots {
+                        count: count as u32,
+                        size: m.dot() as i32,
+                        color,
+                        scale,
+                    };
+                    cache.shape(&self.g, key, &self.qh)
+                })
+                .collect()
+        };
+        self.dot_shapes = dots(Some(self.style.indicator_color));
+        self.active_dot_shapes = dots(self.style.active_indicator_color);
+        let ring = ShapeKey::Ring {
+            size: m.dot() as i32,
+            width: (m.dot() / 4.0).round().max(1.0) as i32,
+            color: self.style.indicator_color,
+            scale,
+        };
+        self.ring_shape = cache.shape(&self.g, ring, &self.qh);
     }
 
     // -- pointer -----------------------------------------------------------
@@ -620,7 +674,10 @@ impl DockView {
     fn moving(&self) -> bool {
         !self.hover.settled()
             || !self.label_alpha.settled()
-            || self.slots.iter().any(|s| !s.presence.settled())
+            || self
+                .slots
+                .iter()
+                .any(|s| !s.presence.settled() || s.bounce.is_some())
     }
 
     /// The frame callback: advance the springs and draw.
@@ -722,22 +779,32 @@ impl DockView {
                 continue;
             };
             let d = cell.size;
-            let r = frame.rect(cell.center - d / 2.0, m.icon_v(), d, d);
+            // A bounce never takes the icon off the surface.
+            let room = (frame.across() - m.icon_v() - d).max(0.0);
+            let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
+            let r = frame.rect(cell.center - d / 2.0, m.icon_v() + hop, d, d);
             // The image reaches past the icon by its shadow, which scales
             // with the icon.
             let padded = r.outset(key.pad() as f64 * d / key_size);
             let alpha = if d >= 0.5 { 1.0 } else { 0.0 };
             subs.icon.present(cache.icon(key).as_ref(), padded, alpha);
 
+            let item = &slot.item;
             let count = match self.style.indicator {
                 Indicator::None => 0,
                 Indicator::Dot => 1,
-                Indicator::Dots => slot.item.windows.len().min(MAX_DOTS),
+                Indicator::Dots => item.windows.len().min(MAX_DOTS),
             };
-            let shape = count
-                .checked_sub(1)
-                .and_then(|k| self.dot_shapes.get(k))
-                .and_then(|s| s.as_ref());
+            let dots = match item.active && !self.active_dot_shapes.is_empty() {
+                true => &self.active_dot_shapes,
+                false => &self.dot_shapes,
+            };
+            let shape = match (item.windows.is_empty(), item.elsewhere.is_empty()) {
+                (false, _) => count.checked_sub(1).and_then(|k| dots.get(k)),
+                (true, false) if self.style.indicator != Indicator::None => Some(&self.ring_shape),
+                _ => None,
+            }
+            .and_then(|s| s.as_ref());
             match shape {
                 Some(s) => {
                     let (w, h) = (s.rect.w as f64, s.rect.h as f64);

@@ -155,6 +155,27 @@ impl Icons {
             .unwrap_or_else(|| app_id.to_string())
     }
 
+    /// What it takes to launch the app: its desktop entry's `Exec=` and
+    /// so on. None without an entry.
+    pub fn entry(&mut self, app_id: &str) -> Option<AppEntry> {
+        self.load_entries();
+        if app_id.is_empty() {
+            return None;
+        }
+        let e = fde::find_app_by_id(&self.entries, Ascii::new(app_id))?;
+        Some(AppEntry {
+            desktop_id: format!("{}.desktop", e.id()),
+            name: e
+                .name(&self.locales)
+                .map(|n| n.trim().to_string())
+                .unwrap_or_default(),
+            icon: e.icon().filter(|i| !i.is_empty()).map(Into::into),
+            exec: e.exec().filter(|x| !x.trim().is_empty()).map(Into::into),
+            terminal: e.terminal(),
+            path: e.path.clone(),
+        })
+    }
+
     /// The icon for `key`, from the cache or looked up and decoded.
     pub fn get(&mut self, key: &Key) -> Option<Arc<Image>> {
         if let Some(cached) = self.cache.get(key) {
@@ -192,6 +213,136 @@ impl Icons {
                 .ok()
         })
     }
+}
+
+/// The launch side of a desktop entry, as plain data.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppEntry {
+    /// The desktop file ID, e.g. `org.gnome.Nautilus.desktop`.
+    pub desktop_id: String,
+    /// The localized `Name=`.
+    pub name: String,
+    pub icon: Option<String>,
+    /// `Exec=` as written (after the file's own escapes).
+    pub exec: Option<String>,
+    /// `Terminal=true`: run it in a terminal.
+    pub terminal: bool,
+    /// The `.desktop` file.
+    pub path: PathBuf,
+}
+
+impl AppEntry {
+    /// The command to run `Exec=` as argv, opening `files` (paths or
+    /// URIs; may be empty). See `exec_argv`.
+    pub fn argv(&self, files: &[String]) -> Result<Vec<String>, String> {
+        let exec = self
+            .exec
+            .as_deref()
+            .ok_or("the desktop entry has no Exec")?;
+        exec_argv(exec, files, self)
+    }
+}
+
+/// `exec` (an `Exec=` value) split into argv, with its field codes
+/// expanded: `%f %u` give the first of `files` and `%F %U` all of them
+/// (an argument that is only the code is dropped without files), `%i`
+/// gives `--icon <Icon>`, `%c` the name, `%k` the entry's path, `%%` a
+/// percent sign; the deprecated `%d %D %n %N %v %m` are removed.
+///
+/// Arguments are split on unquoted spaces. In double quotes, a backslash
+/// escapes `"`, `` ` ``, `$` and `\`; quoted text keeps its field codes
+/// as written, except `%%`.
+pub fn exec_argv(exec: &str, files: &[String], entry: &AppEntry) -> Result<Vec<String>, String> {
+    let mut argv = Vec::new();
+    for (arg, quoted) in split_exec(exec)? {
+        if quoted {
+            argv.push(arg.replace("%%", "%"));
+            continue;
+        }
+        match arg.as_str() {
+            "%f" | "%u" => argv.extend(files.first().cloned()),
+            "%F" | "%U" => argv.extend(files.iter().cloned()),
+            "%i" => {
+                if let Some(icon) = &entry.icon {
+                    argv.extend(["--icon".to_string(), icon.clone()]);
+                }
+            }
+            _ => {
+                let expanded = expand_codes(&arg, files, entry);
+                // `%d` and friends alone leave nothing.
+                if !expanded.is_empty() || !arg.starts_with('%') {
+                    argv.push(expanded);
+                }
+            }
+        }
+    }
+    if argv.is_empty() {
+        return Err(format!("Exec has no command: {exec}"));
+    }
+    Ok(argv)
+}
+
+/// The field codes in part of an argument.
+fn expand_codes(arg: &str, files: &[String], entry: &AppEntry) -> String {
+    let mut out = String::new();
+    let mut chars = arg.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('f' | 'u') => out.push_str(files.first().map_or("", String::as_str)),
+            Some('F' | 'U') => out.push_str(&files.join(" ")),
+            Some('c') => out.push_str(&entry.name),
+            Some('k') => out.push_str(&entry.path.to_string_lossy()),
+            Some('i') => out.push_str(entry.icon.as_deref().unwrap_or("")),
+            // Deprecated or unknown codes are removed.
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+/// Split an `Exec=` value into arguments, each with whether any of it was
+/// quoted.
+fn split_exec(exec: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut args = Vec::new();
+    let mut arg: Option<(String, bool)> = None;
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' => args.extend(arg.take()),
+            '"' => {
+                let (s, quoted) = arg.get_or_insert_default();
+                *quoted = true;
+                loop {
+                    match chars.next() {
+                        None => return Err(format!("unterminated quote in Exec: {exec}")),
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(e @ ('"' | '`' | '$' | '\\')) => s.push(e),
+                            Some(e) => {
+                                s.push('\\');
+                                s.push(e);
+                            }
+                            None => return Err(format!("unterminated quote in Exec: {exec}")),
+                        },
+                        Some(c) => s.push(c),
+                    }
+                }
+            }
+            // Not allowed unquoted by the spec, but seen: escape the next.
+            '\\' => {
+                let (s, _) = arg.get_or_insert_default();
+                s.extend(chars.next());
+            }
+            c => arg.get_or_insert_default().0.push(c),
+        }
+    }
+    args.extend(arg);
+    Ok(args)
 }
 
 /// The GNOME icon theme (a directory name), if gsettings knows one.
@@ -310,6 +461,90 @@ fn center(Premultiplied(img): Premultiplied, size: u32) -> Image {
         width: size,
         height: size,
         data,
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    fn entry() -> AppEntry {
+        AppEntry {
+            desktop_id: "org.example.App.desktop".into(),
+            name: "Example".into(),
+            icon: Some("example".into()),
+            exec: None,
+            terminal: false,
+            path: "/usr/share/applications/org.example.App.desktop".into(),
+        }
+    }
+
+    fn argv(exec: &str, files: &[&str]) -> Result<Vec<String>, String> {
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        exec_argv(exec, &files, &entry())
+    }
+
+    #[test]
+    fn field_codes_without_files_are_removed() {
+        assert_eq!(argv("firefox %u", &[]).unwrap(), ["firefox"]);
+        assert_eq!(
+            argv("nautilus --new-window %U", &[]).unwrap(),
+            ["nautilus", "--new-window"]
+        );
+        assert_eq!(argv("app %F -x", &[]).unwrap(), ["app", "-x"]);
+        assert_eq!(argv("app %d %D %n %N %v %m", &[]).unwrap(), ["app"]);
+    }
+
+    #[test]
+    fn field_codes_with_files() {
+        assert_eq!(argv("app %f", &["/a b", "/c"]).unwrap(), ["app", "/a b"]);
+        assert_eq!(
+            argv("app %U", &["/a b", "/c"]).unwrap(),
+            ["app", "/a b", "/c"]
+        );
+    }
+
+    #[test]
+    fn entry_codes() {
+        assert_eq!(
+            argv("app %i --class=%c %k 100%%", &[]).unwrap(),
+            [
+                "app",
+                "--icon",
+                "example",
+                "--class=Example",
+                "/usr/share/applications/org.example.App.desktop",
+                "100%",
+            ]
+        );
+        let mut no_icon = entry();
+        no_icon.icon = None;
+        assert_eq!(exec_argv("app %i", &[], &no_icon).unwrap(), ["app"]);
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(
+            argv(r#""/opt/My App/run" --arg "a \"b\" \$c \\d" x"#, &[]).unwrap(),
+            ["/opt/My App/run", "--arg", r#"a "b" $c \d"#, "x"]
+        );
+        // Quoted field codes stay as written; an empty quoted arg stays.
+        assert_eq!(
+            argv(r#"sh -c "echo %f" """#, &[]).unwrap(),
+            ["sh", "-c", "echo %f", ""]
+        );
+        assert_eq!(argv("a  b\tc", &[]).unwrap(), ["a", "b", "c"]);
+        assert!(argv(r#"app "open"#, &[]).is_err());
+        assert!(argv("%u", &[]).is_err());
+        assert!(argv("   ", &[]).is_err());
+    }
+
+    #[test]
+    fn entry_argv_needs_exec() {
+        let mut e = entry();
+        assert!(e.argv(&[]).is_err());
+        e.exec = Some("foot -e htop".into());
+        assert_eq!(e.argv(&[]).unwrap(), ["foot", "-e", "htop"]);
     }
 }
 

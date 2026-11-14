@@ -54,10 +54,11 @@ use wayland_protocols::{
 use wl_shell_log::warn;
 
 use crate::capture::{Capture, CaptureEvent, CaptureId};
-use crate::focus::FocusStream;
+use crate::focus;
 use crate::globals::Globals;
 use crate::input::Input;
 use crate::mru::Mru;
+use crate::stream::LineStream;
 use crate::toplevel::Toplevel;
 
 pub type Error = Box<dyn std::error::Error>;
@@ -118,6 +119,10 @@ pub trait Program: Sized + 'static {
     /// position already, and the cursor is set on enter.
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {}
 
+    /// The `mru-event-stream` reported a newly focused window: it is at
+    /// the front of `core.mru` now.
+    fn focus_changed(&mut self, core: &mut Core<Self>) {}
+
     /// An event for capture `id`: if the program has that capture, call
     /// `f` with it and handle what it returns. The program owns its
     /// captures; events for captures it dropped find nothing.
@@ -145,7 +150,7 @@ pub struct Core<P> {
     /// Focus order, fed by `focus_stream`.
     pub mru: Mru,
     /// The `mru-event-stream` command, while configured.
-    pub focus_stream: FocusStream,
+    pub focus_stream: LineStream<P>,
 }
 
 /// The whole state: what the event loop dispatches to.
@@ -179,7 +184,7 @@ impl<P: Program> Shell<P> {
             cursor_shape: CursorShapeManager::bind(&globals, &qh).ok(),
             input: Input::default(),
             mru: Mru::default(),
-            focus_stream: FocusStream::default(),
+            focus_stream: focus::stream(),
         };
         let mut shell = Shell { core, program };
         // The first roundtrip delivers the handles, the second their state.

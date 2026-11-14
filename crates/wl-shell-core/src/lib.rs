@@ -9,6 +9,8 @@ pub mod input;
 pub mod list;
 pub mod mru;
 pub mod shell;
+pub mod spawn;
+pub mod stream;
 pub mod toplevel;
 
 pub use shell::{Core, Error, Program, Shell};

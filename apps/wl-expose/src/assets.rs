@@ -72,7 +72,7 @@ impl Assets {
             }
             // The worker already dropped its stale icons.
             Done::IconsReloaded => self.icons.borrow_mut().clear(),
-            Done::Label { .. } | Done::Pill { .. } => {}
+            Done::Label { .. } | Done::Pill { .. } | Done::Entry { .. } => {}
         }
     }
 }

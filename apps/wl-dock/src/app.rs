@@ -1,21 +1,29 @@
-//! wl-dock as a wl-shell program: the config, the items, one dock per
-//! output, and how they react to the shell's events.
+//! wl-dock as a wl-shell program: the config, the pins, the items, one
+//! dock per output, and how they react to the shell's events.
 //!
 //! Docks follow the outputs: one is created for every output with a name
 //! that the config gives a dock (`outputs`, `[output.<name>]`), restyled
 //! when the config changes, and destroyed with its output. The config file
-//! is watched with inotify and the desktop's color scheme followed; a
-//! config error keeps the previous config.
+//! and the pins file are watched with inotify and the desktop's color
+//! scheme followed; a config error keeps the previous config.
 //!
-//! The worker renders icons and labels for all docks into one cache. Every
-//! dock shows every window (`windows = "all"`).
+//! Each dock gets its own items (dock.rs): the pins, then the running
+//! apps, with the windows on its output if it has `windows = "output"`
+//! and the `output-event-stream` runs. Clicking activates a window with
+//! `activate-command` or launches the app from its desktop entry (looked
+//! up by the worker), and a launched app's icon bounces until one of its
+//! windows appears.
+//!
+//! The worker renders icons and labels for all docks into one cache.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use smithay_client_toolkit::{
-    seat::pointer::{PointerEvent, PointerEventKind},
+    seat::pointer::{BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind},
     shell::{
         WaylandSurface,
         wlr_layer::{LayerSurface, LayerSurfaceConfigure},
@@ -24,15 +32,30 @@ use smithay_client_toolkit::{
 use wayland_client::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::Reloader;
-use wl_shell_core::reexports::calloop::channel;
+use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
+use wl_shell_core::spawn::{self, Output};
+use wl_shell_core::stream::{Hooks, LineStream};
+use wl_shell_core::toplevel::Toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_log::warn;
+use wl_shell_render::icons::AppEntry;
 use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
-use crate::config::Config;
-use crate::dock::{self, Item};
+use crate::config::{Config, Windows};
+use crate::dock::{self, Click, Item, Order, Placement};
+use crate::launch::{self, Command};
+use crate::pins::{self, Pin};
 use crate::view::{DockView, Style};
+
+/// An app launched from the dock, until one of its windows appears.
+struct Launch {
+    app_id: String,
+    /// The app's windows when it was launched: a new one ends the launch.
+    before: Vec<String>,
+    /// Ends it after `launch-timeout`.
+    timeout: Option<RegistrationToken>,
+}
 
 pub struct WlDock {
     /// The config, reloaded when its file changes.
@@ -41,15 +64,36 @@ pub struct WlDock {
     config: Config,
     /// The config file was touched since it was last read.
     config_touched: bool,
+    /// The pins file; None without a state directory.
+    pins_path: Option<PathBuf>,
+    pins: Vec<Pin>,
+    /// The pins file was touched since it was last read.
+    pins_touched: bool,
     /// The worker, started with the dock.
     assets: Option<Rc<Assets>>,
     /// Icons, labels and shapes, shared by the docks.
     cache: Rc<RefCell<Cache>>,
     /// One per output that has a dock.
     docks: Vec<DockView>,
-    /// What the docks show, rebuilt when windows change.
-    items: Vec<Item>,
-    /// The window list changed since `items` was built.
+    /// The running apps, in the order their first window appeared.
+    order: Order,
+    /// Every app ID seen, to notice new apps (which may come with a new
+    /// desktop entry).
+    seen: Vec<String>,
+    /// Which output each window is on, from the output stream.
+    placement: Placement,
+    output_stream: LineStream<Self>,
+    /// Desktop entries from the worker, by app ID; None: it has none.
+    entries: HashMap<String, Option<AppEntry>>,
+    /// Apps to launch once their desktop entry arrives.
+    pending_launches: Vec<String>,
+    launching: Vec<Launch>,
+    /// The app a button went down on, by dock output: it is clicked if the
+    /// button comes up on it too.
+    pressed: Option<(WlOutput, String, u32)>,
+    /// Warned that `activate-command` is missing.
+    warned_activate: bool,
+    /// The items may have changed since they were last built.
     dirty: bool,
     /// The outputs changed since the docks were matched to them.
     outputs_dirty: bool,
@@ -61,17 +105,43 @@ pub struct WlDock {
 }
 
 impl WlDock {
-    /// Read the config (`explicit`, or the default file).
+    /// Read the config (`explicit`, or the default file) and the pins.
     pub fn new(explicit: Option<PathBuf>) -> Result<Self, String> {
         let reloader = Reloader::<Config>::load(explicit).map_err(|e| format!("config: {e}"))?;
+        let pins_path = pins::path();
+        let pins = match &pins_path {
+            Some(path) => pins::read(path).unwrap_or_else(|e| {
+                warn!("{}: {e}", path.display());
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
         Ok(Self {
             config: reloader.config().clone(),
             config_touched: false,
             reloader,
+            pins_path,
+            pins,
+            pins_touched: false,
             assets: None,
             cache: Rc::new(RefCell::new(Cache::default())),
             docks: Vec::new(),
-            items: Vec::new(),
+            order: Order::default(),
+            seen: Vec::new(),
+            placement: Placement::default(),
+            output_stream: LineStream::new(
+                "output-event-stream",
+                Hooks {
+                    locate: |shell: &mut Shell<Self>| &mut shell.program.output_stream,
+                    line: |shell, line| shell.program.output_line(line),
+                    changed: |shell| shell.program.dirty = true,
+                },
+            ),
+            entries: HashMap::new(),
+            pending_launches: Vec::new(),
+            launching: Vec::new(),
+            pressed: None,
+            warned_activate: false,
             dirty: true,
             outputs_dirty: true,
             trim: false,
@@ -80,13 +150,16 @@ impl WlDock {
     }
 
     /// Connected, with the window list and the outputs received: start the
-    /// worker, watch the config, and create the docks.
+    /// worker and the streams, watch the files, and create the docks.
     pub fn started(&mut self, core: &mut Core<Self>) -> Result<(), String> {
         self.reloader
             .refresh(&core.loop_handle, &mut |m| warn!("{m}"));
         self.config = self.reloader.config().clone();
         self.start_worker(core)?;
         self.watch_config(core);
+        self.watch_pins(core);
+        self.use_streams(core);
+        self.prefetch_entries();
         self.after_dispatch(core);
         Ok(())
     }
@@ -122,18 +195,49 @@ impl WlDock {
         }
     }
 
-    /// After every event loop dispatch: follow config and theme changes,
-    /// match the docks to the outputs, and rebuild the items once for
-    /// however many window events arrived.
+    /// Reload the pins when their file changes. Its directory is created,
+    /// so pins added later by `wl-dock pin` are seen.
+    fn watch_pins(&mut self, core: &Core<Self>) {
+        let Some(path) = self.pins_path.clone() else {
+            return warn!("no state directory: pins are not kept");
+        };
+        if let Some(dir) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            return warn!("{}: {e}", dir.display());
+        }
+        let watched =
+            wl_shell_config::watch_file(&core.loop_handle, &path, |shell: &mut Shell<Self>| {
+                shell.program.pins_touched = true;
+            });
+        if let Err(e) = watched {
+            warn!("not watching {}: {e}", path.display());
+        }
+    }
+
+    /// Run the streams the config names (restarting changed ones).
+    fn use_streams(&mut self, core: &mut Core<Self>) {
+        core.use_focus_stream(self.config.mru_event_stream.as_deref());
+        let handle = core.loop_handle.clone();
+        (self.output_stream).configure(self.config.output_event_stream.as_deref(), &handle);
+    }
+
+    /// After every event loop dispatch: follow config, pins and theme
+    /// changes, match the docks to the outputs, and rebuild the items
+    /// once for however many events arrived.
     pub fn after_dispatch(&mut self, core: &mut Core<Self>) {
         let touched = std::mem::take(&mut self.config_touched);
         if (touched || self.reloader.scheme_changed())
             && (self.reloader).refresh(&core.loop_handle, &mut |m| warn!("{m}"))
         {
-            self.config_changed();
+            self.config_changed(core);
+        }
+        if std::mem::take(&mut self.pins_touched) {
+            self.reload_pins();
         }
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_docks(core);
+            self.dirty = true;
         }
         if std::mem::take(&mut self.dirty) {
             self.rebuild(core, None);
@@ -149,7 +253,7 @@ impl WlDock {
 
     /// The config (or the scheme in use) changed: forget what was rendered
     /// with the old one and restyle the docks.
-    fn config_changed(&mut self) {
+    fn config_changed(&mut self, core: &mut Core<Self>) {
         self.config = self.reloader.config().clone();
         let mut cache = self.cache.borrow_mut();
         cache.clear_icons();
@@ -158,9 +262,34 @@ impl WlDock {
         if let Some(assets) = &self.assets {
             assets.clear_icons();
         }
+        self.use_streams(core);
         self.outputs_dirty = true;
         self.reload = true;
         self.trim = true;
+    }
+
+    fn reload_pins(&mut self) {
+        let Some(path) = &self.pins_path else { return };
+        match pins::read(path) {
+            Ok(pins) if pins != self.pins => {
+                self.pins = pins;
+                self.dirty = true;
+                self.prefetch_entries();
+            }
+            Ok(_) => {}
+            Err(e) => warn!("{}: {e}", path.display()),
+        }
+    }
+
+    /// Have the worker look up the pinned apps' desktop entries, so a
+    /// click launches them at once.
+    fn prefetch_entries(&self) {
+        let Some(assets) = &self.assets else { return };
+        for app_id in pins::apps(&self.pins) {
+            if !self.entries.contains_key(&app_id) {
+                assets.entry(&app_id);
+            }
+        }
     }
 
     /// The dock on `output`.
@@ -179,19 +308,21 @@ impl WlDock {
             return; // not started yet
         };
         let reload = std::mem::take(&mut self.reload);
-        let wanted: Vec<(WlOutput, i32, Style)> = (core.output_state.outputs())
+        let wanted: Vec<(WlOutput, String, i32, Style)> = (core.output_state.outputs())
             .filter_map(|output| {
                 let info = core.output_state.info(&output)?;
-                let layout = self.config.dock(info.name.as_deref()?)?;
+                let name = info.name?;
+                let layout = self.config.dock(&name)?;
                 let style = Style::new(&self.config, layout);
-                Some((output, info.scale_factor.max(1), style))
+                Some((output, name, info.scale_factor.max(1), style))
             })
             .collect();
         self.docks.retain(|dock| {
-            (wanted.iter())
-                .any(|(o, _, style)| *o == dock.output && !dock.style().needs_new_surface(style))
+            (wanted.iter()).any(|(o, name, _, style)| {
+                *o == dock.output && *name == dock.name && !dock.style().needs_new_surface(style)
+            })
         });
-        for (output, scale, style) in wanted {
+        for (output, name, scale, style) in wanted {
             match self.docks.iter_mut().find(|d| d.output == output) {
                 Some(dock) => {
                     dock.set_style(style, reload);
@@ -200,40 +331,223 @@ impl WlDock {
                 None => match DockView::new(
                     core,
                     output,
+                    name,
                     scale,
                     style,
-                    &self.items,
                     self.cache.clone(),
                     assets.clone(),
                 ) {
-                    Ok(dock) => self.docks.push(dock),
+                    Ok(mut dock) => {
+                        let apps: Vec<String> =
+                            self.launching.iter().map(|l| l.app_id.clone()).collect();
+                        dock.set_launching(&apps);
+                        self.docks.push(dock);
+                    }
                     Err(e) => warn!("failed to create a dock: {e}"),
                 },
             }
         }
     }
 
-    /// Rebuild the items from the window list, leaving out `closed` (the
-    /// list still knows a window while its close is handled).
-    fn rebuild(&mut self, core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) {
-        let toplevels: Vec<_> = (core.toplevels().into_iter())
+    /// The open windows, leaving out `closed` (the list still knows a
+    /// window while its close is handled).
+    fn toplevels(core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) -> Vec<Toplevel> {
+        (core.toplevels().into_iter())
             .filter(|(h, _)| Some(h) != closed)
             .map(|(_, t)| t)
-            .collect();
-        let items = dock::items(&toplevels);
-        if items == self.items {
-            return;
-        }
+            .collect()
+    }
+
+    /// Rebuild every dock's items from the window list and the pins.
+    fn rebuild(&mut self, core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) {
+        let toplevels = Self::toplevels(core, closed);
+        self.order.update(&toplevels);
         // An app not seen before may come with a new desktop entry.
-        let new_app = (items.iter()).any(|i| !self.items.iter().any(|o| o.app_id == i.app_id));
+        let mut new_app = false;
+        for t in &toplevels {
+            if !self.seen.contains(&t.app_id) {
+                self.seen.push(t.app_id.clone());
+                new_app = true;
+            }
+        }
         if new_app && let Some(assets) = &self.assets {
             assets.refresh();
         }
-        self.items = items;
+        self.end_launches(core, &toplevels);
+
+        let pins = pins::apps(&self.pins);
+        let focused = (self.config.active_indicator && core.focus_stream.running())
+            .then(|| core.mru.first())
+            .flatten();
+        let streaming = self.output_stream.running();
         for dock in &mut self.docks {
-            dock.set_items(&self.items);
+            let by_output = streaming && dock.style().layout.windows == Windows::Output;
+            let items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
+                self.placement.place(id, &dock.name, by_output)
+            });
+            dock.set_items(&items);
         }
     }
+
+    /// The items of the dock on `output`'s hovered app, if any.
+    fn hovered_item(&self, output: &WlOutput) -> Option<Item> {
+        let dock = self.docks.iter().find(|d| d.output == *output)?;
+        dock.hovered_item().cloned()
+    }
+
+    // -- the output stream ---------------------------------------------------
+
+    fn output_line(&mut self, line: &str) {
+        if let Some((output, id)) = dock::parse_output_line(line)
+            && self.placement.report(output, id)
+        {
+            self.dirty = true;
+        }
+    }
+
+    /// A new window: unless the stream has placed it already, keep it off
+    /// the docks that show their output's windows for `output-grace`.
+    fn hold_new_window(&mut self, core: &Core<Self>, id: &str) {
+        let by_output = (self.docks.iter()).any(|d| d.style().layout.windows == Windows::Output);
+        if !by_output || !self.output_stream.running() || self.placement.placed(id) {
+            return;
+        }
+        self.placement.hold(id);
+        let grace = Duration::from_millis(self.config.output_grace.into());
+        let held = id.to_string();
+        let timer = core.timer(grace, move |app: &mut Self, _| {
+            if app.placement.release(&held) {
+                app.dirty = true;
+            }
+        });
+        if let Err(e) = timer {
+            warn!("{e}");
+            self.placement.release(id);
+        }
+    }
+
+    // -- clicks ----------------------------------------------------------------
+
+    fn button(&mut self, core: &Core<Self>, output: &WlOutput, button: u32, pressed: bool) {
+        let Some(item) = self.hovered_item(output) else {
+            self.pressed = None;
+            return;
+        };
+        if pressed {
+            self.pressed = Some((output.clone(), item.app_id, button));
+            return;
+        }
+        let down = self.pressed.take();
+        if down != Some((output.clone(), item.app_id.clone(), button)) {
+            return;
+        }
+        match button {
+            BTN_LEFT => match item.click(&core.mru) {
+                Click::Activate(id) => self.activate(core, &id),
+                Click::Launch => self.launch(core, &item.app_id),
+            },
+            // A new instance (or window), as the app does it.
+            BTN_MIDDLE => self.launch(core, &item.app_id),
+            _ => {}
+        }
+    }
+
+    fn activate(&mut self, core: &Core<Self>, id: &str) {
+        let Some(template) = self.config.activate_command.as_deref() else {
+            if !std::mem::replace(&mut self.warned_activate, true) {
+                warn!("set activate-command to focus windows from the dock");
+            }
+            return;
+        };
+        let command = launch::activate(template, id);
+        let output = Output::Prefixed("activate-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("activate-command: {e}");
+        }
+    }
+
+    /// Launch `app_id`, once its desktop entry is known.
+    fn launch(&mut self, core: &Core<Self>, app_id: &str) {
+        let Some(entry) = self.entries.get(app_id) else {
+            if !self.pending_launches.iter().any(|a| a == app_id) {
+                self.pending_launches.push(app_id.to_string());
+            }
+            if let Some(assets) = &self.assets {
+                assets.entry(app_id);
+            }
+            return;
+        };
+        let command = launch::launch(
+            app_id,
+            entry.as_ref(),
+            self.config.launch_command.as_deref(),
+            &self.config.terminal,
+        );
+        let result = match &command {
+            Ok(Command::Argv(argv)) => spawn::argv(&core.loop_handle, argv, Output::Inherit),
+            Ok(Command::Shell(line)) => spawn::shell(&core.loop_handle, line, Output::Inherit),
+            Err(e) => return warn!("cannot launch {app_id}: {e}"),
+        };
+        if let Err(e) = result {
+            return warn!("cannot launch {app_id}: {e}");
+        }
+        self.start_bounce(core, app_id);
+    }
+
+    /// Bounce `app_id`'s icon until a new window of it appears, or for
+    /// `launch-timeout`.
+    fn start_bounce(&mut self, core: &Core<Self>, app_id: &str) {
+        let timeout = Duration::from_millis(self.config.launch_timeout.into());
+        if timeout.is_zero() {
+            return;
+        }
+        if let Some(old) = self.launching.iter().position(|l| l.app_id == app_id) {
+            let old = self.launching.remove(old);
+            if let Some(token) = old.timeout {
+                core.loop_handle.remove(token);
+            }
+        }
+        let before = (Self::toplevels(core, None).into_iter())
+            .filter(|t| t.app_id == app_id)
+            .map(|t| t.identifier)
+            .collect();
+        let id = app_id.to_string();
+        let token = core.timer(timeout, move |app: &mut Self, _| {
+            app.launching.retain(|l| l.app_id != id);
+            app.launching_changed();
+        });
+        self.launching.push(Launch {
+            app_id: app_id.to_string(),
+            before,
+            timeout: token.ok(),
+        });
+        self.launching_changed();
+    }
+
+    /// End the launches whose app got a new window.
+    fn end_launches(&mut self, core: &Core<Self>, toplevels: &[Toplevel]) {
+        let before = self.launching.len();
+        self.launching.retain_mut(|l| {
+            let done = (toplevels.iter())
+                .any(|t| t.app_id == l.app_id && !l.before.contains(&t.identifier));
+            if done && let Some(token) = l.timeout.take() {
+                core.loop_handle.remove(token);
+            }
+            !done
+        });
+        if self.launching.len() != before {
+            self.launching_changed();
+        }
+    }
+
+    fn launching_changed(&mut self) {
+        let apps: Vec<String> = self.launching.iter().map(|l| l.app_id.clone()).collect();
+        for dock in &mut self.docks {
+            dock.set_launching(&apps);
+        }
+    }
+
+    // -- the worker ------------------------------------------------------------
 
     /// A worker result: into the cache, then to the docks.
     fn worker_done(&mut self, core: &Core<Self>, done: Done) {
@@ -256,8 +570,17 @@ impl WlDock {
             }
             // Re-rendered icons replace the old ones as they arrive.
             Done::IconsReloaded => {
+                self.entries.clear();
+                self.prefetch_entries();
                 for dock in &self.docks {
                     dock.request_assets(true);
+                }
+            }
+            Done::Entry { app_id, entry } => {
+                self.entries.insert(app_id.clone(), entry);
+                if let Some(i) = self.pending_launches.iter().position(|a| *a == app_id) {
+                    self.pending_launches.remove(i);
+                    self.launch(core, &app_id);
                 }
             }
             Done::Pill { .. } => {}
@@ -266,7 +589,10 @@ impl WlDock {
 }
 
 impl Program for WlDock {
-    fn toplevel_new(&mut self, _: &mut Core<Self>, _: &ExtForeignToplevelHandleV1) {
+    fn toplevel_new(&mut self, core: &mut Core<Self>, handle: &ExtForeignToplevelHandleV1) {
+        if let Some(t) = core.toplevel(handle) {
+            self.hold_new_window(core, &t.identifier);
+        }
         self.dirty = true;
     }
 
@@ -275,7 +601,16 @@ impl Program for WlDock {
     }
 
     fn toplevel_closed(&mut self, core: &mut Core<Self>, handle: &ExtForeignToplevelHandleV1) {
+        if let Some(t) = core.toplevel(handle) {
+            self.placement.forget(&t.identifier);
+        }
         self.rebuild(core, Some(handle));
+    }
+
+    fn focus_changed(&mut self, _: &mut Core<Self>) {
+        if self.config.active_indicator {
+            self.dirty = true;
+        }
     }
 
     fn output_new(&mut self, _: &mut Core<Self>, _: &WlOutput) {
@@ -333,7 +668,18 @@ impl Program for WlDock {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                 dock.pointer_motion(core, x, y);
             }
-            PointerEventKind::Leave { .. } => dock.pointer_leave(core),
+            PointerEventKind::Leave { .. } => {
+                dock.pointer_leave(core);
+                self.pressed = None;
+            }
+            PointerEventKind::Press { button, .. } => {
+                let output = dock.output.clone();
+                self.button(core, &output, button, true);
+            }
+            PointerEventKind::Release { button, .. } => {
+                let output = dock.output.clone();
+                self.button(core, &output, button, false);
+            }
             _ => {}
         }
     }

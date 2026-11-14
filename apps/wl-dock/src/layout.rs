@@ -7,8 +7,8 @@
 //! resting sizes: how thick the surface is, the exclusive zone, and where
 //! the panel, icons and indicators sit across the dock.
 
-use wl_shell_ui::Rect;
 use wl_shell_ui::shapes::Axis;
+use wl_shell_ui::Rect;
 
 use crate::config::Position;
 
@@ -29,6 +29,14 @@ impl Frame {
         match self.position {
             Position::Bottom => self.width,
             Position::Left | Position::Right => self.height,
+        }
+    }
+
+    /// The surface's thickness across the dock.
+    pub fn across(&self) -> f64 {
+        match self.position {
+            Position::Bottom => self.height,
+            Position::Left | Position::Right => self.width,
         }
     }
 

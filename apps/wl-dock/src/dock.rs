@@ -1,6 +1,22 @@
-//! What the dock shows: one item per running app. Pure, unit tested; the
-//! Wayland side feeds it the window list.
+//! What a dock shows, and what clicking an item does. Pure, unit tested;
+//! the Wayland side feeds it the window list, the pins, and where the
+//! output stream placed each window.
+//!
+//! - Pinned apps come first, in their pinned order, on every dock, whether
+//!   or not they're running.
+//! - Then the running apps that aren't pinned, in the order their first
+//!   window appeared (`Order`). An app keeps its place while it has
+//!   windows, so icons don't move around when windows close.
+//! - Every window with the same `app_id` (as is) belongs to one item.
+//! - With `windows = "output"`, a dock shows the windows the output stream
+//!   placed on its output (`Placement`). A new window it hasn't reported
+//!   yet is held back for the grace period, then shows on every dock until
+//!   it's reported. Without a running stream, every dock shows every
+//!   window. Unpinned apps only show where they have windows.
 
+use std::collections::{HashMap, HashSet};
+
+use wl_shell_core::mru::Mru;
 use wl_shell_core::toplevel::Toplevel;
 
 /// One window of an app.
@@ -15,28 +31,203 @@ pub struct Window {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub app_id: String,
-    /// In announcement order; never empty.
+    pub pinned: bool,
+    /// The windows shown on this dock, in announcement order. Empty for a
+    /// pinned app without windows here.
     pub windows: Vec<Window>,
+    /// The app's windows on other outputs.
+    pub elsewhere: Vec<Window>,
+    /// The focused window is one of `windows`.
+    pub active: bool,
 }
 
-/// The dock's items: the running apps, in the order their first window
-/// appeared. Apps are grouped by app ID as is.
-pub fn items(toplevels: &[Toplevel]) -> Vec<Item> {
-    let mut items: Vec<Item> = Vec::new();
-    for t in toplevels {
-        let window = Window {
-            id: t.identifier.clone(),
-            title: t.title.clone(),
-        };
-        match items.iter_mut().find(|i| i.app_id == t.app_id) {
-            Some(item) => item.windows.push(window),
-            None => items.push(Item {
-                app_id: t.app_id.clone(),
-                windows: vec![window],
-            }),
+/// What clicking an item does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Click {
+    /// Activate the window with this ID.
+    Activate(String),
+    /// Launch the app.
+    Launch,
+}
+
+impl Item {
+    /// What a click does: activate the most recently focused of the
+    /// windows here (else the first), else of the windows elsewhere, else
+    /// launch the app.
+    pub fn click(&self, mru: &Mru) -> Click {
+        for windows in [&self.windows, &self.elsewhere] {
+            if let Some(first) = windows.first() {
+                let id = mru
+                    .most_recent(windows.iter().map(|w| w.id.as_str()))
+                    .unwrap_or(&first.id);
+                return Click::Activate(id.to_string());
+            }
+        }
+        Click::Launch
+    }
+
+    #[cfg(test)]
+    /// Whether the app has a window anywhere.
+    pub fn running(&self) -> bool {
+        !self.windows.is_empty() || !self.elsewhere.is_empty()
+    }
+}
+
+/// The running apps in the order their first window appeared. Kept across
+/// window list changes, so an app keeps its place while it has windows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Order(Vec<String>);
+
+impl Order {
+    /// Drop the apps without windows and append new ones in the order of
+    /// their first window.
+    pub fn update(&mut self, toplevels: &[Toplevel]) {
+        self.0.retain(|a| toplevels.iter().any(|t| t.app_id == *a));
+        for t in toplevels {
+            if !self.0.contains(&t.app_id) {
+                self.0.push(t.app_id.clone());
+            }
         }
     }
-    items
+
+    pub fn apps(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// Where a window is, for one dock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Here,
+    /// On another output.
+    Elsewhere,
+    /// New and not placed yet: on no dock for now.
+    Held,
+}
+
+/// The windows' outputs, as the output stream reported them.
+#[derive(Clone, Debug, Default)]
+pub struct Placement {
+    /// Window ID to output name.
+    outputs: HashMap<String, String>,
+    /// New windows not reported yet, within their grace period.
+    held: HashSet<String>,
+}
+
+/// Windows remembered at most: the stream may report IDs the toplevel list
+/// never announces, so not every one gets forgotten on close.
+const MAX_PLACED: usize = 4096;
+
+/// A line of the output stream: `<output-name> <id>`. Everything after the
+/// first space is the ID.
+pub fn parse_output_line(line: &str) -> Option<(&str, &str)> {
+    let (output, id) = line.trim_start().split_once(' ')?;
+    let id = id.trim_end_matches(['\r', '\n']);
+    (!output.is_empty() && !id.is_empty()).then_some((output, id))
+}
+
+impl Placement {
+    /// The stream placed window `id` on `output`. Returns whether that
+    /// changed anything.
+    pub fn report(&mut self, output: &str, id: &str) -> bool {
+        let released = self.held.remove(id);
+        if self.outputs.get(id).is_some_and(|o| o == output) {
+            return released;
+        }
+        if self.outputs.len() >= MAX_PLACED && !self.outputs.contains_key(id) {
+            self.outputs.clear();
+        }
+        self.outputs.insert(id.to_string(), output.to_string());
+        true
+    }
+
+    pub fn placed(&self, id: &str) -> bool {
+        self.outputs.contains_key(id)
+    }
+
+    /// Hold the new window `id` back until it's reported or released.
+    pub fn hold(&mut self, id: &str) {
+        if !self.placed(id) {
+            self.held.insert(id.to_string());
+        }
+    }
+
+    /// The grace period of `id` is over. Returns whether it was held.
+    pub fn release(&mut self, id: &str) -> bool {
+        self.held.remove(id)
+    }
+
+    /// Window `id` closed.
+    pub fn forget(&mut self, id: &str) {
+        self.outputs.remove(id);
+        self.held.remove(id);
+    }
+
+    /// Where window `id` is for the dock on `output`. With `by_output`
+    /// false (`windows = "all"`, or no running stream), everywhere.
+    pub fn place(&self, id: &str, output: &str, by_output: bool) -> Place {
+        if !by_output {
+            return Place::Here;
+        }
+        match self.outputs.get(id) {
+            Some(o) if o == output => Place::Here,
+            Some(_) => Place::Elsewhere,
+            None if self.held.contains(id) => Place::Held,
+            None => Place::Here,
+        }
+    }
+}
+
+/// A dock's items. `pins` are app IDs in pinned order, `order` the running
+/// apps' order, `focused` the focused window's ID (None: don't mark the
+/// active app), and `place` says where each window is for this dock.
+pub fn items(
+    toplevels: &[Toplevel],
+    pins: &[String],
+    order: &Order,
+    focused: Option<&str>,
+    place: impl Fn(&str) -> Place,
+) -> Vec<Item> {
+    let item = |app_id: &str, pinned: bool| {
+        let mut item = Item {
+            app_id: app_id.to_string(),
+            pinned,
+            windows: Vec::new(),
+            elsewhere: Vec::new(),
+            active: false,
+        };
+        for t in toplevels.iter().filter(|t| t.app_id == app_id) {
+            let window = Window {
+                id: t.identifier.clone(),
+                title: t.title.clone(),
+            };
+            match place(&t.identifier) {
+                Place::Here => {
+                    item.active |= focused == Some(t.identifier.as_str());
+                    item.windows.push(window);
+                }
+                Place::Elsewhere => item.elsewhere.push(window),
+                Place::Held => {}
+            }
+        }
+        item
+    };
+    let mut out: Vec<Item> = Vec::new();
+    for pin in pins {
+        if !out.iter().any(|i| i.app_id == *pin) {
+            out.push(item(pin, true));
+        }
+    }
+    for app_id in order.apps() {
+        if out.iter().any(|i| i.app_id == *app_id) {
+            continue;
+        }
+        let item = item(app_id, false);
+        if !item.windows.is_empty() {
+            out.push(item);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -60,9 +251,16 @@ mod tests {
             .collect()
     }
 
+    fn all(toplevels: &[Toplevel], pins: &[&str]) -> Vec<Item> {
+        let mut order = Order::default();
+        order.update(toplevels);
+        let pins: Vec<String> = pins.iter().map(|p| p.to_string()).collect();
+        items(toplevels, &pins, &order, None, |_| Place::Here)
+    }
+
     #[test]
     fn empty() {
-        assert!(items(&[]).is_empty());
+        assert!(all(&[], &[]).is_empty());
     }
 
     #[test]
@@ -74,7 +272,7 @@ mod tests {
             toplevel("4", "chat"),
         ];
         assert_eq!(
-            summary(&items(&tls)),
+            summary(&all(&tls, &[])),
             [
                 ("term", vec!["1", "3"]),
                 ("browser", vec!["2"]),
@@ -85,7 +283,180 @@ mod tests {
 
     #[test]
     fn empty_app_id_is_one_app() {
-        let got = items(&[toplevel("1", ""), toplevel("2", "")]);
+        let got = all(&[toplevel("1", ""), toplevel("2", "")], &[]);
         assert_eq!(summary(&got), [("", vec!["1", "2"])]);
+    }
+
+    #[test]
+    fn apps_keep_their_place_while_they_have_windows() {
+        let mut order = Order::default();
+        order.update(&[toplevel("1", "a"), toplevel("2", "b"), toplevel("3", "a")]);
+        assert_eq!(order.apps(), ["a", "b"]);
+        // a's first window closes: a now has a later window than b's,
+        // but stays first.
+        order.update(&[toplevel("2", "b"), toplevel("3", "a")]);
+        assert_eq!(order.apps(), ["a", "b"]);
+        // Once gone, an app comes back at the end.
+        order.update(&[toplevel("2", "b")]);
+        order.update(&[toplevel("2", "b"), toplevel("4", "a")]);
+        assert_eq!(order.apps(), ["b", "a"]);
+    }
+
+    #[test]
+    fn pinned_first_running_or_not() {
+        let tls = [toplevel("1", "term"), toplevel("2", "browser")];
+        let got = all(&tls, &["files", "browser", "files"]);
+        assert_eq!(
+            summary(&got),
+            [
+                ("files", vec![]),
+                ("browser", vec!["2"]),
+                ("term", vec!["1"]),
+            ]
+        );
+        assert_eq!(
+            got.iter().map(|i| i.pinned).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        assert!(!got[0].running() && got[1].running());
+    }
+
+    #[test]
+    fn active_app() {
+        let tls = [toplevel("1", "term"), toplevel("2", "browser")];
+        let mut order = Order::default();
+        order.update(&tls);
+        let got = items(&tls, &[], &order, Some("2"), |_| Place::Here);
+        assert_eq!(
+            got.iter().map(|i| i.active).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let got = items(&tls, &[], &order, None, |_| Place::Here);
+        assert!(got.iter().all(|i| !i.active));
+    }
+
+    #[test]
+    fn clicks() {
+        let tls = [
+            toplevel("1", "term"),
+            toplevel("2", "term"),
+            toplevel("3", "browser"),
+        ];
+        let got = all(&tls, &["files"]);
+        let mut mru = Mru::default();
+        // Not running: launch. No focus history: the first window.
+        assert_eq!(got[0].click(&mru), Click::Launch);
+        assert_eq!(got[1].click(&mru), Click::Activate("1".into()));
+        mru.focus("2");
+        mru.focus("3");
+        assert_eq!(got[1].click(&mru), Click::Activate("2".into()));
+    }
+
+    #[test]
+    fn output_lines() {
+        assert_eq!(parse_output_line("DP-1 42"), Some(("DP-1", "42")));
+        assert_eq!(parse_output_line("DP-1 a b \r"), Some(("DP-1", "a b ")));
+        assert_eq!(parse_output_line("  eDP-1 7"), Some(("eDP-1", "7")));
+        assert_eq!(parse_output_line("DP-1"), None);
+        assert_eq!(parse_output_line("DP-1 "), None);
+        assert_eq!(parse_output_line(""), None);
+    }
+
+    #[test]
+    fn placement() {
+        let mut p = Placement::default();
+        // Not by output: everywhere, held or not.
+        p.hold("1");
+        assert_eq!(p.place("1", "A", false), Place::Here);
+        // Held until reported or released.
+        assert_eq!(p.place("1", "A", true), Place::Held);
+        assert!(p.report("B", "1"));
+        assert_eq!(p.place("1", "A", true), Place::Elsewhere);
+        assert_eq!(p.place("1", "B", true), Place::Here);
+        assert!(!p.report("B", "1"));
+        assert!(p.report("A", "1"));
+        assert_eq!(p.place("1", "A", true), Place::Here);
+        // Released unreported: everywhere.
+        p.hold("2");
+        assert!(p.release("2"));
+        assert!(!p.release("2"));
+        assert_eq!(p.place("2", "A", true), Place::Here);
+        assert_eq!(p.place("2", "B", true), Place::Here);
+        // Placed windows aren't held.
+        p.hold("1");
+        assert_eq!(p.place("1", "A", true), Place::Here);
+        p.forget("1");
+        assert_eq!(p.place("1", "B", true), Place::Here);
+    }
+
+    /// Windows 1 (term) and 3 (browser) on A, 2 (term) on B, 4 (chat) on
+    /// B, 5 (chat) held.
+    fn two_outputs() -> (Vec<Toplevel>, Order, Placement) {
+        let tls = vec![
+            toplevel("1", "term"),
+            toplevel("2", "term"),
+            toplevel("3", "browser"),
+            toplevel("4", "chat"),
+            toplevel("5", "chat"),
+        ];
+        let mut order = Order::default();
+        order.update(&tls);
+        let mut p = Placement::default();
+        p.report("A", "1");
+        p.report("B", "2");
+        p.report("A", "3");
+        p.report("B", "4");
+        p.hold("5");
+        (tls, order, p)
+    }
+
+    #[test]
+    fn docks_show_their_outputs_windows() {
+        let (tls, order, p) = two_outputs();
+        let on = |output: &str| items(&tls, &[], &order, None, |id| p.place(id, output, true));
+        let a = on("A");
+        assert_eq!(summary(&a), [("term", vec!["1"]), ("browser", vec!["3"])]);
+        assert_eq!(a[0].elsewhere.len(), 1);
+        // The held window is on no dock yet.
+        assert_eq!(
+            summary(&on("B")),
+            [("term", vec!["2"]), ("chat", vec!["4"])]
+        );
+    }
+
+    #[test]
+    fn pinned_apps_show_on_every_dock() {
+        let (tls, order, p) = two_outputs();
+        let pins = ["browser".to_string(), "files".to_string()];
+        let b = items(&tls, &pins, &order, Some("3"), |id| p.place(id, "B", true));
+        assert_eq!(
+            summary(&b),
+            [
+                ("browser", vec![]),
+                ("files", vec![]),
+                ("term", vec!["2"]),
+                ("chat", vec!["4"]),
+            ]
+        );
+        // The browser runs on A: hollow here, and clicking it activates
+        // its window there. The focus is there too, so it isn't active.
+        let browser = &b[0];
+        assert!(browser.running() && browser.windows.is_empty() && !browser.active);
+        assert_eq!(browser.click(&Mru::default()), Click::Activate("3".into()));
+        assert!(!b[1].running());
+    }
+
+    #[test]
+    fn without_a_stream_every_dock_shows_every_window() {
+        let (tls, order, p) = two_outputs();
+        let got = items(&tls, &[], &order, None, |id| p.place(id, "A", false));
+        assert_eq!(
+            summary(&got),
+            [
+                ("term", vec!["1", "2"]),
+                ("browser", vec!["3"]),
+                ("chat", vec!["4", "5"]),
+            ]
+        );
     }
 }

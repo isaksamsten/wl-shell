@@ -4,6 +4,9 @@
 //! When the items change, `merge` keeps the slots of items that stay (so
 //! their springs carry on), adds new ones growing in from nothing, and
 //! keeps the removed ones in place, shrinking away, until they are gone.
+//!
+//! A slot whose app is launching bounces (`Bounce`): hop after hop until
+//! the launch ends, then it finishes the hop it's in and lands.
 
 use wl_shell_ui::Spring;
 
@@ -16,6 +19,68 @@ pub struct Slot {
     pub presence: Spring,
     /// No longer an item: it shrinks away and then goes.
     pub leaving: bool,
+    pub bounce: Option<Bounce>,
+}
+
+/// One hop, seconds.
+const HOP: f64 = 0.6;
+
+/// A launching app's icon hopping up and down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounce {
+    /// Hops so far, fractional.
+    t: f64,
+    /// Lands when `t` gets here: the end of the hop it was in when the
+    /// launch ended.
+    land: Option<f64>,
+}
+
+impl Default for Bounce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Bounce {
+    pub fn new() -> Self {
+        Self { t: 0.0, land: None }
+    }
+
+    /// Land at the end of this hop.
+    pub fn stop(&mut self) {
+        if self.land.is_none() {
+            self.land = Some(self.t.ceil());
+        }
+    }
+
+    /// Keep hopping after all.
+    pub fn resume(&mut self) {
+        self.land = None;
+    }
+
+    #[cfg(test)]
+    pub fn stopping(&self) -> bool {
+        self.land.is_some()
+    }
+
+    /// Advance by `dt` seconds. Returns whether it is still in the air.
+    pub fn advance(&mut self, dt: f64) -> bool {
+        self.t += dt.max(0.0) / HOP;
+        match self.land {
+            Some(land) if self.t >= land => {
+                self.t = land;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// How high it is, 0 (on the dock) to 1 (the top of a hop): a
+    /// parabola per hop, so it falls like a thrown thing.
+    pub fn height(&self) -> f64 {
+        let f = self.t.fract();
+        4.0 * f * (1.0 - f)
+    }
 }
 
 /// Update `slots` to show `items`. New slots grow in with springs of
@@ -42,6 +107,7 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
                         item: item.clone(),
                         presence,
                         leaving: false,
+                        bounce: None,
                     }
                 }
             },
@@ -63,12 +129,31 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
     *slots = out;
 }
 
-/// Advance the springs by `dt` seconds and drop the slots that are gone.
-/// Returns whether any still moves.
+/// Bounce the slots of the apps in `launching`; the others land.
+pub fn set_launching(slots: &mut [Slot], launching: &[String]) {
+    for s in slots.iter_mut() {
+        let wanted = !s.leaving && launching.contains(&s.item.app_id);
+        match (&mut s.bounce, wanted) {
+            (None, true) => s.bounce = Some(Bounce::new()),
+            (Some(b), true) => b.resume(),
+            (Some(b), false) => b.stop(),
+            (None, false) => {}
+        }
+    }
+}
+
+/// Advance the springs and bounces by `dt` seconds and drop the slots
+/// that are gone. Returns whether any still moves.
 pub fn advance(slots: &mut Vec<Slot>, dt: f64) -> bool {
     let mut moving = false;
     for s in slots.iter_mut() {
         moving |= s.presence.advance(dt);
+        if let Some(b) = &mut s.bounce {
+            match b.advance(dt) {
+                true => moving = true,
+                false => s.bounce = None,
+            }
+        }
     }
     slots.retain(|s| !(s.leaving && s.presence.settled()));
     moving
@@ -82,10 +167,13 @@ mod tests {
     fn item(app_id: &str) -> Item {
         Item {
             app_id: app_id.into(),
+            pinned: false,
             windows: vec![Window {
                 id: format!("{app_id}-1"),
                 title: String::new(),
             }],
+            elsewhere: Vec::new(),
+            active: false,
         }
     }
 
@@ -170,5 +258,35 @@ mod tests {
         merge(&mut slots, &[a], 100.0, true);
         assert_eq!(slots[0].item.windows.len(), 2);
         assert!(slots[0].presence.settled());
+    }
+
+    #[test]
+    fn bounces_until_stopped_then_lands() {
+        let mut b = Bounce::new();
+        assert_eq!(b.height(), 0.0);
+        assert!(b.advance(HOP / 2.0));
+        assert!((b.height() - 1.0).abs() < 1e-9);
+        // Many hops later, still going.
+        assert!(b.advance(HOP * 3.0));
+        b.stop();
+        assert!(b.stopping());
+        // It finishes the hop it's in.
+        assert!(b.advance(HOP / 4.0));
+        assert!(b.height() > 0.0);
+        assert!(!b.advance(HOP));
+        assert_eq!(b.height(), 0.0);
+    }
+
+    #[test]
+    fn launching_slots_bounce() {
+        let mut slots = Vec::new();
+        merge(&mut slots, &[item("a"), item("b")], 100.0, false);
+        set_launching(&mut slots, &["b".into()]);
+        assert!(slots[0].bounce.is_none() && slots[1].bounce.is_some());
+        assert!(advance(&mut slots, HOP / 2.0));
+        set_launching(&mut slots, &[]);
+        assert!(slots[1].bounce.unwrap().stopping());
+        assert!(!advance(&mut slots, HOP));
+        assert!(slots[1].bounce.is_none());
     }
 }

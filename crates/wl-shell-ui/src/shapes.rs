@@ -52,6 +52,13 @@ pub enum ShapeKey {
         color: u32,
         scale: i32,
     },
+    /// A hollow dot of `size`, its outline `width` thick.
+    Ring {
+        size: i32,
+        width: i32,
+        color: u32,
+        scale: i32,
+    },
     /// One side (top, bottom, left, right) of the shadow of a `w`x`h`
     /// card with square corners; its rect is relative to the card.
     CardShadow {
@@ -99,6 +106,12 @@ impl ShapeKey {
                 let w = (2 * count - 1) * size;
                 Some((dots(count, size * scale, color), rect(w, size)))
             }
+            ShapeKey::Ring {
+                size,
+                width,
+                color,
+                scale,
+            } => Some((ring(size * scale, width * scale, color), rect(size, size))),
             ShapeKey::CardShadow {
                 w,
                 h,
@@ -145,6 +158,29 @@ fn dots(count: i32, size: i32, color: u32) -> Image {
         height: size as u32,
         data,
     }
+}
+
+/// A round outline of `size` pixels, `width` thick: a dot with a smaller
+/// one cut out of its middle.
+fn ring(size: i32, width: i32, color: u32) -> Image {
+    let size = size.max(1);
+    let mut img = text::rounded_rect(size, size, size as f64 / 2.0, color);
+    let inner = size - 2 * width.max(1);
+    if inner <= 0 {
+        return img;
+    }
+    let hole = text::rounded_rect(inner, inner, inner as f64 / 2.0, 0xffffffff);
+    let off = ((size - inner) / 2) as usize;
+    for y in 0..inner as usize {
+        for x in 0..inner as usize {
+            let keep = 255 - hole.data[(y * inner as usize + x) * 4 + 3] as u32;
+            let i = ((y + off) * size as usize + x + off) * 4;
+            for c in &mut img.data[i..i + 4] {
+                *c = ((*c as u32 * keep + 127) / 255) as u8;
+            }
+        }
+    }
+    img
 }
 
 /// The direction a panel grows in.
@@ -283,6 +319,16 @@ mod tests {
         }
         assert_eq!(alpha(5, 2), 0);
         assert_eq!(alpha(13, 2), 0);
+    }
+
+    #[test]
+    fn ring_is_hollow() {
+        let img = ring(10, 2, 0xffffffff);
+        assert_eq!((img.width, img.height), (10, 10));
+        let alpha = |x: u32, y: u32| img.data[((y * 10 + x) * 4 + 3) as usize];
+        assert_eq!(alpha(5, 5), 0);
+        assert!(alpha(5, 1) > 200);
+        assert_eq!(alpha(0, 0), 0);
     }
 
     #[test]

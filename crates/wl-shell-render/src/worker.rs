@@ -25,6 +25,8 @@ enum Job {
     Label(LabelKey),
     /// A pill with arbitrary text (a window title).
     Pill { tag: u64, request: PillRequest },
+    /// What it takes to launch an app.
+    Entry(String),
     /// Reload the desktop entries if they changed.
     Refresh,
     /// Forget decoded icons, e.g. because the config changed.
@@ -61,8 +63,14 @@ pub enum Done {
         key: LabelKey,
         pill: text::Pill,
     },
-    /// The desktop entries changed, so cached icons and names may be stale.
+    /// The desktop entries changed, so cached icons, names and entries
+    /// may be stale.
     IconsReloaded,
+    /// An app's desktop entry; None if it has none.
+    Entry {
+        app_id: String,
+        entry: Option<icons::AppEntry>,
+    },
     Pill {
         tag: u64,
         request: PillRequest,
@@ -75,6 +83,7 @@ pub struct Assets {
     jobs: mpsc::Sender<Job>,
     icons: RefCell<Vec<icons::Key>>,
     labels: RefCell<Vec<LabelKey>>,
+    entries: RefCell<Vec<String>>,
 }
 
 impl Assets {
@@ -91,6 +100,7 @@ impl Assets {
             jobs,
             icons: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
+            entries: RefCell::new(Vec::new()),
         };
         Ok((assets, results))
     }
@@ -123,6 +133,16 @@ impl Assets {
         }
     }
 
+    /// Request `app_id`'s desktop entry, unless it is on its way already.
+    /// It arrives as `Done::Entry`.
+    pub fn entry(&self, app_id: &str) {
+        let mut pending = self.entries.borrow_mut();
+        if !pending.iter().any(|a| a == app_id) {
+            pending.push(app_id.to_string());
+            self.send(Job::Entry(app_id.to_string()));
+        }
+    }
+
     pub fn pill(&self, tag: u64, request: PillRequest) {
         self.send(Job::Pill { tag, request });
     }
@@ -142,6 +162,7 @@ impl Assets {
         match done {
             Done::Icon { key, .. } => self.icons.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
+            Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
             Done::IconsReloaded | Done::Pill { .. } => {}
         }
     }
@@ -206,6 +227,10 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     request.scale,
                 );
                 Done::Pill { tag, request, pill }
+            }
+            Job::Entry(app_id) => {
+                let entry = icons.entry(&app_id);
+                Done::Entry { app_id, entry }
             }
             Job::Refresh => {
                 if !icons.refresh() {

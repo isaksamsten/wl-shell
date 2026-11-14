@@ -1561,6 +1561,7 @@ dependencies = [
  "calloop-wayland-source",
  "drm-fourcc",
  "gbm",
+ "libc",
  "rustix",
  "smithay-client-toolkit",
  "wayland-client",

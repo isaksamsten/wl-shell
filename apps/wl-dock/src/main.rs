@@ -3,8 +3,10 @@
 mod app;
 mod config;
 mod dock;
+mod launch;
 mod layout;
 mod options;
+mod pins;
 mod row;
 mod view;
 mod zoom;
@@ -15,7 +17,7 @@ use wl_shell_core::{Error, Shell};
 use wl_shell_log::warn;
 
 use crate::app::WlDock;
-use crate::options::Options;
+use crate::options::{Cmd, Options};
 
 fn main() -> ExitCode {
     wl_shell_log::set_name("wl-dock");
@@ -23,8 +25,36 @@ fn main() -> ExitCode {
         Ok(opts) => opts,
         Err(code) => return code,
     };
+    if let Some(cmd) = &opts.command {
+        return pins_command(cmd);
+    }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            warn!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pin`, `unpin` and `pins` only edit the pins file; a running dock
+/// notices the change by itself.
+fn pins_command(cmd: &Cmd) -> ExitCode {
+    let result = match cmd {
+        Cmd::Pin { item } => pins::cli::add(item),
+        Cmd::Unpin { item } => pins::cli::remove(item),
+        Cmd::Pins => pins::cli::list().map(|list| {
+            print!("{list}");
+            None
+        }),
+    };
+    match result {
+        Ok(note) => {
+            if let Some(note) = note {
+                warn!("{note}");
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             warn!("{e}");
             ExitCode::FAILURE

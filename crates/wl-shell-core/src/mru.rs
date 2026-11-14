@@ -51,6 +51,19 @@ impl Mru {
         &self.order
     }
 
+    /// The window focused last, if any was seen.
+    pub fn first(&self) -> Option<&str> {
+        self.order.first().map(String::as_str)
+    }
+
+    /// The most recently focused of `ids`; None if none was seen focused.
+    pub fn most_recent<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+        (ids.into_iter())
+            .filter_map(|id| Some((self.order.iter().position(|i| i == id)?, id)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, id)| id)
+    }
+
     /// Sort `items` into the order to show: focused ones by recency first,
     /// the rest keeping their current relative order.
     pub fn sort<T>(&self, items: &mut [T], id: impl Fn(&T) -> &str) {
@@ -121,5 +134,18 @@ mod tests {
         let mut shown = vec!["5", "2", "8"];
         Mru::default().sort(&mut shown, |s| s);
         assert_eq!(shown, ["5", "2", "8"]);
+    }
+
+    #[test]
+    fn most_recent_of_some() {
+        let mut m = Mru::default();
+        assert_eq!(m.first(), None);
+        for id in ["1", "2", "3"] {
+            m.focus(id);
+        }
+        assert_eq!(m.first(), Some("3"));
+        assert_eq!(m.most_recent(["1", "2", "9"]), Some("2"));
+        assert_eq!(m.most_recent(["9"]), None);
+        assert_eq!(m.most_recent([]), None);
     }
 }
