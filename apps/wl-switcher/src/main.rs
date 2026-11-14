@@ -1,10 +1,8 @@
 //! wl-switcher: an Alt+Tab app switcher for Wayland that prints the picked
 //! window's ID. See PLAN.md for the design.
 
-mod anim;
 mod app;
 mod bar;
-mod cache;
 mod config;
 mod input;
 mod ipc;

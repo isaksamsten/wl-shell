@@ -18,7 +18,7 @@
 //! The gaps leave room for the selected card's zoom, so a zoomed card never
 //! overlaps its neighbors.
 
-use crate::bar::Rect;
+use wl_shell_ui::Rect;
 
 /// The aspect ratio (width / height) of a window whose size isn't known.
 pub const DEFAULT_ASPECT: f64 = 16.0 / 10.0;

@@ -39,6 +39,11 @@ impl<C: ConfigFile> Reloader<C> {
         &self.config
     }
 
+    /// The file the config is read from, if there is one.
+    pub fn path(&self) -> Option<PathBuf> {
+        C::path(self.explicit.as_deref())
+    }
+
     /// Reload the config if its file changed and apply the desktop's color
     /// scheme. Errors keep the previous config and are reported to `warn`.
     /// Returns whether the config (or the scheme in use) changed.

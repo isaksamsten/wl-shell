@@ -87,6 +87,15 @@ pub trait Program: Sized + 'static {
     ) {
     }
 
+    /// An output appeared, with its state (`Core::output_state`) complete.
+    fn output_new(&mut self, core: &mut Core<Self>, output: &WlOutput) {}
+
+    /// An output's state changed: its name, scale, mode or the like.
+    fn output_update(&mut self, core: &mut Core<Self>, output: &WlOutput) {}
+
+    /// An output is going away. `Core::output_state` still knows it.
+    fn output_removed(&mut self, core: &mut Core<Self>, output: &WlOutput) {}
+
     fn scale_factor_changed(&mut self, core: &mut Core<Self>, surface: &WlSurface, factor: i32) {}
 
     /// A frame callback of `surface` fired.
@@ -365,11 +374,17 @@ impl<P: Program> OutputHandler for Shell<P> {
         &mut self.core.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.program.output_new(&mut self.core, &output);
+    }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.program.output_update(&mut self.core, &output);
+    }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.program.output_removed(&mut self.core, &output);
+    }
 }
 
 impl<P: Program> SeatHandler for Shell<P> {

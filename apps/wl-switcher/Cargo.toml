@@ -12,6 +12,7 @@ wl-shell-core.workspace = true
 wl-shell-daemon.workspace = true
 wl-shell-log.workspace = true
 wl-shell-render.workspace = true
+wl-shell-ui.workspace = true
 
 clap.workspace = true
 serde.workspace = true

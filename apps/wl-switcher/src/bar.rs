@@ -13,78 +13,10 @@
 //! With the strip open, the bar stays: the strip's app gives way to a slot
 //! as wide as the strip, pushing its neighbors aside (`Expanded`).
 
+use wl_shell_ui::Rect;
+
 /// Icons never shrink below this (unless configured smaller).
 pub const MIN_ICON: f64 = 48.0;
-
-/// A rect in output-local logical pixels.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Rect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-}
-
-impl Rect {
-    pub fn new(x: f64, y: f64, w: f64, h: f64) -> Self {
-        Self { x, y, w, h }
-    }
-
-    pub fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
-    }
-
-    pub fn right(&self) -> f64 {
-        self.x + self.w
-    }
-
-    pub fn bottom(&self) -> f64 {
-        self.y + self.h
-    }
-
-    /// From `self` (`t` = 0) to `to` (`t` = 1).
-    pub fn lerp(self, to: Rect, t: f64) -> Rect {
-        let l = |a: f64, b: f64| a + (b - a) * t;
-        Rect::new(
-            l(self.x, to.x),
-            l(self.y, to.y),
-            l(self.w, to.w),
-            l(self.h, to.h),
-        )
-    }
-
-    /// Scaled by `s` around the point (`cx`, `cy`).
-    pub fn scaled(self, s: f64, cx: f64, cy: f64) -> Rect {
-        Rect::new(
-            cx + (self.x - cx) * s,
-            cy + (self.y - cy) * s,
-            self.w * s,
-            self.h * s,
-        )
-    }
-
-    /// Scaled by `s` around its center.
-    pub fn scaled_center(self, s: f64) -> Rect {
-        let (cx, cy) = self.center();
-        self.scaled(s, cx, cy)
-    }
-
-    pub fn center(&self) -> (f64, f64) {
-        (self.x + self.w / 2.0, self.y + self.h / 2.0)
-    }
-
-    /// The largest square centered in `self`, at most `max` wide.
-    pub fn centered_square(&self, max: f64) -> Rect {
-        let s = self.w.min(self.h).min(max);
-        let (cx, cy) = self.center();
-        Rect::new(cx - s / 2.0, cy - s / 2.0, s, s)
-    }
-
-    /// Grown by `d` on every side.
-    pub fn outset(&self, d: f64) -> Rect {
-        Rect::new(self.x - d, self.y - d, self.w + 2.0 * d, self.h + 2.0 * d)
-    }
-}
 
 pub struct Params {
     pub apps: usize,

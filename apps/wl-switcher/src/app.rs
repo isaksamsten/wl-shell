@@ -29,12 +29,12 @@ use wl_shell_log::warn;
 use wl_shell_render::icons;
 use wl_shell_render::worker::{Assets, Done};
 
-use crate::cache::Cache;
 use crate::config::Config;
 use crate::input::{Action, Hold, Mods};
 use crate::ipc::Request;
 use crate::overlay::{self, Hit, Overlay};
 use crate::switcher::{Mode, Window};
+use wl_shell_ui::Cache;
 
 /// linux/input-event-codes.h
 const BTN_LEFT: u32 = 0x110;

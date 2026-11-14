@@ -15,6 +15,7 @@ wl-shell-core = { path = "crates/wl-shell-core", version = "0.1.0" }
 wl-shell-daemon = { path = "crates/wl-shell-daemon", version = "0.1.0" }
 wl-shell-log = { path = "crates/wl-shell-log", version = "0.1.0" }
 wl-shell-render = { path = "crates/wl-shell-render", version = "0.1.0" }
+wl-shell-ui = { path = "crates/wl-shell-ui", version = "0.1.0" }
 
 calloop = "0.14"
 calloop-wayland-source = "0.4"

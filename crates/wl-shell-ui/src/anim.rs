@@ -1,12 +1,11 @@
 //! Retargetable animation. Pure, unit tested.
 //!
-//! Everything that moves (the selection highlight, the apps/windows
-//! crossfade, the strip's scroll, opening and closing) is a critically damped
-//! spring: changing the target mid-flight keeps position and velocity, so
-//! rapid Alt+Tab presses glide instead of restarting or jumping, which a
-//! fixed-duration tween can't do. Springs are advanced on frame callbacks
-//! with the real elapsed time; the closed-form update is exact for any step,
-//! so a dropped frame doesn't change the trajectory.
+//! Everything that moves is a critically damped spring: changing the
+//! target mid-flight keeps position and velocity, so rapid input (Alt+Tab
+//! presses, a pointer sweeping over the dock) glides instead of restarting
+//! or jumping, which a fixed-duration tween can't do. Springs are advanced
+//! on frame callbacks with the real elapsed time; the closed-form update is
+//! exact for any step, so a dropped frame doesn't change the trajectory.
 
 /// A critically damped spring on one value.
 #[derive(Clone, Copy, Debug, PartialEq)]

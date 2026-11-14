@@ -50,14 +50,12 @@ use wayland_client::{
         wl_buffer::WlBuffer,
         wl_output::{Transform, WlOutput},
         wl_seat::WlSeat,
-        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
 };
 use wayland_protocols::{
     ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     wp::{
-        alpha_modifier::v1::client::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
         keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
         viewporter::client::wp_viewport::WpViewport,
     },
@@ -69,10 +67,11 @@ use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_log::warn;
 use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
 use wl_shell_render::{icons, shadow, text};
+use wl_shell_ui::cache::{self, Cache};
+use wl_shell_ui::shapes::{self, Axis, Shape, ShapeKey};
+use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
-use crate::anim::{Spring, lerp};
 use crate::bar::{self, Layout};
-use crate::cache::{self, Cache, Shape, ShapeKey};
 use crate::config::{Config, Previews};
 use crate::strip;
 use crate::switcher::{Mode, Step, Switcher, Window};
@@ -106,148 +105,6 @@ pub fn label_key(app_id: &str, config: &Config, scale: i32) -> Option<LabelKey> 
         scale,
         style: config.label_style()?,
     })
-}
-
-/// A rect in surface-local logical pixels, as the protocol takes them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IRect {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-}
-
-impl IRect {
-    /// Round the edges, not the size, so neighbors never overlap or part.
-    fn round(r: bar::Rect) -> Self {
-        let (x0, y0) = (r.x.round() as i32, r.y.round() as i32);
-        let (x1, y1) = (r.right().round() as i32, r.bottom().round() as i32);
-        Self {
-            x: x0,
-            y: y0,
-            w: (x1 - x0).max(1),
-            h: (y1 - y0).max(1),
-        }
-    }
-}
-
-/// A sync subsurface scaled with a viewport, without input, faded with
-/// wp_alpha_modifier_v1 if the compositor has it.
-struct Sub {
-    surface: WlSurface,
-    subsurface: WlSubsurface,
-    viewport: WpViewport,
-    alpha: Option<WpAlphaModifierSurfaceV1>,
-    attached: Option<WlBuffer>,
-    /// The multiplier last set.
-    shown_alpha: f64,
-    cropped: bool,
-    transform: Transform,
-}
-
-impl Sub {
-    fn new(g: &Globals, parent: &WlSurface, no_input: &Region, qh: &Qh) -> Self {
-        // Sync, the default: changes apply with the parent's commit.
-        let (subsurface, surface) = g.subcompositor.create_subsurface(parent.clone(), qh);
-        let viewport = g.viewporter.get_viewport(&surface, qh, Ignore);
-        let alpha = (g.alpha_modifier.as_ref()).map(|m| m.get_surface(&surface, qh, Ignore));
-        surface.set_input_region(Some(no_input.wl_region()));
-        Self {
-            surface,
-            subsurface,
-            viewport,
-            alpha,
-            attached: None,
-            shown_alpha: 1.0,
-            cropped: false,
-            transform: Transform::Normal,
-        }
-    }
-
-    /// Attach `buffer` unless it is attached already; true if it wasn't.
-    fn show(&mut self, buffer: &WlBuffer) -> bool {
-        if self.attached.as_ref() == Some(buffer) {
-            return false;
-        }
-        self.surface.attach(Some(buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        self.attached = Some(buffer.clone());
-        true
-    }
-
-    fn hide(&mut self) {
-        if self.attached.take().is_some() {
-            self.surface.attach(None, 0, 0);
-        }
-    }
-
-    fn place(&self, r: IRect) {
-        self.subsurface.set_position(r.x, r.y);
-        self.viewport.set_destination(r.w, r.h);
-    }
-
-    /// Show only `src` (x, y, w, h in buffer pixels) of the buffer, or all
-    /// of it.
-    fn crop(&mut self, src: Option<[f64; 4]>) {
-        match src {
-            Some([x, y, w, h]) => {
-                self.viewport.set_source(x, y, w, h);
-                self.cropped = true;
-            }
-            None if self.cropped => {
-                self.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
-                self.cropped = false;
-            }
-            None => {}
-        }
-    }
-
-    fn set_transform(&mut self, transform: Transform) {
-        if transform != self.transform {
-            self.surface.set_buffer_transform(transform);
-            self.transform = transform;
-        }
-    }
-
-    fn set_alpha(&mut self, a: f64) {
-        let a = a.clamp(0.0, 1.0);
-        if let Some(alpha) = &self.alpha
-            && a != self.shown_alpha
-        {
-            alpha.set_multiplier((a * u32::MAX as f64).round() as u32);
-            self.shown_alpha = a;
-        }
-    }
-
-    /// Show `buffer` at `r` with `alpha`, or nothing if that is invisible
-    /// (or there is no buffer). Commits.
-    fn present(&mut self, buffer: Option<&WlBuffer>, r: bar::Rect, alpha: f64) {
-        match buffer {
-            Some(buffer) if alpha > 0.0 => {
-                self.show(buffer);
-                self.place(IRect::round(r));
-                self.set_alpha(alpha);
-            }
-            _ => self.hide(),
-        }
-        self.commit();
-    }
-
-    fn commit(&self) {
-        self.surface.commit();
-    }
-}
-
-impl Drop for Sub {
-    fn drop(&mut self) {
-        // Before the surface, or it is a protocol error.
-        if let Some(alpha) = self.alpha.take() {
-            alpha.destroy();
-        }
-        self.viewport.destroy();
-        self.subsurface.destroy();
-        self.surface.destroy();
-    }
 }
 
 /// Every subsurface, created in stacking order (bottom first). Rebuilt as
@@ -1399,7 +1256,7 @@ impl Overlay {
         let s_open = lerp(OPEN_SCALE, 1.0, self.open.value);
         let (pcx, pcy) = l.panel.center();
         let scroll = self.scroll.value;
-        let xf = move |r: bar::Rect| IRect::round(r.scaled(s_open, pcx, pcy));
+        let xf = move |r: Rect| IRect::round(r.scaled(s_open, pcx, pcy));
         let scale = self.scale as f64;
         // The bar stays with the strip open; the highlight and label fade.
         let alpha = self.gate(base);
@@ -1442,43 +1299,21 @@ impl Overlay {
         let scene = &mut self.scene;
 
         if let (Some(dim), Some(buffer)) = (&mut scene.dim, &self.dim_buffer) {
-            let full = bar::Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
+            let full = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
             dim.present(Some(buffer), full, dim_alpha);
         }
 
-        // In three slices, so it widens without stretching its corners: the
-        // ends as they are, the middle column stretched between them.
-        match &self.panel_shape {
-            Some(shape) if alpha > 0.0 => {
-                let r = shape.rect;
-                let (rw, rh) = (r.w as f64, r.h as f64);
-                let full = bar::Rect::new(
-                    panel.x + r.x as f64,
-                    panel.y + r.y as f64,
-                    rw + (panel.w - l.panel.w),
-                    rh,
-                );
-                let cap = ((rw / 2.0).floor() - 1.0).max(1.0);
-                let parts = [
-                    (full.x, cap, 0.0, cap),
-                    (full.x + cap, full.w - 2.0 * cap, cap, rw - 2.0 * cap),
-                    (full.right() - cap, cap, rw - cap, cap),
-                ];
-                for (sub, (x, w, sx, sw)) in scene.panel.iter_mut().zip(parts) {
-                    sub.show(&shape.buffer);
-                    sub.crop(Some([sx * scale, 0.0, sw * scale, rh * scale]));
-                    sub.place(xf(bar::Rect::new(x, full.y, w, rh)));
-                    sub.set_alpha(alpha);
-                    sub.commit();
-                }
-            }
-            _ => {
-                for sub in &mut scene.panel {
-                    sub.hide();
-                    sub.commit();
-                }
-            }
-        }
+        // In three slices, so it widens without stretching its corners.
+        shapes::place_panel(
+            &mut scene.panel,
+            self.panel_shape.as_ref(),
+            panel,
+            (l.panel.w, l.panel.h),
+            Axis::Horizontal,
+            scale,
+            &xf,
+            alpha,
+        );
 
         let hl_x = self.highlight_x.value - scroll;
         let hl_x = hl_x + shift(hl_x);
@@ -1510,7 +1345,7 @@ impl Overlay {
             place_clipped(&mut scene.icons[i], icon, padded, clip, &xf, alpha);
 
             let dots = self.dot_shapes.get(i).and_then(|s| s.as_ref()).map(|s| {
-                let rect = bar::Rect::new(
+                let rect = Rect::new(
                     r.x + (r.w - s.rect.w as f64) / 2.0,
                     l.dots_y,
                     s.rect.w as f64,
@@ -1556,7 +1391,7 @@ impl Overlay {
                 continue;
             }
             sub.show(&label.buffer);
-            sub.place(xf(bar::Rect::new(x, l.label_y, w, label.height as f64)));
+            sub.place(xf(Rect::new(x, l.label_y, w, label.height as f64)));
             sub.set_alpha(a);
             sub.commit();
         }
@@ -1567,7 +1402,7 @@ impl Overlay {
     /// The strip's cards, each morphing from `icon` (the strip's app's
     /// icon) to its place by `morph`, and the title. The selected card is
     /// marked by its zoom alone.
-    fn place_strip(&mut self, icon: bar::Rect, base: f64, morph: f64) {
+    fn place_strip(&mut self, icon: Rect, base: f64, morph: f64) {
         let gate = |a: f64| self.gate(a);
         let late = |m: f64| ((m - 0.5) * 2.0).clamp(0.0, 1.0);
         let icon_alpha = match morph > 0.0 {
@@ -1664,19 +1499,7 @@ impl Overlay {
 
             // The shadow scales with the card.
             let card = s.layout.card(i, 0.0);
-            let (sx, sy) = (rect.w / card.w, rect.h / card.h);
-            for (k, side) in shadow.iter_mut().enumerate() {
-                let shape = s.shadows.get(i).and_then(|sides| sides[k].as_ref());
-                let r = shape.map(|sh| {
-                    let r = sh.rect;
-                    let (x, y) = (rect.x + r.x as f64 * sx, rect.y + r.y as f64 * sy);
-                    bar::Rect::new(x, y, r.w as f64 * sx, r.h as f64 * sy)
-                });
-                match (shape, r) {
-                    (Some(sh), Some(r)) => side.present(Some(&sh.buffer), r, a),
-                    _ => side.present(None, bar::Rect::default(), 0.0),
-                }
-            }
+            shapes::place_card_shadow(shadow, s.shadows.get(i), rect, (card.w, card.h), a);
         }
 
         let Some(target) = s.layout.selection(sel, off) else {
@@ -1701,7 +1524,7 @@ impl Overlay {
                 continue;
             };
             let (w, h) = (title.width as f64, title.height as f64);
-            let r = bar::Rect::new(cx - w / 2.0, selected.bottom() - h - TITLE_INSET, w, h);
+            let r = Rect::new(cx - w / 2.0, selected.bottom() - h - TITLE_INSET, w, h);
             sub.present(Some(&title.buffer), r, a);
         }
     }
@@ -1742,9 +1565,9 @@ impl Overlay {
 fn place_clipped(
     sub: &mut Sub,
     buffer: Option<(&WlBuffer, (f64, f64))>,
-    rect: bar::Rect,
+    rect: Rect,
     clip: (f64, f64),
-    xf: &dyn Fn(bar::Rect) -> IRect,
+    xf: &dyn Fn(Rect) -> IRect,
     alpha: f64,
 ) {
     let x0 = rect.x.max(clip.0);
@@ -1760,7 +1583,7 @@ fn place_clipped(
                 [sx, 0.0, sw, floor(bh)]
             });
             sub.crop(src);
-            sub.place(xf(bar::Rect::new(x0, rect.y, x1 - x0, rect.h)));
+            sub.place(xf(Rect::new(x0, rect.y, x1 - x0, rect.h)));
             sub.set_alpha(alpha);
         }
         _ => sub.hide(),
