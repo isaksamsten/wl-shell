@@ -22,6 +22,19 @@
 //! Indicators: a dot (or one per window) under apps with windows on this
 //! dock, brighter for the focused app, and a ring under pinned apps whose
 //! windows are all on other outputs.
+//!
+//! The strip (stripview.rs): hovering an app that gets one (enough
+//! windows here) starts a static capture of each window, so a click finds
+//! the frames ready. Clicking it opens the strip, a grabbing popup, with
+//! the captures live; clicking the icon again closes it. While it is
+//! open, the magnification holds still. Hovering only ever shows the
+//! app's name.
+//!
+//! Keyboard: the surface is `on-demand`, only so that a click gives it
+//! keyboard focus and with it the modifiers (Ctrl+click). After a click
+//! that opens no popup, and when the strip closes, the dock gives the
+//! focus back by turning its interactivity off, until the pointer next
+//! moves on it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -39,26 +52,35 @@ use wayland_client::{
     protocol::{
         wl_buffer::WlBuffer,
         wl_output::{Transform, WlOutput},
+        wl_seat::WlSeat,
         wl_surface::WlSurface,
     },
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
+use smithay_client_toolkit::seat::pointer::PointerEvent;
+use smithay_client_toolkit::shell::xdg::popup::Popup;
+use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::{Globals, Ignore};
+use wl_shell_core::popup::PopupConfigure;
 use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
+use wl_shell_render::worker::PillRequest;
 use wl_shell_render::worker::{Assets, LabelKey};
 use wl_shell_render::{icons, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
+use wl_shell_ui::card::{self, Preview};
 use wl_shell_ui::shapes::{self, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Spring, Sub};
 
 use crate::app::WlDock;
-use crate::config::{Config, DockLayer, DockLayout, Indicator, Position};
-use crate::dock::Item;
+use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
+use crate::dock::{Item, Window};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
 use crate::row::{self, Slot};
+use crate::strip::{self, Key};
+use crate::stripview::{Place, StripInput, StripStyle, StripView};
 use crate::zoom;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -93,6 +115,7 @@ pub struct Style {
     icon_theme: Option<String>,
     icon_shadow: Option<shadow::IconShadow>,
     font: String,
+    pub strip: StripStyle,
 }
 
 impl Style {
@@ -118,6 +141,21 @@ impl Style {
             icon_theme: theme.icon_theme.clone(),
             icon_shadow: config.icon_shadow(),
             font: config.font.clone(),
+            strip: StripStyle {
+                enabled: config.strip,
+                min_windows: config.strip_min_windows as usize,
+                max_columns: layout.strip_max_columns as usize,
+                max_rows: layout.strip_max_rows as usize,
+                card_height: config.strip_card_height,
+                max_width: config.strip_max_width,
+                previews: config.previews,
+                zoom: config.zoom,
+                title: config.title_style(),
+                placeholder: theme.placeholder,
+                shadow: config.shadow(),
+                morph_response: config.response as f64 * 1.7,
+                response: config.response as f64,
+            },
         }
     }
 
@@ -171,6 +209,8 @@ struct SlotSubs {
 
 pub struct DockView {
     // Field order is drop order: children before their parent surface.
+    /// The strip, while open (or closing).
+    strip: Option<StripView>,
     panel: [Sub; 3],
     /// Per slot, at least; extra ones stay hidden.
     slot_subs: Vec<SlotSubs>,
@@ -227,6 +267,20 @@ pub struct DockView {
 
     frame_pending: bool,
     last_frame: Option<Instant>,
+
+    /// The output's logical size.
+    output_size: Option<(f64, f64)>,
+    /// Captures of the windows of the hovered app (if it gets a strip) and
+    /// of the strip's.
+    previews: Vec<Preview>,
+    /// The magnification holds still while the strip is open.
+    frozen: bool,
+    /// The pointer is on the dock.
+    pointer_in: bool,
+    /// The surface's keyboard interactivity is `on-demand` (else `none`).
+    interactive: bool,
+    /// Warned that the strip can't open.
+    warned_strip: bool,
 }
 
 impl DockView {
@@ -264,7 +318,7 @@ impl DockView {
             Position::Right => Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
         };
         layer.set_anchor(anchor);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         // Nothing takes input until there is something to click.
         (layer.wl_surface()).set_input_region(Some(no_input.wl_region()));
 
@@ -274,6 +328,7 @@ impl DockView {
 
         let response = style.response;
         let mut dock = Self {
+            strip: None,
             panel,
             slot_subs: Vec::new(),
             label_sub,
@@ -311,6 +366,12 @@ impl DockView {
             label_timer: None,
             frame_pending: false,
             last_frame: None,
+            output_size: None,
+            previews: Vec::new(),
+            frozen: false,
+            pointer_in: false,
+            interactive: true,
+            warned_strip: false,
         };
         dock.apply_size();
         dock.relayout();
@@ -353,7 +414,18 @@ impl DockView {
             self.update_label();
         }
         self.relayout();
+        if reload && let Some(strip) = &mut self.strip {
+            strip.reload();
+        }
+        self.refresh_strip();
         self.kick();
+    }
+
+    /// The output's logical size, for the strip's room.
+    pub fn set_output_size(&mut self, size: Option<(i32, i32)>) {
+        self.output_size = size
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .map(|(w, h)| (w as f64, h as f64));
     }
 
     pub fn configure(&mut self, width: u32, height: u32) {
@@ -382,11 +454,12 @@ impl DockView {
         if self.label_on {
             self.update_label();
         }
+        self.refresh_strip();
         self.kick();
     }
 
     /// Show `items`; changes animate once the dock is on screen.
-    pub fn set_items(&mut self, items: &[Item]) {
+    pub fn set_items(&mut self, core: &Core<WlDock>, items: &[Item]) {
         row::merge(&mut self.slots, items, self.style.response, self.configured);
         row::set_launching(&mut self.slots, &self.launching);
         let qh = &self.qh;
@@ -414,6 +487,7 @@ impl DockView {
             self.update_label();
         }
         self.request_assets(false);
+        self.sync_strip(core);
         self.kick();
     }
 
@@ -557,25 +631,69 @@ impl DockView {
         if !self.configured {
             return;
         }
+        self.pointer_in = true;
+        // Clicks give the surface keyboard focus again.
+        self.set_interactive(true);
         let (u, _) = self.frame().dock_point(x, y);
-        self.pointer = u;
-        self.hover.retarget(1.0);
+        // Held still while the strip is open: the icons don't move under
+        // the pointer, which may be on its way to another one.
+        let at = if self.frozen { self.pointer } else { u };
         let weights = self.weights();
         let center = self.frame().length() / 2.0;
-        let row = zoom::layout(&weights, center, u, &self.style.zoom(self.hover.value));
+        let row = zoom::layout(&weights, center, at, &self.style.zoom(self.hover.value));
         let hovered = (row.hit(u))
             .map(|i| &self.slots[i])
             .filter(|s| !s.leaving)
             .map(|s| s.item.app_id.clone());
+        if !self.frozen {
+            self.pointer = u;
+        }
+        self.hover.retarget(1.0);
         self.set_hovered(core, hovered);
         self.kick();
     }
 
-    /// The pointer left the dock.
+    /// The pointer left the dock. With the strip open, the magnification
+    /// stays until it closes.
     pub fn pointer_leave(&mut self, core: &Core<WlDock>) {
+        self.pointer_in = false;
+        if self.strip_open() {
+            self.set_hovered(core, None);
+            return;
+        }
+        self.unhover(core);
+    }
+
+    /// Nothing is hovered anymore: the magnification shrinks away.
+    fn unhover(&mut self, core: &Core<WlDock>) {
+        self.frozen = false;
         self.hover.retarget(0.0);
         self.set_hovered(core, None);
         self.kick();
+    }
+
+    /// Turn keyboard focus on clicks on (`on-demand`) or off. Turning it
+    /// off gives the focus back.
+    fn set_interactive(&mut self, on: bool) {
+        if on == self.interactive {
+            return;
+        }
+        self.interactive = on;
+        self.layer.set_keyboard_interactivity(match on {
+            true => KeyboardInteractivity::OnDemand,
+            false => KeyboardInteractivity::None,
+        });
+        if self.configured {
+            self.layer.commit();
+        }
+    }
+
+    /// A click was handled without opening a popup: give the keyboard
+    /// focus it brought back.
+    pub fn release_keyboard(&mut self) {
+        if !self.strip_open() {
+            self.set_interactive(false);
+        }
     }
 
     fn set_hovered(&mut self, core: &Core<WlDock>, hovered: Option<String>) {
@@ -604,6 +722,7 @@ impl DockView {
                 }
             }
         }
+        self.sync_previews(core);
         self.update_label();
     }
 
@@ -623,8 +742,10 @@ impl DockView {
 
     /// Show the hovered app's label if it is due, or fade it out.
     fn update_label(&mut self) {
+        // The strip replaces the label.
+        let stripped = |a: &str| (self.strip.as_ref()).is_some_and(|s| s.app_id == a);
         let want = (self.hovered.as_deref())
-            .filter(|_| self.label_on)
+            .filter(|a| self.label_on && !stripped(a))
             .and_then(|a| self.label_key(a));
         let Some(key) = want else {
             self.label_alpha.retarget(0.0);
@@ -672,7 +793,8 @@ impl DockView {
     }
 
     fn moving(&self) -> bool {
-        !self.hover.settled()
+        self.strip.as_ref().is_some_and(StripView::moving)
+            || !self.hover.settled()
             || !self.label_alpha.settled()
             || self
                 .slots
@@ -688,6 +810,15 @@ impl DockView {
         let mut moving = self.hover.advance(dt);
         moving |= self.label_alpha.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
+        if let Some(strip) = &mut self.strip {
+            moving |= strip.advance(dt);
+            if strip.gone() {
+                self.strip = None;
+                self.prune_previews();
+                // Its app's name can show again.
+                self.update_label();
+            }
+        }
         self.last_frame = moving.then_some(now);
         self.render();
     }
@@ -703,6 +834,7 @@ impl DockView {
             self.request_frame();
         }
         self.layer.commit();
+        self.render_strip();
     }
 
     /// An alpha as shown: without wp_alpha_modifier_v1, things are either
@@ -870,6 +1002,384 @@ impl DockView {
         }
         // Copied on commit; the region can go right away.
         (self.layer.wl_surface()).set_input_region(Some(region.wl_region()));
+    }
+
+    // -- the strip -----------------------------------------------------------
+
+    /// Whether `item` gets a strip: strips are on, it has enough windows
+    /// here, and there are popups to show it in.
+    pub fn can_strip(&self, item: &Item) -> bool {
+        let strip = &self.style.strip;
+        strip.enabled
+            && item.windows.len() >= strip.min_windows.max(1)
+            && self.g.xdg_wm_base.is_some()
+    }
+
+    /// The hovered app, if it gets a strip.
+    fn strip_item(&self) -> Option<&Item> {
+        self.hovered_item().filter(|item| self.can_strip(item))
+    }
+
+    /// Whether the strip is open (and not closing).
+    fn strip_open(&self) -> bool {
+        self.strip.as_ref().is_some_and(|s| !s.closing())
+    }
+
+    /// The app whose strip is open (and not closing).
+    pub fn strip_app(&self) -> Option<&str> {
+        (self.strip.as_ref())
+            .filter(|s| !s.closing())
+            .map(|s| s.app_id.as_str())
+    }
+
+    /// The icon of `app_id` on the dock surface, with the magnification
+    /// where it is headed, and how far its far side is from the edge.
+    fn icon_place(&self, app_id: &str) -> Option<(IRect, f64)> {
+        let i = self.slots.iter().position(|s| s.item.app_id == app_id)?;
+        let frame = self.frame();
+        let m = self.style.metrics();
+        let weights: Vec<f64> = (self.slots.iter())
+            .map(|s| s.presence.target.clamp(0.0, 1.0))
+            .collect();
+        let zoom = self.style.zoom(self.hover.target.clamp(0.0, 1.0));
+        let row = zoom::layout(&weights, frame.length() / 2.0, self.pointer, &zoom);
+        let cell = row.cells.get(i)?;
+        let d = cell.size.max(1.0);
+        let r = frame.rect(cell.center - d / 2.0, m.icon_v(), d, d);
+        Some((IRect::round(r), m.icon_v() + d))
+    }
+
+    /// Where the strip of `app_id` goes.
+    fn strip_place(&self, app_id: &str) -> Option<Place> {
+        let (icon, reach) = self.icon_place(app_id)?;
+        let output = self
+            .output_size
+            .unwrap_or(match self.style.layout.position {
+                Position::Bottom => (self.width as f64, 1080.0),
+                Position::Left | Position::Right => (1920.0, self.height as f64),
+            });
+        Some(Place {
+            position: self.style.layout.position,
+            icon: wl_shell_ui::Rect::new(
+                icon.x as f64,
+                icon.y as f64,
+                icon.w as f64,
+                icon.h as f64,
+            ),
+            output,
+            reach,
+            scale: self.scale,
+        })
+    }
+
+    /// The windows' aspect ratios, from their captures.
+    fn aspects(&self, windows: &[Window]) -> Vec<f64> {
+        (windows.iter())
+            .map(|w| {
+                (self.previews.iter())
+                    .find(|p| p.window == w.id)
+                    .and_then(Preview::aspect)
+                    .unwrap_or(card::DEFAULT_ASPECT)
+            })
+            .collect()
+    }
+
+    /// The items changed: show the open strip's app's windows, or close
+    /// it if none are left.
+    fn sync_strip(&mut self, core: &Core<WlDock>) {
+        if let Some(app_id) = self.strip_app().map(str::to_string) {
+            let windows = (self.slots.iter())
+                .find(|s| !s.leaving && s.item.app_id == app_id)
+                .map(|s| s.item.windows.clone())
+                .unwrap_or_default();
+            if windows.is_empty() {
+                self.close_strip(core);
+            } else {
+                let place = self.strip_place(&app_id);
+                let aspects = self.aspects(&windows);
+                if let (Some(strip), Some(place)) = (&mut self.strip, place) {
+                    strip.update(&windows, &aspects, &self.style.strip, place);
+                }
+            }
+        }
+        self.sync_previews(core);
+    }
+
+    /// Start the captures the hovered app's strip would need (paused
+    /// after their first frame, so a click finds them ready) and the open
+    /// strip's (live), and drop the rest.
+    fn sync_previews(&mut self, core: &Core<WlDock>) {
+        if self.style.strip.previews != Previews::Off {
+            let open: Vec<Window> = (self.strip.as_ref())
+                .filter(|s| !s.closing())
+                .map(|s| s.windows().to_vec())
+                .unwrap_or_default();
+            if let Some(item) = self.strip_item() {
+                let hovered: Vec<Window> = (item.windows.iter())
+                    .filter(|w| !open.contains(w))
+                    .cloned()
+                    .collect();
+                self.capture(core, &hovered, false);
+            }
+            let live = self.style.strip.previews == Previews::Live;
+            self.capture(core, &open, live);
+        }
+        self.prune_previews();
+    }
+
+    /// Open the strip of `app_id`, grabbing `grab` (a seat and the serial
+    /// of the click). Any other strip goes at once. Returns whether it
+    /// opened.
+    pub fn open_strip(
+        &mut self,
+        core: &Core<WlDock>,
+        app_id: &str,
+        grab: Option<(&WlSeat, u32)>,
+    ) -> bool {
+        // A grabbing popup has to be the topmost: the old one goes first.
+        self.strip = None;
+        self.set_interactive(true);
+        let Some(windows) = (self.slots.iter())
+            .find(|s| !s.leaving && s.item.app_id == app_id)
+            .map(|s| s.item.windows.clone())
+        else {
+            return false;
+        };
+        let Some(place) = self.strip_place(app_id) else {
+            return false;
+        };
+        let aspects = self.aspects(&windows);
+        // Start on the app's previous window.
+        let ids: Vec<&str> = windows.iter().map(|w| w.id.as_str()).collect();
+        let focused = (core.focus_stream.running())
+            .then(|| core.mru.first())
+            .flatten();
+        let highlight = strip::first_highlight(&ids, &core.mru, focused);
+        match StripView::new(
+            self.g.clone(),
+            self.assets.clone(),
+            &self.qh,
+            &self.layer,
+            grab,
+            app_id.to_string(),
+            windows,
+            aspects,
+            highlight,
+            self.style.strip.clone(),
+            place,
+        ) {
+            Ok(strip) => {
+                self.strip = Some(strip);
+                // The icons hold still under the strip.
+                self.frozen = true;
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut self.warned_strip, true) {
+                    warn!("cannot show the strip: {e}");
+                }
+            }
+        }
+        self.sync_previews(core);
+        self.update_label();
+        self.kick();
+        self.strip.is_some()
+    }
+
+    /// Shrink the strip back into the icon (a card was picked, say); it
+    /// goes once it's there. Gives the keyboard back.
+    pub fn close_strip(&mut self, core: &Core<WlDock>) {
+        let Some(strip) = &mut self.strip else { return };
+        if !strip.closing() {
+            strip.close();
+        }
+        self.strip_closed(core);
+    }
+
+    /// Drop the strip at once.
+    pub fn drop_strip(&mut self, core: &Core<WlDock>) {
+        if self.strip.take().is_some() {
+            self.strip_closed(core);
+        }
+    }
+
+    fn strip_closed(&mut self, core: &Core<WlDock>) {
+        self.frozen = false;
+        self.set_interactive(false);
+        if !self.pointer_in {
+            self.unhover(core);
+        }
+        self.sync_previews(core);
+        self.update_label();
+        self.kick();
+    }
+
+    /// The style, scale or output changed: lay the strip out again.
+    fn refresh_strip(&mut self) {
+        let Some(strip) = &self.strip else { return };
+        let (app_id, windows) = (strip.app_id.clone(), strip.windows().to_vec());
+        let place = self.strip_place(&app_id);
+        let aspects = self.aspects(&windows);
+        if let (Some(strip), Some(place)) = (&mut self.strip, place) {
+            strip.update(&windows, &aspects, &self.style.strip, place);
+        }
+    }
+
+    /// Capture `windows` (those not captured yet), all `live` or paused.
+    fn capture(&mut self, core: &Core<WlDock>, windows: &[Window], live: bool) {
+        let missing: Vec<&Window> = (windows.iter())
+            .filter(|w| !self.previews.iter().any(|p| p.window == w.id))
+            .collect();
+        if !missing.is_empty() {
+            for (handle, t) in core.toplevels() {
+                if missing.iter().any(|w| w.id == t.identifier) {
+                    let p = Preview::new(t.identifier, &handle, &self.g, live, &self.qh);
+                    self.previews.push(p);
+                }
+            }
+        }
+        for p in &mut self.previews {
+            if windows.iter().any(|w| w.id == p.window) {
+                p.set_live(live, &self.g, &self.qh);
+            }
+        }
+    }
+
+    /// Drop the captures neither the hovered app nor the strip needs, and
+    /// pause the closing strip's.
+    fn prune_previews(&mut self) {
+        let mut keep: Vec<String> = Vec::new();
+        if self.style.strip.previews != Previews::Off {
+            if let Some(item) = self.strip_item() {
+                keep.extend(item.windows.iter().map(|w| w.id.clone()));
+            }
+            if let Some(strip) = &self.strip {
+                keep.extend(strip.windows().iter().map(|w| w.id.clone()));
+            }
+        }
+        self.previews.retain(|p| keep.contains(&p.window));
+        if let Some(strip) = &self.strip
+            && strip.closing()
+        {
+            for p in &mut self.previews {
+                if strip.windows().iter().any(|w| w.id == p.window) {
+                    p.set_live(false, &self.g, &self.qh);
+                }
+            }
+        }
+    }
+
+    /// Draw the strip, if any.
+    fn render_strip(&mut self) {
+        let Some(strip) = &mut self.strip else { return };
+        let key = self.style.strip.previews.eq(&Previews::Off).then(|| {
+            icons::Key::new(
+                &strip.app_id,
+                self.style.icon_key_size(),
+                self.style.icon_theme.clone(),
+                self.style.icon_shadow,
+                self.scale,
+            )
+        });
+        let mut cache = self.cache.borrow_mut();
+        strip.fetch_shadows(&mut cache);
+        let icon = key.as_ref().and_then(|k| Some((cache.icon(k)?, k)));
+        let icon = icon.as_ref().map(|(buffer, k)| {
+            let p = (k.pad() * k.scale) as f64;
+            (
+                buffer,
+                k.image_size() as f64,
+                [p, p, k.size as f64, k.size as f64],
+            )
+        });
+        strip.render(&mut self.previews, icon);
+    }
+
+    /// Whether `surface` is this dock's strip.
+    pub fn has_strip_surface(&self, surface: &WlSurface) -> bool {
+        self.strip.as_ref().is_some_and(|s| s.surface() == surface)
+    }
+
+    pub fn has_popup(&self, popup: &Popup) -> bool {
+        self.strip.as_ref().is_some_and(|s| s.is(popup))
+    }
+
+    /// The compositor placed the strip.
+    pub fn popup_configure(&mut self, configure: &PopupConfigure) {
+        if let Some(strip) = &mut self.strip {
+            strip.configure(configure);
+        }
+        self.render();
+    }
+
+    /// The compositor dismissed the strip (a click on another client).
+    pub fn popup_done(&mut self, core: &Core<WlDock>) {
+        self.drop_strip(core);
+    }
+
+    /// A pointer event on the strip. Returns the window to activate, if a
+    /// card was clicked.
+    pub fn strip_pointer(&mut self, core: &Core<WlDock>, event: &PointerEvent) -> Option<String> {
+        let strip = self.strip.as_mut()?;
+        let (x, y) = event.position;
+        let input = strip.pointer(&event.kind, x, y);
+        self.kick();
+        self.strip_input(core, input)
+    }
+
+    /// A key on the strip. Returns the window to activate, if any.
+    pub fn strip_key(&mut self, core: &Core<WlDock>, key: Key) -> Option<String> {
+        let input = self.strip.as_mut()?.key(key);
+        self.kick();
+        self.strip_input(core, input)
+    }
+
+    fn strip_input(&mut self, core: &Core<WlDock>, input: StripInput) -> Option<String> {
+        match input {
+            StripInput::None => None,
+            StripInput::Close => {
+                self.close_strip(core);
+                None
+            }
+            StripInput::Activate(id) => {
+                self.close_strip(core);
+                Some(id)
+            }
+        }
+    }
+
+    /// A title pill from the worker; true if it was the strip's.
+    pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
+        let ours = (self.strip.as_mut()).is_some_and(|s| s.pill_ready(tag, request, pill));
+        if ours {
+            self.kick();
+        }
+        ours
+    }
+
+    /// Whether capture `id` is one of this dock's.
+    pub fn has_capture(&self, id: CaptureId) -> bool {
+        self.previews.iter().any(|p| p.id == id)
+    }
+
+    /// An event of capture `id`.
+    pub fn capture_update(
+        &mut self,
+        id: CaptureId,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
+    ) {
+        let Some(p) = self.previews.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        let update = p.update(&self.g, &self.qh, f);
+        let window = p.window.clone();
+        let shown =
+            (self.strip.as_ref()).is_some_and(|s| s.windows().iter().any(|w| w.id == window));
+        if update.resized {
+            self.refresh_strip();
+        }
+        if shown && (update.shown || update.resized) {
+            self.kick();
+        }
     }
 }
 

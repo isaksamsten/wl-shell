@@ -98,6 +98,37 @@ impl IRect {
     }
 }
 
+/// Cut `rect`, which shows `src` (x, y, w, h in buffer pixels; None: all
+/// of a buffer `size` pixels large), down to `clip`: the rect left and the
+/// part of the buffer it shows (None if nothing was cut and `src` was
+/// None). None if nothing is left.
+pub fn clip(
+    rect: Rect,
+    size: (f64, f64),
+    src: Option<[f64; 4]>,
+    clip: Rect,
+) -> Option<(Rect, Option<[f64; 4]>)> {
+    let (x0, x1) = (rect.x.max(clip.x), rect.right().min(clip.right()));
+    let (y0, y1) = (rect.y.max(clip.y), rect.bottom().min(clip.bottom()));
+    if x1 <= x0 || y1 <= y0 || rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    if (x0, y0, x1, y1) == (rect.x, rect.y, rect.right(), rect.bottom()) {
+        return Some((rect, src));
+    }
+    let [sx, sy, sw, sh] = src.unwrap_or([0.0, 0.0, size.0, size.1]);
+    // wl_fixed has 1/256 precision; stay inside the buffer part.
+    let floor = |v: f64| (v * 256.0).floor() / 256.0;
+    let cut = |a0: f64, a1: f64, r0: f64, rl: f64, s0: f64, sl: f64| {
+        let start = floor(s0 + (a0 - r0) / rl * sl);
+        let len = floor((a1 - a0) / rl * sl).clamp(1.0 / 256.0, (s0 + sl - start).max(1.0 / 256.0));
+        (start, len)
+    };
+    let (cx, cw) = cut(x0, x1, rect.x, rect.w, sx, sw);
+    let (cy, ch) = cut(y0, y1, rect.y, rect.h, sy, sh);
+    Some((Rect::new(x0, y0, x1 - x0, y1 - y0), Some([cx, cy, cw, ch])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +154,32 @@ mod tests {
         assert_eq!(r.centered_square(100.0), Rect::new(10.0, 20.0, 20.0, 20.0));
         assert_eq!(r.outset(1.0), Rect::new(9.0, 9.0, 22.0, 42.0));
         assert!(r.contains(10.0, 49.9) && !r.contains(30.0, 20.0));
+    }
+
+    #[test]
+    fn clipping_cuts_the_buffer_with_the_rect() {
+        let r = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let all = Rect::new(-10.0, -10.0, 200.0, 200.0);
+        assert_eq!(clip(r, (200.0, 100.0), None, all), Some((r, None)));
+        let src = Some([10.0, 0.0, 100.0, 50.0]);
+        assert_eq!(clip(r, (200.0, 100.0), src, all), Some((r, src)));
+        // The right half and the top 10 px go.
+        let (rect, src) =
+            clip(r, (200.0, 100.0), None, Rect::new(-5.0, 10.0, 55.0, 100.0)).unwrap();
+        assert_eq!(rect, Rect::new(0.0, 10.0, 50.0, 40.0));
+        assert_eq!(src, Some([0.0, 20.0, 100.0, 80.0]));
+        // Within a part of the buffer.
+        let (_, src) = clip(
+            r,
+            (200.0, 100.0),
+            Some([100.0, 0.0, 100.0, 50.0]),
+            Rect::new(50.0, 0.0, 100.0, 100.0),
+        )
+        .unwrap();
+        assert_eq!(src, Some([150.0, 0.0, 50.0, 50.0]));
+        assert_eq!(
+            clip(r, (1.0, 1.0), None, Rect::new(100.0, 0.0, 10.0, 10.0)),
+            None
+        );
     }
 }

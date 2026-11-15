@@ -19,17 +19,10 @@
 //! overlaps its neighbors.
 
 use wl_shell_ui::Rect;
+use wl_shell_ui::card::aspect;
 
-/// The aspect ratio (width / height) of a window whose size isn't known.
-pub const DEFAULT_ASPECT: f64 = 16.0 / 10.0;
-/// Aspect ratios are clamped to this range, so an odd window can't make a
-/// sliver of a card.
-const ASPECTS: (f64, f64) = (0.25, 4.0);
 /// Cards never get shorter than this (unless configured smaller).
 pub const MIN_CARD: f64 = 96.0;
-/// Morph delay per card of distance from the selected one, as a fraction
-/// of the morph.
-pub const STAGGER: f64 = 0.05;
 
 pub struct Params {
     /// Each window's aspect ratio (width / height), in strip order.
@@ -59,15 +52,6 @@ pub struct Layout {
     center_x: f64,
     center_y: f64,
     zoom: f64,
-}
-
-/// The aspect ratio to lay out: `a`, sanitized.
-fn aspect(a: f64) -> f64 {
-    if a.is_finite() && a > 0.0 {
-        a.clamp(ASPECTS.0, ASPECTS.1)
-    } else {
-        DEFAULT_ASPECT
-    }
 }
 
 impl Layout {
@@ -192,16 +176,10 @@ impl Layout {
     }
 }
 
-/// The morph progress of a card `k` cards away from the selected one, at
-/// overall progress `morph`: cards further away start later and catch up.
-pub fn stagger(morph: f64, k: usize) -> f64 {
-    let delay = (k as f64 * STAGGER).min(0.5);
-    ((morph - delay) / (1.0 - delay)).clamp(0.0, 1.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wl_shell_ui::card::DEFAULT_ASPECT;
 
     fn params(n: usize) -> Params {
         Params {
@@ -338,17 +316,5 @@ mod tests {
         }
         let b = l.bounds(0.0);
         assert!((b.center().0 - 400.0).abs() <= 0.5 && b.w == l.width());
-    }
-
-    #[test]
-    fn staggered_morph() {
-        assert_eq!(stagger(0.0, 0), 0.0);
-        assert_eq!(stagger(0.5, 0), 0.5);
-        assert_eq!(stagger(1.0, 0), 1.0);
-        // Later cards start later, all finish together.
-        assert_eq!(stagger(0.05, 1), 0.0);
-        assert!(stagger(0.5, 2) < stagger(0.5, 1));
-        assert_eq!(stagger(1.0, 30), 1.0);
-        assert!(stagger(0.9, 30) > 0.0);
     }
 }

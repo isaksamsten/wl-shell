@@ -55,6 +55,31 @@ pub struct Config {
     pub hover_delay: u32,
     /// The hovered app's name.
     pub labels: bool,
+    /// Clicking an app with `strip-min-windows` windows opens the strip
+    /// of its windows; false: the click activates the most recent one.
+    pub strip: bool,
+    /// Apps with fewer windows activate one on a click instead of opening
+    /// the strip.
+    #[serde(deserialize_with = "strip_min_windows")]
+    pub strip_min_windows: u32,
+    /// Cards per row of the strip, along the dock; 0: no limit.
+    #[serde(deserialize_with = "strip_cap")]
+    pub strip_max_columns: u32,
+    /// Rows of the strip, stacked away from the dock; 0: no limit.
+    #[serde(deserialize_with = "strip_cap")]
+    pub strip_max_rows: u32,
+    /// Strip card height, as a fraction of the output height.
+    #[serde(deserialize_with = "de::fraction")]
+    pub strip_card_height: f64,
+    /// Longest a strip gets along the dock, as a fraction of the output's
+    /// length there; also the widest a card gets, of the output's width.
+    #[serde(deserialize_with = "de::fraction")]
+    pub strip_max_width: f64,
+    /// Window previews in the strip.
+    pub previews: Previews,
+    /// Zoom factor of the highlighted card; 1 disables zooming.
+    #[serde(deserialize_with = "de::zoom")]
+    pub zoom: f64,
     /// What marks running apps.
     pub indicator: Indicator,
     /// Mark the focused app (needs `mru-event-stream`).
@@ -107,6 +132,14 @@ impl Default for Config {
             reserve: true,
             hover_delay: 300,
             labels: true,
+            strip: true,
+            strip_min_windows: 2,
+            strip_max_columns: 3,
+            strip_max_rows: 3,
+            strip_card_height: 0.18,
+            strip_max_width: 0.6,
+            previews: Previews::default(),
+            zoom: 1.04,
             indicator: Indicator::default(),
             active_indicator: true,
             response: 150,
@@ -168,6 +201,19 @@ pub enum Windows {
     Output,
 }
 
+/// Window previews in the strip.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Previews {
+    /// Live while the strip is open.
+    #[default]
+    Live,
+    /// One frame per window.
+    Static,
+    /// The app's icon and the titles only.
+    Off,
+}
+
 /// The outputs that get a dock: `"all"`, or a list of output names.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Outputs {
@@ -222,6 +268,10 @@ pub struct OutputOverride {
     #[serde(deserialize_with = "some_px")]
     pub margin: Option<u32>,
     pub windows: Option<Windows>,
+    #[serde(deserialize_with = "some_strip_cap")]
+    pub strip_max_columns: Option<u32>,
+    #[serde(deserialize_with = "some_strip_cap")]
+    pub strip_max_rows: Option<u32>,
 }
 
 /// The layout of one output's dock: the global keys with its
@@ -234,6 +284,8 @@ pub struct DockLayout {
     pub reserve: bool,
     pub margin: u32,
     pub windows: Windows,
+    pub strip_max_columns: u32,
+    pub strip_max_rows: u32,
 }
 
 /// Colors: the keys of `[appearance]`, and of its `dark` and `light`
@@ -259,6 +311,15 @@ pub struct Theme {
     /// The pill behind it.
     #[serde(deserialize_with = "de::color")]
     pub label_background: u32,
+    /// Window titles in the strip.
+    #[serde(deserialize_with = "de::color")]
+    pub title_color: u32,
+    /// The pill behind them.
+    #[serde(deserialize_with = "de::color")]
+    pub title_background: u32,
+    /// A strip card until its window's first frame arrives.
+    #[serde(deserialize_with = "de::color")]
+    pub placeholder: u32,
     /// Shadow color; alpha 0 disables shadows.
     #[serde(deserialize_with = "de::color")]
     pub shadow_color: u32,
@@ -293,6 +354,9 @@ impl Default for Theme {
             active_indicator_color: 0xffffffff,
             label_color: 0xffffffff,
             label_background: 0x262626e6,
+            title_color: 0xffffffff,
+            title_background: 0x000000b3,
+            placeholder: 0x3a3a3aff,
             shadow_color: 0x00000066,
             shadow_softness: 24,
             shadow_spread: 0,
@@ -329,6 +393,8 @@ impl Config {
             reserve: o.reserve.unwrap_or(self.reserve),
             margin: o.margin.unwrap_or(self.margin),
             windows: o.windows.unwrap_or(self.windows),
+            strip_max_columns: o.strip_max_columns.unwrap_or(self.strip_max_columns),
+            strip_max_rows: o.strip_max_rows.unwrap_or(self.strip_max_rows),
         })
     }
 
@@ -361,6 +427,16 @@ impl Config {
             color: self.theme().label_color,
             background: self.theme().label_background,
         })
+    }
+
+    /// The style of a window's title pill in the strip.
+    pub fn title_style(&self) -> text::Style {
+        text::Style {
+            font: self.font.clone(),
+            size: self.font_size as f64,
+            color: self.theme().title_color,
+            background: self.theme().title_background,
+        }
     }
 }
 
@@ -410,6 +486,20 @@ fn ranged<'de, D: Deserializer<'de>>(d: D, min: f64, max: f64) -> Result<f64, D:
             "expected {min} to {max}, got {v}"
         )))
     }
+}
+
+/// Windows an app needs for its strip, 1 to 100.
+fn strip_min_windows<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 1, 100)
+}
+
+/// Strip columns or rows at most, 0 (no limit) to 100.
+fn strip_cap<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 0, 100)
+}
+
+fn some_strip_cap<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    strip_cap(d).map(Some)
 }
 
 /// Bouncing at most, in milliseconds.
@@ -464,6 +554,14 @@ mod tests {
             output-event-stream = "outputs.sh"
             windows = "output"
             output-grace = 100
+            strip = false
+            strip-min-windows = 3
+            strip-max-columns = 4
+            strip-max-rows = 0
+            strip-card-height = 0.25
+            strip-max-width = 0.5
+            previews = "static"
+            zoom = 1
 
             [appearance]
             panel-color = "00000080"
@@ -472,6 +570,9 @@ mod tests {
             label-color = "eeeeee"
             label-background = "00000080"
             icon-theme = "Papirus"
+            title-color = "eeeeee"
+            title-background = "00000080"
+            placeholder = "#222222"
             "##,
         )
         .unwrap();
@@ -505,6 +606,13 @@ mod tests {
         assert_eq!(c.mru_event_stream.as_deref(), Some("focus.sh"));
         assert_eq!(c.output_event_stream.as_deref(), Some("outputs.sh"));
         assert_eq!((c.windows, c.output_grace), (Windows::Output, 100));
+        assert!(!c.strip);
+        assert_eq!(
+            (c.strip_min_windows, c.strip_max_columns, c.strip_max_rows),
+            (3, 4, 0)
+        );
+        assert_eq!((c.strip_card_height, c.strip_max_width), (0.25, 0.5));
+        assert_eq!((c.previews, c.zoom), (Previews::Static, 1.0));
         let t = c.theme();
         assert_eq!((t.panel_color, t.indicator_color), (0x00000080, 0xffffffff));
         assert_eq!(
@@ -513,6 +621,10 @@ mod tests {
         );
         assert_eq!(t.panel_radius, 20);
         assert_eq!(t.icon_theme.as_deref(), Some("Papirus"));
+        assert_eq!(
+            (t.title_color, t.title_background, t.placeholder),
+            (0xeeeeeeff, 0x00000080, 0x222222ff)
+        );
     }
 
     #[test]
@@ -527,6 +639,7 @@ mod tests {
             magnification = 1
             margin = 2
             windows = "output"
+            strip-max-rows = 1
 
             [output.HDMI-A-1]
             enabled = false
@@ -544,6 +657,8 @@ mod tests {
             (global.windows, edp.windows),
             (Windows::All, Windows::Output)
         );
+        assert_eq!((global.strip_max_columns, global.strip_max_rows), (3, 3));
+        assert_eq!((edp.strip_max_columns, edp.strip_max_rows), (3, 1));
         assert!(c.dock("HDMI-A-1").is_none());
     }
 
@@ -578,6 +693,13 @@ mod tests {
         assert!(err("indicator = \"bar\""));
         assert!(err("windows = \"some\""));
         assert!(err("launch-timeout = 100000"));
+        assert!(err("strip-min-windows = 0"));
+        assert!(err("strip-direction = \"vertical\""));
+        assert!(err("strip-max-rows = 101"));
+        assert!(err("strip-max-columns = -1"));
+        assert!(err("previews = \"sometimes\""));
+        assert!(err("zoom = 0.9"));
+        assert!(err("strip-card-height = 2"));
         assert!(err("outputs = \"some\""));
         assert!(err("outputs = 1"));
         assert!(err("unknown = 1"));

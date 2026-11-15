@@ -2,8 +2,12 @@
 //! we don't care about.
 
 use smithay_client_toolkit::{
-    compositor::CompositorState, dispatch2::Dispatch2, error::GlobalError,
-    globals::ProvidesBoundGlobal, shell::wlr_layer::LayerShell, subcompositor::SubcompositorState,
+    compositor::CompositorState,
+    dispatch2::Dispatch2,
+    error::GlobalError,
+    globals::{GlobalData, ProvidesBoundGlobal},
+    shell::wlr_layer::LayerShell,
+    subcompositor::SubcompositorState,
 };
 use wayland_client::{
     Connection, Proxy, QueueHandle,
@@ -32,6 +36,7 @@ use wayland_protocols::{
         single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
+    xdg::shell::client::xdg_wm_base,
 };
 
 use wl_shell_log::warn;
@@ -89,6 +94,22 @@ impl ProvidesBoundGlobal<WlShm, 1> for Shm {
     }
 }
 
+/// xdg_wm_base alone, for popups: SCTK's `XdgShell` binds the decoration
+/// manager too, which only windows need. Pings are answered by SCTK.
+pub struct XdgWmBase(xdg_wm_base::XdgWmBase);
+
+impl ProvidesBoundGlobal<xdg_wm_base::XdgWmBase, 5> for XdgWmBase {
+    fn bound_global(&self) -> Result<xdg_wm_base::XdgWmBase, GlobalError> {
+        Ok(self.0.clone())
+    }
+}
+
+impl ProvidesBoundGlobal<xdg_wm_base::XdgWmBase, 6> for XdgWmBase {
+    fn bound_global(&self) -> Result<xdg_wm_base::XdgWmBase, GlobalError> {
+        Ok(self.0.clone())
+    }
+}
+
 pub struct Globals {
     pub compositor: CompositorState,
     pub subcompositor: SubcompositorState,
@@ -99,6 +120,8 @@ pub struct Globals {
     /// Optional; without it, surfaces can't fade.
     pub alpha_modifier: Option<WpAlphaModifierV1>,
     pub layer_shell: LayerShell,
+    /// Optional; without it, programs can't open popups.
+    pub xdg_wm_base: Option<XdgWmBase>,
     pub source_manager: ExtForeignToplevelImageCaptureSourceManagerV1,
     /// Optional; without it, outputs can't be captured.
     pub output_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
@@ -153,6 +176,7 @@ impl Globals {
             single_pixel: globals.bind(qh, 1..=1, Ignore).ok(),
             alpha_modifier: globals.bind(qh, 1..=1, Ignore).ok(),
             layer_shell: layer_shell?,
+            xdg_wm_base: (globals.bind(qh, 1..=6, GlobalData).ok()).map(XdgWmBase),
             source_manager: source_manager?,
             output_source_manager: globals.bind(qh, 1..=1, Ignore).ok(),
             copy_manager: copy_manager?,

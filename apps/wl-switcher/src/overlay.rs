@@ -46,12 +46,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     QueueHandle,
-    protocol::{
-        wl_buffer::WlBuffer,
-        wl_output::{Transform, WlOutput},
-        wl_seat::WlSeat,
-        wl_surface::WlSurface,
-    },
+    protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
 };
 use wayland_protocols::{
     ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -68,6 +63,7 @@ use wl_shell_log::warn;
 use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
 use wl_shell_render::{icons, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
+use wl_shell_ui::card::{self, Card, Content, Preview};
 use wl_shell_ui::shapes::{self, Axis, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
@@ -120,10 +116,8 @@ struct Scene {
     dots: Vec<Sub>,
     /// Two, to crossfade.
     labels: [Sub; 2],
-    /// Per strip card: top, bottom, left, right.
-    shadows: Vec<[Sub; 4]>,
-    /// Per strip card.
-    previews: Vec<Sub>,
+    /// Per strip card: its shadow and preview.
+    cards: Vec<Card>,
     /// The strip's app's icon, which the selected card grows out of.
     morph_icon: Sub,
     titles: [Sub; 2],
@@ -147,8 +141,7 @@ impl Scene {
             icons: (0..apps).map(|_| sub()).collect(),
             dots: (0..apps).map(|_| sub()).collect(),
             labels: [sub(), sub()],
-            shadows: (0..cards).map(|_| [sub(), sub(), sub(), sub()]).collect(),
-            previews: (0..cards).map(|_| sub()).collect(),
+            cards: card::cards(g, parent, no_input, cards, qh),
             morph_icon: sub(),
             titles: [sub(), sub()],
         }
@@ -220,42 +213,6 @@ impl Fade {
     fn known_title(&self, request: &PillRequest) -> Option<LabelWant> {
         let same = |w: &&LabelWant| matches!(w, LabelWant::Title(_, r) if r == request);
         (self.wanted.iter()).chain(self.front()).find(same).cloned()
-    }
-}
-
-/// A capture frame handed to the overlay.
-struct Shown {
-    buffer: WlBuffer,
-    width: u32,
-    height: u32,
-    transform: Transform,
-    /// Attached at least once, so the compositor will release it.
-    used: bool,
-}
-
-/// A window's capture and its latest frame.
-struct Preview {
-    /// The window's ext identifier.
-    window: String,
-    id: CaptureId,
-    capture: Capture,
-    frame: Option<Shown>,
-}
-
-impl Preview {
-    /// The window's aspect ratio, once known.
-    fn aspect(&self) -> Option<f64> {
-        let (w, h, transform) = match (&self.frame, self.capture.size()) {
-            (Some(f), _) => (f.width, f.height, f.transform),
-            (None, Some((w, h))) => (w, h, Transform::Normal),
-            (None, None) => return None,
-        };
-        let swaps = matches!(
-            transform,
-            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
-        );
-        let (w, h) = if swaps { (h, w) } else { (w, h) };
-        (w > 0 && h > 0).then(|| w as f64 / h as f64)
     }
 }
 
@@ -744,7 +701,7 @@ impl Overlay {
                 false => (self.previews.iter())
                     .find(|p| p.window == *id)
                     .and_then(Preview::aspect)
-                    .unwrap_or(strip::DEFAULT_ASPECT),
+                    .unwrap_or(card::DEFAULT_ASPECT),
             })
             .collect();
         // Without previews, cards are icons: not larger than they are.
@@ -861,18 +818,13 @@ impl Overlay {
             let Some((handle, _)) = self.handles.iter().find(|(_, i)| i == id) else {
                 continue;
             };
-            let wid = CaptureId::next();
             let is_live = live.contains(&id.as_str());
-            self.previews.push(Preview {
-                window: id.clone(),
-                id: wid,
-                capture: Capture::window(wid, handle, &self.g, is_live, false, &self.qh),
-                frame: None,
-            });
+            let preview = Preview::new(id.clone(), handle, &self.g, is_live, &self.qh);
+            self.previews.push(preview);
         }
         for p in &mut self.previews {
             let is_live = live.contains(&p.window.as_str());
-            p.capture.set_live(is_live, &self.g, &self.qh);
+            p.set_live(is_live, &self.g, &self.qh);
         }
     }
 
@@ -885,29 +837,11 @@ impl Overlay {
         let Some(p) = self.previews.iter_mut().find(|p| p.id == id) else {
             return;
         };
-        let before = p.aspect();
-        match f(&mut p.capture, &self.g) {
-            Some(CaptureEvent::Frame(frame)) => {
-                // A frame never attached is never released: free it here.
-                if let Some(old) = p.frame.take()
-                    && !old.used
-                {
-                    p.capture.discard(&old.buffer, &self.qh);
-                }
-                p.frame = Some(Shown {
-                    buffer: frame.buffer,
-                    width: frame.width,
-                    height: frame.height,
-                    transform: frame.transform,
-                    used: false,
-                });
-            }
-            Some(CaptureEvent::Failed(why)) => {
-                warn!("capture of '{}' failed: {why}", p.window);
-            }
-            None => return,
+        let update = p.update(&self.g, &self.qh, f);
+        if !update.shown {
+            return;
         }
-        let resized = p.aspect() != before;
+        let resized = update.resized;
         let window = p.window.clone();
         let shown = (self.strip.as_ref()).is_some_and(|s| s.windows.contains(&window));
         if shown {
@@ -1421,11 +1355,13 @@ impl Overlay {
             let p = (k.pad() * k.scale) as f64;
             [p, p, k.size as f64, k.size as f64]
         });
+        let image_size = strip_key.as_ref().map_or(1.0, |k| k.image_size() as f64);
+        let scale = self.scale as f64;
         let card_alphas: Vec<f64> = match &self.strip {
             Some(s) => {
                 let sel = self.strip_sel.target.round() as usize;
                 (0..s.layout.len())
-                    .map(|i| gate(base * strip::stagger(morph, i.abs_diff(sel))))
+                    .map(|i| gate(base * card::stagger(morph, i.abs_diff(sel))))
                     .collect()
             }
             None => Vec::new(),
@@ -1434,10 +1370,10 @@ impl Overlay {
         let scene = &mut self.scene;
 
         let Some(s) = &self.strip else {
-            let subs = (scene.shadows.iter_mut().flatten())
-                .chain(&mut scene.previews)
-                .chain([&mut scene.morph_icon])
-                .chain(&mut scene.titles);
+            for card in &mut scene.cards {
+                card.clear();
+            }
+            let subs = [&mut scene.morph_icon].into_iter().chain(&mut scene.titles);
             for sub in subs {
                 sub.hide();
                 sub.commit();
@@ -1447,59 +1383,32 @@ impl Overlay {
         let (off, sel) = (self.strip_offset.value, self.strip_sel.value);
         let sel_i = self.strip_sel.target.round() as usize;
 
-        for (i, (sub, shadow)) in (scene.previews.iter_mut())
-            .zip(scene.shadows.iter_mut())
-            .enumerate()
-        {
+        for (i, card) in scene.cards.iter_mut().enumerate() {
             let Some(&a) = card_alphas.get(i) else {
-                sub.hide();
-                sub.commit();
-                for side in shadow {
-                    side.hide();
-                    side.commit();
-                }
+                card.clear();
                 continue;
             };
-            let local = strip::stagger(morph, i.abs_diff(sel_i));
+            let local = card::stagger(morph, i.abs_diff(sel_i));
             let rect = icon.lerp(s.layout.zoomed(i, off, sel), local);
 
             // The capture's frame, the icon without previews, or the
-            // placeholder until the first frame.
-            let preview = (self.previews.iter_mut())
-                .find(|p| p.window == s.windows[i])
-                .filter(|p| p.frame.as_ref().is_some_and(|f| p.capture.owns(&f.buffer)));
-            // Cards get their own shadow: the icon is shown without its.
-            let (buffer, transform, src) = match (&preview, self.style.previews) {
-                (_, Previews::Off) => (strip_icon.as_ref(), Transform::Normal, unpadded),
-                (Some(p), _) => {
-                    let f = p.frame.as_ref().expect("filtered");
-                    (Some(&f.buffer), f.transform, None)
-                }
-                (None, _) => (Some(&self.placeholder), Transform::Normal, None),
+            // placeholder until the first frame. Cards get their own
+            // shadow: the icon is shown without its.
+            let content = match self.style.previews {
+                Previews::Off => strip_icon.as_ref().map(|buffer| Content::Image {
+                    buffer,
+                    size: (image_size, image_size),
+                    src: unpadded,
+                }),
+                _ => Some(Content::Preview {
+                    preview: (self.previews.iter_mut()).find(|p| p.window == s.windows[i]),
+                    placeholder: &self.placeholder,
+                }),
             };
-            // Hidden while transparent. Detaching releases the buffer; it
-            // is marked busy again when re-attached.
-            match buffer {
-                Some(buffer) if a > 0.0 => {
-                    sub.set_transform(transform);
-                    sub.crop(src);
-                    if sub.show(buffer)
-                        && let Some(p) = preview
-                        && let Some(f) = &mut p.frame
-                    {
-                        f.used = true;
-                        p.capture.attached(&f.buffer);
-                    }
-                    sub.place(IRect::round(rect));
-                    sub.set_alpha(a);
-                }
-                _ => sub.hide(),
-            }
-            sub.commit();
-
             // The shadow scales with the card.
-            let card = s.layout.card(i, 0.0);
-            shapes::place_card_shadow(shadow, s.shadows.get(i), rect, (card.w, card.h), a);
+            let c = s.layout.card(i, 0.0);
+            let shadow = s.shadows.get(i);
+            card.place(content, rect, shadow, (c.w, c.h), scale, a, None);
         }
 
         let Some(target) = s.layout.selection(sel, off) else {

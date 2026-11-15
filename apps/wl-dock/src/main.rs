@@ -8,6 +8,8 @@ mod layout;
 mod options;
 mod pins;
 mod row;
+mod strip;
+mod stripview;
 mod view;
 mod zoom;
 

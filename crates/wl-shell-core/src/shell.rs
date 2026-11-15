@@ -31,7 +31,10 @@ use smithay_client_toolkit::{
             PointerEvent, PointerEventKind, PointerHandler, cursor_shape::CursorShapeManager,
         },
     },
-    shell::wlr_layer::{LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+    shell::{
+        wlr_layer::{LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+        xdg::popup::{Popup, PopupConfigure, PopupHandler},
+    },
 };
 use wayland_client::{
     Connection, Proxy, QueueHandle,
@@ -87,6 +90,14 @@ pub trait Program: Sized + 'static {
         configure: LayerSurfaceConfigure,
     ) {
     }
+
+    /// One of the program's popups (popup.rs) was configured: where it is
+    /// relative to its parent, and its size. Acked already; commit.
+    fn popup_configure(&mut self, core: &mut Core<Self>, popup: &Popup, configure: PopupConfigure) {
+    }
+
+    /// The compositor dismissed one of the program's popups: destroy it.
+    fn popup_done(&mut self, core: &mut Core<Self>, popup: &Popup) {}
 
     /// An output appeared, with its state (`Core::output_state`) complete.
     fn output_new(&mut self, core: &mut Core<Self>, output: &WlOutput) {}
@@ -330,6 +341,23 @@ impl<P: Program> LayerShellHandler for Shell<P> {
     }
 }
 
+impl<P: Program> PopupHandler for Shell<P> {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        popup: &Popup,
+        configure: PopupConfigure,
+    ) {
+        self.program
+            .popup_configure(&mut self.core, popup, configure);
+    }
+
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+        self.program.popup_done(&mut self.core, popup);
+    }
+}
+
 impl<P: Program> CompositorHandler for Shell<P> {
     fn scale_factor_changed(
         &mut self,
@@ -407,6 +435,9 @@ impl<P: Program> SeatHandler for Shell<P> {
         cap: Capability,
     ) {
         let core = &mut self.core;
+        if matches!(cap, Capability::Keyboard | Capability::Pointer) && core.input.seat.is_none() {
+            core.input.seat = Some(seat.clone());
+        }
         match cap {
             Capability::Keyboard if core.input.keyboard.is_none() => {
                 let repeat = Box::new(|shell: &mut Self, _: &WlKeyboard, event: KeyEvent| {
@@ -466,6 +497,7 @@ impl<P: Program> KeyboardHandler for Shell<P> {
         _: &[u32],
         _: &[Keysym],
     ) {
+        self.core.input.keyboard_focus = Some(surface.clone());
         self.program.keyboard_enter(&mut self.core, surface);
     }
 
@@ -477,6 +509,9 @@ impl<P: Program> KeyboardHandler for Shell<P> {
         surface: &WlSurface,
         _: u32,
     ) {
+        if self.core.input.keyboard_focus.as_ref() == Some(surface) {
+            self.core.input.keyboard_focus = None;
+        }
         self.program.keyboard_leave(&mut self.core, surface);
     }
 

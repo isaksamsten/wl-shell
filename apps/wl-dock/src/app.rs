@@ -15,6 +15,13 @@
 //! windows appears.
 //!
 //! The worker renders icons and labels for all docks into one cache.
+//!
+//! Clicking an app with several windows opens its strip (view.rs,
+//! stripview.rs): a grabbing popup of the dock with a card per window,
+//! which takes the keyboard. The dock owns the strip's captures; clicking
+//! a card (or Enter) activates its window. Ctrl+click activates the
+//! app's most recent window instead: the dock surface takes keyboard
+//! focus on clicks, so the modifiers are known by the button's release.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,15 +30,21 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use smithay_client_toolkit::{
-    seat::pointer::{BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind},
+    seat::{
+        keyboard::KeyEvent,
+        pointer::{BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{LayerSurface, LayerSurfaceConfigure},
+        xdg::popup::{Popup, PopupConfigure},
     },
 };
 use wayland_client::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::Reloader;
+use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
+use wl_shell_core::globals::Globals;
 use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
 use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::stream::{Hooks, LineStream};
@@ -46,6 +59,7 @@ use crate::config::{Config, Windows};
 use crate::dock::{self, Click, Item, Order, Placement};
 use crate::launch::{self, Command};
 use crate::pins::{self, Pin};
+use crate::strip::Key;
 use crate::view::{DockView, Style};
 
 /// An app launched from the dock, until one of its windows appears.
@@ -55,6 +69,17 @@ struct Launch {
     before: Vec<String>,
     /// Ends it after `launch-timeout`.
     timeout: Option<RegistrationToken>,
+}
+
+/// A button that went down on an app's icon: it is clicked if the button
+/// comes up on it too.
+#[derive(Clone, Debug, PartialEq)]
+struct Pressed {
+    output: WlOutput,
+    app_id: String,
+    button: u32,
+    /// The press's serial, for the strip's grab.
+    serial: u32,
 }
 
 pub struct WlDock {
@@ -88,9 +113,8 @@ pub struct WlDock {
     /// Apps to launch once their desktop entry arrives.
     pending_launches: Vec<String>,
     launching: Vec<Launch>,
-    /// The app a button went down on, by dock output: it is clicked if the
-    /// button comes up on it too.
-    pressed: Option<(WlOutput, String, u32)>,
+    /// The app a button went down on.
+    pressed: Option<Pressed>,
     /// Warned that `activate-command` is missing.
     warned_activate: bool,
     /// The items may have changed since they were last built.
@@ -325,6 +349,7 @@ impl WlDock {
         for (output, name, scale, style) in wanted {
             match self.docks.iter_mut().find(|d| d.output == output) {
                 Some(dock) => {
+                    dock.set_output_size(Self::output_size(core, &output));
                     dock.set_style(style, reload);
                     dock.set_scale(scale);
                 }
@@ -338,6 +363,7 @@ impl WlDock {
                     assets.clone(),
                 ) {
                     Ok(mut dock) => {
+                        dock.set_output_size(Self::output_size(core, &dock.output.clone()));
                         let apps: Vec<String> =
                             self.launching.iter().map(|l| l.app_id.clone()).collect();
                         dock.set_launching(&apps);
@@ -347,6 +373,11 @@ impl WlDock {
                 },
             }
         }
+    }
+
+    /// `output`'s logical size, if known.
+    fn output_size(core: &Core<Self>, output: &WlOutput) -> Option<(i32, i32)> {
+        core.output_state.info(output)?.logical_size
     }
 
     /// The open windows, leaving out `closed` (the list still knows a
@@ -385,7 +416,7 @@ impl WlDock {
             let items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
                 self.placement.place(id, &dock.name, by_output)
             });
-            dock.set_items(&items);
+            dock.set_items(core, &items);
         }
     }
 
@@ -428,27 +459,102 @@ impl WlDock {
 
     // -- clicks ----------------------------------------------------------------
 
-    fn button(&mut self, core: &Core<Self>, output: &WlOutput, button: u32, pressed: bool) {
+    fn button(
+        &mut self,
+        core: &Core<Self>,
+        output: &WlOutput,
+        button: u32,
+        serial: u32,
+        down: bool,
+    ) {
         let Some(item) = self.hovered_item(output) else {
             self.pressed = None;
+            // A click on the dock between icons is a click outside the
+            // strip.
+            if !down {
+                self.close_strips(core);
+            }
             return;
         };
-        if pressed {
-            self.pressed = Some((output.clone(), item.app_id, button));
+        if down {
+            self.pressed = Some(Pressed {
+                output: output.clone(),
+                app_id: item.app_id,
+                button,
+                serial,
+            });
             return;
         }
-        let down = self.pressed.take();
-        if down != Some((output.clone(), item.app_id.clone(), button)) {
+        // Clicks act on release, on the icon the button went down on.
+        let Some(pressed) = self.pressed.take() else {
+            return;
+        };
+        if pressed.output != *output || pressed.app_id != item.app_id || pressed.button != button {
             return;
         }
         match button {
-            BTN_LEFT => match item.click(&core.mru) {
-                Click::Activate(id) => self.activate(core, &id),
-                Click::Launch => self.launch(core, &item.app_id),
-            },
+            BTN_LEFT => self.click(core, output, &item, pressed.serial),
             // A new instance (or window), as the app does it.
-            BTN_MIDDLE => self.launch(core, &item.app_id),
+            BTN_MIDDLE => {
+                self.close_strips(core);
+                self.launch(core, &item.app_id);
+                self.release_keyboard(output);
+            }
             _ => {}
+        }
+    }
+
+    /// A left click on `item` on the dock on `output`, pressed with
+    /// `serial`: close its strip if open, else open it if it gets one,
+    /// else activate or launch. Ctrl activates the most recent window.
+    fn click(&mut self, core: &Core<Self>, output: &WlOutput, item: &Item, serial: u32) {
+        // Modifiers are only current while the dock has keyboard focus,
+        // which the click gave it.
+        let ctrl = core.input.keyboard_focus().is_some() && core.input.modifiers.ctrl;
+        let Some(dock) = self.docks.iter().find(|d| d.output == *output) else {
+            return;
+        };
+        let toggle = dock.strip_app() == Some(item.app_id.as_str());
+        let strip = !ctrl && !toggle && dock.can_strip(item);
+        // Any click closes the strip that is open; clicking its icon only
+        // that.
+        if toggle {
+            self.close_strips(core);
+            return;
+        }
+        if strip {
+            // Only one grabbing popup at a time: the others go at once.
+            // The clicked dock replaces its own, keeping its keyboard.
+            for dock in self.docks.iter_mut().filter(|d| d.output != *output) {
+                dock.drop_strip(core);
+            }
+            let grab = core.input.seat().map(|seat| (seat, serial));
+            if let Some(dock) = self.dock_mut(output)
+                && dock.open_strip(core, &item.app_id, grab)
+            {
+                return;
+            }
+        }
+        self.close_strips(core);
+        match item.click(&core.mru) {
+            Click::Activate(id) => self.activate(core, &id),
+            Click::Launch => self.launch(core, &item.app_id),
+        }
+        self.release_keyboard(output);
+    }
+
+    /// Close every dock's strip.
+    fn close_strips(&mut self, core: &Core<Self>) {
+        for dock in &mut self.docks {
+            dock.close_strip(core);
+        }
+    }
+
+    /// The dock on `output` handled a click without opening a popup: it
+    /// gives the keyboard focus back.
+    fn release_keyboard(&mut self, output: &WlOutput) {
+        if let Some(dock) = self.dock_mut(output) {
+            dock.release_keyboard();
         }
     }
 
@@ -583,7 +689,13 @@ impl WlDock {
                     self.launch(core, &app_id);
                 }
             }
-            Done::Pill { .. } => {}
+            Done::Pill { tag, request, pill } => {
+                for dock in &mut self.docks {
+                    if dock.pill_ready(tag, &request, &pill) {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -655,7 +767,57 @@ impl Program for WlDock {
         }
     }
 
+    fn popup_configure(&mut self, _: &mut Core<Self>, popup: &Popup, configure: PopupConfigure) {
+        if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
+            dock.popup_configure(&configure);
+        }
+    }
+
+    /// The compositor dismissed a strip: a click on another client.
+    fn popup_done(&mut self, core: &mut Core<Self>, popup: &Popup) {
+        if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
+            dock.popup_done(core);
+        }
+    }
+
+    /// Keys reach the open strip, which has the keyboard while it is open.
+    fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
+        let Some(key) = Key::from_sym(event.keysym) else {
+            return;
+        };
+        if repeat && !key.repeats() {
+            return;
+        }
+        let Some(focus) = core.input.keyboard_focus().cloned() else {
+            return;
+        };
+        let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_strip_surface(&focus)) else {
+            return;
+        };
+        if let Some(id) = dock.strip_key(core, key) {
+            self.activate(core, &id);
+        }
+    }
+
+    fn capture_update(
+        &mut self,
+        _: &mut Core<Self>,
+        id: CaptureId,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
+    ) {
+        // Events of captures a dock dropped find nothing.
+        if let Some(dock) = self.docks.iter_mut().find(|d| d.has_capture(id)) {
+            dock.capture_update(id, f);
+        }
+    }
+
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {
+        if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_strip_surface(&event.surface)) {
+            if let Some(id) = dock.strip_pointer(core, event) {
+                self.activate(core, &id);
+            }
+            return;
+        }
         let Some(dock) = self
             .docks
             .iter_mut()
@@ -672,13 +834,13 @@ impl Program for WlDock {
                 dock.pointer_leave(core);
                 self.pressed = None;
             }
-            PointerEventKind::Press { button, .. } => {
+            PointerEventKind::Press { button, serial, .. } => {
                 let output = dock.output.clone();
-                self.button(core, &output, button, true);
+                self.button(core, &output, button, serial, true);
             }
-            PointerEventKind::Release { button, .. } => {
+            PointerEventKind::Release { button, serial, .. } => {
                 let output = dock.output.clone();
-                self.button(core, &output, button, false);
+                self.button(core, &output, button, serial, false);
             }
             _ => {}
         }

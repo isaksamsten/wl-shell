@@ -7,9 +7,12 @@
 //! - [`cache`]: ready shm buffers for icons, labels and shapes.
 //! - [`shapes`]: panels, rounded rects, dots and card shadows, and how they
 //!   are placed on subsurfaces.
+//! - [`card`]: window preview cards: a capture's frames, and the card's
+//!   subsurfaces with its shadow.
 
 pub mod anim;
 pub mod cache;
+pub mod card;
 pub mod geom;
 pub mod shapes;
 pub mod sub;

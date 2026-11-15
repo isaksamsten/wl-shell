@@ -7,8 +7,8 @@
 //! resting sizes: how thick the surface is, the exclusive zone, and where
 //! the panel, icons and indicators sit across the dock.
 
-use wl_shell_ui::shapes::Axis;
 use wl_shell_ui::Rect;
+use wl_shell_ui::shapes::Axis;
 
 use crate::config::Position;
 

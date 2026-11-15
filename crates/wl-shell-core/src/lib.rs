@@ -8,6 +8,7 @@ pub mod globals;
 pub mod input;
 pub mod list;
 pub mod mru;
+pub mod popup;
 pub mod shell;
 pub mod spawn;
 pub mod stream;
