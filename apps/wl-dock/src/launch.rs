@@ -1,13 +1,19 @@
-//! Launching apps and activating windows: the commands to run. Pure, unit
-//! tested; app.rs runs them detached (`wl_shell_core::spawn`).
+//! Launching apps and running commands: what to run. Pure, unit tested;
+//! app.rs runs them detached (`wl_shell_core::spawn`).
 //!
 //! An app is launched from the desktop entry found for its app ID: its
 //! `Exec=` split into argv with the field codes removed, run directly, or
-//! under `terminal` for `Terminal=true` entries. `launch-command`, if set,
-//! runs instead with `sh -c`, with `{exec}` (the cleaned Exec line, shell
-//! quoted), `{desktop-id}` and `{app-id}` filled in. Without a desktop
-//! entry, only a `launch-command` that needs neither `{exec}` nor
-//! `{desktop-id}` can launch the app.
+//! under `terminal` for `Terminal=true` entries. `launch-command` (the
+//! app's own, else the global one), if set, runs instead with `sh -c`,
+//! with `{exec}` (the cleaned Exec line, shell quoted), `{desktop-id}` and
+//! `{app-id}` filled in. Without a desktop entry, only a `launch-command`
+//! that needs neither `{exec}` nor `{desktop-id}` can launch the app. A
+//! desktop action runs the same way, with its `Exec=` for the entry's.
+//!
+//! Window commands (`activate-command`, `close-command`) get the window's
+//! `{id}`; app commands (menu actions, middle click, scrolling) get
+//! `{app-id}`, `{id}` (the most recent window, empty without one) and
+//! `{ids}` (all of the app's windows). Everything is shell quoted.
 
 use wl_shell_core::spawn::{fill, join, quote, uses};
 use wl_shell_render::icons::AppEntry;
@@ -69,9 +75,23 @@ fn exec(entry: &AppEntry, terminal: &str) -> Result<Command, String> {
     }
 }
 
-/// `activate-command` for the window `id`.
-pub fn activate(template: &str, id: &str) -> String {
+/// `activate-command` or `close-command` for the window `id`.
+pub fn window_command(template: &str, id: &str) -> String {
     fill(template, &[("id", &quote(id))])
+}
+
+/// An app command (a menu action, middle click or scroll) of `app_id`,
+/// whose most recent window is `id` and whose windows are `ids`.
+pub fn app_command(template: &str, app_id: &str, id: Option<&str>, ids: &[String]) -> String {
+    let ids: Vec<String> = ids.iter().map(|i| quote(i)).collect();
+    fill(
+        template,
+        &[
+            ("app-id", &quote(app_id)),
+            ("id", &id.map(quote).unwrap_or_default()),
+            ("ids", &ids.join(" ")),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -82,10 +102,9 @@ mod tests {
         AppEntry {
             desktop_id: "org.example.App.desktop".into(),
             name: "App".into(),
-            icon: None,
             exec: Some(exec.into()),
             terminal,
-            path: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -141,11 +160,44 @@ mod tests {
     }
 
     #[test]
-    fn activating() {
+    fn desktop_actions() {
+        let mut e = entry("app %U", true);
+        e.actions.push(wl_shell_render::icons::DesktopAction {
+            id: "new".into(),
+            name: "New Window".into(),
+            icon: None,
+            exec: "app --new-window %u".into(),
+        });
+        let action = e.with_action(&e.actions[0]);
         assert_eq!(
-            activate("niri msg action focus-window --id {id}", "42"),
+            launch("app", Some(&action), None, "foot"),
+            Ok(Command::Shell("foot app --new-window".into()))
+        );
+        assert_eq!(
+            launch("app", Some(&action), Some("spawn -- {exec}"), "foot"),
+            Ok(Command::Shell("spawn -- foot app --new-window".into()))
+        );
+    }
+
+    #[test]
+    fn window_commands() {
+        assert_eq!(
+            window_command("niri msg action focus-window --id {id}", "42"),
             "niri msg action focus-window --id 42"
         );
-        assert_eq!(activate("focus {id}", "a'b c"), r"focus 'a'\''b c'");
+        assert_eq!(window_command("focus {id}", "a'b c"), r"focus 'a'\''b c'");
+    }
+
+    #[test]
+    fn app_commands() {
+        let ids = ["1".to_string(), "a b".to_string()];
+        assert_eq!(
+            app_command("x {app-id} {id} [{ids}]", "my app", Some("a b"), &ids),
+            "x 'my app' 'a b' [1 'a b']"
+        );
+        assert_eq!(
+            app_command("playerctl -p spotify next {id}", "spotify", None, &[]),
+            "playerctl -p spotify next "
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! A worker thread for everything slow: loading fonts, desktop entries and
-//! icons, and rendering labels, title pills and letter tiles. Results come
-//! back through a calloop channel, and the main thread turns them into shm
-//! buffers.
+//! icons, and rendering labels, title pills, text lines, letter tiles and
+//! speech bubbles. Results come back through a calloop channel, and the
+//! main thread turns them into shm buffers.
 //!
 //! The worker lives as long as the daemon, so its caches (font system,
 //! desktop entries, decoded icons) stay warm. The daemon asks it for every
@@ -14,6 +14,7 @@ use std::sync::{Arc, mpsc};
 
 use calloop::channel;
 
+use crate::bubble::{self, Bubble};
 use crate::icons::{self, Icons};
 use crate::image::Image;
 use crate::text::{self, Text};
@@ -21,10 +22,16 @@ use crate::text::{self, Text};
 enum Job {
     /// The icon for `key`; a letter tile in `font` if there is none.
     Icon { key: icons::Key, font: String },
+    /// An icon by name alone; nothing if there is none.
+    Named(icons::NamedIcon),
     /// An app's name label.
     Label(LabelKey),
     /// A pill with arbitrary text (a window title).
     Pill { tag: u64, request: PillRequest },
+    /// A line of text without a pill (a menu row).
+    Line { tag: u64, request: PillRequest },
+    /// A speech bubble.
+    Bubble { tag: u64, bubble: Bubble },
     /// What it takes to launch an app.
     Entry(String),
     /// Reload the desktop entries if they changed.
@@ -37,6 +44,8 @@ enum Job {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LabelKey {
     pub app_id: String,
+    /// The name to show instead of the desktop entry's.
+    pub name: Option<String>,
     /// Logical pixels.
     pub max_width: i32,
     pub scale: i32,
@@ -59,6 +68,11 @@ pub enum Done {
         key: icons::Key,
         image: Arc<Image>,
     },
+    /// An icon by name; None if there is none.
+    Named {
+        key: icons::NamedIcon,
+        image: Option<Arc<Image>>,
+    },
     Label {
         key: LabelKey,
         pill: text::Pill,
@@ -71,10 +85,16 @@ pub enum Done {
         app_id: String,
         entry: Option<icons::AppEntry>,
     },
+    /// A pill or a line of text (`Assets::line`).
     Pill {
         tag: u64,
         request: PillRequest,
         pill: text::Pill,
+    },
+    Bubble {
+        tag: u64,
+        bubble: Bubble,
+        image: Image,
     },
 }
 
@@ -82,6 +102,7 @@ pub enum Done {
 pub struct Assets {
     jobs: mpsc::Sender<Job>,
     icons: RefCell<Vec<icons::Key>>,
+    named: RefCell<Vec<icons::NamedIcon>>,
     labels: RefCell<Vec<LabelKey>>,
     entries: RefCell<Vec<String>>,
 }
@@ -99,6 +120,7 @@ impl Assets {
         let assets = Self {
             jobs,
             icons: RefCell::new(Vec::new()),
+            named: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
             entries: RefCell::new(Vec::new()),
         };
@@ -120,6 +142,16 @@ impl Assets {
                 key: key.clone(),
                 font: font.to_string(),
             });
+        }
+    }
+
+    /// Request the icon named `key.name`, unless it is on its way already.
+    /// It arrives as `Done::Named`.
+    pub fn named_icon(&self, key: &icons::NamedIcon) {
+        let mut pending = self.named.borrow_mut();
+        if !pending.contains(key) {
+            pending.push(key.clone());
+            self.send(Job::Named(key.clone()));
         }
     }
 
@@ -147,6 +179,17 @@ impl Assets {
         self.send(Job::Pill { tag, request });
     }
 
+    /// `request.text` on one line, without the pill's padding (its
+    /// background shows if it isn't transparent). Arrives as `Done::Pill`.
+    pub fn line(&self, tag: u64, request: PillRequest) {
+        self.send(Job::Line { tag, request });
+    }
+
+    /// Render `bubble`; arrives as `Done::Bubble`.
+    pub fn bubble(&self, tag: u64, bubble: Bubble) {
+        self.send(Job::Bubble { tag, bubble });
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -161,9 +204,10 @@ impl Assets {
     pub fn received(&self, done: &Done) {
         match done {
             Done::Icon { key, .. } => self.icons.borrow_mut().retain(|k| k != key),
+            Done::Named { key, .. } => self.named.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
             Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
-            Done::IconsReloaded | Done::Pill { .. } => {}
+            Done::IconsReloaded | Done::Pill { .. } | Done::Bubble { .. } => {}
         }
     }
 }
@@ -209,8 +253,15 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 };
                 Done::Icon { key, image }
             }
+            Job::Named(key) => {
+                let image = icons.named(&key);
+                Done::Named { key, image }
+            }
             Job::Label(key) => {
-                let name = icons.name(&key.app_id);
+                let name = match &key.name {
+                    Some(name) => name.clone(),
+                    None => icons.name(&key.app_id),
+                };
                 let pill = text.get_or_insert_with(Text::new).pill(
                     &name,
                     &key.style,
@@ -227,6 +278,19 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     request.scale,
                 );
                 Done::Pill { tag, request, pill }
+            }
+            Job::Line { tag, request } => {
+                let pill = text.get_or_insert_with(Text::new).line(
+                    &request.text,
+                    &request.style,
+                    request.max_width,
+                    request.scale,
+                );
+                Done::Pill { tag, request, pill }
+            }
+            Job::Bubble { tag, bubble } => {
+                let image = bubble::render(&bubble);
+                Done::Bubble { tag, bubble, image }
             }
             Job::Entry(app_id) => {
                 let entry = icons.entry(&app_id);

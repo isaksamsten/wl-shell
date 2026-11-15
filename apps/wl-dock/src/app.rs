@@ -22,6 +22,14 @@
 //! a card (or Enter) activates its window. Ctrl+click activates the
 //! app's most recent window instead: the dock surface takes keyboard
 //! focus on clicks, so the modifiers are known by the button's release.
+//!
+//! Right-clicking an app opens its menu (menu.rs, menuview.rs), another
+//! grabbing popup; its rows are built here from the item, its desktop
+//! entry (looked up first if need be) and its `[app.<id>]` table, and
+//! picking one runs it here: activating or closing windows, launching
+//! (a desktop action, or a new window), an app action, or pinning, which
+//! writes the pins file. `[app.<id>]` also binds middle click and
+//! scrolling on the icon to commands.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,7 +40,7 @@ use std::time::Duration;
 use smithay_client_toolkit::{
     seat::{
         keyboard::KeyEvent,
-        pointer::{BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind},
+        pointer::{AxisScroll, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind},
     },
     shell::{
         WaylandSurface,
@@ -51,16 +59,20 @@ use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::toplevel::Toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_log::warn;
-use wl_shell_render::icons::AppEntry;
+use wl_shell_render::icons::{AppEntry, DesktopAction};
 use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
 use crate::config::{Config, Windows};
 use crate::dock::{self, Click, Item, Order, Placement};
 use crate::launch::{self, Command};
+use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin};
 use crate::strip::Key;
 use crate::view::{DockView, Style};
+
+/// Pixels of touchpad scrolling per step of a scroll command.
+const SCROLL_STEP: f64 = 50.0;
 
 /// An app launched from the dock, until one of its windows appears.
 struct Launch {
@@ -115,6 +127,12 @@ pub struct WlDock {
     launching: Vec<Launch>,
     /// The app a button went down on.
     pressed: Option<Pressed>,
+    /// A right click whose menu opens once its app's desktop entry
+    /// arrives.
+    pending_menu: Option<Pressed>,
+    /// Scrolling on an icon not yet run as a command: the app, and steps
+    /// (down is positive).
+    scrolled: Option<(String, f64)>,
     /// Warned that `activate-command` is missing.
     warned_activate: bool,
     /// The items may have changed since they were last built.
@@ -165,6 +183,8 @@ impl WlDock {
             pending_launches: Vec::new(),
             launching: Vec::new(),
             pressed: None,
+            pending_menu: None,
+            scrolled: None,
             warned_activate: false,
             dirty: true,
             outputs_dirty: true,
@@ -305,11 +325,13 @@ impl WlDock {
         }
     }
 
-    /// Have the worker look up the pinned apps' desktop entries, so a
-    /// click launches them at once.
+    /// Have the worker look up the desktop entries of the pinned and
+    /// running apps, so a click launches them and a right click shows
+    /// their menu at once.
     fn prefetch_entries(&self) {
         let Some(assets) = &self.assets else { return };
-        for app_id in pins::apps(&self.pins) {
+        let running = self.order.apps().iter().cloned();
+        for app_id in pins::apps(&self.pins).into_iter().chain(running) {
             if !self.entries.contains_key(&app_id) {
                 assets.entry(&app_id);
             }
@@ -404,6 +426,9 @@ impl WlDock {
         if new_app && let Some(assets) = &self.assets {
             assets.refresh();
         }
+        if new_app {
+            self.prefetch_entries();
+        }
         self.end_launches(core, &toplevels);
 
         let pins = pins::apps(&self.pins);
@@ -470,9 +495,9 @@ impl WlDock {
         let Some(item) = self.hovered_item(output) else {
             self.pressed = None;
             // A click on the dock between icons is a click outside the
-            // strip.
+            // strip or menu.
             if !down {
-                self.close_strips(core);
+                self.close_popups(core);
             }
             return;
         };
@@ -492,16 +517,74 @@ impl WlDock {
         if pressed.output != *output || pressed.app_id != item.app_id || pressed.button != button {
             return;
         }
+        // Any click closes the open menu; right-clicking its icon only
+        // that.
+        let menu_was = (self.docks.iter())
+            .find(|d| d.output == *output)
+            .and_then(|d| d.menu_app())
+            .is_some_and(|a| a == item.app_id);
+        self.close_menus(core);
         match button {
             BTN_LEFT => self.click(core, output, &item, pressed.serial),
-            // A new instance (or window), as the app does it.
             BTN_MIDDLE => {
                 self.close_strips(core);
-                self.launch(core, &item.app_id);
+                self.middle_click(core, &item);
                 self.release_keyboard(output);
             }
-            _ => {}
+            BTN_RIGHT if !menu_was => self.open_menu(core, pressed),
+            _ => self.release_keyboard(output),
         }
+    }
+
+    /// A middle click: the app's `middle-click` command, else a new
+    /// instance (or window), as the app does it.
+    fn middle_click(&mut self, core: &Core<Self>, item: &Item) {
+        let command = (self.config.app(&item.app_id)).and_then(|a| a.middle_click.clone());
+        match command {
+            Some(command) => self.app_command(core, &item.app_id, &command, "middle-click"),
+            None => self.launch(core, &item.app_id),
+        }
+    }
+
+    /// Scrolling on an icon: the app's `scroll-up` and `scroll-down`
+    /// commands, one per wheel notch (or `SCROLL_STEP` pixels of touchpad
+    /// scrolling).
+    fn scroll(&mut self, core: &Core<Self>, output: &WlOutput, vertical: &AxisScroll) {
+        let Some(item) = self.hovered_item(output) else {
+            self.scrolled = None;
+            return;
+        };
+        let app = self.config.app(&item.app_id);
+        let up = app.and_then(|a| a.scroll_up.clone());
+        let down = app.and_then(|a| a.scroll_down.clone());
+        if up.is_none() && down.is_none() {
+            return;
+        }
+        let steps = match (vertical.value120, vertical.discrete) {
+            (0, 0) => vertical.absolute / SCROLL_STEP,
+            (0, d) => d as f64,
+            (v, _) => v as f64 / 120.0,
+        };
+        let mut total = match self.scrolled.take() {
+            Some((app_id, total)) if app_id == item.app_id => total,
+            _ => 0.0,
+        };
+        // Turning around starts over.
+        if total * steps < 0.0 {
+            total = 0.0;
+        }
+        total += steps;
+        while total.abs() >= 1.0 - 1e-6 {
+            let (command, key) = match total > 0.0 {
+                true => (&down, "scroll-down"),
+                false => (&up, "scroll-up"),
+            };
+            if let Some(command) = command {
+                self.app_command(core, &item.app_id, command, key);
+            }
+            total -= total.signum();
+        }
+        self.scrolled = Some((item.app_id, total));
     }
 
     /// A left click on `item` on the dock on `output`, pressed with
@@ -527,6 +610,7 @@ impl WlDock {
             // The clicked dock replaces its own, keeping its keyboard.
             for dock in self.docks.iter_mut().filter(|d| d.output != *output) {
                 dock.drop_strip(core);
+                dock.drop_menu(core);
             }
             let grab = core.input.seat().map(|seat| (seat, serial));
             if let Some(dock) = self.dock_mut(output)
@@ -535,7 +619,7 @@ impl WlDock {
                 return;
             }
         }
-        self.close_strips(core);
+        self.close_popups(core);
         match item.click(&core.mru) {
             Click::Activate(id) => self.activate(core, &id),
             Click::Launch => self.launch(core, &item.app_id),
@@ -547,6 +631,150 @@ impl WlDock {
     fn close_strips(&mut self, core: &Core<Self>) {
         for dock in &mut self.docks {
             dock.close_strip(core);
+        }
+    }
+
+    /// Close every dock's menu, and forget one waiting to open.
+    fn close_menus(&mut self, core: &Core<Self>) {
+        self.pending_menu = None;
+        for dock in &mut self.docks {
+            dock.close_menu(core);
+        }
+    }
+
+    /// Close every dock's strip and menu.
+    fn close_popups(&mut self, core: &Core<Self>) {
+        self.close_strips(core);
+        self.close_menus(core);
+    }
+
+    // -- the menu --------------------------------------------------------------
+
+    /// Open the menu of the item `pressed` was on, once its desktop entry
+    /// is known.
+    fn open_menu(&mut self, core: &Core<Self>, pressed: Pressed) {
+        let app_id = pressed.app_id.clone();
+        if !app_id.is_empty() && !self.entries.contains_key(&app_id) {
+            if let Some(assets) = &self.assets {
+                assets.entry(&app_id);
+            }
+            self.pending_menu = Some(pressed);
+            return;
+        }
+        self.pending_menu = None;
+        let Some(item) = (self.docks.iter())
+            .find(|d| d.output == pressed.output)
+            .and_then(|d| d.item(&app_id).cloned())
+        else {
+            return;
+        };
+        let groups = self.menu_groups(core, &item);
+        // Only one grabbing popup at a time: the others go at once.
+        for dock in self.docks.iter_mut() {
+            if dock.output != pressed.output {
+                dock.drop_strip(core);
+                dock.drop_menu(core);
+            }
+        }
+        let grab = core.input.seat().map(|seat| (seat, pressed.serial));
+        let opened = (self.dock_mut(&pressed.output))
+            .is_some_and(|dock| dock.open_menu(core, &app_id, groups, grab));
+        if !opened {
+            self.release_keyboard(&pressed.output);
+        }
+    }
+
+    /// The rows of `item`'s menu.
+    fn menu_groups(&self, core: &Core<Self>, item: &Item) -> Vec<menu::Group> {
+        let app = self.config.app(&item.app_id);
+        let entry = self.entries.get(&item.app_id).and_then(Option::as_ref);
+        let desktop: &[DesktopAction] = match (entry, app.is_none_or(|a| a.desktop_actions)) {
+            (Some(e), true) => &e.actions,
+            _ => &[],
+        };
+        let focused = (core.focus_stream.running())
+            .then(|| core.mru.first())
+            .flatten();
+        menu::build(&menu::Source {
+            item,
+            focused,
+            desktop,
+            actions: app.map_or(&[], |a| &a.actions),
+            can_launch: self.launch_command(&item.app_id, entry).is_ok(),
+            can_close: self.config.close_command.is_some(),
+        })
+    }
+
+    /// Do what the picked row of `app_id`'s menu says.
+    fn menu_action(&mut self, core: &Core<Self>, app_id: &str, action: Action) {
+        match action {
+            Action::Activate(id) => self.activate(core, &id),
+            Action::NewWindow => self.launch(core, app_id),
+            Action::Desktop(action) => self.launch_action(core, app_id, &action),
+            Action::Command(command) => self.app_command(core, app_id, &command, "action"),
+            Action::Pin => self.set_pinned(app_id, true),
+            Action::Unpin => self.set_pinned(app_id, false),
+            Action::Close(ids) => {
+                for id in ids {
+                    self.close_window(core, &id);
+                }
+            }
+        }
+    }
+
+    /// Keep `app_id` in the dock, or not, and write the pins file.
+    fn set_pinned(&mut self, app_id: &str, pinned: bool) {
+        let pin = Pin::App(app_id.to_string());
+        let changed = match pinned {
+            true => pins::pin(&mut self.pins, pin),
+            false => pins::unpin(&mut self.pins, &pin),
+        };
+        if !changed {
+            return;
+        }
+        self.dirty = true;
+        match &self.pins_path {
+            // The watch reads it back, and finds nothing new.
+            Some(path) => {
+                if let Err(e) = pins::write(path, &self.pins) {
+                    warn!("{}: {e}", path.display());
+                }
+            }
+            None => warn!("no state directory: pins are not kept"),
+        }
+    }
+
+    /// The IDs of `app_id`'s windows, and the most recent of them.
+    fn app_windows(core: &Core<Self>, app_id: &str) -> (Vec<String>, Option<String>) {
+        let ids: Vec<String> = (Self::toplevels(core, None).into_iter())
+            .filter(|t| t.app_id == app_id)
+            .map(|t| t.identifier)
+            .collect();
+        let recent = (core.mru)
+            .most_recent(ids.iter().map(String::as_str))
+            .map(str::to_string)
+            .or_else(|| ids.first().cloned());
+        (ids, recent)
+    }
+
+    /// Run an app command of `app_id` (`key` names where it came from).
+    fn app_command(&mut self, core: &Core<Self>, app_id: &str, template: &str, key: &str) {
+        let (ids, recent) = Self::app_windows(core, app_id);
+        let command = launch::app_command(template, app_id, recent.as_deref(), &ids);
+        let output = Output::Prefixed(key.into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("{key}: {e}");
+        }
+    }
+
+    fn close_window(&mut self, core: &Core<Self>, id: &str) {
+        let Some(template) = self.config.close_command.as_deref() else {
+            return;
+        };
+        let command = launch::window_command(template, id);
+        let output = Output::Prefixed("close-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("close-command: {e}");
         }
     }
 
@@ -565,11 +793,22 @@ impl WlDock {
             }
             return;
         };
-        let command = launch::activate(template, id);
+        let command = launch::window_command(template, id);
         let output = Output::Prefixed("activate-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
             warn!("activate-command: {e}");
         }
+    }
+
+    /// How to launch `app_id` (whose desktop entry is `entry`): its own
+    /// `launch-command`, else the global one, else the entry's command.
+    fn launch_command(&self, app_id: &str, entry: Option<&AppEntry>) -> Result<Command, String> {
+        let own = self
+            .config
+            .app(app_id)
+            .and_then(|a| a.launch_command.as_deref());
+        let template = own.or(self.config.launch_command.as_deref());
+        launch::launch(app_id, entry, template, &self.config.terminal)
     }
 
     /// Launch `app_id`, once its desktop entry is known.
@@ -583,12 +822,25 @@ impl WlDock {
             }
             return;
         };
-        let command = launch::launch(
-            app_id,
-            entry.as_ref(),
-            self.config.launch_command.as_deref(),
-            &self.config.terminal,
-        );
+        let command = self.launch_command(app_id, entry.as_ref());
+        self.run_launch(core, app_id, command);
+    }
+
+    /// Launch `app_id`'s desktop action `action`: like the app, with the
+    /// action's command. `launch-command` is only used if it runs
+    /// `{exec}`; anything else would launch the app instead.
+    fn launch_action(&mut self, core: &Core<Self>, app_id: &str, action: &DesktopAction) {
+        let Some(Some(entry)) = self.entries.get(app_id) else {
+            return warn!("cannot launch {app_id}: its desktop entry is gone");
+        };
+        let entry = entry.with_action(action);
+        let template = (self.config.launch_command.as_deref()).filter(|t| spawn::uses(t, "exec"));
+        let command = launch::launch(app_id, Some(&entry), template, &self.config.terminal);
+        self.run_launch(core, app_id, command);
+    }
+
+    /// Run a launch `command` of `app_id`, and bounce its icon.
+    fn run_launch(&mut self, core: &Core<Self>, app_id: &str, command: Result<Command, String>) {
         let result = match &command {
             Ok(Command::Argv(argv)) => spawn::argv(&core.loop_handle, argv, Output::Inherit),
             Ok(Command::Shell(line)) => spawn::shell(&core.loop_handle, line, Output::Inherit),
@@ -667,6 +919,15 @@ impl WlDock {
                     dock.icon_ready(&key);
                 }
             }
+            Done::Named { key, image } => {
+                let mut cache = self.cache.borrow_mut();
+                cache.insert_named_icon(&core.g, key, image.as_deref(), &core.qh);
+                drop(cache);
+                self.trim = true;
+                for dock in &mut self.docks {
+                    dock.named_icon_ready();
+                }
+            }
             Done::Label { key, pill } => {
                 (self.cache.borrow_mut()).insert_label(&core.g, key.clone(), &pill, &core.qh);
                 self.trim = true;
@@ -688,10 +949,23 @@ impl WlDock {
                     self.pending_launches.remove(i);
                     self.launch(core, &app_id);
                 }
+                if let Some(pending) = self.pending_menu.take() {
+                    match pending.app_id == app_id {
+                        true => self.open_menu(core, pending),
+                        false => self.pending_menu = Some(pending),
+                    }
+                }
             }
             Done::Pill { tag, request, pill } => {
                 for dock in &mut self.docks {
                     if dock.pill_ready(tag, &request, &pill) {
+                        break;
+                    }
+                }
+            }
+            Done::Bubble { tag, bubble, image } => {
+                for dock in &mut self.docks {
+                    if dock.bubble_ready(tag, &bubble, &image) {
                         break;
                     }
                 }
@@ -769,18 +1043,20 @@ impl Program for WlDock {
 
     fn popup_configure(&mut self, _: &mut Core<Self>, popup: &Popup, configure: PopupConfigure) {
         if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
-            dock.popup_configure(&configure);
+            dock.popup_configure(popup, &configure);
         }
     }
 
-    /// The compositor dismissed a strip: a click on another client.
+    /// The compositor dismissed a strip or menu: a click on another
+    /// client.
     fn popup_done(&mut self, core: &mut Core<Self>, popup: &Popup) {
         if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
-            dock.popup_done(core);
+            dock.popup_done(core, popup);
         }
     }
 
-    /// Keys reach the open strip, which has the keyboard while it is open.
+    /// Keys reach the open menu or strip, which has the keyboard while it
+    /// is open.
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
         let Some(key) = Key::from_sym(event.keysym) else {
             return;
@@ -791,6 +1067,14 @@ impl Program for WlDock {
         let Some(focus) = core.input.keyboard_focus().cloned() else {
             return;
         };
+        if let Some(dock) = (self.docks.iter_mut()).find(|d| d.menu_has_keys(&focus)) {
+            if let Some(key) = MenuKey::from_key(key)
+                && let Some((app_id, action)) = dock.menu_key(core, key)
+            {
+                self.menu_action(core, &app_id, action);
+            }
+            return;
+        }
         let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_strip_surface(&focus)) else {
             return;
         };
@@ -818,6 +1102,12 @@ impl Program for WlDock {
             }
             return;
         }
+        if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_menu_surface(&event.surface)) {
+            if let Some((app_id, action)) = dock.menu_pointer(core, event) {
+                self.menu_action(core, &app_id, action);
+            }
+            return;
+        }
         let Some(dock) = self
             .docks
             .iter_mut()
@@ -842,7 +1132,10 @@ impl Program for WlDock {
                 let output = dock.output.clone();
                 self.button(core, &output, button, serial, false);
             }
-            _ => {}
+            PointerEventKind::Axis { vertical, .. } => {
+                let output = dock.output.clone();
+                self.scroll(core, &output, &vertical);
+            }
         }
     }
 }

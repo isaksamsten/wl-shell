@@ -226,7 +226,7 @@ pub fn icon(img: &Image, s: &IconShadow, scale: i32) -> Image {
 
 /// The radii of three box blurs that together approximate a Gaussian
 /// with `sigma` (<https://www.peterkovesi.com/papers/FastGaussianSmoothing.pdf>).
-fn box_radii(sigma: f64) -> [usize; 3] {
+pub(crate) fn box_radii(sigma: f64) -> [usize; 3] {
     if sigma <= 0.0 {
         return [0; 3];
     }
@@ -246,7 +246,7 @@ fn box_radii(sigma: f64) -> [usize; 3] {
 
 /// Blur the `w`x`h` plane with a box of radius `r` along rows
 /// (`horizontal`) or columns; outside the plane counts as 0.
-fn box_blur(plane: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
+pub(crate) fn box_blur(plane: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
     if r == 0 {
         return;
     }
@@ -355,7 +355,7 @@ pub fn panel(
 }
 
 /// 0xRRGGBBAA as premultiplied B, G, R, A in 0 to 1.
-fn premultiplied(rgba: u32) -> [f64; 4] {
+pub(crate) fn premultiplied(rgba: u32) -> [f64; 4] {
     let [r, g, b, a] = rgba.to_be_bytes().map(|c| c as f64 / 255.0);
     [b * a, g * a, r * a, a]
 }

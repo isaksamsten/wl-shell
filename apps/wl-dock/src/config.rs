@@ -6,10 +6,13 @@
 //!
 //! Layout keys can be overridden per output in `[output.<name>]` tables
 //! (see `OutputOverride`); `outputs` picks the outputs that get a dock.
+//! Per-app settings (menu actions, middle click and scroll commands, and
+//! the icon, name and launch command) live in `[app."<app-id>"]` tables
+//! (see `AppConfig`).
 //!
 //! Colors live in `[appearance]`; `[appearance.dark]` and
 //! `[appearance.light]` override its keys in the desktop's dark or light
-//! mode (or the one `mode` forces).
+//! mode (or the one `mode` forces). The menu's look is there too.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -93,6 +96,8 @@ pub struct Config {
     pub font_size: u32,
     /// Focuses a window: `{id}` is its ext toplevel identifier.
     pub activate_command: Option<String>,
+    /// Closes a window: `{id}`. Without it, the menu has no Close rows.
+    pub close_command: Option<String>,
     /// Launches apps instead of their desktop entry's `Exec=`: `{exec}`,
     /// `{desktop-id}`, `{app-id}`.
     pub launch_command: Option<String>,
@@ -114,6 +119,8 @@ pub struct Config {
     pub output_grace: u32,
     /// Per-output overrides, by output name.
     pub output: BTreeMap<String, OutputOverride>,
+    /// Per-app settings, by app ID.
+    pub app: BTreeMap<String, AppConfig>,
     pub appearance: Appearance,
 }
 
@@ -146,6 +153,7 @@ impl Default for Config {
             font: "sans-serif".into(),
             font_size: 13,
             activate_command: None,
+            close_command: None,
             launch_command: None,
             terminal: "foot".into(),
             launch_timeout: 10_000,
@@ -154,6 +162,7 @@ impl Default for Config {
             windows: Windows::default(),
             output_grace: 250,
             output: BTreeMap::new(),
+            app: BTreeMap::new(),
             appearance: Appearance::default(),
         }
     }
@@ -274,6 +283,67 @@ pub struct OutputOverride {
     pub strip_max_rows: Option<u32>,
 }
 
+/// An `[app."<app-id>"]` table.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AppConfig {
+    /// Rows of the app's menu.
+    pub actions: Vec<AppAction>,
+    /// Runs on a middle click instead of launching a new instance.
+    pub middle_click: Option<String>,
+    /// Run on scrolling over the icon, one per wheel notch.
+    pub scroll_up: Option<String>,
+    pub scroll_down: Option<String>,
+    /// An icon name or a path, instead of the desktop entry's.
+    pub icon: Option<String>,
+    /// The name to show instead of the desktop entry's.
+    pub name: Option<String>,
+    /// Launches the app instead of `launch-command` (or its desktop
+    /// entry).
+    pub launch_command: Option<String>,
+    /// The desktop entry's actions in the menu.
+    pub desktop_actions: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            actions: Vec::new(),
+            middle_click: None,
+            scroll_up: None,
+            scroll_down: None,
+            icon: None,
+            name: None,
+            launch_command: None,
+            desktop_actions: true,
+        }
+    }
+}
+
+/// A row of an app's menu that runs a command.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AppAction {
+    pub name: String,
+    /// Run with `sh -c`: `{app-id}`, `{id}` (the most recent window) and
+    /// `{ids}` (all of the app's windows) are filled in.
+    pub command: String,
+    /// An icon name or a path.
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub when: When,
+}
+
+/// When an app action's row shows.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum When {
+    #[default]
+    Always,
+    /// Only while the app has windows.
+    Running,
+}
+
 /// The layout of one output's dock: the global keys with its
 /// `[output.<name>]` table over them.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,6 +413,46 @@ pub struct Theme {
     pub icon_shadow_offset: [i32; 2],
     /// Icon theme (a directory name); default: gsettings, then hicolor.
     pub icon_theme: Option<String>,
+    /// The menu's bubble.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_background: u32,
+    /// Its 1 px inner border.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_border: u32,
+    #[serde(deserialize_with = "de::px")]
+    pub menu_radius: u32,
+    /// The tail's base width and height, `[w, h]`.
+    #[serde(deserialize_with = "menu_tail")]
+    pub menu_tail: [u32; 2],
+    #[serde(deserialize_with = "de::color")]
+    pub menu_text: u32,
+    /// Under the hovered row.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_highlight: u32,
+    /// The hovered row's text.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_highlight_text: u32,
+    /// The line before the dock's rows.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_separator: u32,
+    #[serde(deserialize_with = "menu_row_height")]
+    pub menu_row_height: u32,
+    /// Space around the rows.
+    #[serde(deserialize_with = "de::px")]
+    pub menu_padding: u32,
+    /// Space between groups of rows.
+    #[serde(deserialize_with = "de::px")]
+    pub menu_group_gap: u32,
+    /// The widest the menu gets; longer rows are cut.
+    #[serde(deserialize_with = "menu_max_width")]
+    pub menu_max_width: u32,
+    /// The menu's shadow; alpha 0 disables it.
+    #[serde(deserialize_with = "de::color")]
+    pub menu_shadow_color: u32,
+    #[serde(deserialize_with = "de::px")]
+    pub menu_shadow_softness: u32,
+    #[serde(deserialize_with = "de::offset")]
+    pub menu_shadow_offset: [i32; 2],
 }
 
 impl Default for Theme {
@@ -365,6 +475,21 @@ impl Default for Theme {
             icon_shadow_softness: 6,
             icon_shadow_offset: [0, 2],
             icon_theme: None,
+            menu_background: 0x262626eb,
+            menu_border: 0xffffff1f,
+            menu_radius: 12,
+            menu_tail: [10, 7],
+            menu_text: 0xffffffff,
+            menu_highlight: 0xffffff2e,
+            menu_highlight_text: 0xffffffff,
+            menu_separator: 0xffffff26,
+            menu_row_height: 28,
+            menu_padding: 6,
+            menu_group_gap: 8,
+            menu_max_width: 320,
+            menu_shadow_color: 0x00000066,
+            menu_shadow_softness: 18,
+            menu_shadow_offset: [0, 4],
         }
     }
 }
@@ -436,6 +561,32 @@ impl Config {
             size: self.font_size as f64,
             color: self.theme().title_color,
             background: self.theme().title_background,
+        }
+    }
+
+    /// The settings of `app_id`, if it has an `[app.<id>]` table.
+    pub fn app(&self, app_id: &str) -> Option<&AppConfig> {
+        self.app.get(app_id)
+    }
+
+    /// The menu's shadow; None if disabled.
+    pub fn menu_shadow(&self) -> Option<shadow::Settings> {
+        let t = self.theme();
+        (t.menu_shadow_color & 0xff != 0).then(|| shadow::Settings {
+            color: t.menu_shadow_color,
+            softness: t.menu_shadow_softness as f64,
+            spread: 0,
+            offset: (t.menu_shadow_offset[0], t.menu_shadow_offset[1]),
+        })
+    }
+
+    /// The style of the menu's rows (no background: the bubble has it).
+    pub fn menu_text_style(&self) -> text::Style {
+        text::Style {
+            font: self.font.clone(),
+            size: self.font_size as f64,
+            color: self.theme().menu_text,
+            background: 0,
         }
     }
 }
@@ -510,6 +661,29 @@ fn launch_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 /// Spring response, in milliseconds.
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 10_000)
+}
+
+/// A menu row's height, 12 to 200.
+fn menu_row_height<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 12, 200)
+}
+
+/// The menu's widest, 80 to 4000.
+fn menu_max_width<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 80, 4000)
+}
+
+/// `[w, h]` of the menu's tail, each 0 to 100.
+fn menu_tail<'de, D: Deserializer<'de>>(d: D) -> Result<[u32; 2], D::Error> {
+    use serde::de::Error;
+    let [w, h] = <[i64; 2]>::deserialize(d)?;
+    let check = |v: i64| {
+        u32::try_from(v)
+            .ok()
+            .filter(|&v| v <= 100)
+            .ok_or_else(|| D::Error::custom(format!("expected 0-100, got {v}")))
+    };
+    Ok([check(w)?, check(h)?])
 }
 
 #[cfg(test)]
@@ -628,6 +802,82 @@ mod tests {
     }
 
     #[test]
+    fn apps() {
+        let c = parse(
+            r#"
+            close-command = "niri msg action close-window --id {id}"
+
+            [app.spotify]
+            actions = [
+              { name = "Play/Pause", command = "playerctl play-pause", icon = "media-playback-start" },
+              { name = "Next", command = "playerctl next", when = "running" },
+            ]
+            middle-click = "playerctl play-pause"
+            scroll-up = "playerctl next"
+            scroll-down = "playerctl previous"
+
+            [app."org.gnome.Nautilus"]
+            icon = "~/.local/share/icons/files.svg"
+            name = "Files"
+            launch-command = "nautilus --new-window"
+            desktop-actions = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.close_command.as_deref(),
+            Some("niri msg action close-window --id {id}")
+        );
+        let s = c.app("spotify").unwrap();
+        assert_eq!(s.actions.len(), 2);
+        assert_eq!(s.actions[0].icon.as_deref(), Some("media-playback-start"));
+        assert_eq!(
+            (s.actions[0].when, s.actions[1].when),
+            (When::Always, When::Running)
+        );
+        assert_eq!(s.middle_click.as_deref(), Some("playerctl play-pause"));
+        assert_eq!(
+            (s.scroll_up.as_deref(), s.scroll_down.as_deref()),
+            (Some("playerctl next"), Some("playerctl previous"))
+        );
+        assert!(s.desktop_actions && s.icon.is_none());
+        let n = c.app("org.gnome.Nautilus").unwrap();
+        assert_eq!(n.name.as_deref(), Some("Files"));
+        assert_eq!(n.icon.as_deref(), Some("~/.local/share/icons/files.svg"));
+        assert_eq!(n.launch_command.as_deref(), Some("nautilus --new-window"));
+        assert!(!n.desktop_actions);
+        assert!(c.app("firefox").is_none());
+    }
+
+    #[test]
+    fn menu_appearance() {
+        let c = parse(
+            r#"
+            [appearance]
+            menu-background = "101010cc"
+            menu-radius = 8
+            menu-tail = [12, 6]
+            menu-row-height = 24
+            menu-max-width = 400
+            menu-shadow-color = "00000000"
+
+            [appearance.light]
+            menu-text = "000000"
+            "#,
+        )
+        .unwrap();
+        let t = &c.appearance.dark;
+        assert_eq!((t.menu_background, t.menu_radius), (0x101010cc, 8));
+        assert_eq!(t.menu_tail, [12, 6]);
+        assert_eq!((t.menu_row_height, t.menu_max_width), (24, 400));
+        assert_eq!((t.menu_padding, t.menu_group_gap), (6, 8));
+        assert_eq!(t.menu_text, 0xffffffff);
+        assert_eq!(c.appearance.light.menu_text, 0x000000ff);
+        assert!(c.menu_shadow().is_none());
+        assert!(Config::default().menu_shadow().is_some());
+    }
+
+    #[test]
     fn per_output() {
         let c = parse(
             r#"
@@ -703,6 +953,14 @@ mod tests {
         assert!(err("outputs = \"some\""));
         assert!(err("outputs = 1"));
         assert!(err("unknown = 1"));
+        assert!(err("[app.x]\nunknown = 1"));
+        assert!(err("[app.x]\nactions = [{ name = \"a\" }]"));
+        assert!(err(
+            "[app.x]\nactions = [{ name = \"a\", command = \"b\", when = \"never\" }]"
+        ));
+        assert!(err("[appearance]\nmenu-tail = [10]"));
+        assert!(err("[appearance]\nmenu-tail = [10, 101]"));
+        assert!(err("[appearance]\nmenu-row-height = 4"));
         assert!(err("[appearance]\nicon-size = 1"));
         assert!(err("[output.X]\nicon-size = 8"));
         assert!(err("[output.X]\nfont = \"Inter\""));

@@ -5,6 +5,8 @@ mod config;
 mod dock;
 mod launch;
 mod layout;
+mod menu;
+mod menuview;
 mod options;
 mod pins;
 mod row;

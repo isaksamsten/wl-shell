@@ -97,6 +97,7 @@ pub fn label_max_width(config: &Config) -> i32 {
 pub fn label_key(app_id: &str, config: &Config, scale: i32) -> Option<LabelKey> {
     Some(LabelKey {
         app_id: app_id.to_string(),
+        name: None,
         max_width: label_max_width(config),
         scale,
         style: config.label_style()?,
@@ -547,6 +548,7 @@ impl Overlay {
     fn label_key(&self, app_id: &str) -> Option<LabelKey> {
         Some(LabelKey {
             app_id: app_id.to_string(),
+            name: None,
             max_width: self.style.label_max_width,
             scale: self.scale,
             style: self.style.label.clone()?,

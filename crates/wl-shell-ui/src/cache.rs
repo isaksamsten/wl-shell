@@ -1,8 +1,8 @@
 //! A cache of ready `WlBuffer`s, so drawing a frame renders nothing:
 //!
-//! - Icons and app name labels, by key (one per app and output scale).
-//!   They are rendered by the worker; the program turns the results into
-//!   buffers as they arrive.
+//! - Icons and app name labels, by key (one per app and output scale),
+//!   and icons by name (menu rows). They are rendered by the worker; the
+//!   program turns the results into buffers as they arrive.
 //! - Shapes (shapes.rs), rendered here on first use for a size, color and
 //!   scale. The most recently used few dozen are kept.
 //!
@@ -41,6 +41,8 @@ pub struct Sized {
 #[derive(Default)]
 pub struct Cache {
     icons: HashMap<icons::Key, WlBuffer>,
+    /// None: there is no such icon.
+    named: HashMap<icons::NamedIcon, Option<WlBuffer>>,
     labels: Vec<(LabelKey, Sized)>,
     /// Most recently used first.
     shapes: Vec<(ShapeKey, Shape)>,
@@ -67,6 +69,29 @@ impl Cache {
                 }
             }
             Err(e) => warn!("icon buffer: {e}"),
+        }
+    }
+
+    /// The icon named by `key`: None if it hasn't arrived, Some(None) if
+    /// there is none.
+    pub fn named_icon(&self, key: &icons::NamedIcon) -> Option<Option<WlBuffer>> {
+        self.named.get(key).cloned()
+    }
+
+    pub fn insert_named_icon<P: Program>(
+        &mut self,
+        g: &Globals,
+        key: icons::NamedIcon,
+        img: Option<&Image>,
+        qh: &QueueHandle<Shell<P>>,
+    ) {
+        let buffer = img.and_then(|img| {
+            shm_buffer(g, img, qh)
+                .inspect_err(|e| warn!("icon buffer: {e}"))
+                .ok()
+        });
+        if let Some(Some(old)) = self.named.insert(key, buffer) {
+            self.stale.push(old);
         }
     }
 
@@ -176,6 +201,7 @@ impl Cache {
     /// entries changed.
     pub fn clear_icons(&mut self) {
         self.stale.extend(self.icons.drain().map(|(_, b)| b));
+        self.stale.extend(self.named.drain().filter_map(|(_, b)| b));
         self.stale
             .extend(self.labels.drain(..).map(|(_, s)| s.buffer));
     }

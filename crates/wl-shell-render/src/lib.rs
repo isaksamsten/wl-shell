@@ -3,6 +3,7 @@
 //! produces premultiplied ARGB8888 [`Image`]s and knows nothing about
 //! Wayland.
 
+pub mod bubble;
 pub mod icons;
 pub mod image;
 pub mod shadow;

@@ -30,13 +30,19 @@
 //! open, the magnification holds still. Hovering only ever shows the
 //! app's name.
 //!
+//! The menu (menuview.rs): a right click opens the app's menu, another
+//! grabbing popup, a speech bubble pointing at the icon. While it is open
+//! the magnification holds still and no label shows. Only one of the strip
+//! and the menu is open at a time.
+//!
 //! Keyboard: the surface is `on-demand`, only so that a click gives it
 //! keyboard focus and with it the modifiers (Ctrl+click). After a click
-//! that opens no popup, and when the strip closes, the dock gives the
-//! focus back by turning its interactivity off, until the pointer next
-//! moves on it.
+//! that opens no popup, and when the strip or menu closes, the dock gives
+//! the focus back by turning its interactivity off, until the pointer
+//! next moves on it.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -66,9 +72,9 @@ use wl_shell_core::popup::PopupConfigure;
 use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
-use wl_shell_render::worker::PillRequest;
-use wl_shell_render::worker::{Assets, LabelKey};
-use wl_shell_render::{icons, shadow, text};
+use wl_shell_render::bubble::Bubble;
+use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
+use wl_shell_render::{Image, icons, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
 use wl_shell_ui::card::{self, Preview};
 use wl_shell_ui::shapes::{self, Shape, ShapeKey};
@@ -78,6 +84,8 @@ use crate::app::WlDock;
 use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
 use crate::dock::{Item, Window};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
+use crate::menu::{self, Group, MenuKey};
+use crate::menuview::{MenuInput, MenuStyle, MenuView};
 use crate::row::{self, Slot};
 use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
@@ -116,6 +124,10 @@ pub struct Style {
     icon_shadow: Option<shadow::IconShadow>,
     font: String,
     pub strip: StripStyle,
+    pub menu: MenuStyle,
+    /// Icons (names or paths) and names from `[app.<id>]` tables.
+    icons: BTreeMap<String, String>,
+    names: BTreeMap<String, String>,
 }
 
 impl Style {
@@ -156,6 +168,30 @@ impl Style {
                 morph_response: config.response as f64 * 1.7,
                 response: config.response as f64,
             },
+            menu: MenuStyle {
+                metrics: menu::Metrics {
+                    row_height: theme.menu_row_height as f64,
+                    padding: theme.menu_padding as f64,
+                    group_gap: theme.menu_group_gap as f64,
+                    max_width: theme.menu_max_width as f64,
+                    radius: theme.menu_radius as f64,
+                    tail: (theme.menu_tail[0] as f64, theme.menu_tail[1] as f64),
+                },
+                text: config.menu_text_style(),
+                highlight_text: theme.menu_highlight_text,
+                background: theme.menu_background,
+                border: theme.menu_border,
+                separator: theme.menu_separator,
+                highlight: theme.menu_highlight,
+                shadow: config.menu_shadow(),
+                icon_theme: theme.icon_theme.clone(),
+            },
+            icons: (config.app.iter())
+                .filter_map(|(id, a)| Some((id.clone(), a.icon.clone()?)))
+                .collect(),
+            names: (config.app.iter())
+                .filter_map(|(id, a)| Some((id.clone(), a.name.clone()?)))
+                .collect(),
         }
     }
 
@@ -209,6 +245,8 @@ struct SlotSubs {
 
 pub struct DockView {
     // Field order is drop order: children before their parent surface.
+    /// The menu, while open (or closing).
+    menu: Option<MenuView>,
     /// The strip, while open (or closing).
     strip: Option<StripView>,
     panel: [Sub; 3],
@@ -328,6 +366,7 @@ impl DockView {
 
         let response = style.response;
         let mut dock = Self {
+            menu: None,
             strip: None,
             panel,
             slot_subs: Vec::new(),
@@ -406,6 +445,11 @@ impl DockView {
             return;
         }
         let resized = style.metrics() != self.style.metrics() || style.layout != self.style.layout;
+        // The menu was built for the old look.
+        if style.menu != self.style.menu || style.layout.position != self.style.layout.position {
+            self.menu = None;
+            self.frozen = self.strip_open();
+        }
         self.style = style;
         if resized {
             self.apply_size();
@@ -525,11 +569,13 @@ impl DockView {
             self.style.icon_shadow,
             self.scale,
         )
+        .with_icon(self.style.icons.get(app_id).cloned())
     }
 
     fn label_key(&self, app_id: &str) -> Option<LabelKey> {
         Some(LabelKey {
             app_id: app_id.to_string(),
+            name: self.style.names.get(app_id).cloned(),
             max_width: self.style.label_max_width,
             scale: self.scale,
             style: self.style.label.clone()?,
@@ -635,8 +681,8 @@ impl DockView {
         // Clicks give the surface keyboard focus again.
         self.set_interactive(true);
         let (u, _) = self.frame().dock_point(x, y);
-        // Held still while the strip is open: the icons don't move under
-        // the pointer, which may be on its way to another one.
+        // Held still while the strip or menu is open: the icons don't move
+        // under the pointer, which may be on its way to another one.
         let at = if self.frozen { self.pointer } else { u };
         let weights = self.weights();
         let center = self.frame().length() / 2.0;
@@ -653,11 +699,11 @@ impl DockView {
         self.kick();
     }
 
-    /// The pointer left the dock. With the strip open, the magnification
-    /// stays until it closes.
+    /// The pointer left the dock. With the strip or menu open, the
+    /// magnification stays until it closes.
     pub fn pointer_leave(&mut self, core: &Core<WlDock>) {
         self.pointer_in = false;
-        if self.strip_open() {
+        if self.strip_open() || self.menu_open() {
             self.set_hovered(core, None);
             return;
         }
@@ -691,7 +737,7 @@ impl DockView {
     /// A click was handled without opening a popup: give the keyboard
     /// focus it brought back.
     pub fn release_keyboard(&mut self) {
-        if !self.strip_open() {
+        if !self.strip_open() && !self.menu_open() {
             self.set_interactive(false);
         }
     }
@@ -742,10 +788,10 @@ impl DockView {
 
     /// Show the hovered app's label if it is due, or fade it out.
     fn update_label(&mut self) {
-        // The strip replaces the label.
+        // The strip replaces its app's label; no label shows over a menu.
         let stripped = |a: &str| (self.strip.as_ref()).is_some_and(|s| s.app_id == a);
         let want = (self.hovered.as_deref())
-            .filter(|a| self.label_on && !stripped(a))
+            .filter(|a| self.label_on && !stripped(a) && self.menu.is_none())
             .and_then(|a| self.label_key(a));
         let Some(key) = want else {
             self.label_alpha.retarget(0.0);
@@ -794,6 +840,7 @@ impl DockView {
 
     fn moving(&self) -> bool {
         self.strip.as_ref().is_some_and(StripView::moving)
+            || self.menu.as_ref().is_some_and(MenuView::moving)
             || !self.hover.settled()
             || !self.label_alpha.settled()
             || self
@@ -819,6 +866,13 @@ impl DockView {
                 self.update_label();
             }
         }
+        if let Some(menu) = &mut self.menu {
+            moving |= menu.advance(dt);
+            if menu.gone() {
+                self.menu = None;
+                self.update_label();
+            }
+        }
         self.last_frame = moving.then_some(now);
         self.render();
     }
@@ -835,6 +889,7 @@ impl DockView {
         }
         self.layer.commit();
         self.render_strip();
+        self.render_menu();
     }
 
     /// An alpha as shown: without wp_alpha_modifier_v1, things are either
@@ -1136,7 +1191,8 @@ impl DockView {
         app_id: &str,
         grab: Option<(&WlSeat, u32)>,
     ) -> bool {
-        // A grabbing popup has to be the topmost: the old one goes first.
+        // A grabbing popup has to be the topmost: the old ones go first.
+        self.menu = None;
         self.strip = None;
         self.set_interactive(true);
         let Some(windows) = (self.slots.iter())
@@ -1203,7 +1259,7 @@ impl DockView {
     }
 
     fn strip_closed(&mut self, core: &Core<WlDock>) {
-        self.frozen = false;
+        self.frozen = self.menu_open();
         self.set_interactive(false);
         if !self.pointer_in {
             self.unhover(core);
@@ -1270,16 +1326,11 @@ impl DockView {
 
     /// Draw the strip, if any.
     fn render_strip(&mut self) {
+        let Some(app_id) = self.strip.as_ref().map(|s| s.app_id.clone()) else {
+            return;
+        };
+        let key = (self.style.strip.previews == Previews::Off).then(|| self.icon_key(&app_id));
         let Some(strip) = &mut self.strip else { return };
-        let key = self.style.strip.previews.eq(&Previews::Off).then(|| {
-            icons::Key::new(
-                &strip.app_id,
-                self.style.icon_key_size(),
-                self.style.icon_theme.clone(),
-                self.style.icon_shadow,
-                self.scale,
-            )
-        });
         let mut cache = self.cache.borrow_mut();
         strip.fetch_shadows(&mut cache);
         let icon = key.as_ref().and_then(|k| Some((cache.icon(k)?, k)));
@@ -1301,19 +1352,33 @@ impl DockView {
 
     pub fn has_popup(&self, popup: &Popup) -> bool {
         self.strip.as_ref().is_some_and(|s| s.is(popup))
+            || self.menu.as_ref().is_some_and(|m| m.is(popup))
     }
 
-    /// The compositor placed the strip.
-    pub fn popup_configure(&mut self, configure: &PopupConfigure) {
-        if let Some(strip) = &mut self.strip {
+    /// The compositor placed the strip or the menu.
+    pub fn popup_configure(&mut self, popup: &Popup, configure: &PopupConfigure) {
+        if let Some(strip) = &mut self.strip
+            && strip.is(popup)
+        {
             strip.configure(configure);
+        }
+        if let Some(menu) = &mut self.menu
+            && menu.is(popup)
+        {
+            menu.configure(configure);
         }
         self.render();
     }
 
-    /// The compositor dismissed the strip (a click on another client).
-    pub fn popup_done(&mut self, core: &Core<WlDock>) {
-        self.drop_strip(core);
+    /// The compositor dismissed the strip or the menu (a click on another
+    /// client).
+    pub fn popup_done(&mut self, core: &Core<WlDock>, popup: &Popup) {
+        if self.strip.as_ref().is_some_and(|s| s.is(popup)) {
+            self.drop_strip(core);
+        }
+        if self.menu.as_ref().is_some_and(|m| m.is(popup)) {
+            self.drop_menu(core);
+        }
     }
 
     /// A pointer event on the strip. Returns the window to activate, if a
@@ -1347,13 +1412,189 @@ impl DockView {
         }
     }
 
-    /// A title pill from the worker; true if it was the strip's.
+    /// A text from the worker; true if it was the strip's or the menu's.
     pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
-        let ours = (self.strip.as_mut()).is_some_and(|s| s.pill_ready(tag, request, pill));
+        let ours = (self.strip.as_mut()).is_some_and(|s| s.pill_ready(tag, request, pill))
+            || (self.menu.as_mut()).is_some_and(|m| m.pill_ready(tag, request, pill));
         if ours {
             self.kick();
         }
         ours
+    }
+
+    /// The item of `app_id`, if it is on this dock.
+    pub fn item(&self, app_id: &str) -> Option<&Item> {
+        (self.slots.iter())
+            .find(|s| !s.leaving && s.item.app_id == app_id)
+            .map(|s| &s.item)
+    }
+
+    // -- the menu ------------------------------------------------------------
+
+    /// Whether the menu is open (and not closing).
+    pub fn menu_open(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| !m.closing())
+    }
+
+    /// The app whose menu is open (and not closing).
+    pub fn menu_app(&self) -> Option<&str> {
+        (self.menu.as_ref())
+            .filter(|m| !m.closing())
+            .map(|m| m.app_id.as_str())
+    }
+
+    /// Open `groups` as the menu of `app_id`, grabbing `grab` (a seat and
+    /// the serial of the click). The strip and any other menu go at once.
+    /// It shows once its rows are rendered. Returns whether it opened.
+    pub fn open_menu(
+        &mut self,
+        core: &Core<WlDock>,
+        app_id: &str,
+        groups: Vec<Group>,
+        grab: Option<(&WlSeat, u32)>,
+    ) -> bool {
+        // A grabbing popup has to be the topmost: the old ones go first.
+        self.menu = None;
+        if self.strip.take().is_some() {
+            self.sync_previews(core);
+        }
+        let icon = self
+            .icon_place(app_id)
+            .map(|(r, _)| wl_shell_ui::Rect::new(r.x as f64, r.y as f64, r.w as f64, r.h as f64));
+        if let (Some(icon), false) = (icon, groups.is_empty()) {
+            let menu = MenuView::new(
+                self.g.clone(),
+                self.assets.clone(),
+                &self.cache.borrow(),
+                &self.qh,
+                &self.layer,
+                grab,
+                app_id.to_string(),
+                groups,
+                self.style.menu.clone(),
+                self.style.layout.position,
+                icon,
+                self.scale,
+            );
+            match menu {
+                Ok(menu) => self.menu = Some(menu),
+                Err(e) => warn!("cannot show the menu: {e}"),
+            }
+        }
+        // The icons hold still under the menu.
+        self.frozen = self.menu.is_some();
+        self.set_interactive(true);
+        self.update_label();
+        self.kick();
+        self.menu.is_some()
+    }
+
+    /// Fade the menu out; it goes once it's gone. Gives the keyboard back.
+    pub fn close_menu(&mut self, core: &Core<WlDock>) {
+        let Some(menu) = &mut self.menu else { return };
+        if !menu.closing() {
+            menu.close();
+            self.menu_closed(core);
+        }
+    }
+
+    /// Drop the menu at once.
+    pub fn drop_menu(&mut self, core: &Core<WlDock>) {
+        if self.menu.take().is_some() {
+            self.menu_closed(core);
+        }
+    }
+
+    fn menu_closed(&mut self, core: &Core<WlDock>) {
+        self.frozen = self.strip_open();
+        if !self.strip_open() {
+            self.set_interactive(false);
+        }
+        if !self.pointer_in {
+            self.unhover(core);
+        }
+        self.update_label();
+        self.kick();
+    }
+
+    /// Whether `surface` is this dock's menu.
+    pub fn has_menu_surface(&self, surface: &WlSurface) -> bool {
+        (self.menu.as_ref()).is_some_and(|m| m.surface() == Some(surface))
+    }
+
+    /// Whether keys on `surface` go to this dock's menu: it is the menu's,
+    /// or the dock's while the menu isn't shown yet.
+    pub fn menu_has_keys(&self, surface: &WlSurface) -> bool {
+        self.menu_open() && (self.has_menu_surface(surface) || self.surface() == surface)
+    }
+
+    /// A pointer event on the menu. Returns the app and what to do, if a
+    /// row was picked.
+    pub fn menu_pointer(
+        &mut self,
+        core: &Core<WlDock>,
+        event: &PointerEvent,
+    ) -> Option<(String, menu::Action)> {
+        let menu = self.menu.as_mut()?;
+        let (x, y) = event.position;
+        let input = menu.pointer(&event.kind, x, y);
+        self.kick();
+        self.menu_input(core, input)
+    }
+
+    /// A key on the menu. Returns the app and what to do, if a row was
+    /// picked.
+    pub fn menu_key(
+        &mut self,
+        core: &Core<WlDock>,
+        key: MenuKey,
+    ) -> Option<(String, menu::Action)> {
+        let input = self.menu.as_mut()?.key(key);
+        self.kick();
+        self.menu_input(core, input)
+    }
+
+    fn menu_input(
+        &mut self,
+        core: &Core<WlDock>,
+        input: MenuInput,
+    ) -> Option<(String, menu::Action)> {
+        match input {
+            MenuInput::None => None,
+            MenuInput::Close => {
+                self.close_menu(core);
+                None
+            }
+            // The row flashes, then the menu fades by itself.
+            MenuInput::Pick(action) => {
+                let app_id = self.menu.as_ref()?.app_id.clone();
+                self.menu_closed(core);
+                Some((app_id, action))
+            }
+        }
+    }
+
+    /// A bubble from the worker; true if it was the menu's.
+    pub fn bubble_ready(&mut self, tag: u64, bubble: &Bubble, image: &Image) -> bool {
+        let ours = (self.menu.as_mut()).is_some_and(|m| m.bubble_ready(tag, bubble, image));
+        if ours {
+            self.kick();
+        }
+        ours
+    }
+
+    /// An icon by name arrived (now in the cache): the menu may show it.
+    pub fn named_icon_ready(&mut self) {
+        if self.menu.is_some() {
+            self.kick();
+        }
+    }
+
+    /// Draw the menu, if any.
+    fn render_menu(&mut self) {
+        if let Some(menu) = &mut self.menu {
+            menu.render(&mut self.cache.borrow_mut());
+        }
     }
 
     /// Whether capture `id` is one of this dock's.

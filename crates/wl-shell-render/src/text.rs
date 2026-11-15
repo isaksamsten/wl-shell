@@ -141,6 +141,37 @@ impl Text {
         }
     }
 
+    /// One line of `text` without padding, at most `max_width` logical
+    /// pixels wide (ellipsized), as tall as `line_height`, rendered at
+    /// `scale`. The background shows only if it isn't transparent.
+    pub fn line(&mut self, text: &str, style: &Style, max_width: i32, scale: i32) -> Pill {
+        let s = scale.max(1);
+        let max_width = max_width.max(1);
+        let size = (style.size * s as f64) as f32;
+        let line_h = (line_height(style.size) * s) as f32;
+        let text = clean(text);
+        let mut measure = |t: &str| self.shape(t, &style.font, size, line_h).1;
+        let text = ellipsize(&text, (max_width * s) as f32, &mut measure);
+        let (buffer, text_w) = self.shape(&text, &style.font, size, line_h);
+        let width = ((text_w / s as f32).ceil() as i32).clamp(1, max_width);
+        let height = line_height(style.size);
+        let (bw, bh) = (width * s, height * s);
+        let mut image = match style.background & 0xff {
+            0 => Image {
+                width: bw as u32,
+                height: bh as u32,
+                data: vec![0; (bw * bh * 4) as usize],
+            },
+            _ => rounded_rect(bw, bh, 0.0, style.background),
+        };
+        self.draw(&buffer, &mut image, 0, 0, style.color);
+        Pill {
+            width,
+            height,
+            image,
+        }
+    }
+
     /// A rounded tile of `size` pixels with the first letter of `name`,
     /// colored after `name`.
     pub fn letter(&mut self, name: &str, size: u32, font: &str) -> Image {

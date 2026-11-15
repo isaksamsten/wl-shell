@@ -1,13 +1,17 @@
 //! App icons and names: app_id -> desktop entry -> icon file ->
-//! premultiplied pixels, and the entry's localized `Name=`.
+//! premultiplied pixels, and the entry's localized `Name=` and desktop
+//! actions.
 //!
 //! `freedesktop-desktop-entry` matches the app_id against the desktop
 //! entries (StartupWMClass, desktop file ID, Name, Exec, Snap name;
 //! case-insensitive). The entry's `Icon=` is an absolute path or a theme icon
-//! name; without an entry the app_id itself is tried as an icon name. Names
-//! are resolved by `freedesktop-icons` in the configured theme, else the
-//! gsettings icon theme, else hicolor (and pixmaps). PNGs are decoded with
-//! `image` and scaled down; SVGs are rasterized by `resvg` at the exact size.
+//! name; without an entry the app_id itself is tried as an icon name. A
+//! key's `icon` (a name or a path, from the config) is tried before both.
+//! Names are resolved by `freedesktop-icons` in the configured theme, else
+//! the gsettings icon theme, else hicolor (and pixmaps). PNGs are decoded
+//! with `image` and scaled down; SVGs are rasterized by `resvg` at the
+//! exact size. Icons can also be looked up by name alone (`named`), e.g.
+//! for menu rows; those have no letter tile.
 //!
 //! Runs on the worker thread. Decoded icons are cached; desktop entries are
 //! reloaded when an applications directory changes.
@@ -33,6 +37,19 @@ pub struct Key {
     pub scale: i32,
     /// Drawn under the icon, which is then padded by its `pad`.
     pub shadow: Option<crate::shadow::IconShadow>,
+    /// An icon name or path to try first, instead of the desktop entry's.
+    pub icon: Option<String>,
+}
+
+/// An icon looked up by its name (or path) alone.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NamedIcon {
+    /// A theme icon name, an absolute path, or a path under `~/`.
+    pub name: String,
+    /// Buffer pixels.
+    pub size: u32,
+    /// The configured theme, if any.
+    pub theme: Option<String>,
 }
 
 impl Key {
@@ -52,7 +69,13 @@ impl Key {
             theme,
             scale,
             shadow,
+            icon: None,
         }
+    }
+
+    /// The same key, trying `icon` (a name or path) first.
+    pub fn with_icon(self, icon: Option<String>) -> Self {
+        Self { icon, ..self }
     }
 
     /// The same icon without its shadow.
@@ -84,6 +107,8 @@ pub struct Icons {
     default_theme: Option<Option<String>>,
     /// None: no icon was found (the caller draws a letter tile).
     cache: HashMap<Key, Option<Arc<Image>>>,
+    /// Icons by name; None: not found.
+    named: HashMap<NamedIcon, Option<Arc<Image>>>,
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -104,6 +129,7 @@ impl Icons {
             locales: Vec::new(),
             default_theme: None,
             cache: HashMap::new(),
+            named: HashMap::new(),
         }
     }
 
@@ -111,6 +137,7 @@ impl Icons {
     /// changed.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.named.clear();
         self.default_theme = None;
     }
 
@@ -142,6 +169,7 @@ impl Icons {
             .collect();
         self.dirs = dirs;
         self.cache.clear();
+        self.named.clear();
         reloaded
     }
 
@@ -163,17 +191,7 @@ impl Icons {
             return None;
         }
         let e = fde::find_app_by_id(&self.entries, Ascii::new(app_id))?;
-        Some(AppEntry {
-            desktop_id: format!("{}.desktop", e.id()),
-            name: e
-                .name(&self.locales)
-                .map(|n| n.trim().to_string())
-                .unwrap_or_default(),
-            icon: e.icon().filter(|i| !i.is_empty()).map(Into::into),
-            exec: e.exec().filter(|x| !x.trim().is_empty()).map(Into::into),
-            terminal: e.terminal(),
-            path: e.path.clone(),
-        })
+        Some(AppEntry::from_desktop_entry(e, &self.locales))
     }
 
     /// The icon for `key`, from the cache or looked up and decoded.
@@ -186,33 +204,84 @@ impl Icons {
         image
     }
 
-    fn load(&mut self, key: &Key) -> Option<Image> {
-        if key.app_id.is_empty() || key.size == 0 {
-            return None;
+    /// The icon named `key.name` (a theme name or a path), from the cache
+    /// or looked up and decoded. None if there is none.
+    pub fn named(&mut self, key: &NamedIcon) -> Option<Arc<Image>> {
+        if let Some(cached) = self.named.get(key) {
+            return cached.clone();
         }
-        let icon = fde::find_app_by_id(&self.entries, Ascii::new(key.app_id.as_str()))
-            .and_then(|e| e.icon())
-            .filter(|i| !i.is_empty())
-            .map(str::to_string);
-        let candidates: Vec<String> = match icon {
-            Some(icon) if icon != key.app_id => vec![icon, key.app_id.clone()],
-            _ => vec![key.app_id.clone()],
-        };
-        let theme = match &key.theme {
+        let theme = self.theme(&key.theme);
+        let image = (key.size > 0 && !key.name.trim().is_empty())
+            .then(|| find(&expand_home(key.name.trim()), key.size, &theme))
+            .flatten()
+            .map(Arc::new);
+        self.named.insert(key.clone(), image.clone());
+        image
+    }
+
+    /// The theme to look icons up in: `configured`, else the desktop's.
+    fn theme(&mut self, configured: &Option<String>) -> String {
+        match configured {
             Some(t) => t.clone(),
             None => self
                 .default_theme
                 .get_or_insert_with(gsettings_theme)
                 .clone()
                 .unwrap_or_else(|| "hicolor".into()),
-        };
-        candidates.iter().find_map(|name| {
-            let path = resolve(name, key.size, &theme)?;
-            decode(&path, key.size)
-                .inspect_err(|e| wl_shell_log::warn!("icon {}: {e}", path.display()))
-                .ok()
-        })
+        }
     }
+
+    fn load(&mut self, key: &Key) -> Option<Image> {
+        if key.size == 0 {
+            return None;
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(icon) = key.icon.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+            candidates.push(expand_home(icon));
+        }
+        if !key.app_id.is_empty() {
+            let icon = fde::find_app_by_id(&self.entries, Ascii::new(key.app_id.as_str()))
+                .and_then(|e| e.icon())
+                .filter(|i| !i.is_empty())
+                .map(str::to_string);
+            candidates.extend(icon);
+            candidates.push(key.app_id.clone());
+        }
+        candidates.dedup();
+        let theme = self.theme(&key.theme);
+        candidates
+            .iter()
+            .find_map(|name| find(name, key.size, &theme))
+    }
+}
+
+/// The icon `name` (a theme name or an absolute path) at `size` in
+/// `theme`, decoded.
+fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
+    let path = resolve(name, size, theme)?;
+    decode(&path, size)
+        .inspect_err(|e| wl_shell_log::warn!("icon {}: {e}", path.display()))
+        .ok()
+}
+
+/// `~/` at the start of `path` replaced by the home directory.
+pub fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => Path::new(&home).join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+/// One of a desktop entry's `[Desktop Action <id>]` groups.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub id: String,
+    /// The localized `Name=`.
+    pub name: String,
+    /// `Icon=`: a theme icon name or a path.
+    pub icon: Option<String>,
+    /// `Exec=` as written.
+    pub exec: String,
 }
 
 /// The launch side of a desktop entry, as plain data.
@@ -229,9 +298,55 @@ pub struct AppEntry {
     pub terminal: bool,
     /// The `.desktop` file.
     pub path: PathBuf,
+    /// The `Actions=` that have a name and a command, in that order.
+    pub actions: Vec<DesktopAction>,
 }
 
 impl AppEntry {
+    /// The parts of `e` that launching needs, with names in `locales`.
+    pub fn from_desktop_entry(e: &DesktopEntry, locales: &[String]) -> Self {
+        let text = |s: Option<std::borrow::Cow<'_, str>>| {
+            s.map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
+        };
+        let mut actions: Vec<DesktopAction> = Vec::new();
+        for id in e.actions().unwrap_or_default() {
+            let id = id.trim();
+            if id.is_empty() || actions.iter().any(|a| a.id == id) {
+                continue;
+            }
+            let name = text(e.action_name(id, locales));
+            let exec = e.action_exec(id).map(str::trim).filter(|x| !x.is_empty());
+            if let (Some(name), Some(exec)) = (name, exec) {
+                actions.push(DesktopAction {
+                    id: id.to_string(),
+                    name,
+                    icon: (e.action_entry(id, "Icon"))
+                        .map(str::trim)
+                        .filter(|i| !i.is_empty())
+                        .map(Into::into),
+                    exec: exec.to_string(),
+                });
+            }
+        }
+        Self {
+            desktop_id: format!("{}.desktop", e.id()),
+            name: text(e.name(locales)).unwrap_or_default(),
+            icon: e.icon().filter(|i| !i.is_empty()).map(Into::into),
+            exec: e.exec().filter(|x| !x.trim().is_empty()).map(Into::into),
+            terminal: e.terminal(),
+            path: e.path.clone(),
+            actions,
+        }
+    }
+
+    /// The same entry running `action`'s command instead of its own.
+    pub fn with_action(&self, action: &DesktopAction) -> Self {
+        Self {
+            exec: Some(action.exec.clone()),
+            ..self.clone()
+        }
+    }
+
     /// The command to run `Exec=` as argv, opening `files` (paths or
     /// URIs; may be empty). See `exec_argv`.
     pub fn argv(&self, files: &[String]) -> Result<Vec<String>, String> {
@@ -476,7 +591,86 @@ mod exec_tests {
             exec: None,
             terminal: false,
             path: "/usr/share/applications/org.example.App.desktop".into(),
+            actions: Vec::new(),
         }
+    }
+
+    const DESKTOP: &str = "\
+[Desktop Entry]
+Type=Application
+Name=Example
+Name[de]=Beispiel
+Exec=example %U
+Icon=example
+Terminal=false
+Actions=new-window;private; missing;no-name;new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Name[de]=Neues Fenster
+Exec=example --new-window
+
+[Desktop Action private]
+Name=New Private Window
+Exec=example --private %u
+Icon=example-private
+
+[Desktop Action no-name]
+Exec=example --nameless
+
+[Desktop Action unlisted]
+Name=Unlisted
+Exec=example --unlisted
+";
+
+    fn parse(locales: &[&str]) -> AppEntry {
+        let locales: Vec<String> = locales.iter().map(|l| l.to_string()).collect();
+        let e = DesktopEntry::from_str(
+            "/usr/share/applications/org.example.App.desktop",
+            DESKTOP,
+            Some(&locales),
+        )
+        .unwrap();
+        AppEntry::from_desktop_entry(&e, &locales)
+    }
+
+    #[test]
+    fn desktop_actions() {
+        let e = parse(&["en"]);
+        assert_eq!(e.desktop_id, "org.example.App.desktop");
+        assert_eq!(
+            (e.name.as_str(), e.exec.as_deref()),
+            ("Example", Some("example %U"))
+        );
+        // In `Actions=` order, once each; without a group, a name or a
+        // command they're skipped, and unlisted groups don't show.
+        let ids: Vec<&str> = e.actions.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["new-window", "private"]);
+        assert_eq!(e.actions[0].name, "New Window");
+        assert_eq!(e.actions[0].icon, None);
+        assert_eq!(e.actions[1].icon.as_deref(), Some("example-private"));
+        // Run like the app: field codes removed.
+        let private = e.with_action(&e.actions[1]);
+        assert_eq!(private.argv(&[]).unwrap(), ["example", "--private"]);
+        assert_eq!(private.name, "Example");
+    }
+
+    #[test]
+    fn localized_action_names() {
+        let e = parse(&["de"]);
+        assert_eq!(e.name, "Beispiel");
+        assert_eq!(e.actions[0].name, "Neues Fenster");
+        assert_eq!(e.actions[1].name, "New Private Window");
+    }
+
+    #[test]
+    fn home_paths() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().into_owned();
+            assert_eq!(expand_home("~/x.svg"), format!("{home}/x.svg"));
+        }
+        assert_eq!(expand_home("/a/~/b"), "/a/~/b");
+        assert_eq!(expand_home("firefox"), "firefox");
     }
 
     fn argv(exec: &str, files: &[&str]) -> Result<Vec<String>, String> {
