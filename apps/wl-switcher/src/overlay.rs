@@ -840,7 +840,7 @@ impl Overlay {
             return;
         };
         let update = p.update(&self.g, &self.qh, f);
-        if !update.shown {
+        if !update.shown && !update.resized {
             return;
         }
         let resized = update.resized;
