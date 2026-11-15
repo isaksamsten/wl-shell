@@ -1,6 +1,7 @@
 //! wl-dock: a macOS-style dock for Wayland. See PLAN.md for the design.
 
 mod app;
+mod autohide;
 mod config;
 mod dock;
 mod launch;

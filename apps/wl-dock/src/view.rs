@@ -40,6 +40,15 @@
 //! that opens no popup, and when the strip or menu closes, the dock gives
 //! the focus back by turning its interactivity off, until the pointer
 //! next moves on it.
+//!
+//! Autohide (autohide.rs): a dock with `autohide` starts hidden, slid off
+//! its edge on the `shown` spring, with all of it cleared once it is out
+//! of sight. Its input region is then a thin band along the edge, as long
+//! as the resting panel; the pointer resting there for `reveal-delay`
+//! brings it back, and it hides `hide-delay` after the pointer leaves,
+//! unless its strip or menu is open. While shown, the input region
+//! reaches down to the edge, so moving the pointer into the margin
+//! doesn't count as leaving. It reserves no space.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -69,6 +78,7 @@ use smithay_client_toolkit::shell::xdg::popup::Popup;
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::popup::PopupConfigure;
+use wl_shell_core::reexports::calloop::timer::{TimeoutAction, Timer};
 use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
@@ -81,6 +91,7 @@ use wl_shell_ui::shapes::{self, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Spring, Sub};
 
 use crate::app::WlDock;
+use crate::autohide;
 use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
 use crate::dock::{Item, Window};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
@@ -99,6 +110,8 @@ const MAX_DOTS: usize = 3;
 const LABEL_RESPONSE: f64 = 100.0;
 /// How high a launching app's icon hops, in icon sizes.
 const BOUNCE: f64 = 0.4;
+/// The autohide slide's response, in spring responses.
+const SLIDE_RESPONSE: f64 = 1.5;
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +138,9 @@ pub struct Style {
     font: String,
     pub strip: StripStyle,
     pub menu: MenuStyle,
+    autohide: autohide::Settings,
+    /// How far the panel's shadow reaches past it.
+    shadow_reach: f64,
     /// Icons (names or paths) and names from `[app.<id>]` tables.
     icons: BTreeMap<String, String>,
     names: BTreeMap<String, String>,
@@ -186,6 +202,13 @@ impl Style {
                 shadow: config.menu_shadow(),
                 icon_theme: theme.icon_theme.clone(),
             },
+            autohide: autohide::Settings {
+                enabled: layout.autohide,
+                reveal_delay: Duration::from_millis(config.reveal_delay.into()),
+                hide_delay: Duration::from_millis(config.hide_delay.into()),
+                trigger: config.autohide_trigger as f64,
+            },
+            shadow_reach: autohide::shadow_reach(config.shadow().as_ref()),
             icons: (config.app.iter())
                 .filter_map(|(id, a)| Some((id.clone(), a.icon.clone()?)))
                 .collect(),
@@ -234,6 +257,12 @@ impl Style {
             range: self.range,
             hover,
         }
+    }
+
+    /// How far the resting dock reaches from its edge (autohide slides it
+    /// that far).
+    fn reach(&self) -> f64 {
+        autohide::reach(&self.metrics(), self.shadow_reach)
     }
 }
 
@@ -315,6 +344,13 @@ pub struct DockView {
     frozen: bool,
     /// The pointer is on the dock.
     pointer_in: bool,
+    /// Where the pointer last was on the surface, while it is on it.
+    pointer_at: Option<(f64, f64)>,
+    /// Autohide: 0 hidden (slid off the edge) to 1 shown. Its target says
+    /// where the dock is headed.
+    shown: Spring,
+    /// Shows (true) or hides the dock when it fires.
+    autohide_timer: Option<(bool, RegistrationToken)>,
     /// The surface's keyboard interactivity is `on-demand` (else `none`).
     interactive: bool,
     /// Warned that the strip can't open.
@@ -365,6 +401,11 @@ impl DockView {
         let label_sub = sub();
 
         let response = style.response;
+        // An autohiding dock starts out of sight.
+        let shown = match style.autohide.enabled {
+            true => 0.0,
+            false => 1.0,
+        };
         let mut dock = Self {
             menu: None,
             strip: None,
@@ -409,6 +450,9 @@ impl DockView {
             previews: Vec::new(),
             frozen: false,
             pointer_in: false,
+            pointer_at: None,
+            shown: Spring::new(shown, response * SLIDE_RESPONSE),
+            autohide_timer: None,
             interactive: true,
             warned_strip: false,
         };
@@ -435,7 +479,10 @@ impl DockView {
             Position::Bottom => self.layer.set_size(0, thickness),
             Position::Left | Position::Right => self.layer.set_size(thickness, 0),
         }
-        (self.layer).set_exclusive_zone(m.exclusive_zone(self.style.layout.reserve));
+        // A dock that hides reserves nothing: windows would go under it
+        // anyway once it slides in.
+        let reserve = self.style.layout.reserve && !self.style.autohide.enabled;
+        (self.layer).set_exclusive_zone(m.exclusive_zone(reserve));
     }
 
     /// A new config (`needs_new_surface` is false for it). With `reload`,
@@ -462,6 +509,9 @@ impl DockView {
             strip.reload();
         }
         self.refresh_strip();
+        // Autohide may have been turned on or off, or its delays changed.
+        self.cancel_autohide_timer();
+        self.sync_autohide();
         self.kick();
     }
 
@@ -678,8 +728,15 @@ impl DockView {
             return;
         }
         self.pointer_in = true;
+        self.pointer_at = Some((x, y));
         // Clicks give the surface keyboard focus again.
         self.set_interactive(true);
+        // Hidden, the pointer is on the trigger band: it only brings the
+        // dock back, after the delay.
+        self.sync_autohide();
+        if !self.showing() {
+            return;
+        }
         let (u, _) = self.frame().dock_point(x, y);
         // Held still while the strip or menu is open: the icons don't move
         // under the pointer, which may be on its way to another one.
@@ -703,11 +760,76 @@ impl DockView {
     /// magnification stays until it closes.
     pub fn pointer_leave(&mut self, core: &Core<WlDock>) {
         self.pointer_in = false;
+        self.pointer_at = None;
+        self.sync_autohide();
         if self.strip_open() || self.menu_open() {
             self.set_hovered(core, None);
             return;
         }
         self.unhover(core);
+    }
+
+    // -- autohide ------------------------------------------------------------
+
+    /// Whether the dock is shown or on its way back (else hidden or
+    /// hiding).
+    fn showing(&self) -> bool {
+        self.shown.target > 0.5
+    }
+
+    /// Start (or keep, or cancel) the timer for where autohide wants the
+    /// dock, or show or hide it at once if there is no delay.
+    fn sync_autohide(&mut self) {
+        let held = self.strip_open() || self.menu_open();
+        let next = autohide::next(&self.style.autohide, self.showing(), self.pointer_in, held);
+        let Some((show, delay)) = next else {
+            return self.cancel_autohide_timer();
+        };
+        if (self.autohide_timer).is_some_and(|(s, _)| s == show) {
+            return;
+        }
+        self.cancel_autohide_timer();
+        if delay.is_zero() {
+            return self.set_shown(show);
+        }
+        let output = self.output.clone();
+        let timer = Timer::from_duration(delay);
+        let due = move |_, _: &mut (), shell: &mut Shell<WlDock>| {
+            if let Some(dock) = shell.program.dock_mut(&output) {
+                dock.autohide_due(&shell.core, show);
+            }
+            TimeoutAction::Drop
+        };
+        let token = self.loop_handle.insert_source(timer, due);
+        match token {
+            Ok(token) => self.autohide_timer = Some((show, token)),
+            Err(e) => {
+                warn!("failed to start a timer: {e}");
+                self.set_shown(show);
+            }
+        }
+    }
+
+    fn cancel_autohide_timer(&mut self) {
+        if let Some((_, token)) = self.autohide_timer.take() {
+            self.loop_handle.remove(token);
+        }
+    }
+
+    /// The autohide delay passed: slide in (`show`) or out.
+    fn autohide_due(&mut self, core: &Core<WlDock>, show: bool) {
+        self.autohide_timer = None;
+        self.set_shown(show);
+        // Back under a resting pointer: hover where it is.
+        if show && let Some((x, y)) = self.pointer_at {
+            self.pointer_motion(core, x, y);
+        }
+        self.sync_autohide();
+    }
+
+    fn set_shown(&mut self, show: bool) {
+        self.shown.retarget(if show { 1.0 } else { 0.0 });
+        self.kick();
     }
 
     /// Nothing is hovered anymore: the magnification shrinks away.
@@ -842,6 +964,7 @@ impl DockView {
         self.strip.as_ref().is_some_and(StripView::moving)
             || self.menu.as_ref().is_some_and(MenuView::moving)
             || !self.hover.settled()
+            || !self.shown.settled()
             || !self.label_alpha.settled()
             || self
                 .slots
@@ -856,6 +979,7 @@ impl DockView {
         let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         let mut moving = self.hover.advance(dt);
         moving |= self.label_alpha.advance(dt);
+        moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
         if let Some(strip) = &mut self.strip {
             moving |= strip.advance(dt);
@@ -918,6 +1042,10 @@ impl DockView {
         let center = frame.length() / 2.0;
         let row = zoom::layout(&weights, center, self.pointer, &self.style.zoom(hover));
         let present: f64 = weights.iter().sum();
+        // Autohide slides everything toward the edge, and once it is all
+        // out of sight, clears it.
+        let slide = autohide::slide(self.shown.value, self.style.reach());
+        let seen = if self.shown.value > 0.0 { 1.0 } else { 0.0 };
 
         // The panel: the row without its outer half gaps, plus padding,
         // never shorter than its shape.
@@ -933,8 +1061,8 @@ impl DockView {
         let length = (end - start).max(rendered);
         let mid = (start + end) / 2.0;
         let panel_u = mid - length / 2.0;
-        let panel = frame.rect(panel_u, m.panel_v(), length, m.panel());
-        let panel_alpha = self.gate(present.min(1.0));
+        let panel = frame.rect(panel_u, m.panel_v() - slide, length, m.panel());
+        let panel_alpha = self.gate(present.min(1.0)) * seen;
         shapes::place_panel(
             &mut self.panel,
             self.panel_shape.as_ref(),
@@ -969,11 +1097,11 @@ impl DockView {
             // A bounce never takes the icon off the surface.
             let room = (frame.across() - m.icon_v() - d).max(0.0);
             let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
-            let r = frame.rect(cell.center - d / 2.0, m.icon_v() + hop, d, d);
+            let r = frame.rect(cell.center - d / 2.0, m.icon_v() + hop - slide, d, d);
             // The image reaches past the icon by its shadow, which scales
             // with the icon.
             let padded = r.outset(key.pad() as f64 * d / key_size);
-            let alpha = if d >= 0.5 { 1.0 } else { 0.0 };
+            let alpha = if d >= 0.5 { seen } else { 0.0 };
             subs.icon.present(cache.icon(key).as_ref(), padded, alpha);
 
             let item = &slot.item;
@@ -995,12 +1123,12 @@ impl DockView {
             match shape {
                 Some(s) => {
                     let (w, h) = (s.rect.w as f64, s.rect.h as f64);
-                    let r = frame.rect(cell.center - w / 2.0, m.dot_v(), w, h);
+                    let r = frame.rect(cell.center - w / 2.0, m.dot_v() - slide, w, h);
                     let a = match self.g.alpha_modifier {
                         Some(_) => weights[i],
                         None if weights[i] >= 0.5 => 1.0,
                         None => 0.0,
-                    };
+                    } * seen;
                     subs.indicator.set_transform(transform);
                     subs.indicator.present(Some(&s.buffer), r, a);
                 }
@@ -1015,10 +1143,11 @@ impl DockView {
                 self.label_at = (cell.center, m.icon_v() + cell.size + LABEL_GAP);
             }
         }
-        let label_alpha = self.gate(self.label_alpha.value);
+        let label_alpha = self.gate(self.label_alpha.value) * seen;
         match self.label.as_ref().and_then(|k| cache.label(k)) {
             Some(label) if label_alpha > 0.0 => {
                 let (u, v) = self.label_at;
+                let v = v - slide;
                 let r = frame.upright(u, v, label.width as f64, label.height as f64);
                 self.label_sub.present(Some(&label.buffer), r, label_alpha);
             }
@@ -1027,14 +1156,25 @@ impl DockView {
         drop(cache);
 
         // Input: the panel, and while magnified, the band the icons cover.
+        // An autohiding dock reaches down to its edge, so the pointer
+        // going into the margin doesn't leave it; hidden, it keeps only
+        // the trigger band there.
         let mut input = Vec::new();
-        if present > 0.0 {
-            input.push(IRect::round(panel));
+        let autohide = self.style.autohide;
+        if present > 0.0 && !self.showing() {
+            let trigger = frame.rect(panel_u, 0.0, length, autohide.trigger);
+            input.push(IRect::round(trigger));
+        } else if present > 0.0 {
+            let reach = m.panel_v() + m.panel() - slide;
+            input.push(IRect::round(match autohide.enabled {
+                true => frame.rect(panel_u, 0.0, length, reach.max(autohide.trigger)),
+                false => panel,
+            }));
             if hover > 0.0 {
-                let top = m.icon_v() + row.largest();
+                let top = m.icon_v() + row.largest() - slide;
                 let band = frame.rect(
                     row.start,
-                    m.panel_v(),
+                    m.panel_v() - slide,
                     row.end - row.start,
                     top - m.panel_v(),
                 );
@@ -1265,6 +1405,8 @@ impl DockView {
             self.unhover(core);
         }
         self.sync_previews(core);
+        // Nothing holds the dock anymore.
+        self.sync_autohide();
         self.update_label();
         self.kick();
     }
@@ -1513,6 +1655,7 @@ impl DockView {
         if !self.pointer_in {
             self.unhover(core);
         }
+        self.sync_autohide();
         self.update_label();
         self.kick();
     }
@@ -1627,6 +1770,7 @@ impl DockView {
 impl Drop for DockView {
     fn drop(&mut self) {
         self.cancel_label_timer();
+        self.cancel_autohide_timer();
         self.viewport.destroy();
         self.transparent.destroy();
     }

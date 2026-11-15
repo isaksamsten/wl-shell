@@ -53,6 +53,18 @@ pub struct Config {
     pub magnification_range: f64,
     /// Keep windows out of the resting dock's area (exclusive zone).
     pub reserve: bool,
+    /// Slide off the edge while the pointer is elsewhere.
+    pub autohide: bool,
+    /// Milliseconds the pointer rests on the edge before a hidden dock
+    /// comes back.
+    #[serde(deserialize_with = "de::duration")]
+    pub reveal_delay: u32,
+    /// Milliseconds after the pointer leaves before the dock hides.
+    #[serde(deserialize_with = "de::duration")]
+    pub hide_delay: u32,
+    /// The band along the edge that reveals a hidden dock, px.
+    #[serde(deserialize_with = "autohide_trigger")]
+    pub autohide_trigger: u32,
     /// Milliseconds the pointer rests on an app before its name shows.
     #[serde(deserialize_with = "de::duration")]
     pub hover_delay: u32,
@@ -137,6 +149,10 @@ impl Default for Config {
             magnification: 1.8,
             magnification_range: 3.0,
             reserve: true,
+            autohide: false,
+            reveal_delay: 150,
+            hide_delay: 500,
+            autohide_trigger: 2,
             hover_delay: 300,
             labels: true,
             strip: true,
@@ -274,6 +290,7 @@ pub struct OutputOverride {
     #[serde(deserialize_with = "some_magnification")]
     pub magnification: Option<f64>,
     pub reserve: Option<bool>,
+    pub autohide: Option<bool>,
     #[serde(deserialize_with = "some_px")]
     pub margin: Option<u32>,
     pub windows: Option<Windows>,
@@ -352,6 +369,7 @@ pub struct DockLayout {
     pub icon_size: u32,
     pub magnification: f64,
     pub reserve: bool,
+    pub autohide: bool,
     pub margin: u32,
     pub windows: Windows,
     pub strip_max_columns: u32,
@@ -516,6 +534,7 @@ impl Config {
             icon_size: o.icon_size.unwrap_or(self.icon_size),
             magnification: o.magnification.unwrap_or(self.magnification),
             reserve: o.reserve.unwrap_or(self.reserve),
+            autohide: o.autohide.unwrap_or(self.autohide),
             margin: o.margin.unwrap_or(self.margin),
             windows: o.windows.unwrap_or(self.windows),
             strip_max_columns: o.strip_max_columns.unwrap_or(self.strip_max_columns),
@@ -658,6 +677,11 @@ fn launch_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 0, 60_000)
 }
 
+/// The autohide trigger band, 1 to 50 px.
+fn autohide_trigger<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 1, 50)
+}
+
 /// Spring response, in milliseconds.
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 10_000)
@@ -713,6 +737,10 @@ mod tests {
             magnification = 2.5
             magnification-range = 2
             reserve = false
+            autohide = true
+            reveal-delay = 0
+            hide-delay = 1000
+            autohide-trigger = 4
             hover-delay = 100
             labels = false
             indicator = "dots"
@@ -761,6 +789,11 @@ mod tests {
         );
         assert_eq!((c.magnification, c.magnification_range), (2.5, 2.0));
         assert!(!c.reserve && !c.labels && c.label_style().is_none());
+        assert!(c.autohide);
+        assert_eq!(
+            (c.reveal_delay, c.hide_delay, c.autohide_trigger),
+            (0, 1000, 4)
+        );
         assert_eq!((c.hover_delay, c.response), (100, 200));
         assert_eq!(c.indicator, Indicator::Dots);
         assert_eq!((c.font.as_str(), c.font_size), ("Inter", 12));
@@ -889,6 +922,7 @@ mod tests {
             magnification = 1
             margin = 2
             windows = "output"
+            autohide = true
             strip-max-rows = 1
 
             [output.HDMI-A-1]
@@ -902,7 +936,7 @@ mod tests {
         let edp = c.dock("eDP-1").unwrap();
         assert_eq!(edp.position, Position::Left);
         assert_eq!((edp.icon_size, edp.magnification, edp.margin), (40, 1.0, 2));
-        assert!(edp.reserve);
+        assert!(edp.reserve && edp.autohide && !global.autohide);
         assert_eq!(
             (global.windows, edp.windows),
             (Windows::All, Windows::Output)
@@ -943,6 +977,8 @@ mod tests {
         assert!(err("indicator = \"bar\""));
         assert!(err("windows = \"some\""));
         assert!(err("launch-timeout = 100000"));
+        assert!(err("autohide-trigger = 0"));
+        assert!(err("[output.X]\nhide-delay = 1"));
         assert!(err("strip-min-windows = 0"));
         assert!(err("strip-direction = \"vertical\""));
         assert!(err("strip-max-rows = 101"));

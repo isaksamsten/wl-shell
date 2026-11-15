@@ -494,10 +494,12 @@ impl WlDock {
     ) {
         let Some(item) = self.hovered_item(output) else {
             self.pressed = None;
-            // A click on the dock between icons is a click outside the
-            // strip or menu.
+            // A click on the dock between icons (or on a hidden dock's
+            // trigger band) is a click outside the strip or menu, and
+            // gives back the keyboard focus it brought.
             if !down {
                 self.close_popups(core);
+                self.release_keyboard(output);
             }
             return;
         };
