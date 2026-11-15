@@ -14,4 +14,4 @@ pub mod watch;
 pub use appearance::{Appearance, Mode, Scheme};
 pub use file::ConfigFile;
 pub use reload::Reloader;
-pub use watch::watch_file;
+pub use watch::{watch_dir, watch_file};

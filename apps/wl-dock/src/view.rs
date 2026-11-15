@@ -49,6 +49,23 @@
 //! unless its strip or menu is open. While shown, the input region
 //! reaches down to the edge, so moving the pointer into the margin
 //! doesn't count as leaving. It reserves no space.
+//!
+//! The Trash (dock.rs) comes last, after a separator: a thin line that
+//! takes a fixed length along the dock and doesn't magnify. Its icon
+//! follows whether the Trash is empty.
+//!
+//! Dragging (drag.rs): an app's icon lifts out of the dock and follows
+//! the pointer on its own subsurface, on top of everything, kept on the
+//! surface (the press's implicit grab sends the motion here even off
+//! it). Its slot closes, and a gap opens where it would land, as a cell
+//! of its own with a spring, anchored before the pinned app it would
+//! precede so it stays put while the items change. Back home, its own
+//! slot opens again instead. Over the Trash, if the Trash takes it, the
+//! Trash grows a little and its label says what a drop does. On a drop
+//! the gap's spring becomes the slot's, so the pins' new order (applied
+//! by app.rs right away) takes over without a jump; the icon then flies
+//! to its slot, as it does back home when the drag is cancelled. Into
+//! the Trash, it just goes.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -88,18 +105,20 @@ use wl_shell_render::{Image, icons, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
 use wl_shell_ui::card::{self, Preview};
 use wl_shell_ui::shapes::{self, Shape, ShapeKey};
-use wl_shell_ui::{IRect, Spring, Sub};
+use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
 use crate::app::WlDock;
 use crate::autohide;
 use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
-use crate::dock::{Item, Window};
+use crate::dock::{self, Item, Kind, Window};
+use crate::drag::{self, Target};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
 use crate::menu::{self, Group, MenuKey};
 use crate::menuview::{MenuInput, MenuStyle, MenuView};
 use crate::row::{self, Slot};
 use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
+use crate::trash;
 use crate::zoom;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -112,6 +131,10 @@ const LABEL_RESPONSE: f64 = 100.0;
 const BOUNCE: f64 = 0.4;
 /// The autohide slide's response, in spring responses.
 const SLIDE_RESPONSE: f64 = 1.5;
+/// How much the Trash grows while it takes the dragged icon.
+const TRASH_GROW: f64 = 0.15;
+/// The Trash's label while it takes the dragged icon.
+const REMOVE_LABEL: &str = "Remove from Dock";
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,6 +164,7 @@ pub struct Style {
     autohide: autohide::Settings,
     /// How far the panel's shadow reaches past it.
     shadow_reach: f64,
+    separator_color: u32,
     /// Icons (names or paths) and names from `[app.<id>]` tables.
     icons: BTreeMap<String, String>,
     names: BTreeMap<String, String>,
@@ -209,6 +233,7 @@ impl Style {
                 trigger: config.autohide_trigger as f64,
             },
             shadow_reach: autohide::shadow_reach(config.shadow().as_ref()),
+            separator_color: theme.separator_color,
             icons: (config.app.iter())
                 .filter_map(|(id, a)| Some((id.clone(), a.icon.clone()?)))
                 .collect(),
@@ -264,12 +289,66 @@ impl Style {
     fn reach(&self) -> f64 {
         autohide::reach(&self.metrics(), self.shadow_reach)
     }
+
+    /// The separator's length along the dock (it doesn't magnify).
+    fn separator_len(&self) -> f64 {
+        (self.icon() / 4.0).round().max(2.0 * self.gap).max(4.0)
+    }
 }
 
 /// The subsurfaces of one slot.
 struct SlotSubs {
     indicator: Sub,
     icon: Sub,
+}
+
+/// An icon being dragged.
+struct Drag {
+    app_id: String,
+    /// Where the pointer is on the surface.
+    at: (f64, f64),
+    /// From the pointer to the icon's center, as it was picked up.
+    offset: (f64, f64),
+    /// The icon's size as it was picked up.
+    size: f64,
+    target: Target,
+}
+
+/// A gap among the pinned apps where the dragged icon would land, opening
+/// or closing.
+struct Gap {
+    /// Before the slot of this app; None: after the last pinned app.
+    before: Option<String>,
+    presence: Spring,
+}
+
+/// A dropped (or cancelled) icon flying to its slot.
+struct Fly {
+    app_id: String,
+    /// Where it was let go: the icon on the surface.
+    from: Rect,
+    /// 0 (let go) to 1 (in its slot).
+    t: Spring,
+}
+
+/// The row as laid out: a cell per slot, and per gap.
+struct Laid {
+    row: zoom::Row,
+    /// Per cell, its slot (None: a gap).
+    slots: Vec<Option<usize>>,
+}
+
+impl Laid {
+    /// Slot `i`'s cell.
+    fn cell(&self, i: usize) -> Option<&zoom::Cell> {
+        let k = self.slots.iter().position(|s| *s == Some(i))?;
+        self.row.cells.get(k)
+    }
+
+    /// The slot whose cell is at `u` (None: none, or a gap).
+    fn hit(&self, u: f64) -> Option<usize> {
+        self.slots.get(self.row.hit(u)?).copied().flatten()
+    }
 }
 
 pub struct DockView {
@@ -282,6 +361,8 @@ pub struct DockView {
     /// Per slot, at least; extra ones stay hidden.
     slot_subs: Vec<SlotSubs>,
     label_sub: Sub,
+    /// The dragged (or flying) icon, on top.
+    drag_sub: Sub,
     no_input: Region,
     viewport: WpViewport,
     layer: LayerSurface,
@@ -310,6 +391,8 @@ pub struct DockView {
     active_dot_shapes: Vec<Option<Shape>>,
     /// The hollow indicator: windows only on other outputs.
     ring_shape: Option<Shape>,
+    /// The separator's line.
+    separator_shape: Option<Shape>,
     /// The apps launching: their icons bounce.
     launching: Vec<String>,
     /// The input region last set.
@@ -355,6 +438,15 @@ pub struct DockView {
     interactive: bool,
     /// Warned that the strip can't open.
     warned_strip: bool,
+
+    /// The icon being dragged.
+    drag: Option<Drag>,
+    /// Gaps opening or closing where it would land.
+    gaps: Vec<Gap>,
+    /// A dropped icon on its way to its slot.
+    fly: Option<Fly>,
+    /// The Trash grows while it takes the dragged icon, 0 to 1.
+    trash_grow: Spring,
 }
 
 impl DockView {
@@ -399,6 +491,7 @@ impl DockView {
         let sub = || Sub::new(&g, layer.wl_surface(), &no_input, &qh);
         let panel = [sub(), sub(), sub()];
         let label_sub = sub();
+        let drag_sub = sub();
 
         let response = style.response;
         // An autohiding dock starts out of sight.
@@ -412,6 +505,7 @@ impl DockView {
             panel,
             slot_subs: Vec::new(),
             label_sub,
+            drag_sub,
             no_input,
             viewport,
             layer,
@@ -434,6 +528,7 @@ impl DockView {
             dot_shapes: Vec::new(),
             active_dot_shapes: Vec::new(),
             ring_shape: None,
+            separator_shape: None,
             launching: Vec::new(),
             input: Vec::new(),
             pointer: 0.0,
@@ -455,6 +550,10 @@ impl DockView {
             autohide_timer: None,
             interactive: true,
             warned_strip: false,
+            drag: None,
+            gaps: Vec::new(),
+            fly: None,
+            trash_grow: Spring::new(0.0, response),
         };
         dock.apply_size();
         dock.relayout();
@@ -556,6 +655,7 @@ impl DockView {
     pub fn set_items(&mut self, core: &Core<WlDock>, items: &[Item]) {
         row::merge(&mut self.slots, items, self.style.response, self.configured);
         row::set_launching(&mut self.slots, &self.launching);
+        self.sync_drag();
         let qh = &self.qh;
         let parent = self.layer.wl_surface();
         while self.slot_subs.len() < self.slots.len() {
@@ -611,7 +711,8 @@ impl DockView {
         }
     }
 
-    fn icon_key(&self, app_id: &str) -> icons::Key {
+    /// The icon of an app.
+    fn app_icon_key(&self, app_id: &str) -> icons::Key {
         icons::Key::new(
             app_id,
             self.style.icon_key_size(),
@@ -622,10 +723,28 @@ impl DockView {
         .with_icon(self.style.icons.get(app_id).cloned())
     }
 
+    /// The icon of `item`; None for the separator.
+    fn icon_key(&self, item: &Item) -> Option<icons::Key> {
+        match item.kind {
+            Kind::App => Some(self.app_icon_key(&item.app_id)),
+            Kind::Separator => None,
+            // Named after the icon, so a missing one gets a letter tile.
+            Kind::Trash { full } => {
+                let key = self.app_icon_key(trash::icon(full));
+                Some(key.with_icon(Some(trash::icon(full).into())))
+            }
+        }
+    }
+
     fn label_key(&self, app_id: &str) -> Option<LabelKey> {
+        let name = match app_id {
+            dock::SEPARATOR => return None,
+            dock::TRASH => Some("Trash".to_string()),
+            _ => self.style.names.get(app_id).cloned(),
+        };
         Some(LabelKey {
             app_id: app_id.to_string(),
-            name: self.style.names.get(app_id).cloned(),
+            name,
             max_width: self.style.label_max_width,
             scale: self.scale,
             style: self.style.label.clone()?,
@@ -637,8 +756,9 @@ impl DockView {
     pub fn request_assets(&self, all: bool) {
         let cache = self.cache.borrow();
         for slot in self.slots.iter().filter(|s| !s.leaving) {
-            let key = self.icon_key(&slot.item.app_id);
-            if all || cache.icon(&key).is_none() {
+            if let Some(key) = self.icon_key(&slot.item)
+                && (all || cache.icon(&key).is_none())
+            {
                 self.assets.icon(&key, &self.style.font);
             }
             if let Some(key) = self.label_key(&slot.item.app_id)
@@ -651,15 +771,14 @@ impl DockView {
 
     /// The worker rendered an icon (now in the cache).
     pub fn icon_ready(&mut self, key: &icons::Key) {
-        if (self.slots.iter()).any(|s| self.icon_key(&s.item.app_id) == *key) {
+        if (self.slots.iter()).any(|s| self.icon_key(&s.item).as_ref() == Some(key)) {
             self.kick();
         }
     }
 
     /// The worker rendered a label (now in the cache).
     pub fn label_ready(&mut self, key: &LabelKey) {
-        let wanted = (self.hovered.as_deref()).and_then(|a| self.label_key(a));
-        if self.label_on && wanted.as_ref() == Some(key) {
+        if self.wanted_label().as_ref() == Some(key) {
             self.update_label();
         }
     }
@@ -718,6 +837,15 @@ impl DockView {
             scale,
         };
         self.ring_shape = cache.shape(&self.g, ring, &self.qh);
+        // One pixel, stretched into a line.
+        let line = ShapeKey::Rect {
+            w: 1,
+            h: 1,
+            radius: 0,
+            color: self.style.separator_color,
+            scale,
+        };
+        self.separator_shape = cache.shape(&self.g, line, &self.qh);
     }
 
     // -- pointer -----------------------------------------------------------
@@ -737,16 +865,17 @@ impl DockView {
         if !self.showing() {
             return;
         }
+        if self.drag.is_some() {
+            return self.drag_motion(x, y);
+        }
         let (u, _) = self.frame().dock_point(x, y);
         // Held still while the strip or menu is open: the icons don't move
         // under the pointer, which may be on its way to another one.
         let at = if self.frozen { self.pointer } else { u };
-        let weights = self.weights();
-        let center = self.frame().length() / 2.0;
-        let row = zoom::layout(&weights, center, at, &self.style.zoom(self.hover.value));
-        let hovered = (row.hit(u))
+        let laid = self.lay(at, self.hover.value, false);
+        let hovered = (laid.hit(u))
             .map(|i| &self.slots[i])
-            .filter(|s| !s.leaving)
+            .filter(|s| !s.leaving && s.item.kind != Kind::Separator)
             .map(|s| s.item.app_id.clone());
         if !self.frozen {
             self.pointer = u;
@@ -769,6 +898,320 @@ impl DockView {
         self.unhover(core);
     }
 
+    // -- dragging --------------------------------------------------------------
+
+    /// Whether an icon is being dragged.
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// The app whose icon is dragged or flying back: its slot shows no
+    /// icon of its own.
+    fn lifted(&self) -> Option<&str> {
+        (self.drag.as_ref().map(|d| d.app_id.as_str()))
+            .or(self.fly.as_ref().map(|f| f.app_id.as_str()))
+    }
+
+    /// Where `app_id` is in the dock's order, for drag.rs.
+    fn dragged(&self, app_id: &str) -> Option<drag::Dragged> {
+        let slot = (self.slots.iter()).find(|s| !s.leaving && s.item.app_id == app_id)?;
+        if !slot.item.pinned {
+            return Some(drag::Dragged::Running);
+        }
+        let i = (self.pinned_slots(None)).position(|(_, s)| s.item.app_id == app_id)?;
+        Some(drag::Dragged::Pinned(i))
+    }
+
+    /// The pinned apps' slots (and their indices) in order, but `except`.
+    fn pinned_slots<'a>(
+        &'a self,
+        except: Option<&'a str>,
+    ) -> impl Iterator<Item = (usize, &'a Slot)> + 'a {
+        (self.slots.iter().enumerate()).filter(move |(_, s)| {
+            !s.leaving && s.item.pinned && s.item.is_app() && Some(s.item.app_id.as_str()) != except
+        })
+    }
+
+    /// Where a gap anchored `before` an app's slot goes among the slots.
+    fn gap_index(&self, before: Option<&str>) -> usize {
+        if let Some(key) = before
+            && let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == key)
+        {
+            return i;
+        }
+        // After the last pinned app (other than the lifted one).
+        (self.pinned_slots(self.lifted()))
+            .last()
+            .map_or(0, |(i, _)| i + 1)
+    }
+
+    /// Lay out the slots and gaps with the pointer at `pointer` and the
+    /// magnification at `hover`, with every spring as it is, or where it
+    /// is headed if `targets`.
+    fn lay(&self, pointer: f64, hover: f64, targets: bool) -> Laid {
+        let weight = |s: &Spring| match targets {
+            true => s.target,
+            false => s.value,
+        };
+        let gaps: Vec<(usize, f64)> = (self.gaps.iter())
+            .map(|g| (self.gap_index(g.before.as_deref()), weight(&g.presence)))
+            .collect();
+        let separator = self.style.separator_len();
+        let n = self.slots.len();
+        let mut slots = Vec::with_capacity(n + gaps.len());
+        let mut cells = Vec::with_capacity(n + gaps.len());
+        for i in 0..=n {
+            for &(at, w) in &gaps {
+                if at.min(n) == i {
+                    slots.push(zoom::Slot::from(w.clamp(0.0, 1.0)));
+                    cells.push(None);
+                }
+            }
+            if let Some(s) = self.slots.get(i) {
+                let w = weight(&s.presence).clamp(0.0, 1.0);
+                slots.push(match s.item.kind {
+                    Kind::Separator => zoom::Slot::fixed(separator, w),
+                    _ => zoom::Slot::from(w),
+                });
+                cells.push(Some(i));
+            }
+        }
+        let center = self.frame().length() / 2.0;
+        let row = zoom::layout(
+            &slots,
+            center,
+            pointer,
+            &self.style.zoom(hover.clamp(0.0, 1.0)),
+        );
+        Laid { row, slots: cells }
+    }
+
+    /// A press on `app_id`'s icon moved far enough: pick the icon up, with
+    /// the pointer at (`x`, `y`). Returns whether it was.
+    pub fn start_drag(&mut self, core: &Core<WlDock>, app_id: &str, x: f64, y: f64) -> bool {
+        let draggable = (self.slots.iter())
+            .any(|s| !s.leaving && s.item.app_id == app_id && s.item.draggable());
+        if !draggable || !self.configured || self.drag.is_some() {
+            return false;
+        }
+        let Some(i) = self.slots.iter().position(|s| s.item.app_id == app_id) else {
+            return false;
+        };
+        let laid = self.lay(self.pointer, self.hover.value, false);
+        let Some(cell) = laid.cell(i) else {
+            return false;
+        };
+        let m = self.style.metrics();
+        let size = cell.size.max(m.icon);
+        let icon = self
+            .frame()
+            .rect(cell.center - size / 2.0, m.icon_v(), size, size);
+        let (cx, cy) = icon.center();
+        // A flight still on its way lands at once.
+        self.fly = None;
+        self.drag = Some(Drag {
+            app_id: app_id.to_string(),
+            at: (x, y),
+            offset: (cx - x, cy - y),
+            size,
+            target: Target::Home,
+        });
+        // No label during a drag (but the Trash's).
+        self.cancel_label_timer();
+        self.label_on = false;
+        self.set_hovered(core, None);
+        self.sync_autohide();
+        self.drag_motion(x, y);
+        true
+    }
+
+    /// The pointer moved to (`x`, `y`) while dragging.
+    fn drag_motion(&mut self, x: f64, y: f64) {
+        let Some(app_id) = self.drag.as_ref().map(|d| d.app_id.clone()) else {
+            return;
+        };
+        let Some(dragged) = self.dragged(&app_id) else {
+            return self.cancel_drag();
+        };
+        let frame = self.frame();
+        let m = self.style.metrics();
+        let (u, v) = frame.dock_point(x, y);
+        // As it will be drawn, if the pointer is on the dock.
+        let laid = self.lay(u, self.hover.value, false);
+        let step = m.icon + self.style.gap;
+        let on_dock = v <= m.icon_v() + laid.row.largest().max(m.icon) + LABEL_GAP
+            && u >= laid.row.start - step / 2.0
+            && u <= laid.row.end + step / 2.0;
+        // The other pinned apps' centers, and where they (and the gap
+        // among them) end.
+        let mut pinned = Vec::new();
+        let mut pinned_end = None;
+        for (cell, slot) in laid.row.cells.iter().zip(&laid.slots) {
+            let counts = match slot {
+                None => true,
+                Some(i) => {
+                    let s = &self.slots[*i];
+                    let other = !s.leaving && s.item.pinned && s.item.is_app();
+                    let other = other && s.item.app_id != app_id;
+                    if other {
+                        pinned.push(cell.center);
+                    }
+                    other
+                }
+            };
+            if counts && cell.end > cell.start {
+                pinned_end = Some(cell.end);
+            }
+        }
+        let on_trash = (laid.hit(u)).is_some_and(|i| self.slots[i].item.is_trash());
+        let scene = drag::Scene {
+            pinned: &pinned,
+            pinned_end: pinned_end.unwrap_or(laid.row.start),
+            step,
+            on_dock,
+            on_trash,
+        };
+        let target = drag::target(dragged, &scene, u);
+        // Magnified over the dock, at rest off it.
+        if on_dock {
+            self.pointer = u;
+            self.hover.retarget(1.0);
+        } else {
+            self.hover.retarget(0.0);
+        }
+        let changed = self.drag.as_ref().is_some_and(|d| d.target != target);
+        if let Some(drag) = &mut self.drag {
+            drag.at = (x, y);
+            drag.target = target;
+        }
+        if changed {
+            self.set_gap(match target {
+                Target::Gap(k) => Some(
+                    (self.pinned_slots(Some(&app_id)))
+                        .nth(k)
+                        .map(|(_, s)| s.item.app_id.clone()),
+                ),
+                Target::Home | Target::Trash => None,
+            });
+            self.trash_grow.retarget(match target {
+                Target::Trash => 1.0,
+                _ => 0.0,
+            });
+            self.update_label();
+        }
+        self.sync_drag_slot();
+        self.kick();
+    }
+
+    /// Open a gap before `before` (None: after the pinned apps), or none
+    /// at all; the others close.
+    fn set_gap(&mut self, gap: Option<Option<String>>) {
+        for g in &mut self.gaps {
+            let wanted = gap.as_ref() == Some(&g.before);
+            g.presence.retarget(if wanted { 1.0 } else { 0.0 });
+        }
+        if let Some(before) = gap
+            && !self.gaps.iter().any(|g| g.before == before)
+        {
+            let mut presence = Spring::new(0.0, self.style.response);
+            presence.retarget(1.0);
+            self.gaps.push(Gap { before, presence });
+        }
+    }
+
+    /// The dragged icon's slot is open at home, else closed.
+    fn sync_drag_slot(&mut self) {
+        let Some(drag) = &self.drag else { return };
+        let open = drag.target == Target::Home;
+        for s in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.item.app_id == drag.app_id)
+        {
+            if !s.leaving {
+                s.presence.retarget(if open { 1.0 } else { 0.0 });
+            }
+        }
+    }
+
+    /// The items changed: keep the dragged slot closed, or cancel the
+    /// drag if its app went; a flight to a slot that went lands.
+    fn sync_drag(&mut self) {
+        let present = |slots: &[Slot], app_id: &str| {
+            (slots.iter()).any(|s| !s.leaving && s.item.app_id == app_id)
+        };
+        if let Some(drag) = &self.drag
+            && !present(&self.slots, &drag.app_id)
+        {
+            self.cancel_drag();
+        }
+        if let Some(fly) = &self.fly
+            && !present(&self.slots, &fly.app_id)
+        {
+            self.fly = None;
+        }
+        self.sync_drag_slot();
+    }
+
+    /// Escape, or the pointer left: the icon flies back home.
+    pub fn cancel_drag(&mut self) {
+        if let Some(drag) = &mut self.drag {
+            drag.target = Target::Home;
+            self.end_drag();
+        }
+    }
+
+    /// The button came up: drop the icon. Returns the app and what the
+    /// drop does to the pins, which the caller applies (and rebuilds the
+    /// items) right away.
+    pub fn end_drag(&mut self) -> Option<(String, drag::Drop)> {
+        let drag = self.drag.take()?;
+        let dragged = self.dragged(&drag.app_id);
+        let drop = dragged.map_or(drag::Drop::Nothing, |d| drag::drop(d, drag.target));
+        let from = self.drag_rect(&drag);
+        // Landing in the gap: its spring becomes the slot's, which the
+        // new order moves there.
+        let open = (self.gaps.iter()).position(|g| g.presence.target > 0.5);
+        let slot = (self.slots.iter_mut()).find(|s| !s.leaving && s.item.app_id == drag.app_id);
+        match (drop, open, slot) {
+            (drag::Drop::Pin(_), Some(k), Some(slot)) => {
+                slot.presence = self.gaps.remove(k).presence;
+                slot.presence.retarget(1.0);
+            }
+            (drag::Drop::Unpin, _, _) => {}
+            (_, _, Some(slot)) => slot.presence.retarget(1.0),
+            (_, _, None) => {}
+        }
+        for g in &mut self.gaps {
+            g.presence.retarget(0.0);
+        }
+        // Into the Trash it just goes; anywhere else it flies to its slot.
+        if drop != drag::Drop::Unpin {
+            let mut t = Spring::new(0.0, self.style.response);
+            t.retarget(1.0);
+            self.fly = Some(Fly {
+                app_id: drag.app_id.clone(),
+                from,
+                t,
+            });
+        }
+        self.trash_grow.retarget(0.0);
+        self.sync_autohide();
+        self.update_label();
+        self.kick();
+        Some((drag.app_id, drop))
+    }
+
+    /// Where the dragged icon is drawn: under the pointer as it was picked
+    /// up, kept on the surface.
+    fn drag_rect(&self, drag: &Drag) -> Rect {
+        let half = drag.size / 2.0;
+        let keep = |c: f64, len: f64| c.min(len - half).max(half);
+        let cx = keep(drag.at.0 + drag.offset.0, self.width as f64);
+        let cy = keep(drag.at.1 + drag.offset.1, self.height as f64);
+        Rect::new(cx - half, cy - half, drag.size, drag.size)
+    }
+
     // -- autohide ------------------------------------------------------------
 
     /// Whether the dock is shown or on its way back (else hidden or
@@ -780,7 +1223,7 @@ impl DockView {
     /// Start (or keep, or cancel) the timer for where autohide wants the
     /// dock, or show or hide it at once if there is no delay.
     fn sync_autohide(&mut self) {
-        let held = self.strip_open() || self.menu_open();
+        let held = self.strip_open() || self.menu_open() || self.drag.is_some();
         let next = autohide::next(&self.style.autohide, self.showing(), self.pointer_in, held);
         let Some((show, delay)) = next else {
             return self.cancel_autohide_timer();
@@ -908,14 +1351,26 @@ impl DockView {
         }
     }
 
-    /// Show the hovered app's label if it is due, or fade it out.
-    fn update_label(&mut self) {
+    /// The label that should show: the hovered app's once the delay
+    /// passed, or while dragging, what dropping on the Trash does.
+    fn wanted_label(&self) -> Option<LabelKey> {
+        if let Some(drag) = &self.drag {
+            let key = self.label_key(dock::TRASH)?;
+            return (drag.target == Target::Trash).then(|| LabelKey {
+                name: Some(REMOVE_LABEL.into()),
+                ..key
+            });
+        }
         // The strip replaces its app's label; no label shows over a menu.
         let stripped = |a: &str| (self.strip.as_ref()).is_some_and(|s| s.app_id == a);
-        let want = (self.hovered.as_deref())
+        (self.hovered.as_deref())
             .filter(|a| self.label_on && !stripped(a) && self.menu.is_none())
-            .and_then(|a| self.label_key(a));
-        let Some(key) = want else {
+            .and_then(|a| self.label_key(a))
+    }
+
+    /// Show the label that should show, or fade it out.
+    fn update_label(&mut self) {
+        let Some(key) = self.wanted_label() else {
             self.label_alpha.retarget(0.0);
             self.kick();
             return;
@@ -970,6 +1425,9 @@ impl DockView {
                 .slots
                 .iter()
                 .any(|s| !s.presence.settled() || s.bounce.is_some())
+            || self.gaps.iter().any(|g| !g.presence.settled())
+            || self.fly.is_some()
+            || !self.trash_grow.settled()
     }
 
     /// The frame callback: advance the springs and draw.
@@ -981,6 +1439,18 @@ impl DockView {
         moving |= self.label_alpha.advance(dt);
         moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
+        moving |= self.trash_grow.advance(dt);
+        for g in &mut self.gaps {
+            moving |= g.presence.advance(dt);
+        }
+        // Closed gaps go.
+        (self.gaps).retain(|g| !(g.presence.target == 0.0 && g.presence.settled()));
+        if let Some(fly) = &mut self.fly {
+            moving |= fly.t.advance(dt);
+            if fly.t.settled() {
+                self.fly = None;
+            }
+        }
         if let Some(strip) = &mut self.strip {
             moving |= strip.advance(dt);
             if strip.gone() {
@@ -1027,21 +1497,16 @@ impl DockView {
         }
     }
 
-    fn weights(&self) -> Vec<f64> {
-        (self.slots.iter())
-            .map(|s| s.presence.value.clamp(0.0, 1.0))
-            .collect()
-    }
-
     fn place_all(&mut self) {
         let frame = self.frame();
         let m = self.style.metrics();
         let scale = self.scale as f64;
-        let weights = self.weights();
         let hover = self.hover.value.clamp(0.0, 1.0);
-        let center = frame.length() / 2.0;
-        let row = zoom::layout(&weights, center, self.pointer, &self.style.zoom(hover));
-        let present: f64 = weights.iter().sum();
+        let laid = self.lay(self.pointer, hover, false);
+        let row = &laid.row;
+        let present: f64 = (self.slots.iter())
+            .map(|s| s.presence.value.clamp(0.0, 1.0))
+            .sum();
         // Autohide slides everything toward the edge, and once it is all
         // out of sight, clears it.
         let slide = autohide::slide(self.shown.value, self.style.reach());
@@ -1082,29 +1547,60 @@ impl DockView {
             shapes::Axis::Vertical => Transform::_90,
         };
         let keys: Vec<_> = (self.slots.iter())
-            .map(|s| self.icon_key(&s.item.app_id))
+            .map(|s| self.icon_key(&s.item))
             .collect();
+        let lifted = self.lifted().map(str::to_string);
+        // Where the flying icon's slot has its icon.
+        let mut landing = None;
         let cache = self.cache.borrow();
         for (i, subs) in self.slot_subs.iter_mut().enumerate() {
-            let (Some(slot), Some(key), Some(cell)) =
-                (self.slots.get(i), keys.get(i), row.cells.get(i))
-            else {
+            let (Some(slot), Some(cell)) = (self.slots.get(i), laid.cell(i)) else {
                 subs.icon.clear();
                 subs.indicator.clear();
                 continue;
             };
-            let d = cell.size;
+            let weight = slot.presence.value.clamp(0.0, 1.0);
+            // As `gate`, which can't borrow all of `self` here.
+            let gated = match self.g.alpha_modifier {
+                Some(_) => weight,
+                None if weight >= 0.5 => 1.0,
+                None => 0.0,
+            };
+            let item = &slot.item;
+            if item.kind == Kind::Separator {
+                // A line across the panel, where the icons are.
+                let r = frame.rect(cell.center - 0.5, m.icon_v() - slide, 1.0, m.icon);
+                let shape = self.separator_shape.as_ref().map(|s| &s.buffer);
+                subs.icon.present(shape, r, gated * seen);
+                subs.indicator.clear();
+                continue;
+            }
+            // The Trash grows while it takes the dragged icon.
+            let grow = match item.is_trash() {
+                true => 1.0 + TRASH_GROW * self.trash_grow.value.max(0.0),
+                false => 1.0,
+            };
+            let d = cell.size * grow;
             // A bounce never takes the icon off the surface.
             let room = (frame.across() - m.icon_v() - d).max(0.0);
             let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
             let r = frame.rect(cell.center - d / 2.0, m.icon_v() + hop - slide, d, d);
-            // The image reaches past the icon by its shadow, which scales
-            // with the icon.
-            let padded = r.outset(key.pad() as f64 * d / key_size);
-            let alpha = if d >= 0.5 { seen } else { 0.0 };
-            subs.icon.present(cache.icon(key).as_ref(), padded, alpha);
+            // The dragged or flying icon is drawn on its own.
+            let lifted = lifted.as_deref() == Some(item.app_id.as_str());
+            if lifted && self.fly.is_some() {
+                landing = Some(r);
+            }
+            match keys.get(i).cloned().flatten() {
+                Some(key) if !lifted => {
+                    // The image reaches past the icon by its shadow, which
+                    // scales with the icon.
+                    let padded = r.outset(key.pad() as f64 * d / key_size);
+                    let alpha = if d >= 0.5 { seen } else { 0.0 };
+                    subs.icon.present(cache.icon(&key).as_ref(), padded, alpha);
+                }
+                _ => subs.icon.clear(),
+            }
 
-            let item = &slot.item;
             let count = match self.style.indicator {
                 Indicator::None => 0,
                 Indicator::Dot => 1,
@@ -1124,11 +1620,7 @@ impl DockView {
                 Some(s) => {
                     let (w, h) = (s.rect.w as f64, s.rect.h as f64);
                     let r = frame.rect(cell.center - w / 2.0, m.dot_v() - slide, w, h);
-                    let a = match self.g.alpha_modifier {
-                        Some(_) => weights[i],
-                        None if weights[i] >= 0.5 => 1.0,
-                        None => 0.0,
-                    } * seen;
+                    let a = gated * seen;
                     subs.indicator.set_transform(transform);
                     subs.indicator.present(Some(&s.buffer), r, a);
                 }
@@ -1136,10 +1628,36 @@ impl DockView {
             }
         }
 
+        // The dragged icon under the pointer, or flying to its slot.
+        let lifted_rect = match (&self.drag, &self.fly) {
+            (Some(drag), _) => Some(self.drag_rect(drag)),
+            (None, Some(fly)) => landing.map(|to| {
+                let t = fly.t.value;
+                let f = fly.from;
+                Rect::new(
+                    lerp(f.x, to.x, t),
+                    lerp(f.y, to.y, t),
+                    lerp(f.w, to.w, t),
+                    lerp(f.h, to.h, t),
+                )
+            }),
+            (None, None) => None,
+        };
+        let lifted_key = (lifted.as_deref())
+            .and_then(|a| self.slots.iter().find(|s| s.item.app_id == a))
+            .and_then(|s| self.icon_key(&s.item));
+        match (lifted_rect, lifted_key) {
+            (Some(r), Some(key)) => {
+                let padded = r.outset(key.pad() as f64 * r.w / key_size);
+                (self.drag_sub).present(cache.icon(&key).as_ref(), padded, seen);
+            }
+            _ => self.drag_sub.clear(),
+        }
+
         // The label above (or beside) the hovered icon, following it.
         if let Some(key) = &self.label {
             let slot = self.slots.iter().position(|s| s.item.app_id == key.app_id);
-            if let Some(cell) = slot.and_then(|i| row.cells.get(i)) {
+            if let Some(cell) = slot.and_then(|i| laid.cell(i)) {
                 self.label_at = (cell.center, m.icon_v() + cell.size + LABEL_GAP);
             }
         }
@@ -1233,12 +1751,8 @@ impl DockView {
         let i = self.slots.iter().position(|s| s.item.app_id == app_id)?;
         let frame = self.frame();
         let m = self.style.metrics();
-        let weights: Vec<f64> = (self.slots.iter())
-            .map(|s| s.presence.target.clamp(0.0, 1.0))
-            .collect();
-        let zoom = self.style.zoom(self.hover.target.clamp(0.0, 1.0));
-        let row = zoom::layout(&weights, frame.length() / 2.0, self.pointer, &zoom);
-        let cell = row.cells.get(i)?;
+        let laid = self.lay(self.pointer, self.hover.target, true);
+        let cell = laid.cell(i)?;
         let d = cell.size.max(1.0);
         let r = frame.rect(cell.center - d / 2.0, m.icon_v(), d, d);
         Some((IRect::round(r), m.icon_v() + d))
@@ -1471,7 +1985,7 @@ impl DockView {
         let Some(app_id) = self.strip.as_ref().map(|s| s.app_id.clone()) else {
             return;
         };
-        let key = (self.style.strip.previews == Previews::Off).then(|| self.icon_key(&app_id));
+        let key = (self.style.strip.previews == Previews::Off).then(|| self.app_icon_key(&app_id));
         let Some(strip) = &mut self.strip else { return };
         let mut cache = self.cache.borrow_mut();
         strip.fetch_shadows(&mut cache);

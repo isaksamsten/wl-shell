@@ -9,10 +9,11 @@
 //! sᵢ   = icon · (1 + (magnification − 1) · f(d) · hover)
 //! ```
 //!
-//! Every item has a cell: its icon with half a gap on either side. Cells
-//! are back to back, so icons never overlap. An item's `weight` (0 to 1)
-//! scales its cell and icon, so items appearing or disappearing grow in
-//! or shrink away while their neighbors slide.
+//! Every slot has a cell: an item's icon with half a gap on either side,
+//! or a fixed length that doesn't magnify (the separator). Cells are back
+//! to back, so icons never overlap. A slot's `weight` (0 to 1) scales its
+//! cell and icon, so items appearing or disappearing grow in or shrink
+//! away while their neighbors slide.
 //!
 //! The magnified row is shifted so the point under the pointer stays under
 //! the pointer: `p` falls in a resting cell at some fraction of its length,
@@ -35,12 +36,43 @@ pub struct Params {
     pub hover: f64,
 }
 
+/// One slot of the row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slot {
+    /// 0 (not there) to 1 (fully there): scales the cell and the icon.
+    pub weight: f64,
+    /// The cell's length along the dock, instead of an icon's: it
+    /// doesn't magnify, and has no icon.
+    pub fixed: Option<f64>,
+}
+
+impl Slot {
+    /// A slot `len` long that doesn't magnify.
+    pub fn fixed(len: f64, weight: f64) -> Self {
+        Self {
+            weight,
+            fixed: Some(len),
+        }
+    }
+}
+
+impl From<f64> for Slot {
+    /// An icon's slot of `weight`.
+    fn from(weight: f64) -> Self {
+        Self {
+            weight,
+            fixed: None,
+        }
+    }
+}
+
+/// One slot as laid out.
 /// One item as laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     /// The icon's center.
     pub center: f64,
-    /// The icon's size, weight included.
+    /// The icon's size, weight included; 0 for a fixed slot.
     pub size: f64,
     /// The cell: the icon and half a gap on either side.
     pub start: f64,
@@ -75,29 +107,41 @@ pub fn falloff(d: f64, range: f64) -> f64 {
     (PI * d / (2.0 * range)).cos().powi(2)
 }
 
-/// The resting row of items with `weights`, centered on `center`.
+/// The resting row of `slots`, centered on `center`.
 #[cfg(test)]
-pub fn rest(weights: &[f64], center: f64, p: &Params) -> Row {
-    layout(weights, center, center, &Params { hover: 0.0, ..*p })
+pub fn rest<S: Into<Slot> + Copy>(slots: &[S], center: f64, p: &Params) -> Row {
+    layout(slots, center, center, &Params { hover: 0.0, ..*p })
 }
 
-/// The row of items with `weights`, centered on `center` at rest, with
-/// the pointer at `pointer`.
-pub fn layout(weights: &[f64], center: f64, pointer: f64, p: &Params) -> Row {
+/// The row of `slots` (icons' weights, or `Slot`s), centered on `center`
+/// at rest, with the pointer at `pointer`.
+pub fn layout<S: Into<Slot> + Copy>(slots: &[S], center: f64, pointer: f64, p: &Params) -> Row {
+    let slots: Vec<Slot> = slots.iter().map(|&s| s.into()).collect();
     let step = p.icon + p.gap;
-    let rest: Vec<f64> = weights.iter().map(|w| w.max(0.0) * step).collect();
+    let rest: Vec<f64> = (slots.iter())
+        .map(|s| s.weight.max(0.0) * s.fixed.unwrap_or(step).max(0.0))
+        .collect();
     let total: f64 = rest.iter().sum();
     let start = center - total / 2.0;
-    let mut sizes = Vec::with_capacity(weights.len());
+    // Each slot's icon size (0 for fixed ones) and magnified cell.
+    let mut sizes = Vec::with_capacity(slots.len());
+    let mut cells = Vec::with_capacity(slots.len());
     let mut at = start;
-    for (&len, &w) in rest.iter().zip(weights) {
+    for (&len, s) in rest.iter().zip(&slots) {
         let c = at + len / 2.0;
         at += len;
+        let w = s.weight.max(0.0);
+        if s.fixed.is_some() {
+            sizes.push(0.0);
+            cells.push(len);
+            continue;
+        }
         let d = (c - pointer).abs() / p.icon;
         let grow = (p.magnification - 1.0) * falloff(d, p.range) * p.hover;
-        sizes.push((p.icon * (1.0 + grow), w.max(0.0)));
+        let size = p.icon * (1.0 + grow);
+        sizes.push(size * w);
+        cells.push(w * (size + p.gap));
     }
-    let cells: Vec<f64> = sizes.iter().map(|(s, w)| w * (s + p.gap)).collect();
     let magnified: f64 = cells.iter().sum();
 
     // Where the pointer's resting point lands in the magnified row,
@@ -124,10 +168,10 @@ pub fn layout(weights: &[f64], center: f64, pointer: f64, p: &Params) -> Row {
 
     let mut at = start;
     let cells = (sizes.iter().zip(&cells))
-        .map(|(&(s, w), &len)| {
+        .map(|(&size, &len)| {
             let cell = Cell {
                 center: at + len / 2.0,
-                size: s * w,
+                size,
                 start: at,
                 end: at + len,
             };
@@ -281,5 +325,50 @@ mod tests {
         let half = rest(&[1.0, 0.5], 0.0, &P);
         assert_eq!(half.cells[1].size, 24.0);
         assert!(close(half.cells[1].end - half.cells[1].start, 27.0));
+    }
+
+    /// Four icons with a 20 px fixed slot (weight `w`) after the second.
+    fn with_separator(w: f64) -> Vec<Slot> {
+        let mut s: Vec<Slot> = [1.0; 4].iter().map(|&w| Slot::from(w)).collect();
+        s.insert(2, Slot::fixed(20.0, w));
+        s
+    }
+
+    #[test]
+    fn fixed_slots_keep_their_length() {
+        let s = with_separator(1.0);
+        let rest = rest(&s, 500.0, &P);
+        assert!(close(rest.end - rest.start, 4.0 * 54.0 + 20.0));
+        assert!(close(rest.cells[2].center, 500.0));
+        // Hovered right on it, or next to it: it doesn't grow, its
+        // neighbors do.
+        for p in [500.0, rest.cells[1].center, rest.cells[3].center] {
+            let row = layout(&s, 500.0, p, &P);
+            let sep = row.cells[2];
+            assert!(close(sep.end - sep.start, 20.0), "{p}");
+            assert_eq!(sep.size, 0.0);
+            assert!(row.cells[1].size > 48.0 && row.cells[3].size > 48.0);
+        }
+        // Its weight scales it like any other.
+        let half = super::rest(&with_separator(0.5), 0.0, &P);
+        assert!(close(half.cells[2].end - half.cells[2].start, 10.0));
+    }
+
+    #[test]
+    fn continuous_with_a_fixed_slot() {
+        let s = with_separator(1.0);
+        let mut last = layout(&s, 500.0, 0.0, &P);
+        let mut p = 0.0;
+        while p < 1000.0 {
+            p += 0.25;
+            let row = layout(&s, 500.0, p, &P);
+            for (a, b) in row.cells.iter().zip(&last.cells) {
+                assert!((a.center - b.center).abs() < 1.0, "p = {p}");
+            }
+            for pair in row.cells.windows(2) {
+                assert!(close(pair[0].end, pair[1].start));
+            }
+            last = row;
+        }
     }
 }

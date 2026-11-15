@@ -13,6 +13,7 @@
 //!   yet is held back for the grace period, then shows on every dock until
 //!   it's reported. Without a running stream, every dock shows every
 //!   window. Unpinned apps only show where they have windows.
+//! - With the Trash on, a separator and the Trash come last.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,10 +28,29 @@ pub struct Window {
     pub title: String,
 }
 
+/// What an item is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    App,
+    /// The line between the apps and the Trash.
+    Separator,
+    /// The Trash; `full` if anything is in it.
+    Trash {
+        full: bool,
+    },
+}
+
+/// The separator's key (`Item::app_id`): no app ID can have a NUL.
+pub const SEPARATOR: &str = "\0separator";
+/// The Trash's key.
+pub const TRASH: &str = "\0trash";
+
 /// One icon in the dock: every window with the same app ID shares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
+    /// The app ID; for the separator and the Trash, their keys.
     pub app_id: String,
+    pub kind: Kind,
     pub pinned: bool,
     /// The windows shown on this dock, in announcement order. Empty for a
     /// pinned app without windows here.
@@ -48,13 +68,50 @@ pub enum Click {
     Activate(String),
     /// Launch the app.
     Launch,
+    OpenTrash,
+    Nothing,
 }
 
 impl Item {
+    /// An item that isn't an app.
+    fn other(kind: Kind) -> Self {
+        let key = match kind {
+            Kind::Separator => SEPARATOR,
+            Kind::Trash { .. } | Kind::App => TRASH,
+        };
+        Self {
+            app_id: key.to_string(),
+            kind,
+            pinned: false,
+            windows: Vec::new(),
+            elsewhere: Vec::new(),
+            active: false,
+        }
+    }
+
+    pub fn is_app(&self) -> bool {
+        self.kind == Kind::App
+    }
+
+    pub fn is_trash(&self) -> bool {
+        matches!(self.kind, Kind::Trash { .. })
+    }
+
+    /// Whether it can be dragged to another place (or the Trash): apps
+    /// that can be pinned.
+    pub fn draggable(&self) -> bool {
+        self.is_app() && !self.app_id.is_empty()
+    }
+
     /// What a click does: activate the most recently focused of the
     /// windows here (else the first), else of the windows elsewhere, else
     /// launch the app.
     pub fn click(&self, mru: &Mru) -> Click {
+        match self.kind {
+            Kind::App => {}
+            Kind::Separator => return Click::Nothing,
+            Kind::Trash { .. } => return Click::OpenTrash,
+        }
         for windows in [&self.windows, &self.elsewhere] {
             if let Some(first) = windows.first() {
                 let id = mru
@@ -191,6 +248,7 @@ pub fn items(
     let item = |app_id: &str, pinned: bool| {
         let mut item = Item {
             app_id: app_id.to_string(),
+            kind: Kind::App,
             pinned,
             windows: Vec::new(),
             elsewhere: Vec::new(),
@@ -228,6 +286,12 @@ pub fn items(
         }
     }
     out
+}
+
+/// The separator and the Trash, after `items`.
+pub fn add_trash(items: &mut Vec<Item>, full: bool) {
+    items.push(Item::other(Kind::Separator));
+    items.push(Item::other(Kind::Trash { full }));
 }
 
 #[cfg(test)]
@@ -457,6 +521,34 @@ mod tests {
                 ("browser", vec!["3"]),
                 ("chat", vec!["4", "5"]),
             ]
+        );
+    }
+
+    #[test]
+    fn the_trash_comes_last() {
+        let mut got = all(&[toplevel("1", "term")], &["files"]);
+        add_trash(&mut got, true);
+        let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Kind::App,
+                Kind::App,
+                Kind::Separator,
+                Kind::Trash { full: true }
+            ]
+        );
+        // Neither is an app: no windows, no pinning, no dragging.
+        assert!(!got[2].draggable() && !got[3].draggable());
+        assert!(got[3].is_trash() && !got[3].running());
+        let mru = Mru::default();
+        assert_eq!(got[2].click(&mru), Click::Nothing);
+        assert_eq!(got[3].click(&mru), Click::OpenTrash);
+        // Their keys are no app's.
+        assert!(
+            got.iter()
+                .filter(|i| i.is_app())
+                .all(|i| !i.app_id.contains('\0'))
         );
     }
 }

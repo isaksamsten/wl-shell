@@ -162,11 +162,12 @@ pub fn advance(slots: &mut Vec<Slot>, dt: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::Window;
+    use crate::dock::{Kind, Window};
 
     fn item(app_id: &str) -> Item {
         Item {
             app_id: app_id.into(),
+            kind: Kind::App,
             pinned: false,
             windows: vec![Window {
                 id: format!("{app_id}-1"),

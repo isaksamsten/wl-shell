@@ -124,6 +124,26 @@ pub fn unpin(pins: &mut Vec<Pin>, pin: &Pin) -> bool {
     pins.len() != before
 }
 
+/// Pin `app_id` as the `k`th pinned app (from 0), moving it there if it
+/// is pinned already. Paths keep their places. Returns whether the pins
+/// changed.
+pub fn place_app(pins: &mut Vec<Pin>, app_id: &str, k: usize) -> bool {
+    let pin = Pin::App(app_id.to_string());
+    let before = pins.clone();
+    pins.retain(|p| *p != pin);
+    let apps: Vec<usize> = (pins.iter().enumerate())
+        .filter(|(_, p)| matches!(p, Pin::App(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let at = match apps.get(k) {
+        Some(&i) => i,
+        // After the last app (before the paths after it), or at the end.
+        None => apps.last().map_or(pins.len(), |&i| i + 1),
+    };
+    pins.insert(at, pin);
+    *pins != before
+}
+
 /// What the `pin`, `unpin` and `pins` commands do, on the default file.
 pub mod cli {
     use super::*;
@@ -213,6 +233,27 @@ mod tests {
         assert!(unpin(&mut pins, &Pin::App("a".into())));
         assert!(!unpin(&mut pins, &Pin::App("a".into())));
         assert_eq!(apps(&pins), ["b"]);
+    }
+
+    #[test]
+    fn placing_apps() {
+        let mut pins = parse("a\n~/x\nb\nc\n/y\n");
+        // Moving one: the others close up, paths stay where they were.
+        assert!(place_app(&mut pins, "c", 0));
+        assert_eq!(format(&pins), format(&parse("c\na\n~/x\nb\n/y\n")));
+        assert!(place_app(&mut pins, "c", 2));
+        assert_eq!(format(&pins), format(&parse("a\n~/x\nb\nc\n/y\n")));
+        // Past the end: after the last app.
+        assert!(place_app(&mut pins, "a", 9));
+        assert_eq!(format(&pins), format(&parse("~/x\nb\nc\na\n/y\n")));
+        // Where it is already: nothing changes.
+        assert!(!place_app(&mut pins, "a", 2));
+        // A new one is pinned there.
+        assert!(place_app(&mut pins, "d", 1));
+        assert_eq!(apps(&pins), ["b", "d", "c", "a"]);
+        let mut none = Vec::new();
+        assert!(place_app(&mut none, "a", 3));
+        assert_eq!(none, [Pin::App("a".into())]);
     }
 
     #[test]

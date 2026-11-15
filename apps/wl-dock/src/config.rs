@@ -129,6 +129,16 @@ pub struct Config {
     /// held back.
     #[serde(deserialize_with = "de::duration")]
     pub output_grace: u32,
+    /// Pixels a press on an icon moves before it drags the icon.
+    #[serde(deserialize_with = "drag_threshold")]
+    pub drag_threshold: u32,
+    /// The Trash at the end of the dock.
+    pub trash: bool,
+    /// Opens files, folders and the Trash: `{path}` (`trash:///` for the
+    /// Trash).
+    pub open_command: String,
+    /// Empties the Trash.
+    pub trash_empty_command: String,
     /// Per-output overrides, by output name.
     pub output: BTreeMap<String, OutputOverride>,
     /// Per-app settings, by app ID.
@@ -177,6 +187,10 @@ impl Default for Config {
             output_event_stream: None,
             windows: Windows::default(),
             output_grace: 250,
+            drag_threshold: 6,
+            trash: true,
+            open_command: "xdg-open {path}".into(),
+            trash_empty_command: "gio trash --empty".into(),
             output: BTreeMap::new(),
             app: BTreeMap::new(),
             appearance: Appearance::default(),
@@ -471,6 +485,9 @@ pub struct Theme {
     pub menu_shadow_softness: u32,
     #[serde(deserialize_with = "de::offset")]
     pub menu_shadow_offset: [i32; 2],
+    /// The line between the apps and the Trash.
+    #[serde(deserialize_with = "de::color")]
+    pub separator_color: u32,
 }
 
 impl Default for Theme {
@@ -508,6 +525,7 @@ impl Default for Theme {
             menu_shadow_color: 0x00000066,
             menu_shadow_softness: 18,
             menu_shadow_offset: [0, 4],
+            separator_color: 0xffffff40,
         }
     }
 }
@@ -675,6 +693,11 @@ fn some_strip_cap<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Err
 /// Bouncing at most, in milliseconds.
 fn launch_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 0, 60_000)
+}
+
+/// Pixels before a press drags, 1 to 100.
+fn drag_threshold<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 1, 100)
 }
 
 /// The autohide trigger band, 1 to 50 px.
@@ -883,6 +906,30 @@ mod tests {
     }
 
     #[test]
+    fn dragging_and_the_trash() {
+        let d = Config::default();
+        assert_eq!((d.drag_threshold, d.trash), (6, true));
+        assert_eq!(d.open_command, "xdg-open {path}");
+        assert_eq!(d.trash_empty_command, "gio trash --empty");
+        let c = parse(
+            r#"
+            drag-threshold = 10
+            trash = false
+            open-command = "gio open {path}"
+            trash-empty-command = "trash-empty"
+
+            [appearance]
+            separator-color = "ff000080"
+            "#,
+        )
+        .unwrap();
+        assert_eq!((c.drag_threshold, c.trash), (10, false));
+        assert_eq!(c.open_command, "gio open {path}");
+        assert_eq!(c.trash_empty_command, "trash-empty");
+        assert_eq!(c.theme().separator_color, 0xff000080);
+    }
+
+    #[test]
     fn menu_appearance() {
         let c = parse(
             r#"
@@ -980,6 +1027,8 @@ mod tests {
         assert!(err("autohide-trigger = 0"));
         assert!(err("[output.X]\nhide-delay = 1"));
         assert!(err("strip-min-windows = 0"));
+        assert!(err("drag-threshold = 0"));
+        assert!(err("trash = \"yes\""));
         assert!(err("strip-direction = \"vertical\""));
         assert!(err("strip-max-rows = 101"));
         assert!(err("strip-max-columns = -1"));

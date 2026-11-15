@@ -13,7 +13,8 @@
 //! Window commands (`activate-command`, `close-command`) get the window's
 //! `{id}`; app commands (menu actions, middle click, scrolling) get
 //! `{app-id}`, `{id}` (the most recent window, empty without one) and
-//! `{ids}` (all of the app's windows). Everything is shell quoted.
+//! `{ids}` (all of the app's windows); `open-command` gets `{path}`.
+//! Everything is shell quoted.
 
 use wl_shell_core::spawn::{fill, join, quote, uses};
 use wl_shell_render::icons::AppEntry;
@@ -78,6 +79,11 @@ fn exec(entry: &AppEntry, terminal: &str) -> Result<Command, String> {
 /// `activate-command` or `close-command` for the window `id`.
 pub fn window_command(template: &str, id: &str) -> String {
     fill(template, &[("id", &quote(id))])
+}
+
+/// `open-command` for `path` (or a URI, such as `trash:///`).
+pub fn path_command(template: &str, path: &str) -> String {
+    fill(template, &[("path", &quote(path))])
 }
 
 /// An app command (a menu action, middle click or scroll) of `app_id`,
@@ -186,6 +192,11 @@ mod tests {
             "niri msg action focus-window --id 42"
         );
         assert_eq!(window_command("focus {id}", "a'b c"), r"focus 'a'\''b c'");
+        assert_eq!(
+            path_command("xdg-open {path}", "trash:///"),
+            "xdg-open trash:///"
+        );
+        assert_eq!(path_command("open {path}", "/a b"), "open '/a b'");
     }
 
     #[test]

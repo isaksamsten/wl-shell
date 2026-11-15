@@ -21,7 +21,10 @@
 //! Enter picks a row, Escape closes. Opening, the bubble grows out of its
 //! tail's tip (scaled from 0.9 and faded in); picking flashes the row's
 //! highlight, then the menu fades out quickly, and the dock drops it once
-//! it's gone. Springs advance on the dock's frame callbacks.
+//! it's gone. A row that asks first (Empty Trash) only shows its confirm
+//! text when picked, and runs when picked again; its texts are measured
+//! together, so the bubble doesn't change size. Springs advance on the
+//! dock's frame callbacks.
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,6 +175,10 @@ pub struct MenuView {
     texts: Vec<Text>,
     /// In the highlight's text color; None if it's the same.
     highlighted: Vec<Option<Text>>,
+    /// The confirm texts of rows that ask first, and highlighted.
+    confirms: Vec<Option<(Text, Option<Text>)>>,
+    /// The row that asked and waits for a second pick.
+    armed: Option<usize>,
 
     /// 0: hidden, 1: open.
     open: Spring,
@@ -229,6 +236,14 @@ impl MenuView {
                     .then(|| Text::new(&assets, request(style.highlight_text, &e.label)))
             })
             .collect();
+        let confirms = (entries.iter())
+            .map(|e| {
+                let label = e.confirm.as_ref()?;
+                let lit = (style.highlight_text != style.text.color)
+                    .then(|| Text::new(&assets, request(style.highlight_text, label)));
+                Some((Text::new(&assets, request(style.text.color, label)), lit))
+            })
+            .collect();
         for e in &entries {
             if let Mark::Icon(name) = &e.mark {
                 let key = named(name, scale, &style);
@@ -258,6 +273,8 @@ impl MenuView {
             scale: scale.max(1),
             texts,
             highlighted,
+            confirms,
+            armed: None,
             open: Spring::new(0.0, OPEN_RESPONSE),
             shown: false,
             closing: false,
@@ -333,8 +350,11 @@ impl MenuView {
     pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
         let g = self.g.clone();
         let qh = self.qh.clone();
+        let confirms = (self.confirms.iter_mut().flatten())
+            .flat_map(|(t, lit)| std::iter::once(t).chain(lit.iter_mut()));
         let text = (self.texts.iter_mut())
             .chain(self.highlighted.iter_mut().flatten())
+            .chain(confirms)
             .find(|t| t.tag == tag);
         let Some(t) = text else { return false };
         if t.request != *request {
@@ -349,7 +369,9 @@ impl MenuView {
             }
             Err(e) => warn!("menu text buffer: {e}"),
         }
-        if self.surface.is_none() && !self.closing && self.texts.iter().all(|t| t.pill.is_some()) {
+        let measured = self.texts.iter().all(|t| t.pill.is_some())
+            && (self.confirms.iter().flatten()).all(|(t, _)| t.pill.is_some());
+        if self.surface.is_none() && !self.closing && measured {
             self.realize();
         }
         true
@@ -377,8 +399,10 @@ impl MenuView {
 
     /// The rows are measured: lay them out and open the popup.
     fn realize(&mut self) {
-        let widths: Vec<f64> = (self.texts.iter())
-            .map(|t| t.pill.as_ref().map_or(0.0, |p| p.1))
+        let width = |t: &Text| t.pill.as_ref().map_or(0.0, |p| p.1);
+        // A row that asks first is as wide as the wider of its texts.
+        let widths: Vec<f64> = (self.texts.iter().zip(&self.confirms))
+            .map(|(t, c)| width(t).max(c.as_ref().map_or(0.0, |(c, _)| width(c))))
             .collect();
         let layout = menu::layout(&self.groups, &widths, &self.style.metrics);
         let body = (layout.w, layout.h);
@@ -558,11 +582,17 @@ impl MenuView {
         }
     }
 
-    /// Row `i` was picked: it flashes, then the menu fades out.
+    /// Row `i` was picked: it flashes, then the menu fades out. A row that
+    /// asks first only shows its question the first time.
     fn pick(&mut self, i: usize) -> MenuInput {
         let Some(e) = self.entries.get(i) else {
             return MenuInput::None;
         };
+        if e.confirm.is_some() && self.armed != Some(i) {
+            self.armed = Some(i);
+            self.set_highlight(Some(i));
+            return MenuInput::None;
+        }
         let action = e.action.clone();
         self.set_highlight(Some(i));
         self.highlight_y.snap(self.highlight_y.target);
@@ -671,9 +701,17 @@ impl MenuView {
         let dot = cache.shape(&self.g, dot, &self.qh);
         for (i, e) in self.entries.iter().enumerate() {
             let lit = self.highlight == Some(i) && highlight_alpha > 0.0;
-            let text = match (lit, self.highlighted.get(i)) {
-                (true, Some(Some(t))) if t.pill.is_some() => t,
-                _ => &self.texts[i],
+            // An armed row asks its question instead of its label.
+            let (plain, highlighted) = match (self.armed == Some(i), self.confirms.get(i)) {
+                (true, Some(Some((t, t_lit)))) => (t, t_lit.as_ref()),
+                _ => (
+                    &self.texts[i],
+                    self.highlighted.get(i).and_then(Option::as_ref),
+                ),
+            };
+            let text = match (lit, highlighted) {
+                (true, Some(t)) if t.pill.is_some() => t,
+                _ => plain,
             };
             match &text.pill {
                 Some((buffer, w, h)) => match s.layout.text(i, *w, *h) {

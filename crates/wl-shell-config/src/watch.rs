@@ -1,9 +1,10 @@
-//! Watching a file with inotify, for programs that are always running and
-//! pick up changes to their config (or state) files without being asked.
+//! Watching files and directories with inotify, for programs that are
+//! always running and pick up changes to their config (or state) files
+//! without being asked.
 //!
-//! The directory is watched rather than the file, so editors that save by
-//! writing a new file and renaming it over the old one, files that don't
-//! exist yet, and files that are removed all work.
+//! For a file, its directory is watched rather than the file, so editors
+//! that save by writing a new file and renaming it over the old one, files
+//! that don't exist yet, and files that are removed all work.
 
 use std::ffi::OsString;
 use std::io;
@@ -20,7 +21,7 @@ use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 pub fn watch_file<D: 'static>(
     handle: &LoopHandle<'static, D>,
     path: &Path,
-    mut f: impl FnMut(&mut D) + 'static,
+    f: impl FnMut(&mut D) + 'static,
 ) -> io::Result<RegistrationToken> {
     let dir = (path.parent())
         .filter(|p| !p.as_os_str().is_empty())
@@ -28,6 +29,27 @@ pub fn watch_file<D: 'static>(
     let name: OsString = (path.file_name())
         .ok_or_else(|| io::Error::other(format!("{}: not a file", path.display())))?
         .to_owned();
+    watch(handle, dir, Some(name), f)
+}
+
+/// Call `f` whenever anything in the directory `dir` may have changed: a
+/// file in it written, created, renamed or removed. `dir` must exist.
+/// Remove the returned token from the loop to stop watching.
+pub fn watch_dir<D: 'static>(
+    handle: &LoopHandle<'static, D>,
+    dir: &Path,
+    f: impl FnMut(&mut D) + 'static,
+) -> io::Result<RegistrationToken> {
+    watch(handle, dir, None, f)
+}
+
+/// Watch `dir`, for the file `name` only or for anything.
+fn watch<D: 'static>(
+    handle: &LoopHandle<'static, D>,
+    dir: &Path,
+    name: Option<OsString>,
+    mut f: impl FnMut(&mut D) + 'static,
+) -> io::Result<RegistrationToken> {
     let fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?;
     let flags = WatchFlags::CLOSE_WRITE
         | WatchFlags::CREATE
@@ -46,9 +68,9 @@ pub fn watch_file<D: 'static>(
                     Ok(event) => {
                         // Events were lost: any of them may have been ours.
                         hit |= event.events().contains(ReadFlags::QUEUE_OVERFLOW)
-                            || event
-                                .file_name()
-                                .is_some_and(|n| n.to_bytes() == name.as_bytes());
+                            || name.as_ref().is_none_or(|name| {
+                                (event.file_name()).is_some_and(|n| n.to_bytes() == name.as_bytes())
+                            });
                     }
                     Err(rustix::io::Errno::INTR) => continue,
                     // WOULDBLOCK: all read. Anything else: try again on
@@ -97,6 +119,31 @@ mod tests {
         let before = hits.get();
         std::fs::write(dir.join("tmp"), "a = 2").unwrap();
         std::fs::rename(dir.join("tmp"), &file).unwrap();
+        dispatch();
+        assert!(hits.get() > before);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sees_anything_in_a_directory() {
+        let dir = std::env::temp_dir().join(format!("wl-shell-watch-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        watch_dir(&event_loop.handle(), &dir, move |_| h.set(h.get() + 1)).unwrap();
+        let mut dispatch = || {
+            event_loop
+                .dispatch(Some(Duration::from_millis(50)), &mut ())
+                .unwrap()
+        };
+
+        std::fs::write(dir.join("a"), "x").unwrap();
+        dispatch();
+        assert!(hits.get() > 0);
+        let before = hits.get();
+        std::fs::remove_file(dir.join("a")).unwrap();
         dispatch();
         assert!(hits.get() > before);
 

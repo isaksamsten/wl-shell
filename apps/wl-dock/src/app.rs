@@ -30,6 +30,19 @@
 //! (a desktop action, or a new window), an app action, or pinning, which
 //! writes the pins file. `[app.<id>]` also binds middle click and
 //! scrolling on the icon to commands.
+//!
+//! Dragging: a left press on an app's icon that moves `drag-threshold`
+//! before its release picks the icon up (view.rs) instead of clicking
+//! it, and closes any strip or menu. Dropping it reorders the pins, pins
+//! a running app, or (on the Trash) unpins it (drag.rs); the pins file is
+//! written and the items rebuilt at once, so the dock shows the new order
+//! as the icon lands. Releasing off the dock, Escape, or the pointer
+//! leaving cancels.
+//!
+//! The Trash: its icon follows whether `$XDG_DATA_HOME/Trash/files` is
+//! empty (watched with inotify); clicking it runs `open-command` with
+//! `trash:///`, and its menu has Open and Empty Trash
+//! (`trash-empty-command`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -65,10 +78,12 @@ use wl_shell_ui::Cache;
 
 use crate::config::{Config, Windows};
 use crate::dock::{self, Click, Item, Order, Placement};
+use crate::drag;
 use crate::launch::{self, Command};
 use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin};
 use crate::strip::Key;
+use crate::trash;
 use crate::view::{DockView, Style};
 
 /// Pixels of touchpad scrolling per step of a scroll command.
@@ -92,6 +107,8 @@ struct Pressed {
     button: u32,
     /// The press's serial, for the strip's grab.
     serial: u32,
+    /// Where it went down on the dock surface.
+    at: (f64, f64),
 }
 
 pub struct WlDock {
@@ -144,6 +161,14 @@ pub struct WlDock {
     trim: bool,
     /// The cache was cleared: docks get their shapes again.
     reload: bool,
+    /// The Trash's `files` directory; None without a data directory.
+    trash_dir: Option<PathBuf>,
+    /// Something is in the Trash.
+    trash_full: bool,
+    /// The Trash changed since it was last looked at.
+    trash_touched: bool,
+    /// Watching the Trash.
+    trash_watch: Option<RegistrationToken>,
 }
 
 impl WlDock {
@@ -190,6 +215,10 @@ impl WlDock {
             outputs_dirty: true,
             trim: false,
             reload: false,
+            trash_dir: trash::files_dir(),
+            trash_full: false,
+            trash_touched: true,
+            trash_watch: None,
         })
     }
 
@@ -202,6 +231,7 @@ impl WlDock {
         self.start_worker(core)?;
         self.watch_config(core);
         self.watch_pins(core);
+        self.watch_trash(core);
         self.use_streams(core);
         self.prefetch_entries();
         self.after_dispatch(core);
@@ -259,6 +289,42 @@ impl WlDock {
         }
     }
 
+    /// Follow whether the Trash is empty, once the config shows it. Its
+    /// directories are created if missing (as any trash implementation
+    /// does), so there is something to watch.
+    fn watch_trash(&mut self, core: &Core<Self>) {
+        if !self.config.trash || self.trash_watch.is_some() {
+            return;
+        }
+        let Some(dir) = self.trash_dir.clone() else {
+            return warn!("no data directory: the Trash isn't followed");
+        };
+        let info = dir.parent().map(|t| t.join("info"));
+        for d in std::iter::once(dir.as_path()).chain(info.as_deref()) {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                return warn!("{}: {e}", d.display());
+            }
+        }
+        let watched =
+            wl_shell_config::watch_dir(&core.loop_handle, &dir, |shell: &mut Shell<Self>| {
+                shell.program.trash_touched = true;
+            });
+        match watched {
+            Ok(token) => self.trash_watch = Some(token),
+            Err(e) => warn!("not watching {}: {e}", dir.display()),
+        }
+        self.trash_touched = true;
+    }
+
+    /// Look whether anything is in the Trash.
+    fn check_trash(&mut self) {
+        let full = self.trash_dir.as_deref().is_some_and(trash::full);
+        if full != self.trash_full {
+            self.trash_full = full;
+            self.dirty = true;
+        }
+    }
+
     /// Run the streams the config names (restarting changed ones).
     fn use_streams(&mut self, core: &mut Core<Self>) {
         core.use_focus_stream(self.config.mru_event_stream.as_deref());
@@ -278,6 +344,9 @@ impl WlDock {
         }
         if std::mem::take(&mut self.pins_touched) {
             self.reload_pins();
+        }
+        if std::mem::take(&mut self.trash_touched) {
+            self.check_trash();
         }
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_docks(core);
@@ -307,6 +376,7 @@ impl WlDock {
             assets.clear_icons();
         }
         self.use_streams(core);
+        self.watch_trash(core);
         self.outputs_dirty = true;
         self.reload = true;
         self.trim = true;
@@ -438,9 +508,12 @@ impl WlDock {
         let streaming = self.output_stream.running();
         for dock in &mut self.docks {
             let by_output = streaming && dock.style().layout.windows == Windows::Output;
-            let items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
+            let mut items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
                 self.placement.place(id, &dock.name, by_output)
             });
+            if self.config.trash {
+                dock::add_trash(&mut items, self.trash_full);
+            }
             dock.set_items(core, &items);
         }
     }
@@ -490,6 +563,7 @@ impl WlDock {
         output: &WlOutput,
         button: u32,
         serial: u32,
+        at: (f64, f64),
         down: bool,
     ) {
         let Some(item) = self.hovered_item(output) else {
@@ -509,6 +583,7 @@ impl WlDock {
                 app_id: item.app_id,
                 button,
                 serial,
+                at,
             });
             return;
         }
@@ -528,7 +603,7 @@ impl WlDock {
         self.close_menus(core);
         match button {
             BTN_LEFT => self.click(core, output, &item, pressed.serial),
-            BTN_MIDDLE => {
+            BTN_MIDDLE if item.is_app() => {
                 self.close_strips(core);
                 self.middle_click(core, &item);
                 self.release_keyboard(output);
@@ -625,6 +700,8 @@ impl WlDock {
         match item.click(&core.mru) {
             Click::Activate(id) => self.activate(core, &id),
             Click::Launch => self.launch(core, &item.app_id),
+            Click::OpenTrash => self.open_trash(core),
+            Click::Nothing => {}
         }
         self.release_keyboard(output);
     }
@@ -650,13 +727,73 @@ impl WlDock {
         self.close_menus(core);
     }
 
+    // -- dragging --------------------------------------------------------------
+
+    /// The app whose icon a left press on the dock on `output` went down
+    /// on, if the pointer, now at (`x`, `y`), moved far enough to drag it.
+    fn drag_due(&self, output: &WlOutput, x: f64, y: f64) -> Option<String> {
+        let p = self.pressed.as_ref()?;
+        let (dx, dy) = (x - p.at.0, y - p.at.1);
+        let far = dx.hypot(dy) > self.config.drag_threshold as f64;
+        (p.output == *output && p.button == BTN_LEFT && far).then(|| p.app_id.clone())
+    }
+
+    /// The dragged icon was dropped on the dock on `output`: change the
+    /// pins as the drop says, and show them at once.
+    fn drop_icon(&mut self, core: &Core<Self>, output: &WlOutput) {
+        let dropped = self.dock_mut(output).and_then(DockView::end_drag);
+        if let Some((app_id, drop)) = dropped {
+            let mut pins = self.pins.clone();
+            if drag::apply(&mut pins, &app_id, drop) {
+                self.pins = pins;
+                self.save_pins();
+                self.rebuild(core, None);
+            }
+        }
+        self.release_keyboard(output);
+    }
+
+    /// Cancel every drag (the icons fly back), and give back the keyboard
+    /// the press brought.
+    fn cancel_drags(&mut self) {
+        for dock in self.docks.iter_mut().filter(|d| d.dragging()) {
+            dock.cancel_drag();
+            dock.release_keyboard();
+        }
+    }
+
+    // -- the Trash -------------------------------------------------------------
+
+    fn open_trash(&mut self, core: &Core<Self>) {
+        let command = launch::path_command(&self.config.open_command, trash::URI);
+        let output = Output::Prefixed("open-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("open-command: {e}");
+        }
+    }
+
+    fn empty_trash(&mut self, core: &Core<Self>) {
+        let command = &self.config.trash_empty_command;
+        let output = Output::Prefixed("trash-empty-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, command, output) {
+            warn!("trash-empty-command: {e}");
+        }
+    }
+
     // -- the menu --------------------------------------------------------------
 
     /// Open the menu of the item `pressed` was on, once its desktop entry
     /// is known.
     fn open_menu(&mut self, core: &Core<Self>, pressed: Pressed) {
         let app_id = pressed.app_id.clone();
-        if !app_id.is_empty() && !self.entries.contains_key(&app_id) {
+        let Some(item) = (self.docks.iter())
+            .find(|d| d.output == pressed.output)
+            .and_then(|d| d.item(&app_id).cloned())
+        else {
+            self.pending_menu = None;
+            return;
+        };
+        if item.is_app() && !app_id.is_empty() && !self.entries.contains_key(&app_id) {
             if let Some(assets) = &self.assets {
                 assets.entry(&app_id);
             }
@@ -664,13 +801,11 @@ impl WlDock {
             return;
         }
         self.pending_menu = None;
-        let Some(item) = (self.docks.iter())
-            .find(|d| d.output == pressed.output)
-            .and_then(|d| d.item(&app_id).cloned())
-        else {
-            return;
+        let groups = match item.kind {
+            dock::Kind::App => self.menu_groups(core, &item),
+            dock::Kind::Trash { full } => menu::trash(full),
+            dock::Kind::Separator => Vec::new(),
         };
-        let groups = self.menu_groups(core, &item);
         // Only one grabbing popup at a time: the others go at once.
         for dock in self.docks.iter_mut() {
             if dock.output != pressed.output {
@@ -721,6 +856,8 @@ impl WlDock {
                     self.close_window(core, &id);
                 }
             }
+            Action::OpenTrash => self.open_trash(core),
+            Action::EmptyTrash => self.empty_trash(core),
         }
     }
 
@@ -731,10 +868,14 @@ impl WlDock {
             true => pins::pin(&mut self.pins, pin),
             false => pins::unpin(&mut self.pins, &pin),
         };
-        if !changed {
-            return;
+        if changed {
+            self.dirty = true;
+            self.save_pins();
         }
-        self.dirty = true;
+    }
+
+    /// Write the pins file.
+    fn save_pins(&self) {
         match &self.pins_path {
             // The watch reads it back, and finds nothing new.
             Some(path) => {
@@ -1058,12 +1199,19 @@ impl Program for WlDock {
     }
 
     /// Keys reach the open menu or strip, which has the keyboard while it
-    /// is open.
+    /// is open. Escape cancels a drag (the press gave the dock the
+    /// keyboard).
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
         let Some(key) = Key::from_sym(event.keysym) else {
             return;
         };
         if repeat && !key.repeats() {
+            return;
+        }
+        if self.docks.iter().any(DockView::dragging) {
+            if key == Key::Close {
+                self.cancel_drags();
+            }
             return;
         }
         let Some(focus) = core.input.keyboard_focus().cloned() else {
@@ -1110,32 +1258,56 @@ impl Program for WlDock {
             }
             return;
         }
-        let Some(dock) = self
-            .docks
-            .iter_mut()
+        let Some(output) = (self.docks.iter())
             .find(|d| *d.surface() == event.surface)
+            .map(|d| d.output.clone())
         else {
             return;
         };
+        let dragging = (self.docks.iter()).any(|d| d.output == output && d.dragging());
         let (x, y) = event.position;
         match event.kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                dock.pointer_motion(core, x, y);
+                // A press on an icon that moves far enough picks it up.
+                if !dragging && let Some(app_id) = self.drag_due(&output, x, y) {
+                    let draggable = (self.docks.iter())
+                        .find(|d| d.output == output)
+                        .and_then(|d| d.item(&app_id))
+                        .is_some_and(Item::draggable);
+                    if draggable {
+                        self.pressed = None;
+                        self.close_popups(core);
+                        if let Some(dock) = self.dock_mut(&output)
+                            && dock.start_drag(core, &app_id, x, y)
+                        {
+                            return;
+                        }
+                    }
+                }
+                if let Some(dock) = self.dock_mut(&output) {
+                    dock.pointer_motion(core, x, y);
+                }
             }
             PointerEventKind::Leave { .. } => {
-                dock.pointer_leave(core);
+                if let Some(dock) = self.dock_mut(&output) {
+                    // The grab broke: the icon goes back.
+                    if dragging {
+                        dock.cancel_drag();
+                        dock.release_keyboard();
+                    }
+                    dock.pointer_leave(core);
+                }
                 self.pressed = None;
             }
             PointerEventKind::Press { button, serial, .. } => {
-                let output = dock.output.clone();
-                self.button(core, &output, button, serial, true);
+                self.button(core, &output, button, serial, (x, y), true);
             }
+            PointerEventKind::Release { .. } if dragging => self.drop_icon(core, &output),
             PointerEventKind::Release { button, serial, .. } => {
-                let output = dock.output.clone();
-                self.button(core, &output, button, serial, false);
+                self.button(core, &output, button, serial, (x, y), false);
             }
+            PointerEventKind::Axis { .. } if dragging => {}
             PointerEventKind::Axis { vertical, .. } => {
-                let output = dock.output.clone();
                 self.scroll(core, &output, &vertical);
             }
         }

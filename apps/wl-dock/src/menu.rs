@@ -15,6 +15,10 @@
 //! group also gets a hairline above it, unless it comes first. Rows that
 //! can't run aren't built at all.
 //!
+//! The Trash's menu (`trash`) has Open, and Empty Trash when it is full.
+//! Empty Trash asks first: picking it turns the row into its `confirm`
+//! text, and only picking it again runs it.
+//!
 //! The layout is in logical pixels relative to the bubble's body: rows of
 //! one height inside `padding`, an icon column when any row has an icon,
 //! and as wide as the widest text (up to `max-width`). The tail sits on the
@@ -61,6 +65,9 @@ pub enum Action {
     Unpin,
     /// Close these windows.
     Close(Vec<String>),
+    /// Open the Trash.
+    OpenTrash,
+    EmptyTrash,
 }
 
 /// What the icon column shows for a row.
@@ -78,6 +85,9 @@ pub struct Entry {
     pub label: String,
     pub mark: Mark,
     pub action: Action,
+    /// Picking it first only shows this instead of the label; picking it
+    /// again runs it.
+    pub confirm: Option<String>,
 }
 
 /// A group of rows; `line`: a hairline above it.
@@ -122,6 +132,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 label,
                 mark: if focused { Mark::Focused } else { Mark::None },
                 action: Action::Activate(w.id.clone()),
+                confirm: None,
             });
         }
     }
@@ -138,6 +149,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 label: a.name.clone(),
                 mark: icon(&a.icon),
                 action: Action::Desktop(a.clone()),
+                confirm: None,
             })
             .collect(),
     });
@@ -150,6 +162,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 label: a.name.trim().to_string(),
                 mark: icon(&a.icon),
                 action: Action::Command(a.command.clone()),
+                confirm: None,
             })
             .collect(),
     });
@@ -190,7 +203,24 @@ fn entry(label: &str, action: Action) -> Entry {
         label: label.to_string(),
         mark: Mark::None,
         action,
+        confirm: None,
     }
+}
+
+/// The Trash's menu: Open, and Empty Trash (asking first) if it is
+/// `full`.
+pub fn trash(full: bool) -> Vec<Group> {
+    let mut entries = vec![entry("Open", Action::OpenTrash)];
+    if full {
+        entries.push(Entry {
+            confirm: Some("Empty Trash: click again".into()),
+            ..entry("Empty Trash", Action::EmptyTrash)
+        });
+    }
+    vec![Group {
+        line: false,
+        entries,
+    }]
 }
 
 /// The rows of `groups`, in order.
@@ -459,7 +489,7 @@ pub fn step(current: Option<usize>, n: usize, down: bool) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::Window;
+    use crate::dock::{Kind, Window};
 
     fn window(id: &str, title: &str) -> Window {
         Window {
@@ -471,6 +501,7 @@ mod tests {
     fn item(pinned: bool, windows: &[Window], elsewhere: &[Window]) -> Item {
         Item {
             app_id: "app".into(),
+            kind: Kind::App,
             pinned,
             windows: windows.to_vec(),
             elsewhere: elsewhere.to_vec(),
@@ -793,6 +824,17 @@ mod tests {
             let along = p.configured_tail(far, 12.0, 10.0);
             assert_eq!(along, 12.0 + CORNER_ROOM + 5.0 + bubble::JOIN);
         }
+    }
+
+    #[test]
+    fn trash_menu() {
+        assert_eq!(labels(&trash(false)), [vec!["Open"]]);
+        let g = trash(true);
+        assert_eq!(labels(&g), [vec!["Open", "Empty Trash"]]);
+        // Emptying asks first; opening doesn't.
+        assert_eq!(g[0].entries[0].confirm, None);
+        assert_eq!(g[0].entries[1].action, Action::EmptyTrash);
+        assert!(g[0].entries[1].confirm.is_some());
     }
 
     #[test]

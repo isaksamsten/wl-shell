@@ -4,6 +4,7 @@ mod app;
 mod autohide;
 mod config;
 mod dock;
+mod drag;
 mod launch;
 mod layout;
 mod menu;
@@ -13,6 +14,7 @@ mod pins;
 mod row;
 mod strip;
 mod stripview;
+mod trash;
 mod view;
 mod zoom;
 
