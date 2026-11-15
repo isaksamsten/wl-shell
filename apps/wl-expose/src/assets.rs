@@ -76,7 +76,8 @@ impl Assets {
             | Done::Pill { .. }
             | Done::Entry { .. }
             | Done::Named { .. }
-            | Done::Bubble { .. } => {}
+            | Done::Bubble { .. }
+            | Done::Folder { .. } => {}
         }
     }
 }

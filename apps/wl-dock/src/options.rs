@@ -4,8 +4,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 /// A dock: pinned and running apps, one icon per app ID, magnified around
-/// the pointer. Start it with the compositor. The subcommands edit the
-/// pins ($XDG_STATE_HOME/wl-dock/pinned), which a running dock picks up.
+/// the pointer, and pinned folders. Start it with the compositor. The
+/// subcommands edit the pins ($XDG_STATE_HOME/wl-dock/pinned), which a
+/// running dock picks up.
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Options {
@@ -19,14 +20,15 @@ pub struct Options {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum Cmd {
-    /// Pin an app (by app ID) to the end of the dock
+    /// Pin an app (by app ID) or a folder (by path) to the end of its
+    /// part of the dock; files can't be pinned
     Pin {
-        #[arg(value_name = "APP-ID")]
+        #[arg(value_name = "APP-ID|FOLDER")]
         item: String,
     },
-    /// Unpin an app
+    /// Unpin an app or a folder
     Unpin {
-        #[arg(value_name = "APP-ID")]
+        #[arg(value_name = "APP-ID|FOLDER")]
         item: String,
     },
     /// Print the pins, in dock order

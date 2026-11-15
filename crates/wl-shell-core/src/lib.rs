@@ -3,6 +3,7 @@
 
 pub mod capture;
 pub mod dmabuf;
+pub mod dnd;
 pub mod focus;
 pub mod globals;
 pub mod input;

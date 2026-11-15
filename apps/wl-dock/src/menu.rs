@@ -19,6 +19,11 @@
 //! Empty Trash asks first: picking it turns the row into its `confirm`
 //! text, and only picking it again runs it.
 //!
+//! A folder's menu (`folder`) has Open and Remove from Dock. Its popup
+//! (`folder_popup`) is a menu too: a row per entry, with the entry's
+//! thumbnail or type icon in a larger icon column, and Open in File
+//! Manager. Its entries' rows can be dragged out as files.
+//!
 //! The layout is in logical pixels relative to the bubble's body: rows of
 //! one height inside `padding`, an icon column when any row has an icon,
 //! and as wide as the widest text (up to `max-width`). The tail sits on the
@@ -27,8 +32,11 @@
 //! worked out from the popup's configured position (`configured_tail`),
 //! and clamped so it never runs into a rounded corner.
 
+use std::path::{Path, PathBuf};
+
 use wl_shell_core::popup::{Anchor, Gravity};
 use wl_shell_render::bubble::{self, Side};
+use wl_shell_render::files::FileEntry;
 use wl_shell_render::icons::DesktopAction;
 use wl_shell_render::shadow;
 use wl_shell_ui::Rect;
@@ -41,6 +49,11 @@ use crate::strip::{Arrow, Key};
 pub const INSET: f64 = 12.0;
 /// A row's icon.
 pub const ICON: f64 = 16.0;
+/// A file's icon (or thumbnail).
+pub const FILE_ICON: f64 = 32.0;
+/// Above and below a file's icon in its row.
+pub const FILE_ROW_PAD: f64 = 4.0;
+
 /// Between the icon column and the text.
 pub const ICON_GAP: f64 = 8.0;
 /// The narrowest menu.
@@ -68,6 +81,8 @@ pub enum Action {
     /// Open the Trash.
     OpenTrash,
     EmptyTrash,
+    /// Open this file or folder (`open-command`).
+    Open(PathBuf),
 }
 
 /// What the icon column shows for a row.
@@ -78,6 +93,19 @@ pub enum Mark {
     Icon(String),
     /// The focused window's dot.
     Focused,
+    /// A file's thumbnail or icons (paths or names, best first), larger.
+    File(Vec<String>),
+}
+
+impl Mark {
+    /// The icon column's width for marks like this one.
+    fn column(&self) -> f64 {
+        match self {
+            Mark::None => 0.0,
+            Mark::File(_) => FILE_ICON,
+            Mark::Icon(_) | Mark::Focused => ICON,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +116,8 @@ pub struct Entry {
     /// Picking it first only shows this instead of the label; picking it
     /// again runs it.
     pub confirm: Option<String>,
+    /// The file the row can be dragged out as.
+    pub file: Option<PathBuf>,
 }
 
 /// A group of rows; `line`: a hairline above it.
@@ -133,6 +163,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 mark: if focused { Mark::Focused } else { Mark::None },
                 action: Action::Activate(w.id.clone()),
                 confirm: None,
+                file: None,
             });
         }
     }
@@ -150,6 +181,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 mark: icon(&a.icon),
                 action: Action::Desktop(a.clone()),
                 confirm: None,
+                file: None,
             })
             .collect(),
     });
@@ -163,6 +195,7 @@ pub fn build(s: &Source) -> Vec<Group> {
                 mark: icon(&a.icon),
                 action: Action::Command(a.command.clone()),
                 confirm: None,
+                file: None,
             })
             .collect(),
     });
@@ -204,6 +237,7 @@ fn entry(label: &str, action: Action) -> Entry {
         mark: Mark::None,
         action,
         confirm: None,
+        file: None,
     }
 }
 
@@ -221,6 +255,52 @@ pub fn trash(full: bool) -> Vec<Group> {
         line: false,
         entries,
     }]
+}
+
+/// A folder's menu: Open, if it `exists`, and Remove from Dock.
+pub fn folder(path: &Path, exists: bool) -> Vec<Group> {
+    let mut groups = Vec::new();
+    if exists {
+        groups.push(Group {
+            line: false,
+            entries: vec![entry("Open", Action::Open(path.to_path_buf()))],
+        });
+    }
+    groups.push(Group {
+        line: exists,
+        entries: vec![entry("Remove from Dock", Action::Unpin)],
+    });
+    groups
+}
+
+/// A folder's popup: a row per entry, then Open in File Manager.
+pub fn folder_popup(path: &Path, files: &[FileEntry]) -> Vec<Group> {
+    let entries: Vec<Entry> = (files.iter())
+        .map(|f| Entry {
+            label: f.name.clone(),
+            mark: Mark::File(f.icons.clone()),
+            action: Action::Open(f.path.clone()),
+            confirm: None,
+            file: Some(f.path.clone()),
+        })
+        .collect();
+    let open = entry("Open in File Manager", Action::Open(path.to_path_buf()));
+    let mut groups = vec![Group {
+        line: true,
+        entries: vec![open],
+    }];
+    if !entries.is_empty() {
+        groups.insert(
+            0,
+            Group {
+                line: false,
+                entries,
+            },
+        );
+    } else {
+        groups[0].line = false;
+    }
+    groups
 }
 
 /// The rows of `groups`, in order.
@@ -241,11 +321,16 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// The widest a row's text gets, with or without the icon column.
-    pub fn text_max(&self, icons: bool) -> f64 {
-        let column = if icons { ICON + ICON_GAP } else { 0.0 };
+    /// The widest a row's text gets, with an icon `column` wide (0: none).
+    pub fn text_max(&self, column: f64) -> f64 {
+        let column = if column > 0.0 { column + ICON_GAP } else { 0.0 };
         (self.max_width - 2.0 * self.padding - 2.0 * INSET - column).max(1.0)
     }
+}
+
+/// The icon column's width for `entries` (0: none).
+pub fn column<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> f64 {
+    (entries.into_iter()).fold(0.0, |c, e| c.max(e.mark.column()))
 }
 
 /// Where everything goes in the body, logical pixels.
@@ -262,15 +347,21 @@ pub struct Layout {
     pub icon_x: Option<f64>,
     /// Where text starts.
     pub text_x: f64,
-    row_height: f64,
+    pub row_height: f64,
+    /// The icon column's width.
+    column: f64,
     padding: f64,
 }
 
 /// Lay out `groups` whose rows' texts are `widths` wide.
 pub fn layout(groups: &[Group], widths: &[f64], m: &Metrics) -> Layout {
-    let icons = (groups.iter())
-        .flat_map(|g| &g.entries)
-        .any(|e| e.mark != Mark::None);
+    let column = column(groups.iter().flat_map(|g| &g.entries));
+    let icons = column > 0.0;
+    // Rows of files are as tall as their icons need.
+    let row_height = match column >= FILE_ICON {
+        true => m.row_height.max(FILE_ICON + 2.0 * FILE_ROW_PAD),
+        false => m.row_height,
+    };
     let p = m.padding;
     let mut rows = Vec::new();
     let mut lines = Vec::new();
@@ -284,12 +375,12 @@ pub fn layout(groups: &[Group], widths: &[f64], m: &Metrics) -> Layout {
         }
         for _ in &g.entries {
             rows.push(y);
-            y += m.row_height;
+            y += row_height;
         }
     }
-    let column = if icons { ICON + ICON_GAP } else { 0.0 };
+    let gap = if icons { column + ICON_GAP } else { 0.0 };
     let widest = (widths.iter()).fold(0.0_f64, |a, w| a.max(w.ceil()));
-    let content = 2.0 * p + 2.0 * INSET + column + widest.min(m.text_max(icons));
+    let content = 2.0 * p + 2.0 * INSET + gap + widest.min(m.text_max(column));
     // Room for the tail between the corners, on any side.
     let tail_room = 2.0 * (m.radius + CORNER_ROOM) + m.tail.0 + 2.0 * bubble::JOIN;
     let w = content
@@ -302,8 +393,9 @@ pub fn layout(groups: &[Group], widths: &[f64], m: &Metrics) -> Layout {
         rows,
         lines,
         icon_x: icons.then_some(p + INSET),
-        text_x: p + INSET + column,
-        row_height: m.row_height,
+        text_x: p + INSET + gap,
+        row_height,
+        column,
         padding: p,
     }
 }
@@ -340,7 +432,7 @@ impl Layout {
     pub fn mark(&self, i: usize, size: f64) -> Option<Rect> {
         let (x, r) = (self.icon_x?, self.row(i)?);
         Some(Rect::new(
-            (x + (ICON - size) / 2.0).round(),
+            (x + (self.column - size) / 2.0).round(),
             (r.y + (r.h - size) / 2.0).round(),
             size,
             size,
@@ -666,7 +758,7 @@ mod tests {
         let l = layout(&g, &[100.0; 6], &m);
         assert_eq!((l.icon_x, l.text_x), (Some(18.0), 18.0 + 16.0 + 8.0));
         assert_eq!(l.mark(2, 16.0).unwrap().x, 18.0);
-        assert_eq!(m.text_max(true), 320.0 - 12.0 - 24.0 - 24.0);
+        assert_eq!(m.text_max(ICON), 320.0 - 12.0 - 24.0 - 24.0);
     }
 
     #[test]
@@ -824,6 +916,71 @@ mod tests {
             let along = p.configured_tail(far, 12.0, 10.0);
             assert_eq!(along, 12.0 + CORNER_ROOM + 5.0 + bubble::JOIN);
         }
+    }
+
+    #[test]
+    fn folder_menus() {
+        let p = Path::new("/home/u/Downloads");
+        let g = folder(p, true);
+        assert_eq!(labels(&g), [vec!["Open"], vec!["Remove from Dock"]]);
+        assert_eq!(g[0].entries[0].action, Action::Open(p.into()));
+        assert!(g[1].line);
+        let gone = folder(p, false);
+        assert_eq!(labels(&gone), [vec!["Remove from Dock"]]);
+        assert!(!gone[0].line);
+    }
+
+    #[test]
+    fn folder_popups() {
+        let p = Path::new("/d");
+        let empty = folder_popup(p, &[]);
+        assert_eq!(labels(&empty), [vec!["Open in File Manager"]]);
+        assert!(!empty[0].line);
+        let dir = std::env::temp_dir().join(format!("wl-dock-popup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        let request = wl_shell_render::files::FolderRequest {
+            dir: dir.clone(),
+            sort: Default::default(),
+            count: 5,
+        };
+        let files = wl_shell_render::files::list(&request, &Default::default()).unwrap();
+        let g = folder_popup(&dir, &files);
+        assert_eq!(labels(&g), [vec!["a.txt"], vec!["Open in File Manager"]]);
+        assert!(!g[0].line && g[1].line);
+        let row = &g[0].entries[0];
+        assert_eq!(row.file.as_deref(), Some(dir.join("a.txt").as_path()));
+        assert!(matches!(row.mark, Mark::File(_)));
+        assert_eq!(g[1].entries[0].file, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_rows_are_taller() {
+        let m = metrics();
+        let file = Entry {
+            label: "a.png".into(),
+            mark: Mark::File(vec!["image-png".into()]),
+            action: Action::Open("/d/a.png".into()),
+            confirm: None,
+            file: Some("/d/a.png".into()),
+        };
+        let g = vec![
+            Group {
+                line: false,
+                entries: vec![file],
+            },
+            Group {
+                line: true,
+                entries: vec![entry("Open in File Manager", Action::Open("/d".into()))],
+            },
+        ];
+        let l = layout(&g, &[50.0, 50.0], &m);
+        assert_eq!(l.row_height, FILE_ICON + 2.0 * FILE_ROW_PAD);
+        assert_eq!(l.text_x, 6.0 + INSET + FILE_ICON + ICON_GAP);
+        // A file's icon fills the column; a small one is centered in it.
+        assert_eq!(l.mark(0, FILE_ICON).unwrap().x, 18.0);
+        assert_eq!(l.mark(1, ICON).unwrap().x, 18.0 + 8.0);
     }
 
     #[test]

@@ -6,9 +6,11 @@
 //!
 //! Layout keys can be overridden per output in `[output.<name>]` tables
 //! (see `OutputOverride`); `outputs` picks the outputs that get a dock.
-//! Per-app settings (menu actions, middle click and scroll commands, and
-//! the icon, name and launch command) live in `[app."<app-id>"]` tables
-//! (see `AppConfig`).
+//! Per-app settings (menu actions, middle click and scroll commands, the
+//! icon, name and launch command, and what dropping files does) live in
+//! `[app."<app-id>"]` tables (see `AppConfig`), and per-folder ones (how
+//! its popup lists it, its icon) in `[folder."<path>"]` tables (see
+//! `FolderConfig`).
 //!
 //! Colors live in `[appearance]`; `[appearance.dark]` and
 //! `[appearance.light]` override its keys in the desktop's dark or light
@@ -20,7 +22,7 @@ use std::fmt;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use wl_shell_config::{ConfigFile, Scheme, de};
-use wl_shell_render::{shadow, text};
+use wl_shell_render::{files, shadow, text};
 
 pub type Appearance = wl_shell_config::Appearance<Theme>;
 
@@ -139,10 +141,18 @@ pub struct Config {
     pub open_command: String,
     /// Empties the Trash.
     pub trash_empty_command: String,
+    /// Moves files dropped on the Trash to it: `{paths}`.
+    pub trash_command: String,
+    /// Copies files dropped on a folder into it: `{paths}`, `{dest}`.
+    pub copy_command: String,
+    /// Moves files dropped on a folder into it: `{paths}`, `{dest}`.
+    pub move_command: String,
     /// Per-output overrides, by output name.
     pub output: BTreeMap<String, OutputOverride>,
     /// Per-app settings, by app ID.
     pub app: BTreeMap<String, AppConfig>,
+    /// Per-folder settings, by path (`~/` allowed).
+    pub folder: BTreeMap<String, FolderConfig>,
     pub appearance: Appearance,
 }
 
@@ -191,8 +201,12 @@ impl Default for Config {
             trash: true,
             open_command: "xdg-open {path}".into(),
             trash_empty_command: "gio trash --empty".into(),
+            trash_command: "gio trash -- {paths}".into(),
+            copy_command: "cp -rn -- {paths} {dest}".into(),
+            move_command: "mv -n -- {paths} {dest}".into(),
             output: BTreeMap::new(),
             app: BTreeMap::new(),
+            folder: BTreeMap::new(),
             appearance: Appearance::default(),
         }
     }
@@ -334,6 +348,8 @@ pub struct AppConfig {
     pub launch_command: Option<String>,
     /// The desktop entry's actions in the menu.
     pub desktop_actions: bool,
+    /// Opens files dropped on the icon: `{files}`, `{app-id}`.
+    pub drop: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -347,8 +363,65 @@ impl Default for AppConfig {
             name: None,
             launch_command: None,
             desktop_actions: true,
+            drop: None,
         }
     }
+}
+
+/// A `[folder."<path>"]` table.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FolderConfig {
+    /// How the popup sorts the entries.
+    pub sort: FolderSort,
+    /// Entries the popup shows at most.
+    #[serde(deserialize_with = "folder_count")]
+    pub count: u32,
+    /// How the popup shows them.
+    pub view: FolderView,
+    /// An icon name or a path, instead of the folder's.
+    pub icon: Option<String>,
+}
+
+impl Default for FolderConfig {
+    fn default() -> Self {
+        Self {
+            sort: FolderSort::default(),
+            count: 20,
+            view: FolderView::default(),
+            icon: None,
+        }
+    }
+}
+
+/// How a folder's popup sorts its entries.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderSort {
+    /// Most recently modified first.
+    #[default]
+    Modified,
+    /// Most recently created first.
+    Added,
+    Name,
+}
+
+impl From<FolderSort> for files::Sort {
+    fn from(s: FolderSort) -> Self {
+        match s {
+            FolderSort::Modified => files::Sort::Modified,
+            FolderSort::Added => files::Sort::Added,
+            FolderSort::Name => files::Sort::Name,
+        }
+    }
+}
+
+/// How a folder's popup shows its entries. Only a list so far.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderView {
+    #[default]
+    List,
 }
 
 /// A row of an app's menu that runs a command.
@@ -606,6 +679,20 @@ impl Config {
         self.app.get(app_id)
     }
 
+    /// The settings of the folder pinned as `pin` (keys and pins match
+    /// with `~/` expanded and trailing slashes dropped).
+    pub fn folder(&self, pin: &str) -> Option<&FolderConfig> {
+        let norm = |p: &str| {
+            let p = wl_shell_render::icons::expand_home(p.trim());
+            match p.trim_end_matches('/') {
+                "" => "/".to_string(),
+                t => t.to_string(),
+            }
+        };
+        let pin = norm(pin);
+        (self.folder.iter()).find_map(|(k, f)| (norm(k) == pin).then_some(f))
+    }
+
     /// The menu's shadow; None if disabled.
     pub fn menu_shadow(&self) -> Option<shadow::Settings> {
         let t = self.theme();
@@ -697,6 +784,11 @@ fn launch_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 
 /// Pixels before a press drags, 1 to 100.
 fn drag_threshold<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 1, 100)
+}
+
+/// Entries in a folder's popup, 1 to 100.
+fn folder_count<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 100)
 }
 
@@ -927,6 +1019,54 @@ mod tests {
         assert_eq!(c.open_command, "gio open {path}");
         assert_eq!(c.trash_empty_command, "trash-empty");
         assert_eq!(c.theme().separator_color, 0xff000080);
+    }
+
+    #[test]
+    fn drops_and_folders() {
+        let d = Config::default();
+        assert_eq!(d.trash_command, "gio trash -- {paths}");
+        assert!(d.copy_command.contains("{dest}") && d.move_command.contains("{dest}"));
+        let c = parse(
+            r#"
+            trash-command = "trash-put -- {paths}"
+            copy-command = "gio copy -- {paths} {dest}"
+            move-command = "gio move -- {paths} {dest}"
+
+            [app.mpv]
+            drop = "mpv --player-operation-mode=pseudo-gui -- {files}"
+
+            [folder."~/Downloads/"]
+            sort = "added"
+            count = 30
+            view = "list"
+            icon = "folder-download"
+
+            [folder."/srv"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.trash_command, "trash-put -- {paths}");
+        assert_eq!(c.copy_command, "gio copy -- {paths} {dest}");
+        assert_eq!(c.move_command, "gio move -- {paths} {dest}");
+        assert!(c.app("mpv").unwrap().drop.is_some());
+        assert!(c.app("x").is_none_or(|a| a.drop.is_none()));
+        // Matched with `~/` expanded and without trailing slashes.
+        let dl = c.folder("~/Downloads").unwrap();
+        assert_eq!(
+            (dl.sort, dl.count, dl.view),
+            (FolderSort::Added, 30, FolderView::List)
+        );
+        assert_eq!(dl.icon.as_deref(), Some("folder-download"));
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(c.folder(&format!("{home}/Downloads")).is_some());
+        }
+        assert_eq!(c.folder("/srv/").unwrap(), &FolderConfig::default());
+        assert!(c.folder("/srv/x").is_none());
+        let err = |s: &str| parse(s).is_err();
+        assert!(err("[folder.x]\ncount = 0"));
+        assert!(err("[folder.x]\nsort = \"size\""));
+        assert!(err("[folder.x]\nview = \"fan\""));
+        assert!(err("[folder.x]\nnope = 1"));
     }
 
     #[test]

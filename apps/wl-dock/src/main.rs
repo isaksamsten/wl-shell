@@ -5,6 +5,7 @@ mod autohide;
 mod config;
 mod dock;
 mod drag;
+mod folder;
 mod launch;
 mod layout;
 mod menu;

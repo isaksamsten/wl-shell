@@ -15,8 +15,10 @@ use std::sync::{Arc, mpsc};
 use calloop::channel;
 
 use crate::bubble::{self, Bubble};
+use crate::files::{self, FileEntry, FolderRequest};
 use crate::icons::{self, Icons};
 use crate::image::Image;
+use crate::mime::MimeDb;
 use crate::text::{self, Text};
 
 enum Job {
@@ -36,6 +38,8 @@ enum Job {
     Entry(String),
     /// Reload the desktop entries if they changed.
     Refresh,
+    /// A folder's entries.
+    Folder { tag: u64, request: FolderRequest },
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -95,6 +99,12 @@ pub enum Done {
         tag: u64,
         bubble: Bubble,
         image: Image,
+    },
+    /// A folder's entries (`Assets::folder`), or why it can't be read.
+    Folder {
+        tag: u64,
+        request: FolderRequest,
+        entries: Result<Vec<FileEntry>, String>,
     },
 }
 
@@ -190,6 +200,11 @@ impl Assets {
         self.send(Job::Bubble { tag, bubble });
     }
 
+    /// List a folder; arrives as `Done::Folder`.
+    pub fn folder(&self, tag: u64, request: FolderRequest) {
+        self.send(Job::Folder { tag, request });
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -207,7 +222,8 @@ impl Assets {
             Done::Named { key, .. } => self.named.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
             Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
-            Done::IconsReloaded | Done::Pill { .. } | Done::Bubble { .. } => {}
+            Done::IconsReloaded | Done::Pill { .. } | Done::Bubble { .. } | Done::Folder { .. } => {
+            }
         }
     }
 }
@@ -219,6 +235,8 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
     let mut icons = Icons::new();
     // Letter tiles for apps without an icon, by icon key and font.
     let mut letters: HashMap<(icons::Key, String), Arc<Image>> = HashMap::new();
+    // File types, loaded with the first folder.
+    let mut mime: Option<MimeDb> = None;
     loop {
         let job = match inbox.try_recv() {
             Ok(job) => job,
@@ -302,6 +320,15 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 }
                 letters.clear();
                 Done::IconsReloaded
+            }
+            Job::Folder { tag, request } => {
+                let mime = mime.get_or_insert_with(MimeDb::load);
+                let entries = files::list(&request, mime);
+                Done::Folder {
+                    tag,
+                    request,
+                    entries,
+                }
             }
             Job::ClearIcons => {
                 icons.clear();

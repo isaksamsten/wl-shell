@@ -19,6 +19,7 @@ use calloop::{
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
+    data_device_manager::DataDeviceManagerState,
     delegate_dispatch2, delegate_registry,
     foreign_toplevel_list::{ForeignToplevelList, ForeignToplevelListHandler},
     output::{OutputHandler, OutputState},
@@ -40,6 +41,7 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{
+        wl_data_device_manager::DndAction,
         wl_keyboard::WlKeyboard,
         wl_output::{self, WlOutput},
         wl_pointer::WlPointer,
@@ -57,6 +59,7 @@ use wayland_protocols::{
 use wl_shell_log::warn;
 
 use crate::capture::{Capture, CaptureEvent, CaptureId};
+use crate::dnd::Dnd;
 use crate::focus;
 use crate::globals::Globals;
 use crate::input::Input;
@@ -134,6 +137,38 @@ pub trait Program: Sized + 'static {
     /// the front of `core.mru` now.
     fn focus_changed(&mut self, core: &mut Core<Self>) {}
 
+    /// Whether the program takes part in drag and drop (dnd.rs): a data
+    /// device is only made for programs that do.
+    const DATA_DEVICE: bool = false;
+
+    /// A drag entered `surface` at `at`, offering `mime_types`. Until the
+    /// program accepts it (`core.dnd.accept`), it isn't taken.
+    fn dnd_enter(
+        &mut self,
+        core: &mut Core<Self>,
+        surface: &WlSurface,
+        at: (f64, f64),
+        mime_types: &[String],
+    ) {
+    }
+
+    /// The drag moved to `at` on the surface it entered.
+    fn dnd_motion(&mut self, core: &mut Core<Self>, at: (f64, f64)) {}
+
+    /// The drag left (or ended on) the surface it entered.
+    fn dnd_leave(&mut self, core: &mut Core<Self>) {}
+
+    /// The drag was dropped where it is: use it, then
+    /// `core.dnd.finish()`.
+    fn dnd_drop(&mut self, core: &mut Core<Self>) {}
+
+    /// The compositor picked `action` for the drag over the program.
+    fn dnd_action(&mut self, core: &mut Core<Self>, action: DndAction) {}
+
+    /// The program's own drag (`core.start_drag`) ended: dropped with
+    /// `action`, or cancelled (None).
+    fn drag_source_done(&mut self, core: &mut Core<Self>, action: Option<DndAction>) {}
+
     /// An event for capture `id`: if the program has that capture, call
     /// `f` with it and handle what it returns. The program owns its
     /// captures; events for captures it dropped find nothing.
@@ -162,6 +197,8 @@ pub struct Core<P> {
     pub mru: Mru,
     /// The `mru-event-stream` command, while configured.
     pub focus_stream: LineStream<P>,
+    /// Drag and drop.
+    pub dnd: Dnd,
 }
 
 /// The whole state: what the event loop dispatches to.
@@ -196,6 +233,10 @@ impl<P: Program> Shell<P> {
             input: Input::default(),
             mru: Mru::default(),
             focus_stream: focus::stream(),
+            dnd: Dnd::new(match P::DATA_DEVICE {
+                true => DataDeviceManagerState::bind(&globals, &qh).ok(),
+                false => None,
+            }),
         };
         let mut shell = Shell { core, program };
         // The first roundtrip delivers the handles, the second their state.
@@ -438,6 +479,9 @@ impl<P: Program> SeatHandler for Shell<P> {
         if matches!(cap, Capability::Keyboard | Capability::Pointer) && core.input.seat.is_none() {
             core.input.seat = Some(seat.clone());
         }
+        if cap == Capability::Pointer && core.input.seat.as_ref() == Some(&seat) {
+            core.dnd.use_seat(&seat, qh);
+        }
         match cap {
             Capability::Keyboard if core.input.keyboard.is_none() => {
                 let repeat = Box::new(|shell: &mut Self, _: &WlKeyboard, event: KeyEvent| {
@@ -478,7 +522,10 @@ impl<P: Program> SeatHandler for Shell<P> {
     ) {
         match cap {
             Capability::Keyboard => self.core.input.release_keyboard(),
-            Capability::Pointer => self.core.input.release_pointer(),
+            Capability::Pointer => {
+                self.core.input.release_pointer();
+                self.core.dnd.release();
+            }
             _ => {}
         }
     }

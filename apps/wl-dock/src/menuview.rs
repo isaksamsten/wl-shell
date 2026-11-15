@@ -25,6 +25,11 @@
 //! text when picked, and runs when picked again; its texts are measured
 //! together, so the bubble doesn't change size. Springs advance on the
 //! dock's frame callbacks.
+//!
+//! A folder's popup is a menu too, with file rows: a press on one that
+//! moves `drag-threshold` drags the file out (`MenuInput::Drag`). The
+//! menu then fades but is held (`hold`) until the drag ends, since the
+//! drag started on its surface.
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,6 +94,8 @@ pub struct MenuStyle {
     pub highlight: u32,
     pub shadow: Option<shadow::Settings>,
     pub icon_theme: Option<String>,
+    /// How far a press on a file's row moves before it drags the file.
+    pub drag_threshold: f64,
 }
 
 /// What a pointer event or key on the menu asks for.
@@ -98,6 +105,11 @@ pub enum MenuInput {
     /// Run this (the menu is closing).
     Pick(Action),
     Close,
+    /// The file of row `row` is dragged out, by the press with `serial`.
+    Drag {
+        row: usize,
+        serial: u32,
+    },
 }
 
 /// A rendered line of text and its logical size.
@@ -189,8 +201,20 @@ pub struct MenuView {
     highlight_alpha: Spring,
     /// Seconds since a row was picked.
     flash: Option<f64>,
-    /// A button went down on the menu.
-    pressed: bool,
+    /// A button went down on the menu: on this row (if any), at this
+    /// point, with this serial.
+    pressed: Option<Press>,
+    /// A row was dragged out: the menu stays (faded) until the drag ends,
+    /// since the drag started on its surface.
+    held: bool,
+}
+
+/// A press on the menu.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    row: Option<usize>,
+    at: (f64, f64),
+    serial: u32,
 }
 
 impl MenuView {
@@ -216,8 +240,8 @@ impl MenuView {
         let transparent = cache::color_buffer(&g, 0, qh).map_err(io)?;
         let no_input = Region::new(&g.compositor).map_err(|e| e.to_string())?;
         let entries: Vec<Entry> = menu::entries(&groups).into_iter().cloned().collect();
-        let icons = entries.iter().any(|e| e.mark != Mark::None);
-        let max_width = style.metrics.text_max(icons).floor() as i32;
+        let column = menu::column(&entries);
+        let max_width = style.metrics.text_max(column).floor() as i32;
         let request = |color: u32, label: &str| PillRequest {
             text: label.to_string(),
             max_width,
@@ -245,11 +269,10 @@ impl MenuView {
             })
             .collect();
         for e in &entries {
-            if let Mark::Icon(name) = &e.mark {
-                let key = named(name, scale, &style);
-                if cache.named_icon(&key).is_none() {
-                    assets.named_icon(&key);
-                }
+            if let Some((key, _)) = mark_key(&e.mark, scale, &style)
+                && cache.named_icon(&key).is_none()
+            {
+                assets.named_icon(&key);
             }
         }
         Ok(Self {
@@ -282,7 +305,8 @@ impl MenuView {
             highlight_y: Spring::new(0.0, HIGHLIGHT_RESPONSE),
             highlight_alpha: Spring::new(0.0, HIGHLIGHT_RESPONSE),
             flash: None,
-            pressed: false,
+            pressed: None,
+            held: false,
         })
     }
 
@@ -300,9 +324,10 @@ impl MenuView {
         self.closing || self.flash.is_some()
     }
 
-    /// Faded out (or closed before it showed): it can go.
+    /// Faded out (or closed before it showed), and not held by a drag
+    /// from it: it can go.
     pub fn gone(&self) -> bool {
-        self.closing && self.flash.is_none() && (!self.shown || self.open.settled())
+        self.closing && !self.held && self.flash.is_none() && (!self.shown || self.open.settled())
     }
 
     /// Fade out; the dock drops it after.
@@ -311,11 +336,45 @@ impl MenuView {
             return;
         }
         self.closing = true;
-        self.pressed = false;
+        self.pressed = None;
         // Faster out than in.
         let mut fade = Spring::new(self.open.value, CLOSE_RESPONSE);
         fade.retarget(0.0);
         self.open = fade;
+    }
+
+    /// A row was dragged out: fade out, but stay until `release`.
+    pub fn hold(&mut self) {
+        self.held = true;
+        self.close();
+        if let Some(s) = &self.surface
+            && let Ok(region) = Region::new(&self.g.compositor)
+        {
+            // Nothing to click on anymore.
+            s.popup
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+        }
+    }
+
+    /// The drag from it ended: it can go.
+    pub fn release(&mut self) {
+        self.held = false;
+    }
+
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// Row `i`.
+    pub fn entry(&self, i: usize) -> Option<&Entry> {
+        self.entries.get(i)
+    }
+
+    /// Row `i`'s icon, if it has one there, and its logical size.
+    pub fn mark_buffer(&self, i: usize, cache: &Cache) -> Option<(WlBuffer, f64)> {
+        let (key, size) = mark_key(&self.entries.get(i)?.mark, self.scale, &self.style)?;
+        Some((cache.named_icon(&key).flatten()?, size))
     }
 
     pub fn moving(&self) -> bool {
@@ -515,8 +574,10 @@ impl MenuView {
         let tail = s
             .place
             .configured_tail((x as f64, y as f64), radius, m.tail.0);
-        // Input on the bubble, not on its shadow.
-        if let Ok(region) = Region::new(&self.g.compositor) {
+        // Input on the bubble, not on its shadow (none once a drag left it).
+        if !self.held
+            && let Ok(region) = Region::new(&self.g.compositor)
+        {
             let (ox, oy) = s.place.body_origin();
             for r in input_rects(&s.layout, self.position, tail, m) {
                 let r = IRect::round(Rect::new(r.x + ox, r.y + oy, r.w, r.h));
@@ -543,15 +604,34 @@ impl MenuView {
         let hit = s.layout.hit(x - ox, y - oy);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                // A press on a file's row that moves far enough drags the
+                // file out.
+                if let Some(p) = self.pressed
+                    && let Some(row) = p.row
+                    && (self.entries.get(row)).is_some_and(|e| e.file.is_some())
+                    && (x - p.at.0).hypot(y - p.at.1) > self.style.drag_threshold
+                {
+                    self.pressed = None;
+                    return MenuInput::Drag {
+                        row,
+                        serial: p.serial,
+                    };
+                }
                 self.set_highlight(hit);
             }
             PointerEventKind::Leave { .. } => {
-                self.pressed = false;
+                self.pressed = None;
                 self.set_highlight(None);
             }
-            PointerEventKind::Press { .. } => self.pressed = true,
+            PointerEventKind::Press { serial, .. } => {
+                self.pressed = Some(Press {
+                    row: hit,
+                    at: (x, y),
+                    serial: *serial,
+                });
+            }
             PointerEventKind::Release { .. } => {
-                if std::mem::take(&mut self.pressed)
+                if self.pressed.take().is_some()
                     && let Some(i) = hit
                 {
                     return self.pick(i);
@@ -679,7 +759,7 @@ impl MenuView {
             p,
             self.highlight_y.value,
             s.layout.w - 2.0 * p,
-            m.row_height,
+            s.layout.row_height,
         );
         let key = ShapeKey::Rect {
             w: row.w.round() as i32,
@@ -723,9 +803,8 @@ impl MenuView {
             let mark = match &e.mark {
                 Mark::None => None,
                 Mark::Focused => (dot.as_ref()).map(|d| (d.buffer.clone(), DOT as f64)),
-                Mark::Icon(name) => (cache.named_icon(&named(name, self.scale, &style)))
-                    .flatten()
-                    .map(|b| (b, menu::ICON)),
+                Mark::Icon(_) | Mark::File(_) => mark_key(&e.mark, self.scale, &style)
+                    .and_then(|(key, size)| Some((cache.named_icon(&key).flatten()?, size))),
             };
             match mark.and_then(|(b, size)| Some((b, s.layout.mark(i, size)?))) {
                 Some((buffer, r)) => s.marks[i].present(Some(&buffer), body(r), alpha),
@@ -753,13 +832,24 @@ impl Drop for MenuView {
     }
 }
 
-/// The key of the icon `name` in a menu row at `scale`.
-fn named(name: &str, scale: i32, style: &MenuStyle) -> NamedIcon {
-    NamedIcon {
-        name: name.to_string(),
-        size: (menu::ICON as u32) * scale.max(1) as u32,
+/// The key of a row's icon at `scale`, and its logical size; None for
+/// marks that aren't icons.
+fn mark_key(mark: &Mark, scale: i32, style: &MenuStyle) -> Option<(NamedIcon, f64)> {
+    let (name, fallbacks, size) = match mark {
+        Mark::Icon(name) => (name.clone(), Vec::new(), menu::ICON),
+        Mark::File(names) => {
+            let (first, rest) = names.split_first()?;
+            (first.clone(), rest.to_vec(), menu::FILE_ICON)
+        }
+        Mark::None | Mark::Focused => return None,
+    };
+    let key = NamedIcon {
+        name,
+        fallbacks,
+        size: (size as u32) * scale.max(1) as u32,
         theme: style.icon_theme.clone(),
-    }
+    };
+    Some((key, size))
 }
 
 /// The bubble's input region in body coordinates: the body without its

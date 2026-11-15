@@ -13,7 +13,9 @@
 //!   yet is held back for the grace period, then shows on every dock until
 //!   it's reported. Without a running stream, every dock shows every
 //!   window. Unpinned apps only show where they have windows.
-//! - With the Trash on, a separator and the Trash come last.
+//! - Then the separator, the pinned folders (in their pinned order, on
+//!   every dock, faded if they don't exist), and the Trash. The separator
+//!   shows when anything follows it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +34,12 @@ pub struct Window {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     App,
-    /// The line between the apps and the Trash.
+    /// The line between the apps and the folders and Trash.
     Separator,
+    /// A pinned folder; `exists` if it is there (as a directory).
+    Folder {
+        exists: bool,
+    },
     /// The Trash; `full` if anything is in it.
     Trash {
         full: bool,
@@ -44,11 +50,23 @@ pub enum Kind {
 pub const SEPARATOR: &str = "\0separator";
 /// The Trash's key.
 pub const TRASH: &str = "\0trash";
+/// What folders' keys start with; their pin follows.
+const FOLDER: &str = "\0folder\0";
+
+/// The key of the folder pinned as `pin`.
+pub fn folder_key(pin: &str) -> String {
+    format!("{FOLDER}{pin}")
+}
+
+/// The pin of the folder whose key is `key`, if it is one.
+pub fn folder_pin(key: &str) -> Option<&str> {
+    key.strip_prefix(FOLDER)
+}
 
 /// One icon in the dock: every window with the same app ID shares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
-    /// The app ID; for the separator and the Trash, their keys.
+    /// The app ID; for the other items, their keys.
     pub app_id: String,
     pub kind: Kind,
     pub pinned: bool,
@@ -69,18 +87,24 @@ pub enum Click {
     /// Launch the app.
     Launch,
     OpenTrash,
+    /// Open the folder's popup.
+    OpenFolder,
     Nothing,
 }
 
 impl Item {
-    /// An item that isn't an app.
+    /// An item that isn't an app or a folder.
     fn other(kind: Kind) -> Self {
         let key = match kind {
             Kind::Separator => SEPARATOR,
-            Kind::Trash { .. } | Kind::App => TRASH,
+            Kind::Trash { .. } | Kind::App | Kind::Folder { .. } => TRASH,
         };
+        Self::keyed(key.to_string(), kind)
+    }
+
+    fn keyed(key: String, kind: Kind) -> Self {
         Self {
-            app_id: key.to_string(),
+            app_id: key,
             kind,
             pinned: false,
             windows: Vec::new(),
@@ -97,10 +121,19 @@ impl Item {
         matches!(self.kind, Kind::Trash { .. })
     }
 
+    pub fn is_folder(&self) -> bool {
+        matches!(self.kind, Kind::Folder { .. })
+    }
+
+    /// The folder's pin, if it is a folder.
+    pub fn folder(&self) -> Option<&str> {
+        folder_pin(&self.app_id).filter(|_| self.is_folder())
+    }
+
     /// Whether it can be dragged to another place (or the Trash): apps
-    /// that can be pinned.
+    /// that can be pinned, and folders.
     pub fn draggable(&self) -> bool {
-        self.is_app() && !self.app_id.is_empty()
+        (self.is_app() && !self.app_id.is_empty()) || self.is_folder()
     }
 
     /// What a click does: activate the most recently focused of the
@@ -111,6 +144,13 @@ impl Item {
             Kind::App => {}
             Kind::Separator => return Click::Nothing,
             Kind::Trash { .. } => return Click::OpenTrash,
+            Kind::Folder { exists } => {
+                return if exists {
+                    Click::OpenFolder
+                } else {
+                    Click::Nothing
+                };
+            }
         }
         for windows in [&self.windows, &self.elsewhere] {
             if let Some(first) = windows.first() {
@@ -288,10 +328,25 @@ pub fn items(
     out
 }
 
-/// The separator and the Trash, after `items`.
-pub fn add_trash(items: &mut Vec<Item>, full: bool) {
+/// After `items`: the separator if anything follows it, the pinned
+/// `folders` (each a pin and whether it exists), and the Trash if
+/// `trash` says whether it is full.
+pub fn add_tail(items: &mut Vec<Item>, folders: &[(String, bool)], trash: Option<bool>) {
+    if folders.is_empty() && trash.is_none() {
+        return;
+    }
     items.push(Item::other(Kind::Separator));
-    items.push(Item::other(Kind::Trash { full }));
+    for (pin, exists) in folders {
+        let key = folder_key(pin);
+        if !items.iter().any(|i| i.app_id == key) {
+            let mut item = Item::keyed(key, Kind::Folder { exists: *exists });
+            item.pinned = true;
+            items.push(item);
+        }
+    }
+    if let Some(full) = trash {
+        items.push(Item::other(Kind::Trash { full }));
+    }
 }
 
 #[cfg(test)]
@@ -527,7 +582,7 @@ mod tests {
     #[test]
     fn the_trash_comes_last() {
         let mut got = all(&[toplevel("1", "term")], &["files"]);
-        add_trash(&mut got, true);
+        add_tail(&mut got, &[], Some(true));
         let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();
         assert_eq!(
             kinds,
@@ -550,5 +605,37 @@ mod tests {
                 .filter(|i| i.is_app())
                 .all(|i| !i.app_id.contains('\0'))
         );
+    }
+
+    #[test]
+    fn folders_after_the_separator() {
+        let mut got = all(&[toplevel("1", "term")], &[]);
+        let folders = [
+            ("~/Downloads".to_string(), true),
+            ("/gone".to_string(), false),
+            ("~/Downloads".to_string(), true),
+        ];
+        add_tail(&mut got, &folders, None);
+        let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Kind::App,
+                Kind::Separator,
+                Kind::Folder { exists: true },
+                Kind::Folder { exists: false },
+            ]
+        );
+        assert_eq!(got[2].folder(), Some("~/Downloads"));
+        assert_eq!(folder_pin(&got[3].app_id), Some("/gone"));
+        assert!(got[2].draggable() && got[2].pinned && !got[0].is_folder());
+        let mru = Mru::default();
+        assert_eq!(got[2].click(&mru), Click::OpenFolder);
+        // A missing folder does nothing.
+        assert_eq!(got[3].click(&mru), Click::Nothing);
+        // Nothing after the apps: no separator.
+        let mut alone = all(&[toplevel("1", "term")], &[]);
+        add_tail(&mut alone, &[], None);
+        assert_eq!(alone.len(), 1);
     }
 }

@@ -46,6 +46,8 @@ pub struct Key {
 pub struct NamedIcon {
     /// A theme icon name, an absolute path, or a path under `~/`.
     pub name: String,
+    /// Tried in order if `name` isn't found.
+    pub fallbacks: Vec<String>,
     /// Buffer pixels.
     pub size: u32,
     /// The configured theme, if any.
@@ -204,16 +206,18 @@ impl Icons {
         image
     }
 
-    /// The icon named `key.name` (a theme name or a path), from the cache
-    /// or looked up and decoded. None if there is none.
+    /// The icon named `key.name` (a theme name or a path), or else one of
+    /// its fallbacks, from the cache or looked up and decoded. None if
+    /// there is none.
     pub fn named(&mut self, key: &NamedIcon) -> Option<Arc<Image>> {
         if let Some(cached) = self.named.get(key) {
             return cached.clone();
         }
         let theme = self.theme(&key.theme);
-        let image = (key.size > 0 && !key.name.trim().is_empty())
-            .then(|| find(&expand_home(key.name.trim()), key.size, &theme))
-            .flatten()
+        let image = (std::iter::once(&key.name).chain(&key.fallbacks))
+            .map(|name| name.trim())
+            .filter(|name| key.size > 0 && !name.is_empty())
+            .find_map(|name| find(&expand_home(name), key.size, &theme))
             .map(Arc::new);
         self.named.insert(key.clone(), image.clone());
         image
@@ -356,6 +360,29 @@ impl AppEntry {
             .ok_or("the desktop entry has no Exec")?;
         exec_argv(exec, files, self)
     }
+
+    /// The file field code `Exec=` has (`f`, `F`, `u` or `U`): how it
+    /// opens files. None: it can't.
+    pub fn file_code(&self) -> Option<char> {
+        file_code(self.exec.as_deref()?)
+    }
+}
+
+/// The first file field code (`%f %F %u %U`) outside quotes in `exec`.
+pub fn file_code(exec: &str) -> Option<char> {
+    let args = split_exec(exec).ok()?;
+    (args.iter().filter(|(_, quoted)| !quoted)).find_map(|(arg, _)| {
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                match chars.next() {
+                    Some(code @ ('f' | 'F' | 'u' | 'U')) => return Some(code),
+                    _ => continue,
+                }
+            }
+        }
+        None
+    })
 }
 
 /// `exec` (an `Exec=` value) split into argv, with its field codes
@@ -731,6 +758,21 @@ Exec=example --unlisted
         assert!(argv(r#"app "open"#, &[]).is_err());
         assert!(argv("%u", &[]).is_err());
         assert!(argv("   ", &[]).is_err());
+    }
+
+    #[test]
+    fn file_codes() {
+        assert_eq!(file_code("app %U"), Some('U'));
+        assert_eq!(file_code("app --open=%f -x"), Some('f'));
+        assert_eq!(file_code("app %i %u %F"), Some('u'));
+        // Quoted, escaped or missing: none.
+        assert_eq!(file_code(r#"sh -c "echo %f""#), None);
+        assert_eq!(file_code("app 100%%f"), None);
+        assert_eq!(file_code("app --new-window"), None);
+        let mut e = entry();
+        assert_eq!(e.file_code(), None);
+        e.exec = Some("nautilus %U".into());
+        assert_eq!(e.file_code(), Some('U'));
     }
 
     #[test]

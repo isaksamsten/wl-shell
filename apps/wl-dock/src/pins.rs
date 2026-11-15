@@ -6,11 +6,12 @@
 //! ```
 //!
 //! One item per line, in dock order. Blank lines and `#` comments are
-//! ignored. A line that starts with `/` or `~/` is a path (a folder or a
-//! file; not shown yet), anything else an app ID. The file is written
-//! atomically (a temp file, then a rename). The dock watches it and
-//! reloads it when it changes, so `wl-dock pin` and editing it by hand
-//! both work. A missing file means no pins.
+//! ignored. A line that starts with `/` or `~/` is a folder's path,
+//! anything else an app ID. Folders are shown after the apps; a path
+//! that is a file is skipped (files are never pinned). The file is
+//! written atomically (a temp file, then a rename). The dock watches it
+//! and reloads it when it changes, so `wl-dock pin` and editing it by
+//! hand both work. A missing file means no pins.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pin {
     App(String),
-    /// A folder or file, as written (`~/` kept).
+    /// A folder, as written (`~/` kept).
     Path(String),
 }
 
@@ -28,7 +29,7 @@ impl Pin {
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
         match s.starts_with('/') || s.starts_with("~/") {
-            true => Pin::Path(s.to_string()),
+            true => Pin::Path(s.to_string()).normalized(),
             false => Pin::App(s.to_string()),
         }
     }
@@ -86,6 +87,57 @@ pub fn apps(pins: &[Pin]) -> Vec<String> {
         .collect()
 }
 
+/// The paths among `pins`, in order.
+pub fn paths(pins: &[Pin]) -> Vec<String> {
+    (pins.iter())
+        .filter_map(|p| match p {
+            Pin::Path(p) => Some(p.clone()),
+            Pin::App(_) => None,
+        })
+        .collect()
+}
+
+/// A pinned path as a path: `~/` expanded.
+pub fn expand(path: &str) -> PathBuf {
+    PathBuf::from(wl_shell_render::icons::expand_home(path))
+}
+
+/// The pin of the absolute `path`: under `~/` if it is in the home
+/// directory, so the pins file reads well.
+pub fn for_path(path: &Path) -> Pin {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let text = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    };
+    Pin::Path(text).normalized()
+}
+
+impl Pin {
+    /// The same pin, a path without trailing slashes (but `/`).
+    fn normalized(self) -> Self {
+        match self {
+            Pin::Path(p) if p.len() > 1 && p.ends_with('/') => {
+                let trimmed = match p.trim_end_matches('/') {
+                    "" => "/",
+                    "~" => "~/",
+                    t => t,
+                };
+                Pin::Path(trimmed.to_string())
+            }
+            pin => pin,
+        }
+    }
+
+    /// The same kind of pin: both apps or both paths.
+    fn same_kind(&self, other: &Pin) -> bool {
+        matches!(
+            (self, other),
+            (Pin::App(_), Pin::App(_)) | (Pin::Path(_), Pin::Path(_))
+        )
+    }
+}
+
 /// Read the pins at `path`; none if it doesn't exist.
 pub fn read(path: &Path) -> io::Result<Vec<Pin>> {
     match std::fs::read_to_string(path) {
@@ -124,24 +176,29 @@ pub fn unpin(pins: &mut Vec<Pin>, pin: &Pin) -> bool {
     pins.len() != before
 }
 
-/// Pin `app_id` as the `k`th pinned app (from 0), moving it there if it
-/// is pinned already. Paths keep their places. Returns whether the pins
-/// changed.
-pub fn place_app(pins: &mut Vec<Pin>, app_id: &str, k: usize) -> bool {
-    let pin = Pin::App(app_id.to_string());
+/// Pin `pin` as the `k`th pin of its kind (apps or paths; from 0),
+/// moving it there if it is pinned already. The other kind keeps its
+/// places. Returns whether the pins changed.
+pub fn place(pins: &mut Vec<Pin>, pin: Pin, k: usize) -> bool {
     let before = pins.clone();
     pins.retain(|p| *p != pin);
-    let apps: Vec<usize> = (pins.iter().enumerate())
-        .filter(|(_, p)| matches!(p, Pin::App(_)))
+    let same: Vec<usize> = (pins.iter().enumerate())
+        .filter(|(_, p)| p.same_kind(&pin))
         .map(|(i, _)| i)
         .collect();
-    let at = match apps.get(k) {
+    let at = match same.get(k) {
         Some(&i) => i,
-        // After the last app (before the paths after it), or at the end.
-        None => apps.last().map_or(pins.len(), |&i| i + 1),
+        // After the last of its kind, or at the end.
+        None => same.last().map_or(pins.len(), |&i| i + 1),
     };
     pins.insert(at, pin);
     *pins != before
+}
+
+/// Pin `app_id` as the `k`th pinned app (see `place`).
+#[cfg(test)]
+pub fn place_app(pins: &mut Vec<Pin>, app_id: &str, k: usize) -> bool {
+    place(pins, Pin::App(app_id.to_string()), k)
 }
 
 /// What the `pin`, `unpin` and `pins` commands do, on the default file.
@@ -160,11 +217,39 @@ pub mod cli {
         write(path, pins).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Pin `item` (an app ID or a path). The message for the user, if any.
+    /// An argument: an app ID, or a path (relative ones made absolute).
+    fn item(arg: &str) -> Pin {
+        let arg = arg.trim();
+        let relative = arg == "."
+            || arg == ".."
+            || (arg.contains('/') && !arg.starts_with('/') && !arg.starts_with("~/"));
+        let absolute = || {
+            std::fs::canonicalize(arg)
+                .or_else(|_| std::path::absolute(arg))
+                .ok()
+        };
+        match relative.then(absolute).flatten() {
+            Some(abs) => for_path(&abs),
+            None => Pin::parse(arg),
+        }
+    }
+
+    /// Pin `item` (an app ID or a folder). The message for the user, if
+    /// any. Files are refused.
     pub fn add(item: &str) -> Result<Option<String>, String> {
-        let item = Pin::parse(item);
+        let item = self::item(item);
         if item.text().is_empty() {
             return Err("nothing to pin".into());
+        }
+        let mut note = None;
+        if let Pin::Path(p) = &item {
+            match std::fs::metadata(expand(p)) {
+                Ok(m) if !m.is_dir() => {
+                    return Err(format!("{p} is a file: only folders can be pinned"));
+                }
+                Ok(_) => {}
+                Err(_) => note = Some(format!("{p} doesn't exist: it shows faded")),
+            }
         }
         let path = file()?;
         let mut pins = load(&path)?;
@@ -172,15 +257,12 @@ pub mod cli {
             return Ok(Some(format!("{} is pinned already", item.text())));
         }
         save(&path, &pins)?;
-        Ok(match item {
-            Pin::Path(_) => Some("the dock doesn't show folders and files yet".into()),
-            Pin::App(_) => None,
-        })
+        Ok(note)
     }
 
     /// Unpin `item`. The message for the user, if any.
     pub fn remove(item: &str) -> Result<Option<String>, String> {
-        let item = Pin::parse(item);
+        let item = self::item(item);
         let path = file()?;
         let mut pins = load(&path)?;
         if !unpin(&mut pins, &item) {
@@ -254,6 +336,35 @@ mod tests {
         let mut none = Vec::new();
         assert!(place_app(&mut none, "a", 3));
         assert_eq!(none, [Pin::App("a".into())]);
+    }
+
+    #[test]
+    fn placing_folders() {
+        let mut pins = parse("a\n~/x\nb\n/y\n");
+        let path = |p: &str| Pin::Path(p.into());
+        // Among the paths only; the apps keep their places.
+        assert!(place(&mut pins, path("/y"), 0));
+        assert_eq!(format(&pins), format(&parse("a\n/y\n~/x\nb\n")));
+        // A new one, after the last path.
+        assert!(place(&mut pins, path("/z"), 5));
+        assert_eq!(paths(&pins), ["/y", "~/x", "/z"]);
+        assert!(place(&mut pins, path("/w"), 1));
+        assert_eq!(paths(&pins), ["/y", "/w", "~/x", "/z"]);
+        assert_eq!(apps(&pins), ["a", "b"]);
+    }
+
+    #[test]
+    fn paths_as_written() {
+        // Trailing slashes go, but `/` stays.
+        assert_eq!(Pin::parse("~/Downloads/"), Pin::Path("~/Downloads".into()));
+        assert_eq!(Pin::parse("/"), Pin::Path("/".into()));
+        assert_eq!(for_path(Path::new("/srv/x/")), Pin::Path("/srv/x".into()));
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && home != Path::new("/")
+        {
+            assert_eq!(for_path(&home.join("Music")), Pin::Path("~/Music".into()));
+            assert_eq!(expand("~/Music"), home.join("Music"));
+        }
     }
 
     #[test]

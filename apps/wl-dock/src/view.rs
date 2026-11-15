@@ -52,7 +52,10 @@
 //!
 //! The Trash (dock.rs) comes last, after a separator: a thin line that
 //! takes a fixed length along the dock and doesn't magnify. Its icon
-//! follows whether the Trash is empty.
+//! follows whether the Trash is empty. Pinned folders sit between the
+//! separator and the Trash, with their theme icon (folder.rs), faded if
+//! they don't exist; a folder's popup is a menu (`open_menu` with
+//! `popup`) whose file rows can be dragged out (`MenuEvent::DragOut`).
 //!
 //! Dragging (drag.rs): an app's icon lifts out of the dock and follows
 //! the pointer on its own subsurface, on top of everything, kept on the
@@ -65,10 +68,19 @@
 //! the gap's spring becomes the slot's, so the pins' new order (applied
 //! by app.rs right away) takes over without a jump; the icon then flies
 //! to its slot, as it does back home when the drag is cancelled. Into
-//! the Trash, it just goes.
+//! the Trash, it just goes. Folders reorder among the folders the same
+//! way.
+//!
+//! Drops from outside (drag.rs): a `wl_data_device` drag over the dock
+//! magnifies it as the pointer does. app.rs says which items take it and
+//! what their labels say (`Offer`); the target under it grows and its
+//! label says what a drop does, and folders that can be pinned open a
+//! gap among the folders, labelled over the gap. A hidden dock comes back
+//! for a drag on its trigger band and stays while the drag is over it.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -112,9 +124,11 @@ use crate::autohide;
 use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
 use crate::dock::{self, Item, Kind, Window};
 use crate::drag::{self, Target};
+use crate::folder::{self, UserDirs};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
-use crate::menu::{self, Group, MenuKey};
+use crate::menu::{self, MenuKey};
 use crate::menuview::{MenuInput, MenuStyle, MenuView};
+use crate::pins;
 use crate::row::{self, Slot};
 use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
@@ -131,10 +145,15 @@ const LABEL_RESPONSE: f64 = 100.0;
 const BOUNCE: f64 = 0.4;
 /// The autohide slide's response, in spring responses.
 const SLIDE_RESPONSE: f64 = 1.5;
-/// How much the Trash grows while it takes the dragged icon.
-const TRASH_GROW: f64 = 0.15;
+/// How much the target of a drag grows while it takes it.
+const TARGET_GROW: f64 = 0.15;
 /// The Trash's label while it takes the dragged icon.
 const REMOVE_LABEL: &str = "Remove from Dock";
+/// The label's key while a drop from outside would pin folders: it
+/// follows the gap.
+const GAP_LABEL: &str = "\0gap";
+/// How visible a folder that doesn't exist is.
+const MISSING_ALPHA: f64 = 0.4;
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -168,6 +187,10 @@ pub struct Style {
     /// Icons (names or paths) and names from `[app.<id>]` tables.
     icons: BTreeMap<String, String>,
     names: BTreeMap<String, String>,
+    /// Icons from `[folder.<path>]` tables, by path.
+    folder_icons: Vec<(PathBuf, String)>,
+    /// The XDG user directories, for their folders' icons.
+    user_dirs: UserDirs,
 }
 
 impl Style {
@@ -225,6 +248,7 @@ impl Style {
                 highlight: theme.menu_highlight,
                 shadow: config.menu_shadow(),
                 icon_theme: theme.icon_theme.clone(),
+                drag_threshold: config.drag_threshold as f64,
             },
             autohide: autohide::Settings {
                 enabled: layout.autohide,
@@ -240,6 +264,10 @@ impl Style {
             names: (config.app.iter())
                 .filter_map(|(id, a)| Some((id.clone(), a.name.clone()?)))
                 .collect(),
+            folder_icons: (config.folder.iter())
+                .filter_map(|(path, f)| Some((pins::expand(path), f.icon.clone()?)))
+                .collect(),
+            user_dirs: UserDirs::load(),
         }
     }
 
@@ -294,6 +322,15 @@ impl Style {
     fn separator_len(&self) -> f64 {
         (self.icon() / 4.0).round().max(2.0 * self.gap).max(4.0)
     }
+
+    /// The theme icon (or icon path) of the folder at `path`.
+    fn folder_icon(&self, path: &Path) -> String {
+        let own = (self.folder_icons.iter()).find(|(p, _)| p == path);
+        match own {
+            Some((_, icon)) => icon.clone(),
+            None => self.user_dirs.icon(path).unwrap_or(folder::ICON).into(),
+        }
+    }
 }
 
 /// The subsurfaces of one slot.
@@ -302,9 +339,27 @@ struct SlotSubs {
     icon: Sub,
 }
 
+/// The pinned items that have an order among themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    Apps,
+    Folders,
+}
+
+impl Group {
+    fn of(item: &Item) -> Option<Self> {
+        match item.kind {
+            Kind::App => Some(Group::Apps),
+            Kind::Folder { .. } => Some(Group::Folders),
+            Kind::Separator | Kind::Trash { .. } => None,
+        }
+    }
+}
+
 /// An icon being dragged.
 struct Drag {
     app_id: String,
+    group: Group,
     /// Where the pointer is on the surface.
     at: (f64, f64),
     /// From the pointer to the icon's center, as it was picked up.
@@ -314,10 +369,11 @@ struct Drag {
     target: Target,
 }
 
-/// A gap among the pinned apps where the dragged icon would land, opening
-/// or closing.
+/// A gap among the pinned apps or folders where a dragged icon (or
+/// folders from outside) would land, opening or closing.
 struct Gap {
-    /// Before the slot of this app; None: after the last pinned app.
+    group: Group,
+    /// Before the slot of this item; None: after the last pinned one.
     before: Option<String>,
     presence: Spring,
 }
@@ -331,17 +387,59 @@ struct Fly {
     t: Spring,
 }
 
+/// What a drag from outside over the dock may do, from app.rs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Offer {
+    /// The items that take it, and the label saying what a drop does.
+    pub takers: Vec<(String, String)>,
+    /// It holds folders only: the label for pinning them, if they can be.
+    pub pin: Option<String>,
+}
+
+/// What happened on the menu.
+pub enum MenuEvent {
+    /// A row of the menu of this item was picked.
+    Pick(String, menu::Action),
+    /// A file's row was dragged out, by the press with `serial` on
+    /// `surface`; start a drag of it, with `icon` (a buffer at `scale`
+    /// and its logical size) under the pointer, then `hold_menu`.
+    DragOut {
+        path: PathBuf,
+        serial: u32,
+        surface: WlSurface,
+        icon: Option<(WlBuffer, f64)>,
+        scale: i32,
+    },
+}
+
+/// A drag from outside over the dock.
+struct Incoming {
+    /// Where it is on the surface.
+    at: (f64, f64),
+    /// None until its data is there.
+    offer: Option<Offer>,
+    target: drag::DropTarget,
+}
+
 /// The row as laid out: a cell per slot, and per gap.
 struct Laid {
     row: zoom::Row,
     /// Per cell, its slot (None: a gap).
     slots: Vec<Option<usize>>,
+    /// Per cell, its gap (None: a slot).
+    gaps: Vec<Option<usize>>,
 }
 
 impl Laid {
     /// Slot `i`'s cell.
     fn cell(&self, i: usize) -> Option<&zoom::Cell> {
         let k = self.slots.iter().position(|s| *s == Some(i))?;
+        self.row.cells.get(k)
+    }
+
+    /// Gap `i`'s cell.
+    fn gap_cell(&self, i: usize) -> Option<&zoom::Cell> {
+        let k = self.gaps.iter().position(|g| *g == Some(i))?;
         self.row.cells.get(k)
     }
 
@@ -445,8 +543,15 @@ pub struct DockView {
     gaps: Vec<Gap>,
     /// A dropped icon on its way to its slot.
     fly: Option<Fly>,
-    /// The Trash grows while it takes the dragged icon, 0 to 1.
-    trash_grow: Spring,
+    /// The target of a drag (the Trash, or what a drop from outside goes
+    /// to) grows while it takes it, 0 to 1.
+    grow: Spring,
+    /// The item growing.
+    grow_key: Option<String>,
+    /// A drag from outside over the dock.
+    incoming: Option<Incoming>,
+    /// The open menu is a folder's popup.
+    popup: bool,
 }
 
 impl DockView {
@@ -553,7 +658,10 @@ impl DockView {
             drag: None,
             gaps: Vec::new(),
             fly: None,
-            trash_grow: Spring::new(0.0, response),
+            grow: Spring::new(0.0, response),
+            grow_key: None,
+            incoming: None,
+            popup: false,
         };
         dock.apply_size();
         dock.relayout();
@@ -656,6 +764,9 @@ impl DockView {
         row::merge(&mut self.slots, items, self.style.response, self.configured);
         row::set_launching(&mut self.slots, &self.launching);
         self.sync_drag();
+        if let Some((x, y)) = self.incoming.as_ref().map(|i| i.at) {
+            self.dnd_motion(x, y);
+        }
         let qh = &self.qh;
         let parent = self.layer.wl_surface();
         while self.slot_subs.len() < self.slots.len() {
@@ -733,6 +844,19 @@ impl DockView {
                 let key = self.app_icon_key(trash::icon(full));
                 Some(key.with_icon(Some(trash::icon(full).into())))
             }
+            // Named `folder`, so a theme without the folder's icon falls
+            // back to it (then to a letter tile).
+            Kind::Folder { .. } => {
+                let path = pins::expand(item.folder()?);
+                let key = icons::Key::new(
+                    folder::ICON,
+                    self.style.icon_key_size(),
+                    self.style.icon_theme.clone(),
+                    self.style.icon_shadow,
+                    self.scale,
+                );
+                Some(key.with_icon(Some(self.style.folder_icon(&path))))
+            }
         }
     }
 
@@ -740,7 +864,10 @@ impl DockView {
         let name = match app_id {
             dock::SEPARATOR => return None,
             dock::TRASH => Some("Trash".to_string()),
-            _ => self.style.names.get(app_id).cloned(),
+            _ => match dock::folder_pin(app_id) {
+                Some(pin) => Some(folder::name(pin, &pins::expand(pin))),
+                None => self.style.names.get(app_id).cloned(),
+            },
         };
         Some(LabelKey {
             app_id: app_id.to_string(),
@@ -915,34 +1042,55 @@ impl DockView {
     /// Where `app_id` is in the dock's order, for drag.rs.
     fn dragged(&self, app_id: &str) -> Option<drag::Dragged> {
         let slot = (self.slots.iter()).find(|s| !s.leaving && s.item.app_id == app_id)?;
+        let group = Group::of(&slot.item)?;
         if !slot.item.pinned {
             return Some(drag::Dragged::Running);
         }
-        let i = (self.pinned_slots(None)).position(|(_, s)| s.item.app_id == app_id)?;
+        let i = (self.pinned_slots(group, None)).position(|(_, s)| s.item.app_id == app_id)?;
         Some(drag::Dragged::Pinned(i))
     }
 
-    /// The pinned apps' slots (and their indices) in order, but `except`.
+    /// The pinned slots of `group` (and their indices) in order, but
+    /// `except`.
     fn pinned_slots<'a>(
         &'a self,
+        group: Group,
         except: Option<&'a str>,
     ) -> impl Iterator<Item = (usize, &'a Slot)> + 'a {
         (self.slots.iter().enumerate()).filter(move |(_, s)| {
-            !s.leaving && s.item.pinned && s.item.is_app() && Some(s.item.app_id.as_str()) != except
+            !s.leaving
+                && s.item.pinned
+                && Group::of(&s.item) == Some(group)
+                && Some(s.item.app_id.as_str()) != except
         })
     }
 
-    /// Where a gap anchored `before` an app's slot goes among the slots.
-    fn gap_index(&self, before: Option<&str>) -> usize {
+    /// Where a gap of `group` anchored `before` a slot goes among the
+    /// slots.
+    fn gap_index(&self, group: Group, before: Option<&str>) -> usize {
         if let Some(key) = before
             && let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == key)
         {
             return i;
         }
-        // After the last pinned app (other than the lifted one).
-        (self.pinned_slots(self.lifted()))
-            .last()
-            .map_or(0, |(i, _)| i + 1)
+        // After the last pinned one (other than the lifted one).
+        if let Some((i, _)) = self.pinned_slots(group, self.lifted()).last() {
+            return i + 1;
+        }
+        match group {
+            Group::Apps => 0,
+            // The folders' place: after the separator, else before the
+            // Trash, else at the end.
+            Group::Folders => {
+                let at = |kind: fn(&Item) -> bool| {
+                    (self.slots.iter()).position(|s| !s.leaving && kind(&s.item))
+                };
+                at(|i| i.kind == Kind::Separator)
+                    .map(|i| i + 1)
+                    .or_else(|| at(Item::is_trash))
+                    .unwrap_or(self.slots.len())
+            }
+        }
     }
 
     /// Lay out the slots and gaps with the pointer at `pointer` and the
@@ -954,17 +1102,24 @@ impl DockView {
             false => s.value,
         };
         let gaps: Vec<(usize, f64)> = (self.gaps.iter())
-            .map(|g| (self.gap_index(g.before.as_deref()), weight(&g.presence)))
+            .map(|g| {
+                (
+                    self.gap_index(g.group, g.before.as_deref()),
+                    weight(&g.presence),
+                )
+            })
             .collect();
         let separator = self.style.separator_len();
         let n = self.slots.len();
         let mut slots = Vec::with_capacity(n + gaps.len());
         let mut cells = Vec::with_capacity(n + gaps.len());
+        let mut gap_cells = Vec::with_capacity(n + gaps.len());
         for i in 0..=n {
-            for &(at, w) in &gaps {
+            for (k, &(at, w)) in gaps.iter().enumerate() {
                 if at.min(n) == i {
                     slots.push(zoom::Slot::from(w.clamp(0.0, 1.0)));
                     cells.push(None);
+                    gap_cells.push(Some(k));
                 }
             }
             if let Some(s) = self.slots.get(i) {
@@ -974,6 +1129,7 @@ impl DockView {
                     _ => zoom::Slot::from(w),
                 });
                 cells.push(Some(i));
+                gap_cells.push(None);
             }
         }
         let center = self.frame().length() / 2.0;
@@ -983,15 +1139,33 @@ impl DockView {
             pointer,
             &self.style.zoom(hover.clamp(0.0, 1.0)),
         );
-        Laid { row, slots: cells }
+        Laid {
+            row,
+            slots: cells,
+            gaps: gap_cells,
+        }
+    }
+
+    /// Whether the point (`u`, `v`) along and across the dock is over it,
+    /// as laid out.
+    fn on_dock(&self, laid: &Laid, u: f64, v: f64) -> bool {
+        let m = self.style.metrics();
+        let step = m.icon + self.style.gap;
+        v <= m.icon_v() + laid.row.largest().max(m.icon) + LABEL_GAP
+            && u >= laid.row.start - step / 2.0
+            && u <= laid.row.end + step / 2.0
     }
 
     /// A press on `app_id`'s icon moved far enough: pick the icon up, with
     /// the pointer at (`x`, `y`). Returns whether it was.
     pub fn start_drag(&mut self, core: &Core<WlDock>, app_id: &str, x: f64, y: f64) -> bool {
-        let draggable = (self.slots.iter())
-            .any(|s| !s.leaving && s.item.app_id == app_id && s.item.draggable());
-        if !draggable || !self.configured || self.drag.is_some() {
+        let item = (self.slots.iter())
+            .find(|s| !s.leaving && s.item.app_id == app_id && s.item.draggable())
+            .map(|s| &s.item);
+        let Some(group) = item.and_then(Group::of) else {
+            return false;
+        };
+        if !self.configured || self.drag.is_some() || self.incoming.is_some() {
             return false;
         }
         let Some(i) = self.slots.iter().position(|s| s.item.app_id == app_id) else {
@@ -1011,6 +1185,7 @@ impl DockView {
         self.fly = None;
         self.drag = Some(Drag {
             app_id: app_id.to_string(),
+            group,
             at: (x, y),
             offset: (cx - x, cy - y),
             size,
@@ -1027,7 +1202,7 @@ impl DockView {
 
     /// The pointer moved to (`x`, `y`) while dragging.
     fn drag_motion(&mut self, x: f64, y: f64) {
-        let Some(app_id) = self.drag.as_ref().map(|d| d.app_id.clone()) else {
+        let Some((app_id, group)) = self.drag.as_ref().map(|d| (d.app_id.clone(), d.group)) else {
             return;
         };
         let Some(dragged) = self.dragged(&app_id) else {
@@ -1039,11 +1214,9 @@ impl DockView {
         // As it will be drawn, if the pointer is on the dock.
         let laid = self.lay(u, self.hover.value, false);
         let step = m.icon + self.style.gap;
-        let on_dock = v <= m.icon_v() + laid.row.largest().max(m.icon) + LABEL_GAP
-            && u >= laid.row.start - step / 2.0
-            && u <= laid.row.end + step / 2.0;
-        // The other pinned apps' centers, and where they (and the gap
-        // among them) end.
+        let on_dock = self.on_dock(&laid, u, v);
+        // The other pinned items' centers of its group, and where they
+        // (and the gap among them) end.
         let mut pinned = Vec::new();
         let mut pinned_end = None;
         for (cell, slot) in laid.row.cells.iter().zip(&laid.slots) {
@@ -1051,7 +1224,7 @@ impl DockView {
                 None => true,
                 Some(i) => {
                     let s = &self.slots[*i];
-                    let other = !s.leaving && s.item.pinned && s.item.is_app();
+                    let other = !s.leaving && s.item.pinned && Group::of(&s.item) == Some(group);
                     let other = other && s.item.app_id != app_id;
                     if other {
                         pinned.push(cell.center);
@@ -1086,16 +1259,12 @@ impl DockView {
         }
         if changed {
             self.set_gap(match target {
-                Target::Gap(k) => Some(
-                    (self.pinned_slots(Some(&app_id)))
-                        .nth(k)
-                        .map(|(_, s)| s.item.app_id.clone()),
-                ),
+                Target::Gap(k) => Some((group, self.nth_pinned(group, k, Some(&app_id)))),
                 Target::Home | Target::Trash => None,
             });
-            self.trash_grow.retarget(match target {
-                Target::Trash => 1.0,
-                _ => 0.0,
+            self.set_grow(match target {
+                Target::Trash => Some(dock::TRASH.to_string()),
+                _ => None,
             });
             self.update_label();
         }
@@ -1103,19 +1272,47 @@ impl DockView {
         self.kick();
     }
 
-    /// Open a gap before `before` (None: after the pinned apps), or none
-    /// at all; the others close.
-    fn set_gap(&mut self, gap: Option<Option<String>>) {
+    /// The key of the `k`th pinned item of `group` but `except` (None:
+    /// past the last), which a gap before it is anchored to.
+    fn nth_pinned(&self, group: Group, k: usize, except: Option<&str>) -> Option<String> {
+        (self.pinned_slots(group, except))
+            .nth(k)
+            .map(|(_, s)| s.item.app_id.clone())
+    }
+
+    /// Make `key` the item that grows (None: none).
+    fn set_grow(&mut self, key: Option<String>) {
+        match key {
+            Some(key) => {
+                if self.grow_key.as_ref() != Some(&key) {
+                    // Another target: it grows from its rest.
+                    self.grow.snap(0.0);
+                    self.grow_key = Some(key);
+                }
+                self.grow.retarget(1.0);
+            }
+            // The last one shrinks back.
+            None => self.grow.retarget(0.0),
+        }
+    }
+
+    /// Open a gap of a group before an item (None: after the group's
+    /// pinned items), or none at all; the others close.
+    fn set_gap(&mut self, gap: Option<(Group, Option<String>)>) {
         for g in &mut self.gaps {
-            let wanted = gap.as_ref() == Some(&g.before);
+            let wanted = gap.as_ref() == Some(&(g.group, g.before.clone()));
             g.presence.retarget(if wanted { 1.0 } else { 0.0 });
         }
-        if let Some(before) = gap
-            && !self.gaps.iter().any(|g| g.before == before)
+        if let Some((group, before)) = gap
+            && !(self.gaps.iter()).any(|g| g.group == group && g.before == before)
         {
             let mut presence = Spring::new(0.0, self.style.response);
             presence.retarget(1.0);
-            self.gaps.push(Gap { before, presence });
+            self.gaps.push(Gap {
+                group,
+                before,
+                presence,
+            });
         }
     }
 
@@ -1195,7 +1392,7 @@ impl DockView {
                 t,
             });
         }
-        self.trash_grow.retarget(0.0);
+        self.set_grow(None);
         self.sync_autohide();
         self.update_label();
         self.kick();
@@ -1212,6 +1409,167 @@ impl DockView {
         Rect::new(cx - half, cy - half, drag.size, drag.size)
     }
 
+    // -- drops from outside ----------------------------------------------------
+
+    /// A drag from outside entered the dock at (`x`, `y`); what it may do
+    /// follows with `set_offer` once its data is read.
+    pub fn dnd_enter(&mut self, core: &Core<WlDock>, x: f64, y: f64) {
+        self.incoming = Some(Incoming {
+            at: (x, y),
+            offer: None,
+            target: drag::DropTarget::Nothing,
+        });
+        self.cancel_label_timer();
+        self.label_on = false;
+        self.set_hovered(core, None);
+        self.sync_autohide();
+        self.dnd_motion(x, y);
+    }
+
+    /// What the drag from outside may do (None: nothing).
+    pub fn set_offer(&mut self, offer: Option<Offer>) {
+        let Some(incoming) = &mut self.incoming else {
+            return;
+        };
+        if incoming.offer == offer {
+            return;
+        }
+        incoming.offer = offer;
+        let (x, y) = incoming.at;
+        self.dnd_motion(x, y);
+        // The label may say something else now.
+        self.update_label();
+    }
+
+    /// What dropping the drag from outside would do now.
+    pub fn incoming_target(&self) -> Option<&drag::DropTarget> {
+        self.incoming.as_ref().map(|i| &i.target)
+    }
+
+    /// The drag from outside moved to (`x`, `y`).
+    pub fn dnd_motion(&mut self, x: f64, y: f64) {
+        let Some(incoming) = &mut self.incoming else {
+            return;
+        };
+        incoming.at = (x, y);
+        let offer = incoming.offer.clone();
+        if !self.configured {
+            return;
+        }
+        let (u, v) = self.frame().dock_point(x, y);
+        let laid = self.lay(u, self.hover.value, false);
+        // Hidden, it only brings the dock back (after the delay).
+        let on_dock = self.showing() && self.on_dock(&laid, u, v);
+        let target = match &offer {
+            Some(offer) => self.drop_target(&laid, offer, on_dock, u),
+            None => drag::DropTarget::Nothing,
+        };
+        if on_dock {
+            self.pointer = u;
+            self.hover.retarget(1.0);
+        } else {
+            self.hover.retarget(0.0);
+        }
+        let changed = self.incoming.as_ref().is_some_and(|i| i.target != target);
+        if changed {
+            self.set_gap(match target {
+                drag::DropTarget::Pin(k) => {
+                    Some((Group::Folders, self.nth_pinned(Group::Folders, k, None)))
+                }
+                _ => None,
+            });
+            self.set_grow(match &target {
+                drag::DropTarget::Open(key) | drag::DropTarget::Into(key) => Some(key.clone()),
+                drag::DropTarget::Trash => Some(dock::TRASH.to_string()),
+                drag::DropTarget::Pin(_) | drag::DropTarget::Nothing => None,
+            });
+            if let Some(incoming) = &mut self.incoming {
+                incoming.target = target;
+            }
+            self.update_label();
+        }
+        self.kick();
+    }
+
+    /// What a drop with `offer` at `u` would do, on the dock as `laid`.
+    fn drop_target(&self, laid: &Laid, offer: &Offer, on_dock: bool, u: f64) -> drag::DropTarget {
+        let hit = laid.hit(u).and_then(|i| {
+            let s = &self.slots[i];
+            let cell = laid.cell(i)?;
+            let kind = match s.item.kind {
+                Kind::App => drag::HitKind::App,
+                Kind::Folder { .. } => drag::HitKind::Folder,
+                Kind::Trash { .. } => drag::HitKind::Trash,
+                Kind::Separator => drag::HitKind::Separator,
+            };
+            let len = (cell.end - cell.start).max(1e-6);
+            Some(drag::Hit {
+                key: &s.item.app_id,
+                kind,
+                takes: !s.leaving && offer.takers.iter().any(|(k, _)| *k == s.item.app_id),
+                at: ((u - cell.start) / len).clamp(0.0, 1.0),
+            })
+        });
+        let mut folders = Vec::new();
+        let mut zone = None;
+        for (cell, slot) in laid.row.cells.iter().zip(&laid.slots) {
+            let Some(s) = slot.map(|i| &self.slots[i]) else {
+                continue;
+            };
+            match s.item.kind {
+                Kind::Folder { .. } if !s.leaving => folders.push(cell.center),
+                Kind::Separator | Kind::Trash { .. } if zone.is_none() => zone = Some(cell.start),
+                _ => {}
+            }
+        }
+        let step = self.style.icon() + self.style.gap;
+        let scene = drag::DropScene {
+            on_dock,
+            hit,
+            folders: &folders,
+            zone: zone.unwrap_or(laid.row.end - step / 2.0),
+            pinnable: offer.pin.is_some(),
+        };
+        drag::drop_target(&scene, u)
+    }
+
+    /// The drag from outside left (or was dropped and handled).
+    pub fn dnd_leave(&mut self, core: &Core<WlDock>) {
+        if self.incoming.take().is_none() {
+            return;
+        }
+        self.set_gap(None);
+        self.set_grow(None);
+        if !self.pointer_in {
+            self.unhover(core);
+        }
+        self.sync_autohide();
+        self.update_label();
+        self.kick();
+    }
+
+    /// The label for the drag from outside, if its target takes it.
+    fn incoming_label(&self, incoming: &Incoming) -> Option<LabelKey> {
+        let offer = incoming.offer.as_ref()?;
+        let (key, name) = match &incoming.target {
+            drag::DropTarget::Nothing => return None,
+            drag::DropTarget::Pin(_) => (GAP_LABEL, offer.pin.clone()?),
+            drag::DropTarget::Open(key) | drag::DropTarget::Into(key) => {
+                let label = offer.takers.iter().find(|(k, _)| k == key)?;
+                (key.as_str(), label.1.clone())
+            }
+            drag::DropTarget::Trash => {
+                let label = offer.takers.iter().find(|(k, _)| k == dock::TRASH)?;
+                (dock::TRASH, label.1.clone())
+            }
+        };
+        Some(LabelKey {
+            app_id: key.to_string(),
+            name: Some(name),
+            ..self.label_key(dock::TRASH)?
+        })
+    }
+
     // -- autohide ------------------------------------------------------------
 
     /// Whether the dock is shown or on its way back (else hidden or
@@ -1224,7 +1582,9 @@ impl DockView {
     /// dock, or show or hide it at once if there is no delay.
     fn sync_autohide(&mut self) {
         let held = self.strip_open() || self.menu_open() || self.drag.is_some();
-        let next = autohide::next(&self.style.autohide, self.showing(), self.pointer_in, held);
+        // A drag from outside counts as the pointer.
+        let pointer_in = self.pointer_in || self.incoming.is_some();
+        let next = autohide::next(&self.style.autohide, self.showing(), pointer_in, held);
         let Some((show, delay)) = next else {
             return self.cancel_autohide_timer();
         };
@@ -1264,7 +1624,10 @@ impl DockView {
         self.autohide_timer = None;
         self.set_shown(show);
         // Back under a resting pointer: hover where it is.
-        if show && let Some((x, y)) = self.pointer_at {
+        if show && let Some((x, y)) = self.incoming.as_ref().map(|i| i.at) {
+            // Back under a drag from outside: it can drop now.
+            self.dnd_motion(x, y);
+        } else if show && let Some((x, y)) = self.pointer_at {
             self.pointer_motion(core, x, y);
         }
         self.sync_autohide();
@@ -1352,7 +1715,7 @@ impl DockView {
     }
 
     /// The label that should show: the hovered app's once the delay
-    /// passed, or while dragging, what dropping on the Trash does.
+    /// passed, or while dragging, what a drop does.
     fn wanted_label(&self) -> Option<LabelKey> {
         if let Some(drag) = &self.drag {
             let key = self.label_key(dock::TRASH)?;
@@ -1360,6 +1723,9 @@ impl DockView {
                 name: Some(REMOVE_LABEL.into()),
                 ..key
             });
+        }
+        if let Some(incoming) = &self.incoming {
+            return self.incoming_label(incoming);
         }
         // The strip replaces its app's label; no label shows over a menu.
         let stripped = |a: &str| (self.strip.as_ref()).is_some_and(|s| s.app_id == a);
@@ -1427,7 +1793,7 @@ impl DockView {
                 .any(|s| !s.presence.settled() || s.bounce.is_some())
             || self.gaps.iter().any(|g| !g.presence.settled())
             || self.fly.is_some()
-            || !self.trash_grow.settled()
+            || !self.grow.settled()
     }
 
     /// The frame callback: advance the springs and draw.
@@ -1439,7 +1805,7 @@ impl DockView {
         moving |= self.label_alpha.advance(dt);
         moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
-        moving |= self.trash_grow.advance(dt);
+        moving |= self.grow.advance(dt);
         for g in &mut self.gaps {
             moving |= g.presence.advance(dt);
         }
@@ -1576,8 +1942,9 @@ impl DockView {
                 continue;
             }
             // The Trash grows while it takes the dragged icon.
-            let grow = match item.is_trash() {
-                true => 1.0 + TRASH_GROW * self.trash_grow.value.max(0.0),
+            // The target of a drag grows while it takes it.
+            let grow = match self.grow_key.as_deref() == Some(item.app_id.as_str()) {
+                true => 1.0 + TARGET_GROW * self.grow.value.max(0.0),
                 false => 1.0,
             };
             let d = cell.size * grow;
@@ -1595,7 +1962,11 @@ impl DockView {
                     // The image reaches past the icon by its shadow, which
                     // scales with the icon.
                     let padded = r.outset(key.pad() as f64 * d / key_size);
-                    let alpha = if d >= 0.5 { seen } else { 0.0 };
+                    let faded = match item.kind {
+                        Kind::Folder { exists: false } => MISSING_ALPHA,
+                        _ => 1.0,
+                    };
+                    let alpha = if d >= 0.5 { seen * faded } else { 0.0 };
                     subs.icon.present(cache.icon(&key).as_ref(), padded, alpha);
                 }
                 _ => subs.icon.clear(),
@@ -1657,7 +2028,15 @@ impl DockView {
         // The label above (or beside) the hovered icon, following it.
         if let Some(key) = &self.label {
             let slot = self.slots.iter().position(|s| s.item.app_id == key.app_id);
-            if let Some(cell) = slot.and_then(|i| laid.cell(i)) {
+            // Pinning folders: over the open gap.
+            let gap = (key.app_id == GAP_LABEL)
+                .then(|| self.gaps.iter().position(|g| g.presence.target > 0.5))
+                .flatten();
+            let cell = match gap {
+                Some(k) => laid.gap_cell(k),
+                None => slot.and_then(|i| laid.cell(i)),
+            };
+            if let Some(cell) = cell {
                 self.label_at = (cell.center, m.icon_v() + cell.size + LABEL_GAP);
             }
         }
@@ -2032,8 +2411,14 @@ impl DockView {
         if self.strip.as_ref().is_some_and(|s| s.is(popup)) {
             self.drop_strip(core);
         }
-        if self.menu.as_ref().is_some_and(|m| m.is(popup)) {
-            self.drop_menu(core);
+        if let Some(menu) = &mut self.menu
+            && menu.is(popup)
+        {
+            // A drag from the menu still needs its surface.
+            match menu.held() {
+                true => menu.close(),
+                false => self.drop_menu(core),
+            }
         }
     }
 
@@ -2078,6 +2463,11 @@ impl DockView {
         ours
     }
 
+    /// The items on this dock (not those on their way out).
+    pub fn items(&self) -> impl Iterator<Item = &Item> {
+        (self.slots.iter().filter(|s| !s.leaving)).map(|s| &s.item)
+    }
+
     /// The item of `app_id`, if it is on this dock.
     pub fn item(&self, app_id: &str) -> Option<&Item> {
         (self.slots.iter())
@@ -2099,16 +2489,24 @@ impl DockView {
             .map(|m| m.app_id.as_str())
     }
 
-    /// Open `groups` as the menu of `app_id`, grabbing `grab` (a seat and
-    /// the serial of the click). The strip and any other menu go at once.
-    /// It shows once its rows are rendered. Returns whether it opened.
+    /// The folder whose popup is open (and not closing), by its key.
+    pub fn popup_folder(&self) -> Option<&str> {
+        self.menu_app().filter(|_| self.popup)
+    }
+
+    /// Open `groups` as the menu of `app_id` (a folder's popup if
+    /// `popup`), grabbing `grab` (a seat and the serial of the click). The
+    /// strip and any other menu go at once. It shows once its rows are
+    /// rendered. Returns whether it opened.
     pub fn open_menu(
         &mut self,
         core: &Core<WlDock>,
         app_id: &str,
-        groups: Vec<Group>,
+        groups: Vec<menu::Group>,
+        popup: bool,
         grab: Option<(&WlSeat, u32)>,
     ) -> bool {
+        self.popup = popup;
         // A grabbing popup has to be the topmost: the old ones go first.
         self.menu = None;
         if self.strip.take().is_some() {
@@ -2185,18 +2583,42 @@ impl DockView {
         self.menu_open() && (self.has_menu_surface(surface) || self.surface() == surface)
     }
 
-    /// A pointer event on the menu. Returns the app and what to do, if a
-    /// row was picked.
-    pub fn menu_pointer(
-        &mut self,
-        core: &Core<WlDock>,
-        event: &PointerEvent,
-    ) -> Option<(String, menu::Action)> {
+    /// A pointer event on the menu: a row picked, or a file dragged out.
+    pub fn menu_pointer(&mut self, core: &Core<WlDock>, event: &PointerEvent) -> Option<MenuEvent> {
         let menu = self.menu.as_mut()?;
         let (x, y) = event.position;
         let input = menu.pointer(&event.kind, x, y);
         self.kick();
-        self.menu_input(core, input)
+        if let MenuInput::Drag { row, serial } = input {
+            let menu = self.menu.as_ref()?;
+            let path = menu.entry(row)?.file.clone()?;
+            return Some(MenuEvent::DragOut {
+                path,
+                serial,
+                surface: menu.surface()?.clone(),
+                icon: menu.mark_buffer(row, &self.cache.borrow()),
+                scale: self.scale,
+            });
+        }
+        let (app_id, action) = self.menu_input(core, input)?;
+        Some(MenuEvent::Pick(app_id, action))
+    }
+
+    /// A file was dragged out of the menu: it fades, but stays until the
+    /// drag ends (`release_menu`).
+    pub fn hold_menu(&mut self, core: &Core<WlDock>) {
+        if let Some(menu) = &mut self.menu {
+            menu.hold();
+            self.menu_closed(core);
+        }
+    }
+
+    /// The drag out of the menu ended.
+    pub fn release_menu(&mut self) {
+        if let Some(menu) = &mut self.menu {
+            menu.release();
+            self.kick();
+        }
     }
 
     /// A key on the menu. Returns the app and what to do, if a row was
@@ -2217,7 +2639,7 @@ impl DockView {
         input: MenuInput,
     ) -> Option<(String, menu::Action)> {
         match input {
-            MenuInput::None => None,
+            MenuInput::None | MenuInput::Drag { .. } => None,
             MenuInput::Close => {
                 self.close_menu(core);
                 None

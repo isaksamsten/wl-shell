@@ -139,7 +139,11 @@ impl Expose {
             Done::Icon { key, .. } => overlay.icon_ready(&key),
             Done::IconsReloaded => overlay.icons_reloaded(),
             Done::Pill { tag, request, pill } => overlay.pill_ready(tag, request, pill),
-            Done::Label { .. } | Done::Entry { .. } | Done::Named { .. } | Done::Bubble { .. } => {}
+            Done::Label { .. }
+            | Done::Entry { .. }
+            | Done::Named { .. }
+            | Done::Bubble { .. }
+            | Done::Folder { .. } => {}
         }
     }
 
