@@ -42,6 +42,8 @@ enum Job {
     Refresh,
     /// A folder's entries.
     Folder { tag: u64, request: FolderRequest },
+    /// The icons of a file (or folder): its thumbnail, or its type's.
+    FileIcons { path: std::path::PathBuf, dir: bool },
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -111,6 +113,12 @@ pub enum Done {
         tag: u64,
         request: FolderRequest,
         entries: Result<Vec<FileEntry>, String>,
+    },
+    /// A file's icons (`Assets::file_icons`): its thumbnail's path, else
+    /// theme icon names for its type; best first.
+    FileIcons {
+        path: std::path::PathBuf,
+        icons: Vec<String>,
     },
 }
 
@@ -211,6 +219,15 @@ impl Assets {
         self.send(Job::Folder { tag, request });
     }
 
+    /// Look up the icons of `path` (a folder if `dir`); arrive as
+    /// `Done::FileIcons`.
+    pub fn file_icons(&self, path: &std::path::Path, dir: bool) {
+        self.send(Job::FileIcons {
+            path: path.to_path_buf(),
+            dir,
+        });
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -237,6 +254,7 @@ impl Assets {
             | Done::Pill { .. }
             | Done::Bubble { .. }
             | Done::Folder { .. }
+            | Done::FileIcons { .. }
             | Done::Apps(_) => {}
         }
     }
@@ -350,6 +368,11 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     request,
                     entries,
                 }
+            }
+            Job::FileIcons { path, dir } => {
+                let mime = mime.get_or_insert_with(MimeDb::load);
+                let icons = files::icons(&path, dir, mime);
+                Done::FileIcons { path, icons }
             }
             Job::ClearIcons => {
                 icons.clear();

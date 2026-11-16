@@ -141,6 +141,7 @@ impl WlSwitcher {
             | Done::Named { .. }
             | Done::Bubble { .. }
             | Done::Folder { .. }
+            | Done::FileIcons { .. }
             | Done::Apps(_) => {}
         }
     }

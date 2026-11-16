@@ -15,6 +15,8 @@ wl-shell-render.workspace = true
 wl-shell-ui.workspace = true
 
 clap.workspace = true
+ignore.workspace = true
+nucleo.workspace = true
 nucleo-matcher.workspace = true
 serde.workspace = true
 smithay-client-toolkit.workspace = true

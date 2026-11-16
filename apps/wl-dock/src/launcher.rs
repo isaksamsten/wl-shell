@@ -4,12 +4,20 @@
 //! | Key                       | Effect                                     |
 //! | ------------------------- | ------------------------------------------ |
 //! | typing                    | edits the query                            |
+//! | the trigger (`'`)         | typed first: search files instead          |
 //! | Backspace, Ctrl+W, Ctrl+U | delete a character, a word, everything     |
 //! | Enter                     | open the selection (`launcher-enter`)      |
 //! | Ctrl+Enter                | the other of activating and launching      |
 //! | Up, Ctrl+N                | the next match: the drum rolls toward you  |
 //! | Down, Ctrl+P              | the previous match: the drum rolls back    |
+//! | Shift+Tab                 | from files back to the apps                |
 //! | Escape                    | clear the query; with an empty one, close  |
+//!
+//! The trigger, typed into an empty app query, becomes a token in the
+//! field (the scope is then files) and the rest is the file query; a
+//! space is never one. Backspace (or Ctrl+W) on an empty file query, or
+//! Shift+Tab, goes back to the apps with the query empty. A trigger typed
+//! in the file query is a plain character (nucleo's exact-match prefix).
 //!
 //! Tab (the selection's actions) comes later. The caret is always at the
 //! end of the query.
@@ -32,6 +40,8 @@ pub enum Key {
     Open {
         other: bool,
     },
+    /// Shift+Tab: out of files, back to the apps.
+    Back,
     Escape,
 }
 
@@ -47,6 +57,8 @@ impl Key {
             Keysym::BackSpace => Key::Backspace,
             Keysym::Up | Keysym::KP_Up => Key::Roll(1),
             Keysym::Down | Keysym::KP_Down => Key::Roll(-1),
+            Keysym::ISO_Left_Tab => Key::Back,
+            Keysym::Tab if mods.shift => Key::Back,
             Keysym::n if ctrl => Key::Roll(1),
             Keysym::p if ctrl => Key::Roll(-1),
             Keysym::w if ctrl => Key::DeleteWord,
@@ -64,14 +76,24 @@ impl Key {
 
     /// Whether holding it down repeats it.
     pub fn repeats(&self) -> bool {
-        !matches!(self, Key::Open { .. } | Key::Escape)
+        !matches!(self, Key::Open { .. } | Key::Escape | Key::Back)
     }
 }
 
-/// The query: what was typed, with the caret at its end.
+/// What the query searches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    Apps,
+    Files,
+}
+
+/// The query: what was typed, with the caret at its end, and what it
+/// searches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Query {
     text: String,
+    scope: Scope,
 }
 
 impl Query {
@@ -79,15 +101,39 @@ impl Query {
         &self.text
     }
 
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
-    /// Apply an editing key. Returns whether the text changed.
-    pub fn edit(&mut self, key: &Key) -> bool {
-        let before = self.text.len();
+    /// Apply an editing key; `trigger` typed first in an empty app query
+    /// switches to files. Returns whether the text or the scope changed.
+    pub fn edit(&mut self, key: &Key, trigger: Option<char>) -> bool {
+        let before = (self.text.len(), self.scope);
+        let files = self.scope == Scope::Files;
         match key {
-            Key::Text(t) => self.text.push_str(t),
+            Key::Text(t) => {
+                let rest = (trigger.filter(|c| !c.is_whitespace()))
+                    .filter(|_| !files && self.text.is_empty())
+                    .and_then(|c| t.strip_prefix(c));
+                match rest {
+                    Some(rest) => {
+                        self.scope = Scope::Files;
+                        self.text.push_str(rest);
+                    }
+                    None => self.text.push_str(t),
+                }
+            }
+            Key::Backspace | Key::DeleteWord | Key::Back if files && self.text.is_empty() => {
+                self.scope = Scope::Apps;
+            }
+            Key::Back if files => {
+                self.scope = Scope::Apps;
+                self.text.clear();
+            }
             Key::Backspace => {
                 self.text.pop();
             }
@@ -98,10 +144,10 @@ impl Query {
                 self.text.truncate(start);
             }
             Key::Clear => self.text.clear(),
-            Key::Roll(_) | Key::Open { .. } | Key::Escape => {}
+            Key::Roll(_) | Key::Open { .. } | Key::Back | Key::Escape => {}
         }
-        // Every edit changes the length.
-        self.text.len() != before
+        // Every edit of the text changes its length.
+        (self.text.len(), self.scope) != before
     }
 }
 
@@ -184,28 +230,83 @@ mod tests {
         assert_eq!(k(Keysym::a, Some("\x01"), true), None);
         assert_eq!(k(Keysym::Tab, Some("\t"), false), None);
         assert_eq!(k(Keysym::Shift_L, None, false), None);
+        assert_eq!(k(Keysym::ISO_Left_Tab, None, false), Some(Key::Back));
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(Key::from(Keysym::Tab, Some("\t"), &shift), Some(Key::Back));
         assert!(Key::Backspace.repeats() && Key::Roll(1).repeats());
         assert!(!Key::Open { other: false }.repeats() && !Key::Escape.repeats());
+        assert!(!Key::Back.repeats());
     }
 
     #[test]
     fn editing() {
         let mut q = Query::default();
+        let edit = |q: &mut Query, key: Key| q.edit(&key, Some('\''));
         for t in ["v", "isual", " stu", "dio "] {
-            assert!(q.edit(&Key::Text(t.into())));
+            assert!(edit(&mut q, Key::Text(t.into())));
         }
         assert_eq!(q.text(), "visual studio ");
-        assert!(q.edit(&Key::DeleteWord));
+        assert!(edit(&mut q, Key::DeleteWord));
         assert_eq!(q.text(), "visual ");
-        assert!(q.edit(&Key::Backspace));
+        assert!(edit(&mut q, Key::Backspace));
         assert_eq!(q.text(), "visual");
-        assert!(q.edit(&Key::Text("é".into())) && q.edit(&Key::Backspace));
+        assert!(edit(&mut q, Key::Text("é".into())) && edit(&mut q, Key::Backspace));
         assert_eq!(q.text(), "visual");
-        assert!(q.edit(&Key::DeleteWord) && q.is_empty());
-        assert!(!q.edit(&Key::Backspace) && !q.edit(&Key::DeleteWord));
-        q.edit(&Key::Text("a b".into()));
-        assert!(q.edit(&Key::Clear) && q.is_empty());
-        assert!(!q.edit(&Key::Roll(1)));
+        assert!(edit(&mut q, Key::DeleteWord) && q.is_empty());
+        assert!(!edit(&mut q, Key::Backspace) && !edit(&mut q, Key::DeleteWord));
+        edit(&mut q, Key::Text("a b".into()));
+        assert!(edit(&mut q, Key::Clear) && q.is_empty());
+        assert!(!edit(&mut q, Key::Roll(1)) && !edit(&mut q, Key::Back));
+        assert_eq!(q.scope(), Scope::Apps);
+    }
+
+    #[test]
+    fn the_files_trigger() {
+        let t = |s: &str| Key::Text(s.into());
+        let edit = |q: &mut Query, key: Key| q.edit(&key, Some('\''));
+        // `'file.pdf` searches files for `file.pdf`, typed or pasted.
+        let mut q = Query::default();
+        assert!(edit(&mut q, t("'")));
+        assert_eq!((q.scope(), q.text()), (Scope::Files, ""));
+        edit(&mut q, t("file.pdf"));
+        assert_eq!((q.scope(), q.text()), (Scope::Files, "file.pdf"));
+        let mut pasted = Query::default();
+        edit(&mut pasted, t("'file.pdf"));
+        assert_eq!(pasted, q);
+        // In the file query, it is a plain character: `''x` is exact.
+        let mut exact = Query::default();
+        edit(&mut exact, t("'"));
+        edit(&mut exact, t("'x"));
+        assert_eq!((exact.scope(), exact.text()), (Scope::Files, "'x"));
+        // Only first: after anything else, it is part of an app query.
+        let mut apps = Query::default();
+        edit(&mut apps, t("a'"));
+        assert_eq!((apps.scope(), apps.text()), (Scope::Apps, "a'"));
+        let mut apps = Query::default();
+        edit(&mut apps, t(" "));
+        edit(&mut apps, t("'"));
+        assert_eq!((apps.scope(), apps.text()), (Scope::Apps, " '"));
+        // A space never triggers, and without a trigger there are no files.
+        let mut space = Query::default();
+        space.edit(&t(" x"), Some(' '));
+        assert_eq!((space.scope(), space.text()), (Scope::Apps, " x"));
+        let mut none = Query::default();
+        none.edit(&t("'x"), None);
+        assert_eq!((none.scope(), none.text()), (Scope::Apps, "'x"));
+        // Backspace on an empty file query goes back to the apps.
+        assert!(edit(&mut q, Key::Clear) && q.scope() == Scope::Files);
+        assert!(edit(&mut q, Key::Backspace));
+        assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+        // So does Ctrl+W, and Shift+Tab at any time, emptying the query.
+        edit(&mut q, t("'a"));
+        assert!(edit(&mut q, Key::DeleteWord) && q.scope() == Scope::Files);
+        assert!(edit(&mut q, Key::DeleteWord) && q.scope() == Scope::Apps);
+        edit(&mut q, t("'abc"));
+        assert!(edit(&mut q, Key::Back));
+        assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
     }
 
     #[test]

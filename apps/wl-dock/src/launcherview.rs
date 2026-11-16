@@ -30,11 +30,28 @@
 //! gives up the keyboard and the input at once, so the app opened gets
 //! them.
 //!
+//! Files (the query's scope is files once the trigger was typed): the bar
+//! holds two lines. The first is the query and the selected file's name:
+//! inline after the caret if the query is the start of it, else after an
+//! arrow, with what the query matched brighter. The second, smaller and
+//! dimmer, is the file's full path (`~` for home) with what the query
+//! matched brighter and its name brighter than its directories;
+//! directories the query didn't match are elided to fit. While nothing
+//! is selected, it shows the search's progress. With an empty file query,
+//! the front is a folder icon and the first line is a placeholder. A
+//! file's icon is its thumbnail or its type's (looked up by the worker);
+//! a generic icon stands in until it arrives. Its pill on the drum has
+//! its name, then its parent directory's dimmed. Results stream in
+//! (`stream_matches`): until the drum is rolled the best is in front;
+//! after, the selection stays in front while it is among them.
+//!
 //! Texts (the query, the completion, the name) are lines from the worker;
 //! a line shows its last text until the new one arrives. Icons come from
 //! the shared cache.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -54,7 +71,7 @@ use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
 use wl_shell_render::icons::{self, NamedIcon};
 use wl_shell_render::worker::{Assets, PillRequest};
-use wl_shell_render::{shadow, text};
+use wl_shell_render::{files, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
 use wl_shell_ui::shapes::{self, Axis, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub};
@@ -62,7 +79,8 @@ use wl_shell_ui::{IRect, Rect, Spring, Sub};
 use crate::app::WlDock;
 use crate::config::{Config, DockLayout};
 use crate::drum::{self, Drum};
-use crate::launcher::{Completion, Query, completion};
+use crate::filesearch;
+use crate::launcher::{Completion, Query, Scope, completion};
 use crate::view::Handover;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -71,8 +89,15 @@ type Qh = QueueHandle<Shell<WlDock>>;
 const FADE_RESPONSE: f64 = 120.0;
 /// Shown while nothing was typed.
 const PLACEHOLDER: &str = "Search apps";
+const FILES_PLACEHOLDER: &str = "Search files";
 /// The front's icon with an empty query.
 const SEARCH_ICON: &str = "system-search";
+/// Stand-ins for a file's icon, and a folder's.
+const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
+/// Before a file's name that doesn't continue the query.
+const NAME_MARK: &str = "→";
+/// A character's width, of the font size, at most (to fit paths).
+const CHAR_WIDTH: f64 = 0.55;
 /// Pixels of touchpad scrolling per roll step.
 const SCROLL_STEP: f64 = 50.0;
 /// The matches' names on the drum, of the query's font size.
@@ -165,18 +190,59 @@ impl LauncherStyle {
             background: self.background,
         }
     }
+
+    /// The file path's font size under the query: the drum labels'.
+    fn path_size(&self) -> f64 {
+        (self.font_size * LABEL_FONT).round()
+    }
+
+    /// The file path under the query: bare, in the drum labels' size.
+    fn path_style(&self, color: u32) -> text::Style {
+        text::Style {
+            font: self.font.clone(),
+            size: self.path_size(),
+            color,
+            background: 0,
+        }
+    }
 }
 
 /// A match as the launcher shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Match {
-    /// The app's desktop ID (without `.desktop`).
+    /// The app's desktop ID (without `.desktop`), or the file's path
+    /// relative to the search's root.
     pub id: String,
+    /// The app's name, or the file's.
     pub name: String,
     /// Its `Icon=`.
     pub icon: Option<String>,
     /// The parts of the name the query matched, as byte ranges.
     pub matched: Vec<Range<usize>>,
+    /// What a file match has besides.
+    pub file: Option<FileMatch>,
+}
+
+/// A file match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMatch {
+    pub path: PathBuf,
+    pub dir: bool,
+    /// The parent directory's name (empty at the root), and the parts the
+    /// query matched in it.
+    pub parent: String,
+    pub parent_matched: Vec<Range<usize>>,
+    /// Its full path for showing (`~` for home), and the parts the query
+    /// matched in it.
+    pub shown: String,
+    pub shown_matched: Vec<Range<usize>>,
+}
+
+/// The file search, as the bar shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilesStatus {
+    /// Under the query while nothing is selected: how far the search got.
+    pub progress: Option<String>,
 }
 
 /// What the pointer did on the launcher.
@@ -302,14 +368,59 @@ impl Drop for Line {
     }
 }
 
+/// An icon on the drum: an app's, or one by name (a file's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IconKey {
+    App(icons::Key),
+    Named(NamedIcon),
+}
+
+impl IconKey {
+    /// Its buffer, if it is there.
+    fn buffer(&self, cache: &Cache) -> Option<WlBuffer> {
+        match self {
+            IconKey::App(k) => cache.icon(k),
+            IconKey::Named(k) => cache.named_icon(k).flatten(),
+        }
+    }
+
+    /// How far the image reaches past the icon, of its size.
+    fn pad(&self) -> f64 {
+        let (pad, size, scale) = match self {
+            IconKey::App(k) => (k.pad(), k.size, k.scale),
+            IconKey::Named(k) => (k.pad(), k.size, k.scale),
+        };
+        pad as f64 / (size as f64 / scale.max(1) as f64)
+    }
+
+    /// Have the worker render it, unless it is cached.
+    fn request(&self, cache: &Cache, assets: &Assets, font: &str) {
+        match self {
+            IconKey::App(k) if cache.icon(k).is_none() => assets.icon(k, font),
+            IconKey::Named(k) if cache.named_icon(k).is_none() => assets.named_icon(k),
+            _ => {}
+        }
+    }
+}
+
 /// A match on the drum: its icon, and the one it replaced while that
 /// fades out.
 struct Ringed {
     m: Match,
-    key: icons::Key,
-    old: Option<icons::Key>,
+    key: IconKey,
+    /// Shown while `key` isn't there (a file's generic icon).
+    standin: Option<IconKey>,
+    old: Option<IconKey>,
     /// 0 (the old icon) to 1 (this one).
     fade: Spring,
+}
+
+impl Ringed {
+    /// The icon to draw, and its pad of its size.
+    fn icon(&self, cache: &Cache) -> Option<(WlBuffer, f64)> {
+        let shown = |k: &IconKey| k.buffer(cache).map(|b| (b, k.pad()));
+        shown(&self.key).or_else(|| self.standin.as_ref().and_then(shown))
+    }
 }
 
 /// A ring slot's subsurfaces.
@@ -322,7 +433,7 @@ struct RingSubs {
 
 /// The opened app's icon on its way to the dock.
 struct Fly {
-    key: icons::Key,
+    key: IconKey,
     from: Rect,
     to: Rect,
     t: Spring,
@@ -352,7 +463,12 @@ pub struct LauncherView {
     bar: [Sub; 3],
     search: Sub,
     query_line: Line,
+    /// A file search's second line: the selected file's path.
+    path_line: Line,
     inline: Line,
+    /// The inline text stands apart from the query (a file's name that
+    /// doesn't continue it).
+    inline_apart: bool,
     after: Line,
     caret: Sub,
     no_input: Region,
@@ -376,8 +492,15 @@ pub struct LauncherView {
     ring: Vec<Ringed>,
     /// The drum's roll; the selection is where it is headed.
     roll: Spring,
+    /// Rolled since the matches were last ranked anew.
+    rolled: bool,
     /// Scrolling not yet rolled, in steps.
     scrolled: f64,
+    files: FilesStatus,
+    /// Files' icons from the worker (thumbnails or type icons, best
+    /// first), and the files asked for.
+    file_icons: HashMap<PathBuf, Vec<String>>,
+    asked_icons: HashSet<PathBuf>,
     /// 0 (the dock's panel) to 1 (the bar).
     morph: Spring,
     /// The search icon shows (an empty ring), 0 to 1.
@@ -425,6 +548,7 @@ impl LauncherView {
         let search = sub();
         let inline = Line::new(sub());
         let query_line = Line::new(sub());
+        let path_line = Line::new(sub());
         let after = Line::new(sub());
         let caret = sub();
         let fly_sub = sub();
@@ -436,7 +560,9 @@ impl LauncherView {
             bar,
             search,
             query_line,
+            path_line,
             inline,
+            inline_apart: false,
             after,
             caret,
             no_input,
@@ -456,7 +582,11 @@ impl LauncherView {
             query: Query::default(),
             ring: Vec::new(),
             roll: Spring::new(0.0, response),
+            rolled: false,
             scrolled: 0.0,
+            files: FilesStatus::default(),
+            file_icons: HashMap::new(),
+            asked_icons: HashSet::new(),
             morph: Spring::new(0.0, response),
             searching: Spring::new(1.0, FADE_RESPONSE),
             closing: false,
@@ -545,8 +675,9 @@ impl LauncherView {
         }
         self.scale = scale;
         self.relayout();
+        let attached = self.attached.as_ref();
         for r in &mut self.ring {
-            r.key = Self::icon_key(self.attached.as_ref(), &r.m, scale);
+            (r.key, r.standin) = Self::icon_keys(attached, &r.m, scale, &self.file_icons);
             r.old = None;
         }
         self.request_icons();
@@ -579,10 +710,34 @@ impl LauncherView {
             self.stale.push(old);
         }
         self.caret_buffer = cache::color_buffer(&self.g, caret, &self.qh).ok();
-        self.search_key().inspect(|k| self.assets.named_icon(k));
+        for scope in [Scope::Apps, Scope::Files] {
+            self.search_key(scope)
+                .inspect(|k| self.assets.named_icon(k));
+        }
     }
 
-    fn icon_key(attached: Option<&Attached>, m: &Match, scale: i32) -> icons::Key {
+    /// The icon `names` (the first found) at the front's size.
+    fn front_named(a: &Attached, scale: i32, names: Vec<String>) -> Option<NamedIcon> {
+        let mut names = names.into_iter();
+        Some(NamedIcon {
+            name: names.next()?,
+            fallbacks: names.collect(),
+            size: a.style.front().ceil() as u32 * scale as u32,
+            theme: a.style.icon_theme.clone(),
+            shadow: a.style.icon_shadow,
+            scale,
+        })
+    }
+
+    /// The icon of `m`, and what stands in for it until it is there: a
+    /// file's thumbnail or type icon (once `file_icons` has it), else a
+    /// generic one.
+    fn icon_keys(
+        attached: Option<&Attached>,
+        m: &Match,
+        scale: i32,
+        file_icons: &HashMap<PathBuf, Vec<String>>,
+    ) -> (IconKey, Option<IconKey>) {
         let (size, theme, shadow) = match attached {
             Some(a) => (
                 a.style.front(),
@@ -591,31 +746,78 @@ impl LauncherView {
             ),
             None => (60.0, None, None),
         };
-        icons::Key::new(&m.id, size.ceil() as u32, theme, shadow, scale).with_icon(m.icon.clone())
+        let app = || {
+            let key = icons::Key::new(&m.id, size.ceil() as u32, theme.clone(), shadow, scale);
+            IconKey::App(key.with_icon(m.icon.clone()))
+        };
+        let (Some(f), Some(a)) = (&m.file, attached) else {
+            return (app(), None);
+        };
+        let generic = match f.dir {
+            true => &files::FOLDER_ICONS[..],
+            false => &FILE_ICONS[..],
+        };
+        let generic = generic.iter().map(|s| s.to_string()).collect();
+        let standin = Self::front_named(a, scale, generic).map(IconKey::Named);
+        let own = (file_icons.get(&f.path).cloned())
+            .and_then(|names| Self::front_named(a, scale, names))
+            .map(IconKey::Named);
+        match (own, standin) {
+            (Some(own), standin) => (own, standin),
+            (None, Some(standin)) => (standin, None),
+            (None, None) => (app(), None),
+        }
     }
 
-    fn search_key(&self) -> Option<NamedIcon> {
+    /// The front's icon while there is no match: a search icon, or a
+    /// folder for files.
+    fn search_key(&self, scope: Scope) -> Option<NamedIcon> {
         let a = self.attached.as_ref()?;
-        Some(NamedIcon {
-            name: SEARCH_ICON.into(),
-            fallbacks: vec!["edit-find".into(), "search".into()],
-            size: a.style.front().ceil() as u32 * self.scale as u32,
-            theme: a.style.icon_theme.clone(),
-            shadow: a.style.icon_shadow,
-            scale: self.scale,
-        })
+        let names: &[&str] = match scope {
+            Scope::Apps => &[SEARCH_ICON, "edit-find", "search"],
+            Scope::Files => &files::FOLDER_ICONS,
+        };
+        let names = names.iter().map(|s| s.to_string()).collect();
+        Self::front_named(a, self.scale, names)
     }
 
-    fn request_icons(&self) {
+    /// Have the worker render the ring's icons, and look up those of its
+    /// files.
+    fn request_icons(&mut self) {
         let cache = self.cache.borrow();
         let font = self
             .attached
             .as_ref()
             .map_or("sans-serif", |a| a.style.font.as_str());
         for r in &self.ring {
-            if cache.icon(&r.key).is_none() {
-                self.assets.icon(&r.key, font);
+            r.key.request(&cache, &self.assets, font);
+            if let Some(standin) = &r.standin {
+                standin.request(&cache, &self.assets, font);
             }
+            if let Some(f) = &r.m.file
+                && !self.file_icons.contains_key(&f.path)
+                && self.asked_icons.insert(f.path.clone())
+            {
+                self.assets.file_icons(&f.path, f.dir);
+            }
+        }
+    }
+
+    /// A file's icons arrived (thumbnail or type icons, best first).
+    pub fn file_icons_ready(&mut self, path: PathBuf, names: Vec<String>) {
+        self.asked_icons.remove(&path);
+        let mut changed = false;
+        self.file_icons.insert(path.clone(), names);
+        let attached = self.attached.as_ref();
+        for r in &mut self.ring {
+            if r.m.file.as_ref().is_some_and(|f| f.path == path) {
+                (r.key, r.standin) = Self::icon_keys(attached, &r.m, self.scale, &self.file_icons);
+                changed = true;
+            }
+        }
+        if changed {
+            self.request_icons();
+            self.kick();
         }
     }
 
@@ -632,38 +834,93 @@ impl LauncherView {
     /// Show `matches`, best first: the best in front, without rolling.
     /// Slots whose match changed cross-fade their icons.
     pub fn set_matches(&mut self, matches: Vec<Match>) {
+        self.rolled = false;
+        self.replace(matches, 0);
+    }
+
+    /// Matches streamed in, best first: like `set_matches`, but once the
+    /// drum was rolled, the selection stays in front as long as it is
+    /// among them. Nothing happens if they are the ones shown.
+    pub fn stream_matches(&mut self, matches: Vec<Match>) {
+        let same = matches.len() == self.ring.len()
+            && matches.iter().zip(&self.ring).all(|(m, r)| *m == r.m);
+        if same {
+            return;
+        }
+        let kept = (self.kept().map(str::to_string))
+            .and_then(|id| matches.iter().position(|m| m.id == id));
+        match kept {
+            Some(front) => self.replace(matches, front),
+            None => self.set_matches(matches),
+        }
+    }
+
+    /// Forget the roll: the next matches put their best in front.
+    pub fn unroll(&mut self) {
+        self.rolled = false;
+    }
+
+    /// The ID of the selection the user rolled to, if they did.
+    pub fn kept(&self) -> Option<&str> {
+        let i = self.selected().filter(|_| self.rolled)?;
+        Some(&self.ring.get(i)?.m.id)
+    }
+
+    /// Put `matches` on the drum with the one at `front` in front; an
+    /// unfinished roll carries on. Each slot whose match changed
+    /// cross-fades its icon.
+    fn replace(&mut self, matches: Vec<Match>, front: usize) {
         let slots = self.attached.as_ref().map_or(1, |a| a.style.matches);
-        // What each slot shows now: slot `i` holds the match `i` past the
+        // What each slot shows now: slot `k` holds the match `k` past the
         // one in front.
-        let front = self.selected().unwrap_or(0);
-        let n = self.ring.len();
-        let old: Vec<icons::Key> = (0..n)
-            .map(|i| self.ring[(i + front) % n].key.clone())
+        let old_front = self.selected().unwrap_or(0);
+        let n_old = self.ring.len();
+        let old: Vec<IconKey> = (0..n_old)
+            .map(|k| self.ring[(k + old_front) % n_old].key.clone())
             .collect();
-        let response = FADE_RESPONSE;
+        let matches: Vec<Match> = matches.into_iter().take(slots).collect();
+        let n = matches.len();
+        let front = front.min(n.saturating_sub(1));
         let attached = self.attached.as_ref();
-        let ring: Vec<Ringed> = (matches.into_iter().take(slots).enumerate())
+        let ring: Vec<Ringed> = (matches.into_iter().enumerate())
             .map(|(i, m)| {
-                let key = Self::icon_key(attached, &m, self.scale);
-                let prev = old.get(i).cloned();
+                let (key, standin) = Self::icon_keys(attached, &m, self.scale, &self.file_icons);
+                let prev = old.get((i + n - front) % n).cloned();
                 let same = prev.as_ref() == Some(&key);
-                let mut fade = Spring::new(if same { 1.0 } else { 0.0 }, response);
+                let mut fade = Spring::new(if same { 1.0 } else { 0.0 }, FADE_RESPONSE);
                 fade.retarget(1.0);
                 Ringed {
                     m,
                     key,
+                    standin,
                     old: prev.filter(|_| !same),
                     fade,
                 }
             })
             .collect();
         self.ring = ring;
-        self.roll.snap(0.0);
+        match front {
+            0 if !self.rolled => self.roll.snap(0.0),
+            _ => {
+                let unfinished = self.roll.value - self.roll.target;
+                self.roll.target = front as f64;
+                self.roll.value = front as f64 + unfinished;
+            }
+        }
         self.searching
             .retarget(if self.ring.is_empty() { 1.0 } else { 0.0 });
         self.request_icons();
         self.sync_texts();
         self.kick();
+    }
+
+    /// How the file search is doing.
+    pub fn set_files_status(&mut self, status: FilesStatus) {
+        if status != self.files {
+            self.files = status;
+            self.sync_texts();
+            self.kick();
+        }
     }
 
     /// Roll the drum `by` steps (positive: the next match comes to the
@@ -674,6 +931,7 @@ impl LauncherView {
         }
         let target = self.roll.target + by as f64;
         self.roll.retarget(target);
+        self.rolled = true;
         self.sync_texts();
         self.kick();
     }
@@ -693,49 +951,78 @@ impl LauncherView {
         let style = &a.style;
         let scale = self.scale;
         let max = (a.bar.w - text_x(style) - 2.0 * style.padding).max(1.0) as i32;
-        let line = |text: String, color: u32| PillRequest {
+        let spanned = |text: String, spans: Vec<(Range<usize>, u32)>, color: u32| PillRequest {
             text,
-            spans: Vec::new(),
+            spans,
             max_width: max,
             scale,
             style: style.line_style(color),
         };
+        let line = |text: String, color: u32| spanned(text, Vec::new(), color);
         // The names on the drum, with what the query matched brighter.
         let labels: Vec<PillRequest> = (self.ring.iter())
-            .map(|r| PillRequest {
-                text: r.m.name.clone(),
-                spans: r
-                    .m
-                    .matched
-                    .iter()
-                    .map(|m| (m.clone(), style.text))
-                    .collect(),
-                max_width: max,
-                scale,
-                style: style.label_style(),
-            })
+            .map(|r| label_request(&r.m, style, max, scale))
             .collect();
-        let name = self
-            .selected()
-            .and_then(|i| self.ring.get(i))
-            .map(|r| r.m.name.as_str());
+        let selected = self.selected().and_then(|i| self.ring.get(i)).map(|r| &r.m);
         let q = self.query.text();
         // Zero-width spaces keep the query's own spaces at its ends.
         let query = (!q.is_empty()).then(|| line(format!("\u{200b}{q}\u{200b}"), style.text));
-        let (inline, after) = match completion(q, name) {
-            Completion::None if q.is_empty() => (Some(PLACEHOLDER.to_string()), None),
-            Completion::None => (None, None),
-            Completion::Inline(rest) if rest.is_empty() => (None, None),
-            Completion::Inline(rest) => (Some(rest), None),
-            Completion::After(name) => (None, Some(name)),
+        let (path, inline, after, apart) = match self.query.scope() {
+            Scope::Files => {
+                let file = selected.and_then(|m| Some((m, m.file.as_ref()?)));
+                // Under the query: the selection's path, else the progress.
+                let path = match file {
+                    Some((_, f)) => Some(path_request(f, style, max, scale)),
+                    None => (self.files.progress.clone()).map(|p| PillRequest {
+                        text: p,
+                        spans: Vec::new(),
+                        max_width: max,
+                        scale,
+                        style: style.path_style(dimmer(style.completion)),
+                    }),
+                };
+                let name = file.map(|(m, _)| m.name.as_str());
+                let (inline, apart) = match (completion(q, name), file) {
+                    (Completion::None, _) if q.is_empty() => {
+                        (Some(line(FILES_PLACEHOLDER.into(), style.completion)), false)
+                    }
+                    (Completion::Inline(rest), _) if !rest.is_empty() => {
+                        (Some(line(rest, style.completion)), false)
+                    }
+                    // Not the query's continuation: apart, after an arrow,
+                    // with what the query matched brighter.
+                    (Completion::After(name), Some((m, _))) => {
+                        let at = NAME_MARK.len() + 1;
+                        let mut spans = vec![(0..NAME_MARK.len(), dimmer(style.completion))];
+                        spans.extend(m.matched.iter().map(|r| (r.start + at..r.end + at, style.text)));
+                        let text = format!("{NAME_MARK} {name}");
+                        (Some(spanned(text, spans, style.completion)), true)
+                    }
+                    _ => (None, false),
+                };
+                (path, inline, None, apart)
+            }
+            Scope::Apps => {
+                let name = selected.map(|m| m.name.as_str());
+                let (inline, after) = match completion(q, name) {
+                    Completion::None if q.is_empty() => (Some(PLACEHOLDER.to_string()), None),
+                    Completion::None => (None, None),
+                    Completion::Inline(rest) if rest.is_empty() => (None, None),
+                    Completion::Inline(rest) => (Some(rest), None),
+                    Completion::After(name) => (None, Some(name)),
+                };
+                let inline = inline.map(|t| line(t, style.completion));
+                let after = after.map(|t| line(t, style.completion));
+                (None, inline, after, false)
+            }
         };
-        let inline = inline.map(|t| line(t, style.completion));
-        let after = after.map(|t| line(t, style.completion));
+        self.inline_apart = apart;
         let assets = self.assets.clone();
         // The query first, so its width is there when the rest arrives.
         self.query_line.want(&assets, query, &mut self.stale);
         self.inline.want(&assets, inline, &mut self.stale);
         self.after.want(&assets, after, &mut self.stale);
+        self.path_line.want(&assets, path, &mut self.stale);
         self.grow_ring_subs(labels.len());
         let mut labels = labels.into_iter();
         for subs in &mut self.ring_subs {
@@ -763,8 +1050,13 @@ impl LauncherView {
     pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
         let _ = request;
         let (g, qh) = (self.g.clone(), self.qh.clone());
-        let ours = [&mut self.query_line, &mut self.inline, &mut self.after]
-            .into_iter()
+        let lines = [
+            &mut self.path_line,
+            &mut self.query_line,
+            &mut self.inline,
+            &mut self.after,
+        ];
+        let ours = (lines.into_iter())
             .chain(self.ring_subs.iter_mut().map(|s| &mut s.label))
             .any(|l| l.ready(&g, &qh, tag, pill, &mut self.stale));
         if ours {
@@ -1015,16 +1307,19 @@ impl LauncherView {
             };
             let alpha = gate(p.alpha * open * present);
             let fade = r.fade.value.clamp(0.0, 1.0);
-            let place = |sub: &mut Sub, key: &icons::Key, a: f64| {
-                let pad = key.pad() as f64 * size / (key.size as f64 / key.scale as f64);
-                sub.present(cache.icon(key).as_ref(), rect.outset(pad), a);
+            let place = |sub: &mut Sub, icon: Option<(WlBuffer, f64)>, a: f64| match icon {
+                Some((buffer, pad)) => sub.present(Some(&buffer), rect.outset(pad * size), a),
+                None => sub.clear(),
             };
             match flying {
                 true => subs.icon.clear(),
-                false => place(&mut subs.icon, &r.key, alpha * fade),
+                false => place(&mut subs.icon, r.icon(&cache), alpha * fade),
             }
             match (&r.old, flying) {
-                (Some(old), false) => place(&mut subs.old, old, alpha * (1.0 - fade)),
+                (Some(old), false) => {
+                    let icon = old.buffer(&cache).map(|b| (b, old.pad()));
+                    place(&mut subs.old, icon, alpha * (1.0 - fade));
+                }
                 _ => subs.old.clear(),
             }
             if alpha > 0.3 {
@@ -1043,9 +1338,9 @@ impl LauncherView {
             }
         }
 
-        // The search icon, with nothing typed.
+        // The search icon (or a folder, for files), with nothing found.
         let search = self
-            .search_key()
+            .search_key(self.query.scope())
             .and_then(|k| Some((cache.named_icon(&k)??, k)));
         let search_alpha = self.gate(self.searching.value * open);
         match &search {
@@ -1062,20 +1357,30 @@ impl LauncherView {
             Some(fly) => {
                 let t = fly.t.value;
                 let r = fly.from.lerp(fly.to, t);
-                let pad = fly.key.pad() as f64 * r.w / (fly.key.size as f64 / fly.key.scale as f64);
                 // Into the dock's own icon at the end.
                 let alpha = self.gate(((1.0 - t) / 0.15).clamp(0.0, 1.0));
-                (self.fly_sub).present(cache.icon(&fly.key).as_ref(), r.outset(pad), alpha);
+                let buffer = fly.key.buffer(&cache);
+                (self.fly_sub).present(buffer.as_ref(), r.outset(fly.key.pad() * r.w), alpha);
             }
             None => self.fly_sub.clear(),
         }
         drop(cache);
 
-        // The query, the completion and the caret.
+        // The query, the completion and the caret; for files, the path
+        // under them, the two lines centered together.
         let text_alpha = self.gate((m - 0.5) / 0.5);
         let line_h = text::line_height(style.font_size) as f64;
+        let files = self.query.scope() == Scope::Files;
         let x0 = bar.x + text_x(&style);
-        let ty = (bar.y + (bar.h - line_h) / 2.0).round();
+        let block_h = match files {
+            true => line_h + text::line_height(style.path_size()) as f64,
+            false => line_h,
+        };
+        let ty = (bar.y + (bar.h - block_h) / 2.0).round();
+        match files {
+            true => self.path_line.present(x0, ty + line_h, text_alpha),
+            false => self.path_line.sub.clear(),
+        }
         let query_w = match self.query.is_empty() {
             true => 0.0,
             false => self.query_line.width(),
@@ -1084,16 +1389,73 @@ impl LauncherView {
             true => self.query_line.sub.clear(),
             false => self.query_line.present(x0, ty, text_alpha),
         }
-        self.inline.present(x0 + query_w, ty, text_alpha);
+        // A file's name that doesn't continue the query stands apart.
+        let gap = match self.inline_apart {
+            true => 1.5 * style.padding,
+            false => 0.0,
+        };
+        self.inline.present(x0 + query_w + gap, ty, text_alpha);
         let after_x = bar.right() - 2.0 * style.padding - self.after.width();
-        self.after
-            .present(after_x.max(x0 + query_w + style.padding), ty, text_alpha);
+        let after_min = x0 + query_w + style.padding;
+        self.after.present(after_x.max(after_min), ty, text_alpha);
         let caret_w = (style.font_size / 12.0).round().max(1.0);
         let caret = Rect::new(x0 + query_w, ty, caret_w, line_h);
         let caret_alpha = if self.closing { 0.0 } else { text_alpha };
         self.caret
             .present(self.caret_buffer.as_ref(), caret, caret_alpha);
     }
+}
+
+/// A file's path under the query: its directories dim, its name less so,
+/// and what the query matched bright. Directories the query didn't match
+/// are elided so it fits in `max`, by an estimate.
+fn path_request(f: &FileMatch, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
+    let chars = (max as f64 / (style.path_size() * CHAR_WIDTH)).max(1.0) as usize;
+    let (text, matched) = filesearch::fit_path(&f.shown, &f.shown_matched, chars);
+    let name_at = text.rfind('/').map_or(0, |i| i + 1);
+    // The first span holding a character colors it.
+    let mut spans: Vec<(Range<usize>, u32)> =
+        matched.into_iter().map(|r| (r, style.text)).collect();
+    spans.push((name_at..text.len(), style.completion));
+    PillRequest {
+        text,
+        spans,
+        max_width: max,
+        scale,
+        style: style.path_style(dimmer(style.completion)),
+    }
+}
+
+/// A match's pill on the drum: its name, with what the query matched
+/// brighter, and for a file its parent directory's name, dimmer.
+fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
+    let mut spans: Vec<(Range<usize>, u32)> =
+        m.matched.iter().map(|r| (r.clone(), style.text)).collect();
+    let mut text = m.name.clone();
+    if let Some(f) = m.file.as_ref().filter(|f| !f.parent.is_empty()) {
+        text.push_str("  ");
+        let at = text.len();
+        text.push_str(&f.parent);
+        // The first span holding a character colors it.
+        let matched = f
+            .parent_matched
+            .iter()
+            .map(|r| (r.start + at..r.end + at, style.completion));
+        spans.extend(matched);
+        spans.push((at..text.len(), dimmer(style.completion)));
+    }
+    PillRequest {
+        text,
+        spans,
+        max_width: max,
+        scale,
+        style: style.label_style(),
+    }
+}
+
+/// `color` at half its alpha.
+fn dimmer(color: u32) -> u32 {
+    (color & !0xff) | ((color & 0xff) / 2)
 }
 
 /// Where the query starts, from the bar's left edge.

@@ -11,7 +11,8 @@
 //!   older than the file.
 //! - A listing leaves out hidden entries and sorts by modification time,
 //!   creation time (`added`) or name. Each entry's icon is its thumbnail,
-//!   else theme icons for its type (mime.rs), else a folder's.
+//!   else theme icons for its type (mime.rs), else a folder's; `icons`
+//!   gives the same for any one path.
 
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -263,19 +264,39 @@ pub fn list(request: &FolderRequest, mime: &MimeDb) -> Result<Vec<FileEntry>, St
     }
     sort_entries(&mut entries, request.sort, request.count);
     for e in &mut entries {
-        e.icons = match e.dir {
-            true => FOLDER_ICONS.map(String::from).to_vec(),
-            false => {
-                let thumb = thumbnail(&e.path, e.modified);
-                let thumb = thumb.map(|t| t.to_string_lossy().into_owned());
-                thumb
-                    .into_iter()
-                    .chain(mime.icons(mime.type_of(&e.name)))
-                    .collect()
-            }
-        };
+        e.icons = entry_icons(&e.path, &e.name, e.dir, e.modified, mime);
     }
     Ok(entries)
+}
+
+/// The icons of a file named `name` at `path` (a folder if `dir`), last
+/// modified at `mtime`: its thumbnail's path, else theme icon names for
+/// its type; best first.
+fn entry_icons(
+    path: &Path,
+    name: &str,
+    dir: bool,
+    mtime: Option<SystemTime>,
+    mime: &MimeDb,
+) -> Vec<String> {
+    if dir {
+        return FOLDER_ICONS.map(String::from).to_vec();
+    }
+    let thumb = thumbnail(path, mtime).map(|t| t.to_string_lossy().into_owned());
+    thumb
+        .into_iter()
+        .chain(mime.icons(mime.type_of(name)))
+        .collect()
+}
+
+/// The icons of `path` (a folder if `dir`), as a listing gives them.
+pub fn icons(path: &Path, dir: bool, mime: &MimeDb) -> Vec<String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mtime = match dir {
+        true => None,
+        false => std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+    };
+    entry_icons(path, &name, dir, mtime, mime)
 }
 
 #[cfg(test)]

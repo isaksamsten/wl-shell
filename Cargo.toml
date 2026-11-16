@@ -25,8 +25,10 @@ drm-fourcc = "2"
 freedesktop-desktop-entry = { version = "0.8", default-features = false }
 freedesktop-icons = "0.4"
 gbm = { version = "0.18", default-features = false }
+ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
+nucleo = "0.5"
 nucleo-matcher = "0.3"
 resvg = { version = "0.50", default-features = false, features = ["raster-images"] }
 rustix = { version = "1", features = ["process"] }

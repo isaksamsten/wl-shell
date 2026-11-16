@@ -182,6 +182,8 @@ pub struct LauncherConfig {
     pub far_scale: f64,
     pub enter: LauncherEnter,
     pub history: bool,
+    /// File search (`[launcher.files]`).
+    pub files: LauncherFiles,
 }
 
 impl Default for LauncherConfig {
@@ -194,7 +196,55 @@ impl Default for LauncherConfig {
             far_scale: 0.5,
             enter: LauncherEnter::default(),
             history: true,
+            files: LauncherFiles::default(),
         }
+    }
+}
+
+/// The launcher's file search.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct LauncherFiles {
+    /// Typed first, switches to file search; None: there is none.
+    #[serde(deserialize_with = "files_trigger")]
+    pub trigger: Option<char>,
+    /// The directory walked; `~/` expands.
+    pub root: String,
+    /// Gitignore-style globs, relative to the root.
+    pub exclude: Vec<String>,
+    /// Include hidden files and directories.
+    pub hidden: bool,
+    /// Honor `.gitignore`, `.ignore` and git's excludes.
+    pub gitignore: bool,
+    /// Entries walked at most.
+    #[serde(deserialize_with = "files_max")]
+    pub max: u32,
+}
+
+impl Default for LauncherFiles {
+    fn default() -> Self {
+        Self {
+            trigger: Some('\''),
+            root: "~".into(),
+            exclude: ["node_modules", "target", "__pycache__"]
+                .map(String::from)
+                .to_vec(),
+            hidden: false,
+            gitignore: true,
+            max: 1_000_000,
+        }
+    }
+}
+
+impl LauncherFiles {
+    /// The root, with `~` expanded.
+    pub fn root(&self) -> std::path::PathBuf {
+        let root = self.root.trim();
+        let root = match root {
+            "~" => "~/",
+            r => r,
+        };
+        wl_shell_render::icons::expand_home(root).into()
     }
 }
 
@@ -974,6 +1024,26 @@ fn launcher_far_scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> 
     ranged(d, 0.25, 1.0)
 }
 
+/// The file search's trigger: one character, not a space; `""` turns file
+/// search off.
+fn files_trigger<'de, D: Deserializer<'de>>(d: D) -> Result<Option<char>, D::Error> {
+    use serde::de::Error;
+    let s = String::deserialize(d)?;
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) if !c.is_whitespace() && !c.is_control() => Ok(Some(c)),
+        _ => Err(D::Error::custom(format!(
+            "expected one character that isn't a space, or \"\", got {s:?}"
+        ))),
+    }
+}
+
+/// Entries the file search walks at most, 1 to 100 million.
+fn files_max<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 1, 100_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1400,42 @@ mod tests {
         assert!(err("[launcher]\nfar-scale = 0.1"));
         assert!(err("[launcher]\nicon-scale = 0.5"));
         assert!(err("[launcher]\nenter = \"open\""));
+    }
+
+    #[test]
+    fn file_search() {
+        let d = Config::default().launcher.files;
+        assert_eq!((d.trigger, d.root.as_str()), (Some('\''), "~"));
+        assert_eq!(d.exclude, ["node_modules", "target", "__pycache__"]);
+        assert!(!d.hidden && d.gitignore && d.max == 1_000_000);
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(d.root(), std::path::Path::new(&home));
+        }
+        let c = parse(
+            r#"
+            [launcher.files]
+            trigger = "/"
+            root = "/srv"
+            exclude = ["*.o"]
+            hidden = true
+            gitignore = false
+            max = 5000
+            "#,
+        )
+        .unwrap()
+        .launcher
+        .files;
+        assert_eq!((c.trigger, c.root().to_str()), (Some('/'), Some("/srv")));
+        assert_eq!(c.exclude, ["*.o"]);
+        assert!(c.hidden && !c.gitignore && c.max == 5000);
+        let off = parse("[launcher.files]\ntrigger = \"\"").unwrap();
+        assert_eq!(off.launcher.files.trigger, None);
+        let err = |s: &str| parse(s).is_err();
+        assert!(err("[launcher.files]\ntrigger = \" \""));
+        assert!(err("[launcher.files]\ntrigger = \"ab\""));
+        assert!(err("[launcher.files]\nmax = 0"));
+        assert!(err("[launcher.files]\nunknown = 1"));
+        assert!(err("files-trigger = \"'\""));
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod config;
 mod dock;
 mod drag;
 mod drum;
+mod filesearch;
 mod folder;
 mod history;
 mod ipc;

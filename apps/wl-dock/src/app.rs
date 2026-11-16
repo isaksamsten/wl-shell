@@ -66,6 +66,13 @@
 //! most recent window or launches it (`launcher-enter`), and the client
 //! is answered once the launcher gave up the keyboard. Escape, a click
 //! outside, or another `--launcher` closes it.
+//!
+//! Typing the files trigger first searches files instead (filesearch.rs):
+//! the walk starts then, on threads of its own, and lives until the
+//! launcher closes. Its news pings the loop; the launcher's next frame
+//! takes the best matches (never blocking) and streams them onto the
+//! drum. Enter opens the front match with `open-command`, Ctrl+Enter its
+//! folder.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -73,6 +80,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use smithay_client_toolkit::{
@@ -94,7 +102,7 @@ use wl_shell_config::Reloader;
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::dnd::DragIcon;
 use wl_shell_core::globals::Globals;
-use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
+use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken, channel, ping};
 use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::toplevel::Toplevel;
@@ -109,12 +117,15 @@ use wl_shell_ui::Cache;
 use crate::config::{Config, FolderView, LauncherEnter, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
+use crate::filesearch::{self, FileSearch, Found};
 use crate::folder;
 use crate::history::{self, History};
 use crate::ipc::DockRequest;
 use crate::launch::{self, Command};
-use crate::launcher;
-use crate::launcherview::{LauncherInput, LauncherStyle, LauncherView, Match};
+use crate::launcher::{self, Scope};
+use crate::launcherview::{
+    FileMatch, FilesStatus, LauncherInput, LauncherStyle, LauncherView, Match,
+};
 use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin};
 use crate::search::Search;
@@ -182,6 +193,67 @@ struct PendingOpen {
     id: String,
     /// Launch a new instance (else activate a window, if it has one).
     launch: bool,
+}
+
+/// The launcher's file search, from the trigger until the launcher
+/// closes. Dropping it cancels the walk and frees the items.
+struct Files {
+    search: FileSearch,
+    /// Set by the search's threads when there is something new (the
+    /// first time since it was cleared, they ping the loop).
+    news: Arc<AtomicBool>,
+    ping: RegistrationToken,
+    handle: LoopHandle<'static, Shell<WlDock>>,
+}
+
+impl Drop for Files {
+    fn drop(&mut self) {
+        self.handle.remove(self.ping);
+    }
+}
+
+/// A file the search `found` (under `root`), as the launcher shows it.
+fn file_match(search: &mut FileSearch, root: &Path, home: Option<&Path>, found: Found) -> Match {
+    let matched = search.highlight(&found.rel);
+    let parts = filesearch::parts(&found.rel, &matched);
+    let path = root.join(&found.rel);
+    // The shown path ends with `rel`, so its matches move by the rest.
+    let shown = filesearch::tilde(&path, home);
+    let shown_matched = match shown.ends_with(found.rel.as_str()) {
+        true => {
+            let at = shown.len() - found.rel.len();
+            (matched.iter()).map(|r| r.start + at..r.end + at).collect()
+        }
+        false => Vec::new(),
+    };
+    let file = FileMatch {
+        path,
+        dir: found.dir,
+        parent: parts.parent.to_string(),
+        parent_matched: parts.parent_matched,
+        shown,
+        shown_matched,
+    };
+    Match {
+        name: parts.name.to_string(),
+        icon: None,
+        matched: parts.name_matched,
+        file: Some(file),
+        id: found.rel,
+    }
+}
+
+/// `n` with its thousands separated: `12,345`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Tags of folder listings, unique in the process.
@@ -262,6 +334,10 @@ pub struct WlDock {
     /// The `--launcher` waiting for the launcher's outcome.
     launcher_client: Option<Client>,
     pending_open: Option<PendingOpen>,
+    /// A file the launcher opened (with `open-command`), and the path
+    /// its client is told; run once it gave up the keyboard.
+    pending_path: Option<(PathBuf, String)>,
+    files: Option<Files>,
     /// The installed apps, from the worker.
     apps: Arc<Vec<IndexedApp>>,
     search: Search,
@@ -325,6 +401,8 @@ impl WlDock {
             launcher: None,
             launcher_client: None,
             pending_open: None,
+            pending_path: None,
+            files: None,
             apps: Arc::default(),
             search: Search::default(),
             history: (history::path().as_deref())
@@ -585,11 +663,20 @@ impl WlDock {
         let scale = (core.output_state.info(output)).map_or(1, |i| i.scale_factor.max(1));
         launcher.attach(output.clone(), scale, style, dock.handover());
         dock.begin_launcher(core);
-        self.rank_launcher();
+        self.rank_launcher(core);
+    }
+
+    /// Rank the launcher's matches for its query: apps, or files.
+    fn rank_launcher(&mut self, core: &Core<Self>) {
+        match self.launcher.as_ref().map(|l| l.query().scope()) {
+            Some(Scope::Apps) => self.rank_apps(),
+            Some(Scope::Files) => self.rank_files(core),
+            None => {}
+        }
     }
 
     /// Rank the apps for the launcher's query.
-    fn rank_launcher(&mut self) {
+    fn rank_apps(&mut self) {
         let Self {
             launcher: Some(launcher),
             search,
@@ -616,9 +703,127 @@ impl WlDock {
                 name: a.name.clone(),
                 icon: a.entry.icon.clone(),
                 matched: search.highlight(&a.name, query),
+                file: None,
             })
             .collect();
         launcher.set_matches(matches);
+    }
+
+    /// Search files for the launcher's query: start the search if it
+    /// isn't running, and match the query. The matches stream in as they
+    /// are found (`files_frame`).
+    fn rank_files(&mut self, core: &Core<Self>) {
+        if self.files.is_none() {
+            self.start_files(core);
+        }
+        let (Some(files), Some(launcher)) = (&mut self.files, &mut self.launcher) else {
+            return;
+        };
+        // Typing ranks anew: the best comes to the front again.
+        launcher.unroll();
+        files.search.set_query(launcher.query().text());
+        files.search.tick();
+        self.show_files();
+    }
+
+    /// Start walking `launcher.files.root` for the launcher.
+    fn start_files(&mut self, core: &Core<Self>) {
+        let config = &self.config.launcher.files;
+        let settings = filesearch::Settings {
+            root: config.root(),
+            exclude: config.exclude.clone(),
+            hidden: config.hidden,
+            gitignore: config.gitignore,
+            max: config.max as usize,
+        };
+        let (ping, source) = match ping::make_ping() {
+            Ok(ping) => ping,
+            Err(e) => return warn!("cannot search files: {e}"),
+        };
+        let token = (core.loop_handle).insert_source(source, |_, _, shell: &mut Shell<Self>| {
+            // A frame takes the news in.
+            if let Some(launcher) = &mut shell.program.launcher {
+                launcher.kick();
+            }
+        });
+        let token = match token {
+            Ok(token) => token,
+            Err(e) => return warn!("cannot search files: {}", e.error),
+        };
+        let news = Arc::new(AtomicBool::new(false));
+        let flag = news.clone();
+        // Called for every entry found: only the first news pings.
+        let notify = Arc::new(move || {
+            // Reading first keeps the flag's cache line shared while set.
+            if !flag.load(Ordering::Acquire) && !flag.swap(true, Ordering::AcqRel) {
+                ping.ping();
+            }
+        });
+        match FileSearch::start(&settings, notify) {
+            Ok(search) => {
+                self.files = Some(Files {
+                    search,
+                    news,
+                    ping: token,
+                    handle: core.loop_handle.clone(),
+                })
+            }
+            Err(e) => {
+                core.loop_handle.remove(token);
+                warn!("{e}");
+            }
+        }
+    }
+
+    /// A launcher frame: take in what the file search found since the
+    /// last one, without waiting for it.
+    fn files_frame(&mut self) {
+        let Some(files) = &mut self.files else { return };
+        if !files.news.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if (self.launcher.as_ref()).is_some_and(|l| l.query().scope() == Scope::Files) {
+            files.search.tick();
+            self.show_files();
+        }
+    }
+
+    /// Put the file search's best matches on the launcher's drum (once
+    /// they are the query's), and say how far it got.
+    fn show_files(&mut self) {
+        let (Some(files), Some(launcher)) = (&mut self.files, &mut self.launcher) else {
+            return;
+        };
+        if launcher.query().scope() != Scope::Files {
+            return;
+        }
+        let search = &mut files.search;
+        let root = search.root().to_path_buf();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let empty = launcher.query().text().trim().is_empty();
+        let current = search.current();
+        if empty {
+            launcher.stream_matches(Vec::new());
+        } else if current {
+            let slots = (self.config.launcher.matches as usize).max(1);
+            let kept = launcher.kept().map(str::to_string);
+            let matches = (search.top(slots, kept.as_deref()).into_iter())
+                .map(|found| file_match(search, &root, home.as_deref(), found))
+                .collect();
+            launcher.stream_matches(matches);
+        }
+        let none = !empty && current && search.settled() && search.matched() == 0;
+        let progress = match none {
+            true => "No files".to_string(),
+            // Still walking: an ellipsis.
+            false => {
+                let more = if search.walked() { "" } else { "…" };
+                format!("{} items{more}", thousands(search.seen()))
+            }
+        };
+        launcher.set_files_status(FilesStatus {
+            progress: Some(progress),
+        });
     }
 
     /// A key on the launcher.
@@ -630,18 +835,24 @@ impl WlDock {
         if repeat && !key.repeats() {
             return;
         }
+        let trigger = self.config.launcher.files.trigger;
         let Some(l) = &mut self.launcher else { return };
         match key {
             launcher::Key::Escape if l.query().is_empty() => self.cancel_launcher(core),
             launcher::Key::Escape => {
-                l.query_mut().edit(&launcher::Key::Clear);
-                self.rank_launcher();
+                l.query_mut().edit(&launcher::Key::Clear, trigger);
+                self.rank_launcher(core);
             }
             launcher::Key::Roll(by) => l.roll(by),
             launcher::Key::Open { other } => self.launcher_pick(core, None, other),
             edit => {
-                if l.query_mut().edit(&edit) {
-                    self.rank_launcher();
+                let scope = l.query().scope();
+                if l.query_mut().edit(&edit, trigger) {
+                    // Apps and files never share the drum.
+                    if l.query().scope() != scope {
+                        l.set_matches(Vec::new());
+                    }
+                    self.rank_launcher(core);
                 }
             }
         }
@@ -649,13 +860,24 @@ impl WlDock {
 
     /// Open the launcher's match at ring index `index` (None: the
     /// selection): activate it if it runs, else launch it, or the other
-    /// way around with `other`. It runs once the launcher gave up the
+    /// way around with `other`. A file opens with `open-command`, or with
+    /// `other`, its folder does. It runs once the launcher gave up the
     /// keyboard (`launcher_after`).
     fn launcher_pick(&mut self, core: &Core<Self>, index: Option<usize>, other: bool) {
         let Some(l) = &self.launcher else { return };
         let Some(m) = index.or(l.selected()).and_then(|i| l.match_at(i)) else {
             return;
         };
+        if let Some(f) = &m.file {
+            let path = match other {
+                true => f.path.parent().unwrap_or(&f.path).to_path_buf(),
+                false => f.path.clone(),
+            };
+            let picked = f.path.to_string_lossy().into_owned();
+            self.close_launcher(core, None);
+            self.pending_path = Some((path, picked));
+            return;
+        }
         let Some(app) = self.apps.iter().find(|a| a.id == m.id).cloned() else {
             return;
         };
@@ -707,9 +929,11 @@ impl WlDock {
     }
 
     /// Run the launcher backwards into its dock, with the icon of
-    /// `opened` (an app ID) flying to it if it opened one.
+    /// `opened` (an app ID) flying to it if it opened one. A file search
+    /// stops now.
     fn close_launcher(&mut self, core: &Core<Self>, opened: Option<String>) {
         let _ = core;
+        self.files = None;
         let Some(launcher) = &mut self.launcher else {
             return;
         };
@@ -730,6 +954,7 @@ impl WlDock {
 
     /// Drop the launcher at once; its dock gets its panel back.
     fn drop_launcher(&mut self) {
+        self.files = None;
         let Some(launcher) = self.launcher.take() else {
             return;
         };
@@ -745,12 +970,13 @@ impl WlDock {
     /// After a dispatch: run what the launcher opened, now that it gave up
     /// the keyboard, and drop it once it is out of sight.
     fn launcher_after(&mut self, core: &mut Core<Self>) {
+        let pending = self.pending_open.is_some() || self.pending_path.is_some();
+        // The compositor has given the keyboard back before the app is
+        // activated (or the file opened), so the app keeps it.
+        if pending && let Err(e) = core.conn.roundtrip() {
+            warn!("{e}");
+        }
         if let Some(open) = self.pending_open.take() {
-            // The compositor has given the keyboard back before the app
-            // is activated, so the app keeps it.
-            if let Err(e) = core.conn.roundtrip() {
-                warn!("{e}");
-            }
             let (_, recent) = Self::app_windows(core, &open.app_id);
             match recent {
                 Some(id) if !open.launch => {
@@ -761,6 +987,12 @@ impl WlDock {
             }
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(open.id));
+            }
+        }
+        if let Some((path, picked)) = self.pending_path.take() {
+            self.open_path(core, &path);
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(picked));
             }
         }
         if self.launcher.as_ref().is_some_and(LauncherView::gone) {
@@ -1919,9 +2151,16 @@ impl WlDock {
                 request,
                 entries,
             } => self.folder_listed(core, tag, &request.dir, entries),
+            Done::FileIcons { path, icons } => {
+                if let Some(launcher) = &mut self.launcher {
+                    launcher.file_icons_ready(path, icons);
+                }
+            }
             Done::Apps(apps) => {
                 self.apps = apps;
-                self.rank_launcher();
+                if (self.launcher.as_ref()).is_some_and(|l| l.query().scope() == Scope::Apps) {
+                    self.rank_apps();
+                }
             }
         }
     }
@@ -2107,6 +2346,9 @@ impl Program for WlDock {
     }
 
     fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+        if (self.launcher.as_ref()).is_some_and(|l| l.surface() == surface) {
+            self.files_frame();
+        }
         if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.surface() == surface) {
             launcher.frame_done();
         }

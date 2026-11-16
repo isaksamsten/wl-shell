@@ -63,6 +63,15 @@
 #enter = "activate"              # activate, launch (Ctrl+Enter does the other)
 #history = true                  # Record launches to rank matches
 
+# A query starting with the trigger searches files under root instead.
+#[launcher.files]
+#trigger = "'"                   # One character; "" turns file search off
+#root = "~"
+#exclude = ["node_modules", "target", "__pycache__"]  # Gitignore-style globs
+#hidden = false                  # Include hidden files and directories
+#gitignore = true                # Honor .gitignore, .ignore and git excludes
+#max = 1000000                   # Entries searched at most; 1–100000000
+
 # --- Compositor integration -----------------------------------------------
 # Commands run through `sh -c`. The commands below are niri examples; replace
 # them with your compositor's equivalents. Without close-command, the menu has

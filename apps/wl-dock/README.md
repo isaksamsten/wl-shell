@@ -56,6 +56,18 @@ once something was opened and 1 otherwise.
 Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches
 (`launcher.history = false` turns that off).
 
+Start the query with `'` to search files instead, as in Alfred: `'plan`
+finds `PLAN.md`. There is no index; the launcher walks your home directory
+while you type and the best matches stream onto the drum, each with its
+thumbnail or type icon and its folder. The query uses
+[nucleo's syntax](https://github.com/helix-editor/nucleo): spaces separate
+terms, `^` and `$` anchor, `!` excludes, and `'` asks for an exact substring
+(`''file.pdf`). Enter opens the selected file or folder with
+`files.open-command`, and Ctrl+Enter opens its folder. Backspace on an empty
+file query, or Shift+Tab, goes back to the apps. Hidden files, `.gitignore`d
+files and `launcher.files.exclude` are skipped, symlinks aren't followed, and
+the walk stays on one file system.
+
 ## Configuration
 
 Edit `~/.config/wl-dock/config.toml` (or
@@ -120,6 +132,14 @@ matches = 5                    # Matches on the drum; 0–12, 0 shows only one
 far-scale = 0.5                # Farthest match's size; 0.25–1
 enter = "activate"             # activate, launch (Ctrl+Enter does the other)
 history = true                  # Record launches to rank matches
+
+[launcher.files]
+trigger = "'"                  # Typed first, searches files; "" turns it off
+root = "~"                     # The directory searched
+exclude = ["node_modules", "target", "__pycache__"] # Gitignore-style globs
+hidden = false                 # Include hidden files and directories
+gitignore = true               # Skip what .gitignore, .ignore and git exclude
+max = 1000000                  # Entries searched at most; 1–100000000
 ```
 
 ### Commands and desktop integration
