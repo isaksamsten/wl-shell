@@ -295,6 +295,18 @@ impl Icons {
 /// The icon `name` (a theme name or an absolute path) at `size` in
 /// `theme`, decoded.
 fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
+    // Explicit bundled names bypass theme lookup and need no installed files.
+    let bundled: Option<&[u8]> = match name {
+        "builtin:pin" => Some(include_bytes!("../assets/pin.svg")),
+        "builtin:unpin" => Some(include_bytes!("../assets/unpin.svg")),
+        _ => None,
+    };
+    if let Some(data) = bundled {
+        return render_svg(data, size)
+            .map(|rgba| center(rgba, size))
+            .inspect_err(|e| wl_shell_log::warn!("icon {name}: {e}"))
+            .ok();
+    }
     let path = resolve(name, size, theme)?;
     decode(&path, size)
         .inspect_err(|e| wl_shell_log::warn!("icon {}: {e}", path.display()))
@@ -1052,6 +1064,19 @@ Exec=example --unlisted
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_pins() {
+        for size in [16, 24, 32, 64] {
+            let pin = find("builtin:pin", size, "nonexistent-theme").unwrap();
+            let unpin = find("builtin:unpin", size, "nonexistent-theme").unwrap();
+            for icon in [&pin, &unpin] {
+                assert_eq!((icon.width, icon.height), (size, size));
+                assert!(icon.data.chunks_exact(4).any(|p| p[3] > 0));
+            }
+            assert_ne!(pin.data, unpin.data);
+        }
+    }
 
     #[test]
     fn fitting() {

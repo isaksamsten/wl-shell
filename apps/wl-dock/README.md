@@ -71,13 +71,15 @@ the walk stays on one file system.
 
 Tab on a file shows what you can do with it: its icon flies into a small pill
 above the bar's right end, with its name and folder, and the drum fills with
-Open file, Open with… and Open containing directory. Type to filter them (`ow`
-finds Open with…) and press Enter to run the front one. Open with… (Enter or
-Tab) lists the apps that take the file's type, from their `MimeType=` and your
-`mimeapps.list`, the default first, and adds its icon to the pill; Enter opens
-the file with the front one. Escape, Shift+Tab, or Backspace on an empty query
-go back a step, to where you were; clicking an icon in the pill goes back to
-where it was chosen.
+Open file, Open with…, Open containing directory, Open terminal here
+(`open-terminal-command`, in a file's folder), Copy path, Keep in Dock (or
+Remove from Dock; folders only) and Move to Trash (`trash-command`). Type to
+filter them (`ow` finds Open with…) and press Enter to run the front one. Open
+with… (Enter or Tab) lists the apps that take the file's type, from their
+`MimeType=` and your `mimeapps.list`, the default first, and adds its icon to
+the pill; Enter opens the file with the front one. Escape, Shift+Tab, or
+Backspace on an empty query go back a step, to where you were; clicking an icon
+in the pill goes back to where it was chosen.
 
 ## Configuration
 
@@ -166,6 +168,7 @@ Without `close-command`, the menu has no Close entries. Commands run through
 # close-command = "niri msg action close-window --id {id}"
 # launch-command = "uwsm app -- {desktop-id}"
 terminal = "foot"               # Command for Terminal=true desktop entries
+open-terminal-command = "cd {dir} && exec foot"  # Open terminal here; "" hides it
 launch-timeout = 10000          # Maximum launch bounce; 0–60000
 # mru-event-stream = "~/.config/wl-dock/focus-stream.sh"
 # output-event-stream = "~/.config/wl-dock/output-stream.sh"
@@ -176,6 +179,8 @@ launch-timeout = 10000          # Maximum launch bounce; 0–60000
   By default, apps launch using their desktop entry's `Exec=`.
 - `terminal`: the app's command is appended; include any needed flag, such as
   `"alacritty -e"`.
+- `open-terminal-command`: the launcher's Open terminal here, with `{dir}` the
+  folder (shell quoted). Run with `sh -c`; `""` removes the action.
 - `mru-event-stream`: a long-running command printing one focused window ID per
   line. Enables focus ordering and the active indicator.
 - `output-event-stream`: a long-running command printing `<output> <id>` when

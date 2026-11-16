@@ -82,6 +82,7 @@
 #close-command = "niri msg action close-window --id {id}"      # Example
 #launch-command = "uwsm app -- {desktop-id}"  # Example; also {exec}, {app-id}
 #terminal = "foot"               # For Terminal=true apps, e.g. "alacritty -e"
+#open-terminal-command = "cd {dir} && exec foot"  # Launcher's Open terminal here
 #launch-timeout = 10000          # Maximum launch bounce; 0–60000
 #mru-event-stream = "~/.config/wl-dock/focus-stream.sh"     # Example
 #output-event-stream = "~/.config/wl-dock/output-stream.sh" # Example

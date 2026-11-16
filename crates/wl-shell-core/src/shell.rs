@@ -544,11 +544,12 @@ impl<P: Program> KeyboardHandler for Shell<P> {
         _: &QueueHandle<Self>,
         _: &WlKeyboard,
         surface: &WlSurface,
-        _: u32,
+        serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
         self.core.input.keyboard_focus = Some(surface.clone());
+        self.core.input.serial = Some(serial);
         self.program.keyboard_enter(&mut self.core, surface);
     }
 
@@ -571,9 +572,10 @@ impl<P: Program> KeyboardHandler for Shell<P> {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &WlKeyboard,
-        _: u32,
+        serial: u32,
         event: KeyEvent,
     ) {
+        self.core.input.serial = Some(serial);
         self.program.key(&mut self.core, &event, false);
     }
 
@@ -638,6 +640,7 @@ impl<P: Program> PointerHandler for Shell<P> {
                     }
                 }
                 PointerEventKind::Motion { .. } => input.pointer_pos = event.position,
+                PointerEventKind::Press { serial, .. } => input.serial = Some(serial),
                 _ => {}
             }
             self.program.pointer(&mut self.core, event);

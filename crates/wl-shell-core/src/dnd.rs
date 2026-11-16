@@ -1,6 +1,7 @@
-//! Drag and drop through `wl_data_device`, for programs that set
-//! `Program::DATA_DEVICE`: a data device for the seat, the offer of a
-//! drag over one of the program's surfaces, and the program's own drags.
+//! Drag and drop, and the clipboard, through `wl_data_device`, for
+//! programs that set `Program::DATA_DEVICE`: a data device for the seat,
+//! the offer of a drag over one of the program's surfaces, the program's
+//! own drags, and the selection it sets.
 //!
 //! Dropping on the program: `Program::dnd_enter` gets the offered mime
 //! types, then `dnd_motion`, and `dnd_leave` or `dnd_drop`. The program
@@ -15,6 +16,12 @@
 //! The data is written on a thread when asked for, so a drop on the
 //! program itself can't block it. `Program::drag_source_done` reports how
 //! it ended.
+//!
+//! Copying: `Core::set_selection` puts data of a few mime types on the
+//! clipboard, as of the last input event (a key or button press, or the
+//! keyboard entering one of the program's surfaces), which the compositor
+//! may check is the focus's. The program keeps the data, and writes it
+//! as above, until another client sets the selection.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -25,7 +32,7 @@ use smithay_client_toolkit::data_device_manager::{
     DataDeviceManagerState, WritePipe,
     data_device::{DataDevice, DataDeviceHandler},
     data_offer::{DataOfferHandler, DragOffer},
-    data_source::{DataSourceHandler, DragSource},
+    data_source::{CopyPasteSource, DataSourceHandler, DragSource},
 };
 use wayland_client::{
     Connection, Proxy, QueueHandle,
@@ -51,6 +58,14 @@ pub struct Dnd {
     dropped: bool,
     /// The program's own drag.
     source: Option<Source>,
+    /// The selection the program set, until another replaces it.
+    selection: Option<Selection>,
+}
+
+/// The data the program put on the clipboard.
+struct Selection {
+    source: CopyPasteSource,
+    data: Vec<(String, Vec<u8>)>,
 }
 
 /// One of the program's drags.
@@ -78,6 +93,7 @@ impl Dnd {
             action: DndAction::empty(),
             dropped: false,
             source: None,
+            selection: None,
         }
     }
 
@@ -96,6 +112,7 @@ impl Dnd {
     pub(crate) fn release(&mut self) {
         self.device = None;
         self.source = None;
+        self.selection = None;
     }
 
     /// The offer of the drag over one of the program's surfaces (or
@@ -247,6 +264,21 @@ impl<P: Program> Core<P> {
         }
         Ok(())
     }
+
+    /// Put `data` (mime types and their bytes) on the clipboard, as of the
+    /// last input event. The program's earlier selection goes.
+    pub fn set_selection(&mut self, data: Vec<(String, Vec<u8>)>) -> Result<(), String> {
+        let (Some(manager), Some(device)) = (&self.dnd.manager, &self.dnd.device) else {
+            return Err("the compositor has no data device manager".into());
+        };
+        let serial = (self.input.serial()).ok_or("no input event to copy with")?;
+        let mimes = data.iter().map(|(m, _)| m.clone());
+        let source = manager.create_copy_paste_source(&self.qh, mimes);
+        source.set_selection(device, serial);
+        // Dropping the old CopyPasteSource destroys it.
+        self.dnd.selection = Some(Selection { source, data });
+        Ok(())
+    }
 }
 
 fn drop_source(source: Source) {
@@ -357,30 +389,46 @@ impl<P: Program> DataSourceHandler for Shell<P> {
         mime: String,
         fd: WritePipe,
     ) {
-        let bytes = (self.core.dnd.source.as_ref())
+        let dnd = &self.core.dnd;
+        let drag = (dnd.source.as_ref())
             .filter(|s| s.source.inner() == source)
-            .and_then(|s| s.data.iter().find(|(m, _)| *m == mime))
+            .map(|s| &s.data);
+        let copied = (dnd.selection.as_ref())
+            .filter(|s| s.source.inner() == source)
+            .map(|s| &s.data);
+        let bytes = (drag.or(copied))
+            .and_then(|data| data.iter().find(|(m, _)| *m == mime))
             .map(|(_, b)| b.clone());
         let Some(bytes) = bytes else { return };
         // On a thread: the reader may be this very program, which reads
         // from its event loop.
         let fd = OwnedFd::from(fd);
         let spawned = std::thread::Builder::new()
-            .name("dnd-send".into())
+            .name("data-send".into())
             .spawn(move || {
                 let mut file = File::from(fd);
                 if let Err(e) = file.write_all(&bytes)
                     && e.kind() != ErrorKind::BrokenPipe
                 {
-                    warn!("sending drag data: {e}");
+                    warn!("sending data: {e}");
                 }
             });
         if let Err(e) = spawned {
-            warn!("sending drag data: {e}");
+            warn!("sending data: {e}");
         }
     }
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        // Another client set the selection: ours goes.
+        let dnd = &mut self.core.dnd;
+        if dnd
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.source.inner() == source)
+        {
+            dnd.selection = None;
+            return;
+        }
         self.source_done(source, false);
     }
 

@@ -257,6 +257,9 @@ pub struct IntegrationConfig {
     /// Accepts `{exec}`, `{desktop-id}`, and `{app-id}`.
     pub launch_command: Option<String>,
     pub terminal: String,
+    /// Opens a terminal in a folder (the launcher's Open terminal here):
+    /// `{dir}`. Empty: no such action.
+    pub open_terminal_command: String,
     #[serde(deserialize_with = "launch_timeout")]
     pub launch_timeout: u32,
     pub mru_event_stream: Option<String>,
@@ -270,6 +273,7 @@ impl Default for IntegrationConfig {
             close_command: None,
             launch_command: None,
             terminal: "foot".into(),
+            open_terminal_command: "cd {dir} && exec foot".into(),
             launch_timeout: 10_000,
             mru_event_stream: None,
             output_event_stream: None,
@@ -1092,6 +1096,7 @@ mod tests {
             activate-command = "niri msg action focus-window --id {id}"
             launch-command = "uwsm app -- {desktop-id}"
             terminal = "alacritty -e"
+            open-terminal-command = "alacritty --working-directory {dir}"
             launch-timeout = 5000
             mru-event-stream = "focus.sh"
             output-event-stream = "outputs.sh"
@@ -1165,6 +1170,10 @@ mod tests {
                 c.integration.launch_timeout
             ),
             ("alacritty -e", 5000)
+        );
+        assert_eq!(
+            c.integration.open_terminal_command,
+            "alacritty --working-directory {dir}"
         );
         assert_eq!(c.integration.mru_event_stream.as_deref(), Some("focus.sh"));
         assert_eq!(

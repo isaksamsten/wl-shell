@@ -15,7 +15,8 @@
 //! `{app-id}`, `{id}` (the most recent window, empty without one) and
 //! `{ids}` (all of the app's windows); `open-command` gets `{path}`;
 //! `copy-command` and `move-command` get `{paths}` and `{dest}`,
-//! `trash-command` `{paths}`. Everything is shell quoted.
+//! `trash-command` `{paths}`, `open-terminal-command` `{dir}`. Everything
+//! is shell quoted.
 //!
 //! Files dropped on an app open with its `[app.<id>] drop` command
 //! (`{files}`), else with a `launch-command` that has `{files}`, else with
@@ -95,6 +96,11 @@ pub fn window_command(template: &str, id: &str) -> String {
 /// `open-command` for `path` (or a URI, such as `trash:///`).
 pub fn path_command(template: &str, path: &str) -> String {
     fill(template, &[("path", &quote(path))])
+}
+
+/// `open-terminal-command` in `dir`.
+pub fn dir_command(template: &str, dir: &Path) -> String {
+    fill(template, &[("dir", &quote(&dir.to_string_lossy()))])
 }
 
 /// `paths` shell quoted, separated by spaces.
@@ -271,6 +277,10 @@ mod tests {
             "xdg-open trash:///"
         );
         assert_eq!(path_command("open {path}", "/a b"), "open '/a b'");
+        assert_eq!(
+            dir_command("cd {dir} && exec foot", Path::new("/a b")),
+            "cd '/a b' && exec foot"
+        );
     }
 
     #[test]

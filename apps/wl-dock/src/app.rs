@@ -361,6 +361,9 @@ pub struct WlDock {
     pending_path: Option<(PathBuf, String)>,
     /// A file the launcher opens with an app.
     pending_with: Option<PendingWith>,
+    /// A folder the launcher opens a terminal in, and the path its
+    /// client is told; run once it gave up the keyboard.
+    pending_terminal: Option<(PathBuf, String)>,
     files: Option<Files>,
     /// Files' types for the launcher's actions, for its session.
     file_types: HashMap<PathBuf, FileType>,
@@ -431,6 +434,7 @@ impl WlDock {
             pending_open: None,
             pending_path: None,
             pending_with: None,
+            pending_terminal: None,
             files: None,
             file_types: HashMap::new(),
             pending_tab: None,
@@ -919,7 +923,7 @@ impl WlDock {
     }
 
     /// A key on the launcher.
-    fn launcher_key(&mut self, core: &Core<Self>, event: &KeyEvent, repeat: bool) {
+    fn launcher_key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
         let mods = core.input.modifiers;
         let Some(key) = launcher::Key::from(event.keysym, event.utf8.as_deref(), &mods) else {
             return;
@@ -939,7 +943,7 @@ impl WlDock {
             Act::Roll(by) => l.roll(by),
             Act::Open { .. } if l.depth() > 0 => self.launcher_run(core, None),
             Act::Open { other } => self.launcher_pick(core, None, other),
-            Act::Into => self.launcher_into(None),
+            Act::Into => self.launcher_into(core, None),
             Act::Out => {
                 let to = l.depth().saturating_sub(1);
                 self.launcher_back(to);
@@ -1016,7 +1020,7 @@ impl WlDock {
     /// Tab on the launcher's match at ring index `index` (None: the
     /// selection): a file's actions (once its type is known), or an
     /// action's choices.
-    fn launcher_into(&mut self, index: Option<usize>) {
+    fn launcher_into(&mut self, core: &Core<Self>, index: Option<usize>) {
         let Some(l) = &mut self.launcher else { return };
         if let Some(i) = index {
             l.select(i);
@@ -1064,6 +1068,15 @@ impl WlDock {
             apps: &self.apps,
             file_type,
             history: &history,
+            trash: self.trash_takes(std::slice::from_ref(&f.path)),
+            pinned: f.dir && self.pins.contains(&pins::for_path(&f.path)),
+            terminal: !self
+                .config
+                .integration
+                .open_terminal_command
+                .trim()
+                .is_empty(),
+            clipboard: core.dnd.available(),
         };
         let level = actions::actions(&subject, &cx);
         self.pending_tab = None;
@@ -1075,7 +1088,7 @@ impl WlDock {
 
     /// A file's type arrived: a Tab waiting for it goes on, if the file
     /// is still the selection.
-    fn file_type_ready(&mut self, path: PathBuf, file_type: FileType) {
+    fn file_type_ready(&mut self, core: &Core<Self>, path: PathBuf, file_type: FileType) {
         self.file_types.insert(path.clone(), file_type);
         if self.pending_tab.as_ref() != Some(&path) {
             return;
@@ -1086,14 +1099,14 @@ impl WlDock {
             .and_then(|m| m.file.as_ref())
             .is_some_and(|f| f.path == path);
         if selected && l.depth() == 0 && !l.closing() {
-            self.launcher_into(None);
+            self.launcher_into(core, None);
         }
     }
 
     /// Run the launcher's choice at ring index `index` (None: the
     /// selection). One that opens something closes the launcher (and
     /// runs once it gave up the keyboard); one with choices enters them.
-    fn launcher_run(&mut self, core: &Core<Self>, index: Option<usize>) {
+    fn launcher_run(&mut self, core: &mut Core<Self>, index: Option<usize>) {
         let Some(l) = &self.launcher else { return };
         let Some(i) = index.or(l.selected()) else {
             return;
@@ -1109,7 +1122,7 @@ impl WlDock {
             .map(|f| f.path.to_string_lossy().into_owned())
             .unwrap_or_default();
         match does {
-            Does::Choose(_) => self.launcher_into(Some(i)),
+            Does::Choose(_) => self.launcher_into(core, Some(i)),
             Does::Open(path) => {
                 self.close_launcher(core, None);
                 self.pending_path = Some((path, picked));
@@ -1129,6 +1142,48 @@ impl WlDock {
                     path,
                 });
             }
+            Does::Terminal(dir) => {
+                self.close_launcher(core, None);
+                self.pending_terminal = Some((dir, picked));
+            }
+            // Copied while the launcher has the keyboard, which the
+            // compositor may want.
+            Does::CopyPath(path) => {
+                let text = path.to_string_lossy().into_owned();
+                let data = ([
+                    "text/plain;charset=utf-8",
+                    "text/plain",
+                    "UTF8_STRING",
+                    "STRING",
+                ])
+                .map(|mime| (mime.to_string(), text.clone().into_bytes()));
+                if let Err(e) = core.set_selection(data.into()) {
+                    warn!("copying the path: {e}");
+                }
+                self.finish_launcher(core, picked);
+            }
+            Does::Pin { path, pinned } => {
+                self.finish_launcher(core, picked);
+                self.keep(pins::for_path(&path), pinned);
+            }
+            Does::Trash(path) => {
+                self.finish_launcher(core, picked);
+                let paths = std::slice::from_ref(&path);
+                let command = launch::paths_command(&self.config.trash.command, paths, None);
+                let output = Output::Prefixed("trash-command".into());
+                if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+                    warn!("trash-command: {e}");
+                }
+            }
+        }
+    }
+
+    /// Close the launcher after an action that opens nothing, and tell
+    /// its client what it was done to.
+    fn finish_launcher(&mut self, core: &Core<Self>, picked: String) {
+        self.close_launcher(core, None);
+        if let Some(client) = self.launcher_client.take() {
+            client.answer(Reply::Picked(picked));
         }
     }
 
@@ -1213,7 +1268,8 @@ impl WlDock {
     fn launcher_after(&mut self, core: &mut Core<Self>) {
         let pending = self.pending_open.is_some()
             || self.pending_path.is_some()
-            || self.pending_with.is_some();
+            || self.pending_with.is_some()
+            || self.pending_terminal.is_some();
         // The compositor has given the keyboard back before the app is
         // activated (or the file opened), so the app keeps it.
         if pending && let Err(e) = core.conn.roundtrip() {
@@ -1239,6 +1295,16 @@ impl WlDock {
             self.open_with(core, &with);
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(with.path.to_string_lossy().into_owned()));
+            }
+        }
+        if let Some((dir, picked)) = self.pending_terminal.take() {
+            let command = launch::dir_command(&self.config.integration.open_terminal_command, &dir);
+            let output = Output::Prefixed("open-terminal-command".into());
+            if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+                warn!("open-terminal-command: {e}");
+            }
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(picked));
             }
         }
         if let Some((path, picked)) = self.pending_path.take() {
@@ -1933,7 +1999,11 @@ impl WlDock {
     /// Keep the item `key` (an app or a folder) in the dock, or not, and
     /// write the pins file.
     fn set_pinned(&mut self, key: &str, pinned: bool) {
-        let pin = Self::pin_of(key);
+        self.keep(Self::pin_of(key), pinned);
+    }
+
+    /// Keep `pin` in the dock, or not, and write the pins file.
+    fn keep(&mut self, pin: Pin, pinned: bool) {
         let changed = match pinned {
             true => pins::pin(&mut self.pins, pin),
             false => pins::unpin(&mut self.pins, &pin),
@@ -2428,7 +2498,7 @@ impl WlDock {
                 entries,
             } => self.folder_listed(core, tag, &request.dir, entries),
             Done::FileType { path, types, assoc } => {
-                self.file_type_ready(path, FileType { types, assoc });
+                self.file_type_ready(core, path, FileType { types, assoc });
             }
             Done::FileIcons { path, icons } => {
                 if let Some(launcher) = &mut self.launcher {

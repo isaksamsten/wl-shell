@@ -28,6 +28,9 @@ pub struct Input {
     /// The keyboard's current modifiers. Only current while one of the
     /// program's surfaces has keyboard focus (`keyboard_focus`).
     pub modifiers: Modifiers,
+    /// The serial of the last keyboard enter, key press or button press:
+    /// what setting the selection is checked against.
+    pub(crate) serial: Option<u32>,
 }
 
 impl Input {
@@ -44,6 +47,11 @@ impl Input {
     /// The surface with keyboard focus, if it is one of the program's.
     pub fn keyboard_focus(&self) -> Option<&WlSurface> {
         self.keyboard_focus.as_ref()
+    }
+
+    /// The serial of the last keyboard enter, key press or button press.
+    pub fn serial(&self) -> Option<u32> {
+        self.serial
     }
 
     /// Forget the pointer's surface, e.g. because the program destroyed it:
