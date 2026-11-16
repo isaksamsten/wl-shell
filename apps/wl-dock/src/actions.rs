@@ -113,8 +113,9 @@ pub struct Level {
     /// Its name: the subject's, or the action's. Not shown (the pill
     /// shows icons), but there for logs.
     pub name: String,
-    /// Shown while nothing is typed.
-    pub placeholder: &'static str,
+    /// Shown while nothing is typed: for the subject's actions, the
+    /// default's (the first) name.
+    pub placeholder: String,
     pub choices: Vec<Choice>,
 }
 
@@ -161,7 +162,7 @@ const ACTIONS: &[Action] = &[
         does: |s, cx| match s {
             Subject::File { path, .. } => Does::Choose(Level {
                 name: "Open with".into(),
-                placeholder: "Apps",
+                placeholder: "Apps".into(),
                 choices: open_with(path, cx),
             }),
         },
@@ -189,7 +190,7 @@ fn parent(path: &Path) -> Option<&Path> {
 
 /// The actions that apply to `subject`.
 pub fn actions(subject: &Subject, cx: &Context) -> Level {
-    let choices = (ACTIONS.iter())
+    let choices: Vec<Choice> = (ACTIONS.iter())
         .filter(|a| (a.applies)(subject, cx))
         .map(|a| Choice {
             id: a.id.to_string(),
@@ -200,7 +201,7 @@ pub fn actions(subject: &Subject, cx: &Context) -> Level {
         .collect();
     Level {
         name: subject.name(),
-        placeholder: "Actions",
+        placeholder: choices.first().map(|c| c.name.clone()).unwrap_or_default(),
         choices,
     }
 }
@@ -296,6 +297,7 @@ mod tests {
         let ft = file_type(&["application/pdf"], PDF_DEFAULT);
         let l = level(&file("/d/report.pdf", false), &apps, &ft);
         assert_eq!(l.name, "report.pdf");
+        assert_eq!(l.placeholder, "Open file");
         assert_eq!(ids(&l), ["open", "open-with", "open-directory"]);
         let names: Vec<&str> = l.choices.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -337,6 +339,7 @@ mod tests {
         // Only the file manager takes folders: no Open with….
         assert_eq!(ids(&l), ["open", "open-directory"]);
         assert_eq!(l.choices[0].name, "Open folder");
+        assert_eq!(l.placeholder, "Open folder");
         assert_eq!(l.choices[0].icon, Icon::App("nautilus".into()));
         // Another app that takes folders brings it back.
         let mut more = apps.clone();

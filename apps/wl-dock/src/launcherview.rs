@@ -1458,7 +1458,7 @@ impl LauncherView {
             }
             Scope::Apps | Scope::Actions => {
                 let placeholder = match scope {
-                    Scope::Actions => self.nav.level().map_or("", |l| l.placeholder),
+                    Scope::Actions => self.nav.level().map_or("", |l| l.placeholder.as_str()),
                     _ => PLACEHOLDER,
                 };
                 let name = selected.map(|m| m.name.as_str());
