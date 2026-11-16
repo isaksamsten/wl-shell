@@ -673,6 +673,12 @@ impl WlDock {
             Some(Scope::Files) => self.rank_files(core),
             None => {}
         }
+        // The query can change without changing the file matches or status
+        // (for example, a trailing space). Refresh it independently.
+        if let Some(launcher) = &mut self.launcher {
+            launcher.sync_texts();
+            launcher.kick();
+        }
     }
 
     /// Rank the apps for the launcher's query.
