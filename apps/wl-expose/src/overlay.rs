@@ -1726,6 +1726,7 @@ impl Overlay {
                 let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.content_rect.w);
                 let request = PillRequest {
                     text: w.title.clone(),
+                    spans: Vec::new(),
                     max_width,
                     scale: self.scale,
                     style: style.clone(),

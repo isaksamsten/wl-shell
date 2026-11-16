@@ -147,6 +147,26 @@ pub struct Config {
     pub copy_command: String,
     /// Moves files dropped on a folder into it: `{paths}`, `{dest}`.
     pub move_command: String,
+    /// The launcher's bar, as a fraction of the output's width (at least
+    /// the resting dock's length).
+    #[serde(deserialize_with = "de::fraction")]
+    pub launcher_width: f64,
+    /// The bar's icon, times `icon-size`.
+    #[serde(deserialize_with = "launcher_icon_scale")]
+    pub launcher_icon_scale: f64,
+    /// The query's font size; default: from the icon size.
+    #[serde(deserialize_with = "some_font_size")]
+    pub launcher_font_size: Option<u32>,
+    /// Matches on the launcher's drum; 0 shows only the selection.
+    #[serde(deserialize_with = "launcher_matches")]
+    pub launcher_matches: u32,
+    /// The farthest match's size, times the front one's.
+    #[serde(deserialize_with = "launcher_far_scale")]
+    pub launcher_far_scale: f64,
+    /// What Enter does in the launcher (Ctrl+Enter does the other).
+    pub launcher_enter: LauncherEnter,
+    /// Record launches, to rank the launcher's matches by.
+    pub history: bool,
     /// Per-output overrides, by output name.
     pub output: BTreeMap<String, OutputOverride>,
     /// Per-app settings, by app ID.
@@ -204,6 +224,13 @@ impl Default for Config {
             trash_command: "gio trash -- {paths}".into(),
             copy_command: "cp -rn -- {paths} {dest}".into(),
             move_command: "mv -n -- {paths} {dest}".into(),
+            launcher_width: 0.4,
+            launcher_icon_scale: 1.25,
+            launcher_font_size: None,
+            launcher_matches: 5,
+            launcher_far_scale: 0.5,
+            launcher_enter: LauncherEnter::default(),
+            history: true,
             output: BTreeMap::new(),
             app: BTreeMap::new(),
             folder: BTreeMap::new(),
@@ -265,6 +292,17 @@ pub enum Previews {
     Static,
     /// The app's icon and the titles only.
     Off,
+}
+
+/// What Enter does in the launcher.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LauncherEnter {
+    /// Activate the app's most recent window if it runs, else launch it.
+    #[default]
+    Activate,
+    /// Always launch a new instance.
+    Launch,
 }
 
 /// The outputs that get a dock: `"all"`, or a list of output names.
@@ -565,6 +603,17 @@ pub struct Theme {
     /// The line between the apps and the Trash.
     #[serde(deserialize_with = "de::color")]
     pub separator_color: u32,
+    /// The launcher's bar.
+    #[serde(deserialize_with = "de::color")]
+    pub launcher_background: u32,
+    /// The query.
+    #[serde(deserialize_with = "de::color")]
+    pub launcher_text: u32,
+    /// The rest of the selected app's name, and the placeholder.
+    #[serde(deserialize_with = "de::color")]
+    pub launcher_completion: u32,
+    #[serde(deserialize_with = "de::color")]
+    pub launcher_caret: u32,
 }
 
 impl Default for Theme {
@@ -603,6 +652,10 @@ impl Default for Theme {
             menu_shadow_softness: 18,
             menu_shadow_offset: [0, 4],
             separator_color: 0xffffff40,
+            launcher_background: 0x262626e6,
+            launcher_text: 0xffffffff,
+            launcher_completion: 0xffffff73,
+            launcher_caret: 0xffffffcc,
         }
     }
 }
@@ -717,6 +770,16 @@ impl Config {
             background: 0,
         }
     }
+
+    /// The launcher's query font size.
+    pub fn launcher_font_size(&self) -> f64 {
+        match self.launcher_font_size {
+            Some(size) => size as f64,
+            None => (self.icon_size as f64 * 0.42)
+                .round()
+                .max(self.font_size as f64),
+        }
+    }
 }
 
 impl ConfigFile for Config {
@@ -827,6 +890,25 @@ fn menu_tail<'de, D: Deserializer<'de>>(d: D) -> Result<[u32; 2], D::Error> {
             .ok_or_else(|| D::Error::custom(format!("expected 0-100, got {v}")))
     };
     Ok([check(w)?, check(h)?])
+}
+
+fn some_font_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    de::font_size(d).map(Some)
+}
+
+/// The launcher's icon scale, 1 to 3.
+fn launcher_icon_scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    ranged(d, 1.0, 3.0)
+}
+
+/// Matches on the drum, 0 to 12.
+fn launcher_matches<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 0, 12)
+}
+
+/// The farthest match's scale, 0.25 to 1.
+fn launcher_far_scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    ranged(d, 0.25, 1.0)
 }
 
 #[cfg(test)]
@@ -1101,6 +1183,53 @@ mod tests {
         assert_eq!(c.appearance.light.menu_text, 0x000000ff);
         assert!(c.menu_shadow().is_none());
         assert!(Config::default().menu_shadow().is_some());
+    }
+
+    #[test]
+    fn launcher() {
+        let d = Config::default();
+        assert_eq!((d.launcher_width, d.launcher_icon_scale), (0.4, 1.25));
+        assert_eq!((d.launcher_matches, d.launcher_far_scale), (5, 0.5));
+        assert_eq!(
+            (d.launcher_enter, d.history),
+            (LauncherEnter::Activate, true)
+        );
+        assert_eq!(d.launcher_font_size(), 20.0);
+        let c = parse(
+            r#"
+            launcher-width = 0.5
+            launcher-icon-scale = 1.5
+            launcher-font-size = 24
+            launcher-matches = 0
+            launcher-far-scale = 0.75
+            launcher-enter = "launch"
+            history = false
+
+            [appearance]
+            launcher-background = "000000"
+            launcher-caret = "ff0000"
+            "#,
+        )
+        .unwrap();
+        assert_eq!((c.launcher_width, c.launcher_icon_scale), (0.5, 1.5));
+        assert_eq!((c.launcher_font_size(), c.launcher_matches), (24.0, 0));
+        assert_eq!(c.launcher_far_scale, 0.75);
+        assert_eq!(
+            (c.launcher_enter, c.history),
+            (LauncherEnter::Launch, false)
+        );
+        let t = c.theme();
+        assert_eq!(
+            (t.launcher_background, t.launcher_caret),
+            (0x000000ff, 0xff0000ff)
+        );
+        assert_eq!(t.launcher_text, 0xffffffff);
+        let err = |s: &str| parse(s).is_err();
+        assert!(err("launcher-width = 0"));
+        assert!(err("launcher-matches = 13"));
+        assert!(err("launcher-far-scale = 0.1"));
+        assert!(err("launcher-icon-scale = 0.5"));
+        assert!(err("launcher-enter = \"open\""));
     }
 
     #[test]

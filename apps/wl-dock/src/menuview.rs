@@ -306,6 +306,7 @@ impl MenuView {
         };
         let request = |color: u32, label: &str| PillRequest {
             text: label.to_string(),
+            spans: Vec::new(),
             max_width,
             scale,
             style: text::Style {

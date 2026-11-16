@@ -27,11 +27,13 @@ freedesktop-icons = "0.4"
 gbm = { version = "0.18", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
+nucleo-matcher = "0.3"
 resvg = { version = "0.50", default-features = false, features = ["raster-images"] }
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 smithay-client-toolkit = "0.21"
 toml = "1"
+unicode-normalization = "0.1"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 

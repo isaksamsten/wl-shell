@@ -439,6 +439,7 @@ impl StripView {
             };
             wanted.push(PillRequest {
                 text: w.title.clone(),
+                spans: Vec::new(),
                 max_width: slot.round() as i32,
                 scale: self.place.scale,
                 style: self.style.title.clone(),

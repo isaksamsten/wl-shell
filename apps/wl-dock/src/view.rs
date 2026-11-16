@@ -455,6 +455,27 @@ impl Laid {
     }
 }
 
+/// The dock while the launcher is open on its output.
+struct Launcher {
+    /// 0 (the dock) to 1 (the launcher's bar): the icons shrink and fade
+    /// into the bar's center. The launcher draws the panel meanwhile.
+    morph: Spring,
+    /// The app the launcher opened: its icon flies here, so the slot
+    /// shows none until the launcher is gone.
+    landing: Option<String>,
+}
+
+/// What the launcher takes over from the dock, on the dock's surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Handover {
+    /// The panel as it is now.
+    pub panel: Rect,
+    /// The resting panel's length.
+    pub rest_length: f64,
+    /// The surface's height.
+    pub height: f64,
+}
+
 pub struct DockView {
     // Field order is drop order: children before their parent surface.
     /// The menu, while open (or closing).
@@ -558,6 +579,8 @@ pub struct DockView {
     incoming: Option<Incoming>,
     /// The open menu is a folder's popup.
     popup: bool,
+    /// The launcher is open on this dock's output.
+    launcher: Option<Launcher>,
 }
 
 impl DockView {
@@ -668,6 +691,7 @@ impl DockView {
             grow_key: None,
             incoming: None,
             popup: false,
+            launcher: None,
         };
         dock.apply_size();
         dock.relayout();
@@ -995,7 +1019,8 @@ impl DockView {
         // Hidden, the pointer is on the trigger band: it only brings the
         // dock back, after the delay.
         self.sync_autohide();
-        if !self.showing() {
+        // The launcher covers the output; nothing magnifies meanwhile.
+        if !self.showing() || self.launcher.is_some() {
             return;
         }
         if self.drag.is_some() {
@@ -1587,7 +1612,8 @@ impl DockView {
     /// Start (or keep, or cancel) the timer for where autohide wants the
     /// dock, or show or hide it at once if there is no delay.
     fn sync_autohide(&mut self) {
-        let held = self.strip_open() || self.menu_open() || self.drag.is_some();
+        let held =
+            self.strip_open() || self.menu_open() || self.drag.is_some() || self.launcher.is_some();
         // A drag from outside counts as the pointer.
         let pointer_in = self.pointer_in || self.incoming.is_some();
         let next = autohide::next(&self.style.autohide, self.showing(), pointer_in, held);
@@ -1723,6 +1749,9 @@ impl DockView {
     /// The label that should show: the hovered app's once the delay
     /// passed, or while dragging, what a drop does.
     fn wanted_label(&self) -> Option<LabelKey> {
+        if self.launcher.is_some() {
+            return None;
+        }
         if let Some(drag) = &self.drag {
             let key = self.label_key(dock::TRASH)?;
             return (drag.target == Target::Trash).then(|| LabelKey {
@@ -1800,6 +1829,7 @@ impl DockView {
             || self.gaps.iter().any(|g| !g.presence.settled())
             || self.fly.is_some()
             || !self.grow.settled()
+            || (self.launcher.as_ref()).is_some_and(|l| !l.morph.settled())
     }
 
     /// The frame callback: advance the springs and draw.
@@ -1812,6 +1842,9 @@ impl DockView {
         moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
         moving |= self.grow.advance(dt);
+        if let Some(l) = &mut self.launcher {
+            moving |= l.morph.advance(dt);
+        }
         for g in &mut self.gaps {
             moving |= g.presence.advance(dt);
         }
@@ -1884,22 +1917,13 @@ impl DockView {
         let slide = autohide::slide(self.shown.value, self.style.reach());
         let seen = if self.shown.value > 0.0 { 1.0 } else { 0.0 };
 
-        // The panel: the row without its outer half gaps, plus padding,
-        // never shorter than its shape.
-        let half_gap = self.style.gap / 2.0;
-        let (start, end) = (
-            row.start + half_gap - m.padding,
-            row.end - half_gap + m.padding,
-        );
-        let rendered = match frame.axis() {
-            shapes::Axis::Horizontal => self.panel_rendered.0,
-            shapes::Axis::Vertical => self.panel_rendered.1,
+        // The panel; the launcher draws it while it is open.
+        let (panel, panel_u, length) = self.panel_at(row, slide);
+        let mid = panel_u + length / 2.0;
+        let panel_alpha = match self.launcher {
+            Some(_) => 0.0,
+            None => self.gate(present.min(1.0)) * seen,
         };
-        let length = (end - start).max(rendered);
-        let mid = (start + end) / 2.0;
-        let panel_u = mid - length / 2.0;
-        let panel = frame.rect(panel_u, m.panel_v() - slide, length, m.panel());
-        let panel_alpha = self.gate(present.min(1.0)) * seen;
         shapes::place_panel(
             &mut self.panel,
             self.panel_shape.as_ref(),
@@ -1910,6 +1934,10 @@ impl DockView {
             &IRect::round,
             panel_alpha,
         );
+        // Into the launcher's bar: the icons shrink into its center.
+        let morph = (self.launcher.as_ref()).map_or(0.0, |l| l.morph.value.clamp(0.0, 1.0));
+        let landing_app = (self.launcher.as_ref()).and_then(|l| l.landing.clone());
+        let into = |u: f64| lerp(u, mid, morph);
 
         // Icons rise from the panel's inner edge; indicators sit between
         // them and the edge.
@@ -1931,7 +1959,7 @@ impl DockView {
                 subs.indicator.clear();
                 continue;
             };
-            let weight = slot.presence.value.clamp(0.0, 1.0);
+            let weight = slot.presence.value.clamp(0.0, 1.0) * (1.0 - morph);
             // As `gate`, which can't borrow all of `self` here.
             let gated = match self.g.alpha_modifier {
                 Some(_) => weight,
@@ -1941,7 +1969,7 @@ impl DockView {
             let item = &slot.item;
             if item.kind == Kind::Separator {
                 // A line across the panel, where the icons are.
-                let r = frame.rect(cell.center - 0.5, m.icon_v() - slide, 1.0, m.icon);
+                let r = frame.rect(into(cell.center) - 0.5, m.icon_v() - slide, 1.0, m.icon);
                 let shape = self.separator_shape.as_ref().map(|s| &s.buffer);
                 subs.icon.present(shape, r, gated * seen);
                 subs.indicator.clear();
@@ -1953,14 +1981,16 @@ impl DockView {
                 true => 1.0 + TARGET_GROW * self.grow.value.max(0.0),
                 false => 1.0,
             };
-            let d = cell.size * grow;
+            let d = cell.size * grow * (1.0 - morph);
             // A bounce never takes the icon off the surface.
             let room = (frame.across() - m.icon_v() - d).max(0.0);
             let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
-            let r = frame.rect(cell.center - d / 2.0, m.icon_v() + hop - slide, d, d);
-            // The dragged or flying icon is drawn on its own.
-            let lifted = lifted.as_deref() == Some(item.app_id.as_str());
-            if lifted && self.fly.is_some() {
+            let r = frame.rect(into(cell.center) - d / 2.0, m.icon_v() + hop - slide, d, d);
+            // The dragged or flying icon is drawn on its own, and so is the
+            // one the launcher sends here.
+            let landing_here = landing_app.as_deref() == Some(item.app_id.as_str());
+            let lifted = lifted.as_deref() == Some(item.app_id.as_str()) || landing_here;
+            if lifted && !landing_here && self.fly.is_some() {
                 landing = Some(r);
             }
             match keys.get(i).cloned().flatten() {
@@ -1972,7 +2002,11 @@ impl DockView {
                         Kind::Folder { exists: false } => MISSING_ALPHA,
                         _ => 1.0,
                     };
-                    let alpha = if d >= 0.5 { seen * faded } else { 0.0 };
+                    let alpha = if d >= 0.5 {
+                        seen * faded * (1.0 - morph)
+                    } else {
+                        0.0
+                    };
                     subs.icon.present(cache.icon(&key).as_ref(), padded, alpha);
                 }
                 _ => subs.icon.clear(),
@@ -1996,7 +2030,7 @@ impl DockView {
             match shape {
                 Some(s) => {
                     let (w, h) = (s.rect.w as f64, s.rect.h as f64);
-                    let r = frame.rect(cell.center - w / 2.0, m.dot_v() - slide, w, h);
+                    let r = frame.rect(into(cell.center) - w / 2.0, m.dot_v() - slide, w, h);
                     let a = gated * seen;
                     subs.indicator.set_transform(transform);
                     subs.indicator.present(Some(&s.buffer), r, a);
@@ -2061,9 +2095,15 @@ impl DockView {
         // Input: the panel, and while magnified, the band the icons cover.
         // An autohiding dock reaches down to its edge, so the pointer
         // going into the margin doesn't leave it; hidden, it keeps only
-        // the trigger band there.
+        // the trigger band there. The launcher takes the input while it
+        // is open.
         let mut input = Vec::new();
         let autohide = self.style.autohide;
+        let present = if self.launcher.is_some() {
+            0.0
+        } else {
+            present
+        };
         if present > 0.0 && !self.showing() {
             let trigger = frame.rect(panel_u, 0.0, length, autohide.trigger);
             input.push(IRect::round(trigger));
@@ -2088,6 +2128,107 @@ impl DockView {
             self.set_input(&input);
             self.input = input;
         }
+    }
+
+    /// The panel for `row` slid by `slide`: its rect on the surface, where
+    /// it starts along the dock, and its length. It is the row without
+    /// its outer half gaps, plus padding, never shorter than its shape.
+    fn panel_at(&self, row: &zoom::Row, slide: f64) -> (Rect, f64, f64) {
+        let frame = self.frame();
+        let m = self.style.metrics();
+        let half_gap = self.style.gap / 2.0;
+        let (start, end) = (
+            row.start + half_gap - m.padding,
+            row.end - half_gap + m.padding,
+        );
+        let rendered = match frame.axis() {
+            shapes::Axis::Horizontal => self.panel_rendered.0,
+            shapes::Axis::Vertical => self.panel_rendered.1,
+        };
+        let length = (end - start).max(rendered);
+        let panel_u = (start + end) / 2.0 - length / 2.0;
+        let panel = frame.rect(panel_u, m.panel_v() - slide, length, m.panel());
+        (panel, panel_u, length)
+    }
+
+    // -- the launcher --------------------------------------------------------
+
+    /// Whether the launcher can open on this dock: it is at the bottom and
+    /// on screen.
+    pub fn takes_launcher(&self) -> bool {
+        self.style.layout.position == Position::Bottom && self.configured && self.height > 0
+    }
+
+    /// What the launcher takes over: where the panel is now, and how long
+    /// it is at rest.
+    pub fn handover(&self) -> Handover {
+        let laid = self.lay(self.pointer, self.hover.value.clamp(0.0, 1.0), false);
+        let slide = autohide::slide(self.shown.value, self.style.reach());
+        let (panel, ..) = self.panel_at(&laid.row, slide);
+        let rest = self.lay(self.pointer, 0.0, true);
+        let (_, _, rest_length) = self.panel_at(&rest.row, 0.0);
+        Handover {
+            panel,
+            rest_length,
+            height: self.height as f64,
+        }
+    }
+
+    /// The launcher opened over this dock (its first frame is drawn): the
+    /// panel is the launcher's now, and the icons shrink into it. Nothing
+    /// magnifies, no label shows, and a hidden dock comes back.
+    pub fn begin_launcher(&mut self, core: &Core<WlDock>) {
+        let mut morph = Spring::new(0.0, self.style.response);
+        morph.retarget(1.0);
+        self.launcher = Some(Launcher {
+            morph,
+            landing: None,
+        });
+        self.cancel_label_timer();
+        self.label_on = false;
+        self.unhover(core);
+        self.cancel_autohide_timer();
+        self.set_shown(true);
+        self.update_label();
+        self.render();
+    }
+
+    /// The launcher is closing: the icons come back, and if it opened an
+    /// app, that app's icon is the one flying in.
+    pub fn end_launcher(&mut self, landing: Option<String>) {
+        if let Some(l) = &mut self.launcher {
+            l.morph.retarget(0.0);
+            l.landing = landing;
+        }
+        self.kick();
+    }
+
+    /// The launcher is gone: the dock has its panel back.
+    pub fn launcher_gone(&mut self) {
+        if self.launcher.take().is_some() {
+            self.sync_autohide();
+            self.render();
+        }
+    }
+
+    /// Where the launcher sends the icon of `app_id` it opened: its slot at
+    /// rest, or where a new app's slot appears (after the last app).
+    pub fn landing_rect(&self, app_id: &str) -> Rect {
+        let frame = self.frame();
+        let m = self.style.metrics();
+        let laid = self.lay(self.pointer, 0.0, true);
+        let at = |u: f64| frame.rect(u - m.icon / 2.0, m.icon_v(), m.icon, m.icon);
+        if let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == app_id)
+            && let Some(cell) = laid.cell(i)
+        {
+            return at(cell.center);
+        }
+        let step = m.icon + self.style.gap;
+        let last_app = (self.slots.iter().enumerate().rev())
+            .filter(|(_, s)| !s.leaving && s.item.is_app())
+            .find_map(|(i, _)| laid.cell(i))
+            .map(|c| c.center + step);
+        at(last_app.unwrap_or(frame.length() / 2.0))
     }
 
     fn set_input(&self, rects: &[IRect]) {

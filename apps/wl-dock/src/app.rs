@@ -57,12 +57,22 @@
 //! files open with an app, move or copy into a folder (as the source and
 //! compositor agree), go to the trash, or, if they are all folders,
 //! get pinned.
+//!
+//! The launcher (launcher.rs, launcherview.rs): `wl-dock --launcher`
+//! asks over the dock's socket. The launcher surface lands on the focused
+//! output, and the bottom dock there hands over its panel; with none, the
+//! client gets an error. Typing ranks the installed apps (search.rs, with
+//! the launch history in history.rs); Enter activates the selection's
+//! most recent window or launches it (`launcher-enter`), and the client
+//! is answered once the launcher gave up the keyboard. Escape, a click
+//! outside, or another `--launcher` closes it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use smithay_client_toolkit::{
@@ -89,22 +99,32 @@ use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::toplevel::Toplevel;
 use wl_shell_core::{Core, Program, Shell};
+use wl_shell_daemon::{Client, Incoming as SocketEvent, Listener, Reply};
 use wl_shell_log::warn;
 use wl_shell_render::files::{self, FileEntry, FolderRequest};
-use wl_shell_render::icons::{AppEntry, DesktopAction};
+use wl_shell_render::icons::{AppEntry, DesktopAction, IndexedApp};
 use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
-use crate::config::{Config, FolderView, Windows};
+use crate::config::{Config, FolderView, LauncherEnter, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
 use crate::folder;
+use crate::history::{self, History};
+use crate::ipc::DockRequest;
 use crate::launch::{self, Command};
+use crate::launcher;
+use crate::launcherview::{LauncherInput, LauncherStyle, LauncherView, Match};
 use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin};
+use crate::search::Search;
 use crate::strip::Key;
 use crate::trash;
 use crate::view::{DockView, MenuEvent, Offer, Style};
+
+/// How long the launcher waits for the compositor to say which output it
+/// is on before it takes the first bottom dock.
+const LAUNCHER_PLACE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The mime type of dropped (and dragged out) files.
 const URI_LIST: &str = "text/uri-list";
@@ -152,6 +172,16 @@ struct PendingFolder {
     pressed: Pressed,
     tag: u64,
     view: FolderView,
+}
+
+/// An app the launcher opened, run once it gave up the keyboard.
+struct PendingOpen {
+    /// The app as the dock knows it.
+    app_id: String,
+    /// Its desktop ID, for the history.
+    id: String,
+    /// Launch a new instance (else activate a window, if it has one).
+    launch: bool,
 }
 
 /// Tags of folder listings, unique in the process.
@@ -225,6 +255,19 @@ pub struct WlDock {
     pending_folder: Option<PendingFolder>,
     /// The dock a file is being dragged out of (its popup).
     dragging_out: Option<WlOutput>,
+    /// The socket `--launcher` talks to; None if it couldn't be bound.
+    listener: Option<Listener<DockRequest>>,
+    /// The launcher, while open (or closing).
+    launcher: Option<LauncherView>,
+    /// The `--launcher` waiting for the launcher's outcome.
+    launcher_client: Option<Client>,
+    pending_open: Option<PendingOpen>,
+    /// The installed apps, from the worker.
+    apps: Arc<Vec<IndexedApp>>,
+    search: Search,
+    /// Launches, for ranking; None without a state directory.
+    history_path: Option<PathBuf>,
+    history: History,
 }
 
 impl WlDock {
@@ -278,6 +321,21 @@ impl WlDock {
             incoming: None,
             pending_folder: None,
             dragging_out: None,
+            listener: None,
+            launcher: None,
+            launcher_client: None,
+            pending_open: None,
+            apps: Arc::default(),
+            search: Search::default(),
+            history: (history::path().as_deref())
+                .map(|p| {
+                    history::read(p).unwrap_or_else(|e| {
+                        warn!("{}: {e}", p.display());
+                        History::default()
+                    })
+                })
+                .unwrap_or_default(),
+            history_path: history::path(),
         })
     }
 
@@ -293,6 +351,13 @@ impl WlDock {
         self.watch_trash(core);
         self.use_streams(core);
         self.prefetch_entries();
+        if let Some(assets) = &self.assets {
+            assets.apps();
+        }
+        match Listener::bind(core) {
+            Ok(listener) => self.listener = Some(listener),
+            Err(e) => warn!("no launcher: {e}"),
+        }
         self.after_dispatch(core);
         Ok(())
     }
@@ -419,11 +484,309 @@ impl WlDock {
             for dock in &mut self.docks {
                 dock.render();
             }
+            if let Some(launcher) = &mut self.launcher {
+                launcher.render();
+            }
             self.cache.borrow_mut().trim();
         }
         // The dock may show another target for a drag from outside (its
         // items changed, or it slid back in): accept to match.
         self.sync_accept(core);
+        self.serve(core);
+        self.launcher_after(core);
+    }
+
+    // -- the launcher ------------------------------------------------------------
+
+    /// Answer what came over the socket.
+    fn serve(&mut self, core: &mut Core<Self>) {
+        let Some(listener) = &self.listener else {
+            return;
+        };
+        for event in listener.take() {
+            match event {
+                SocketEvent::Request { client, req } => match req {
+                    DockRequest::Nothing => client.answer(Reply::Error("nothing asked".into())),
+                    DockRequest::Launcher => self.toggle_launcher(core, client),
+                },
+                SocketEvent::Gone(id) => {
+                    // Closing the client cancels.
+                    if self.launcher_client.as_ref().is_some_and(|c| c.id() == id) {
+                        self.launcher_client = None;
+                        self.close_launcher(core, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `--launcher`: open the launcher, or close it if it is open.
+    fn toggle_launcher(&mut self, core: &mut Core<Self>, client: Client) {
+        if self.launcher.as_ref().is_some_and(|l| !l.closing()) {
+            self.cancel_launcher(core);
+            return client.answer(Reply::Cancelled);
+        }
+        // One closing still goes at once.
+        self.drop_launcher();
+        if !self.docks.iter().any(DockView::takes_launcher) {
+            let e = "the launcher needs a dock at the bottom of the screen";
+            return client.answer(Reply::Error(e.into()));
+        }
+        let Some(assets) = self.assets.clone() else {
+            return client.answer(Reply::Error("not started yet".into()));
+        };
+        let response = self.config.response as f64;
+        match LauncherView::new(core, assets, self.cache.clone(), response) {
+            Ok(launcher) => {
+                self.close_popups(core);
+                self.cancel_drags();
+                self.launcher = Some(launcher);
+                self.launcher_client = Some(client);
+                // Should the compositor not say where it is, it takes the
+                // first bottom dock.
+                let timer = core.timer(LAUNCHER_PLACE_TIMEOUT, |app: &mut Self, core| {
+                    let unplaced = app.launcher.as_ref().is_some_and(|l| l.output().is_none());
+                    let first = app.docks.iter().find(|d| d.takes_launcher());
+                    if let (true, Some(output)) = (unplaced, first.map(|d| d.output.clone())) {
+                        app.attach_launcher(core, &output);
+                    }
+                });
+                if let Err(e) = timer {
+                    warn!("{e}");
+                }
+            }
+            Err(e) => client.answer(Reply::Error(format!("cannot show the launcher: {e}"))),
+        }
+    }
+
+    /// The launcher's surface is on `output`: the dock there takes it
+    /// over, if it is at the bottom; else the launcher closes.
+    fn attach_launcher(&mut self, core: &Core<Self>, output: &WlOutput) {
+        let Some(launcher) = &mut self.launcher else {
+            return;
+        };
+        if launcher.output().is_some() || launcher.closing() {
+            return;
+        }
+        let Some(dock) =
+            (self.docks.iter_mut()).find(|d| d.output == *output && d.takes_launcher())
+        else {
+            self.drop_launcher();
+            if let Some(client) = self.launcher_client.take() {
+                let e = "the launcher needs a dock at the bottom of this screen";
+                client.answer(Reply::Error(e.into()));
+            }
+            return;
+        };
+        let style = LauncherStyle::new(&self.config, &dock.style().layout);
+        let scale = (core.output_state.info(output)).map_or(1, |i| i.scale_factor.max(1));
+        launcher.attach(output.clone(), scale, style, dock.handover());
+        dock.begin_launcher(core);
+        self.rank_launcher();
+    }
+
+    /// Rank the apps for the launcher's query.
+    fn rank_launcher(&mut self) {
+        let Self {
+            launcher: Some(launcher),
+            search,
+            apps,
+            history,
+            config,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let now = history::now();
+        let boost = |a: &IndexedApp| match config.history {
+            true => history.boost(&a.id, now),
+            false => 0.0,
+        };
+        let query = launcher.query().text();
+        let ranked = search.rank(apps, query, &boost);
+        let slots = (config.launcher_matches as usize).max(1);
+        let matches = (ranked.into_iter().take(slots))
+            .map(|i| &apps[i])
+            .map(|a| Match {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                icon: a.entry.icon.clone(),
+                matched: search.highlight(&a.name, query),
+            })
+            .collect();
+        launcher.set_matches(matches);
+    }
+
+    /// A key on the launcher.
+    fn launcher_key(&mut self, core: &Core<Self>, event: &KeyEvent, repeat: bool) {
+        let mods = core.input.modifiers;
+        let Some(key) = launcher::Key::from(event.keysym, event.utf8.as_deref(), &mods) else {
+            return;
+        };
+        if repeat && !key.repeats() {
+            return;
+        }
+        let Some(l) = &mut self.launcher else { return };
+        match key {
+            launcher::Key::Escape if l.query().is_empty() => self.cancel_launcher(core),
+            launcher::Key::Escape => {
+                l.query_mut().edit(&launcher::Key::Clear);
+                self.rank_launcher();
+            }
+            launcher::Key::Roll(by) => l.roll(by),
+            launcher::Key::Open { other } => self.launcher_pick(core, None, other),
+            edit => {
+                if l.query_mut().edit(&edit) {
+                    self.rank_launcher();
+                }
+            }
+        }
+    }
+
+    /// Open the launcher's match at ring index `index` (None: the
+    /// selection): activate it if it runs, else launch it, or the other
+    /// way around with `other`. It runs once the launcher gave up the
+    /// keyboard (`launcher_after`).
+    fn launcher_pick(&mut self, core: &Core<Self>, index: Option<usize>, other: bool) {
+        let Some(l) = &self.launcher else { return };
+        let Some(m) = index.or(l.selected()).and_then(|i| l.match_at(i)) else {
+            return;
+        };
+        let Some(app) = self.apps.iter().find(|a| a.id == m.id).cloned() else {
+            return;
+        };
+        let launch = (self.config.launcher_enter == LauncherEnter::Launch) != other;
+        let app_id = self.dock_app_id(core, &app);
+        // Launching needs its entry, which the index has.
+        if !matches!(self.entries.get(&app_id), Some(Some(_))) {
+            self.entries.insert(app_id.clone(), Some(app.entry.clone()));
+        }
+        self.close_launcher(core, Some(app_id.clone()));
+        self.pending_open = Some(PendingOpen {
+            app_id,
+            id: app.id,
+            launch,
+        });
+    }
+
+    /// The app ID the dock knows `app` by: a pinned or running app whose
+    /// desktop entry it is, else a window's app ID that names it, else
+    /// its `StartupWMClass` or desktop ID.
+    fn dock_app_id(&self, core: &Core<Self>, app: &IndexedApp) -> String {
+        let known = pins::apps(&self.pins)
+            .into_iter()
+            .chain(self.order.apps().iter().cloned());
+        for app_id in known {
+            if let Some(Some(e)) = self.entries.get(&app_id)
+                && e.desktop_id == app.entry.desktop_id
+            {
+                return app_id;
+            }
+        }
+        let names: Vec<&str> = std::iter::once(app.id.as_str())
+            .chain(app.wm_class.as_deref())
+            .collect();
+        for (_, t) in core.toplevels() {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&t.app_id)) {
+                return t.app_id;
+            }
+        }
+        app.wm_class.clone().unwrap_or_else(|| app.id.clone())
+    }
+
+    /// Close the launcher, and say so to its client.
+    fn cancel_launcher(&mut self, core: &Core<Self>) {
+        self.close_launcher(core, None);
+        if let Some(client) = self.launcher_client.take() {
+            client.answer(Reply::Cancelled);
+        }
+    }
+
+    /// Run the launcher backwards into its dock, with the icon of
+    /// `opened` (an app ID) flying to it if it opened one.
+    fn close_launcher(&mut self, core: &Core<Self>, opened: Option<String>) {
+        let _ = core;
+        let Some(launcher) = &mut self.launcher else {
+            return;
+        };
+        if launcher.closing() {
+            return;
+        }
+        let output = launcher.output().cloned();
+        let dock = (self.docks.iter_mut()).find(|d| Some(&d.output) == output.as_ref());
+        match dock {
+            Some(dock) => {
+                let fly_to = opened.as_deref().map(|a| dock.landing_rect(a));
+                launcher.close(Some(dock.handover()), fly_to);
+                dock.end_launcher(opened);
+            }
+            None => launcher.close(None, None),
+        }
+    }
+
+    /// Drop the launcher at once; its dock gets its panel back.
+    fn drop_launcher(&mut self) {
+        let Some(launcher) = self.launcher.take() else {
+            return;
+        };
+        if let Some(output) = launcher.output()
+            && let Some(dock) = self.docks.iter_mut().find(|d| d.output == *output)
+        {
+            dock.launcher_gone();
+        }
+        // The dock shows its panel before the launcher's surface goes.
+        drop(launcher);
+    }
+
+    /// After a dispatch: run what the launcher opened, now that it gave up
+    /// the keyboard, and drop it once it is out of sight.
+    fn launcher_after(&mut self, core: &mut Core<Self>) {
+        if let Some(open) = self.pending_open.take() {
+            // The compositor has given the keyboard back before the app
+            // is activated, so the app keeps it.
+            if let Err(e) = core.conn.roundtrip() {
+                warn!("{e}");
+            }
+            let (_, recent) = Self::app_windows(core, &open.app_id);
+            match recent {
+                Some(id) if !open.launch => {
+                    self.activate(core, &id);
+                    self.record(&open.id);
+                }
+                _ => self.launch(core, &open.app_id),
+            }
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(open.id));
+            }
+        }
+        if self.launcher.as_ref().is_some_and(LauncherView::gone) {
+            self.drop_launcher();
+        }
+    }
+
+    /// `id` (a desktop ID, or an app ID) was opened: remember it for
+    /// ranking.
+    fn record(&mut self, id: &str) {
+        if !self.config.history {
+            return;
+        }
+        self.history.record(id, history::now());
+        if let Some(path) = &self.history_path
+            && let Err(e) = history::write(path, &self.history)
+        {
+            warn!("{}: {e}", path.display());
+        }
+    }
+
+    /// `app_id` was launched: record it under its desktop ID if it has
+    /// one.
+    fn record_launch(&mut self, app_id: &str) {
+        let id = match self.entries.get(app_id) {
+            Some(Some(e)) => e.desktop_id.trim_end_matches(".desktop").to_string(),
+            _ => app_id.to_string(),
+        };
+        self.record(&id);
     }
 
     /// The config (or the scheme in use) changed: forget what was rendered
@@ -1187,6 +1550,7 @@ impl WlDock {
         if let Err(e) = result {
             return warn!("cannot launch {app_id}: {e}");
         }
+        self.record_launch(app_id);
         self.start_bounce(core, app_id);
     }
 
@@ -1468,6 +1832,9 @@ impl WlDock {
                 for dock in &mut self.docks {
                     dock.icon_ready(&key);
                 }
+                if let Some(launcher) = &mut self.launcher {
+                    launcher.icon_ready();
+                }
             }
             Done::Named { key, image } => {
                 let mut cache = self.cache.borrow_mut();
@@ -1476,6 +1843,9 @@ impl WlDock {
                 self.trim = true;
                 for dock in &mut self.docks {
                     dock.named_icon_ready();
+                }
+                if let Some(launcher) = &mut self.launcher {
+                    launcher.icon_ready();
                 }
             }
             Done::Label { key, pill } => {
@@ -1492,6 +1862,7 @@ impl WlDock {
                 for dock in &self.docks {
                     dock.request_assets(true);
                 }
+                assets.apps();
             }
             Done::Entry { app_id, entry } => {
                 self.entries.insert(app_id.clone(), entry);
@@ -1509,6 +1880,10 @@ impl WlDock {
                 }
             }
             Done::Pill { tag, request, pill } => {
+                let launcher = self.launcher.as_mut();
+                if launcher.is_some_and(|l| l.pill_ready(tag, &request, &pill)) {
+                    return;
+                }
                 for dock in &mut self.docks {
                     if dock.pill_ready(tag, &request, &pill) {
                         break;
@@ -1527,6 +1902,10 @@ impl WlDock {
                 request,
                 entries,
             } => self.folder_listed(core, tag, &request.dir, entries),
+            Done::Apps(apps) => {
+                self.apps = apps;
+                self.rank_launcher();
+            }
         }
     }
 }
@@ -1655,13 +2034,22 @@ impl Program for WlDock {
         self.outputs_dirty = true;
     }
 
-    fn output_removed(&mut self, _: &mut Core<Self>, output: &WlOutput) {
+    fn output_removed(&mut self, core: &mut Core<Self>, output: &WlOutput) {
+        if self.launcher.as_ref().and_then(LauncherView::output) == Some(output) {
+            self.cancel_launcher(core);
+            self.drop_launcher();
+        }
         self.docks.retain(|d| d.output != *output);
     }
 
     /// The compositor closed a dock, e.g. because its output is going
-    /// away. It comes back if the outputs or the config change.
-    fn layer_closed(&mut self, _: &mut Core<Self>, layer: &LayerSurface) {
+    /// away. It comes back if the outputs or the config change. Closing
+    /// the launcher cancels it.
+    fn layer_closed(&mut self, core: &mut Core<Self>, layer: &LayerSurface) {
+        if self.launcher.as_ref().is_some_and(|l| l.is(layer)) {
+            self.cancel_launcher(core);
+            self.drop_launcher();
+        }
         self.docks.retain(|d| d.surface() != layer.wl_surface());
     }
 
@@ -1671,19 +2059,40 @@ impl Program for WlDock {
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
     ) {
+        let (width, height) = configure.new_size;
+        if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.is(layer)) {
+            launcher.configure(width, height);
+        }
         if let Some(dock) = self.dock_on(layer.wl_surface()) {
-            let (width, height) = configure.new_size;
             dock.configure(width, height);
         }
     }
 
     fn scale_factor_changed(&mut self, _: &mut Core<Self>, surface: &WlSurface, factor: i32) {
+        if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.surface() == surface) {
+            launcher.set_scale(factor);
+        }
         if let Some(dock) = self.dock_on(surface) {
             dock.set_scale(factor);
         }
     }
 
+    /// The launcher's surface is on an output: the dock there takes it
+    /// over.
+    fn surface_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface, output: &WlOutput) {
+        if self
+            .launcher
+            .as_ref()
+            .is_some_and(|l| l.surface() == surface)
+        {
+            self.attach_launcher(core, output);
+        }
+    }
+
     fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+        if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.surface() == surface) {
+            launcher.frame_done();
+        }
         if let Some(dock) = self.dock_on(surface) {
             dock.frame_done();
         }
@@ -1703,10 +2112,15 @@ impl Program for WlDock {
         }
     }
 
-    /// Keys reach the open menu or strip, which has the keyboard while it
-    /// is open. Escape cancels a drag (the press gave the dock the
-    /// keyboard).
+    /// Keys reach the launcher, or the open menu or strip, which have the
+    /// keyboard while they are open. Escape cancels a drag (the press gave
+    /// the dock the keyboard).
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
+        // The launcher has the keyboard while it is open.
+        let focus = core.input.keyboard_focus();
+        if (self.launcher.as_ref()).is_some_and(|l| !l.closing() && Some(l.surface()) == focus) {
+            return self.launcher_key(core, event, repeat);
+        }
         let Some(key) = Key::from_sym(event.keysym) else {
             return;
         };
@@ -1751,6 +2165,14 @@ impl Program for WlDock {
     }
 
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {
+        if let Some(launcher) = (self.launcher.as_mut()).filter(|l| *l.surface() == event.surface) {
+            match launcher.pointer(event) {
+                LauncherInput::Open(i) => self.launcher_pick(core, Some(i), false),
+                LauncherInput::Close => self.cancel_launcher(core),
+                LauncherInput::None => {}
+            }
+            return;
+        }
         if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_strip_surface(&event.surface)) {
             if let Some(id) = dock.strip_pointer(core, event) {
                 self.activate(core, &id);

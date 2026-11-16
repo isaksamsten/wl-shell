@@ -216,6 +216,19 @@ impl Icons {
         Some(AppEntry::from_desktop_entry(e, &self.locales))
     }
 
+    /// Every installed app to list (see `index`), sorted by name.
+    pub fn index(&mut self) -> Vec<IndexedApp> {
+        self.load_entries();
+        let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .split(':')
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .collect();
+        index(&self.entries, &self.locales, &desktops, &program_exists)
+    }
+
     /// The icon for `key`, from the cache or looked up and decoded.
     pub fn get(&mut self, key: &Key) -> Option<Arc<Image>> {
         if let Some(cached) = self.cache.get(key) {
@@ -623,6 +636,230 @@ fn center(Premultiplied(img): Premultiplied, size: u32) -> Image {
         width: size,
         height: size,
         data,
+    }
+}
+
+/// An installed app, as the launcher (and later the app grid) lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedApp {
+    /// The desktop file ID without `.desktop`, e.g. `org.gnome.Nautilus`.
+    pub id: String,
+    /// The localized `Name=`.
+    pub name: String,
+    pub generic_name: Option<String>,
+    pub keywords: Vec<String>,
+    pub categories: Vec<String>,
+    /// `StartupWMClass=`: the app ID its windows likely have.
+    pub wm_class: Option<String>,
+    /// The file name of the program `Exec=` runs.
+    pub program: Option<String>,
+    pub entry: AppEntry,
+}
+
+impl IndexedApp {
+    /// The desktop ID without a reverse-DNS prefix: `Nautilus` for
+    /// `org.gnome.Nautilus`, `firefox` for `firefox`.
+    pub fn short_id(&self) -> &str {
+        match self.id.matches('.').count() {
+            0 => &self.id,
+            _ => self.id.rsplit('.').next().unwrap_or(&self.id),
+        }
+    }
+}
+
+/// The apps among `entries` to list, sorted by name (ignoring case and
+/// accents): each desktop ID once (the first wins, so a user's copy hides
+/// the system's), of type Application with an `Exec=`, not `NoDisplay` or
+/// `Hidden`, shown in `desktops` (`OnlyShowIn`, `NotShowIn`; the
+/// `$XDG_CURRENT_DESKTOP` names), and with a `TryExec=` that `exists`.
+pub fn index(
+    entries: &[DesktopEntry],
+    locales: &[String],
+    desktops: &[String],
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<IndexedApp> {
+    let mut seen = std::collections::HashSet::new();
+    let shown_in = |list: Option<Vec<&str>>| {
+        list.map(|l| {
+            l.iter()
+                .any(|d| desktops.iter().any(|x| x.eq_ignore_ascii_case(d.trim())))
+        })
+    };
+    let mut apps: Vec<IndexedApp> = Vec::new();
+    for e in entries {
+        if !seen.insert(e.id().to_string()) {
+            continue;
+        }
+        let exec = e.exec().map(str::trim).unwrap_or_default();
+        let visible = e.type_() == Some("Application")
+            && !exec.is_empty()
+            && !e.no_display()
+            && !e.hidden()
+            && shown_in(e.only_show_in()) != Some(false)
+            && shown_in(e.not_show_in()) != Some(true)
+            && (e.try_exec().map(str::trim)).is_none_or(|t| t.is_empty() || exists(t));
+        if !visible {
+            continue;
+        }
+        let entry = AppEntry::from_desktop_entry(e, locales);
+        if entry.name.is_empty() {
+            continue;
+        }
+        let text = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+        let list = |l: Option<Vec<&str>>| -> Vec<String> {
+            l.unwrap_or_default().into_iter().filter_map(text).collect()
+        };
+        apps.push(IndexedApp {
+            id: e.id().to_string(),
+            name: entry.name.clone(),
+            generic_name: e.generic_name(locales).as_deref().and_then(text),
+            keywords: (e.keywords(locales).unwrap_or_default().iter())
+                .filter_map(|k| text(k))
+                .collect(),
+            categories: list(e.categories()),
+            wm_class: e.startup_wm_class().and_then(text),
+            program: program(exec),
+            entry,
+        });
+    }
+    apps.sort_by_cached_key(|a| (fold(&a.name), a.id.clone()));
+    apps
+}
+
+/// `s` lowercased without accents, for sorting and matching.
+pub fn fold(s: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    s.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The file name of the program an `Exec=` line runs, past `env` and
+/// its variables.
+fn program(exec: &str) -> Option<String> {
+    let args = split_exec(exec).ok()?;
+    let mut args = args.iter().map(|(a, _)| a.as_str()).skip_while(|a| {
+        *a == "env" || a.ends_with("/env") || (a.contains('=') && !a.starts_with('-'))
+    });
+    let first = args.next()?;
+    let name = Path::new(first).file_name()?.to_string_lossy().into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether `TryExec=`'s program is there: an absolute path that is a
+/// file, or a name found in `$PATH`.
+fn program_exists(name: &str) -> bool {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    let Some(dirs) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&dirs).any(|d| d.join(name).is_file())
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    fn entry(file: &str, text: &str) -> DesktopEntry {
+        let locales = vec!["de".to_string()];
+        let path = format!("/usr/share/applications/{file}");
+        DesktopEntry::from_str(path, text, Some(&locales)).unwrap()
+    }
+
+    fn app(file: &str, name: &str, extra: &str) -> DesktopEntry {
+        let text =
+            format!("[Desktop Entry]\nType=Application\nName={name}\nExec={file} %U\n{extra}");
+        entry(&format!("{file}.desktop"), &text)
+    }
+
+    fn ids(apps: &[IndexedApp]) -> Vec<&str> {
+        apps.iter().map(|a| a.id.as_str()).collect()
+    }
+
+    fn listed(entries: &[DesktopEntry], desktops: &[&str]) -> Vec<IndexedApp> {
+        let locales = vec!["de".to_string()];
+        let desktops: Vec<String> = desktops.iter().map(|d| d.to_string()).collect();
+        index(entries, &locales, &desktops, &|p| p == "present")
+    }
+
+    #[test]
+    fn filters() {
+        let entries = [
+            app("shown", "Shown", ""),
+            app("nodisplay", "Hidden 1", "NoDisplay=true"),
+            app("hidden", "Hidden 2", "Hidden=true"),
+            app("gnome", "Gnome only", "OnlyShowIn=GNOME;"),
+            app("notniri", "Not niri", "NotShowIn=niri;"),
+            app("tryexec", "Try", "TryExec=present"),
+            app("missing", "Missing", "TryExec=absent"),
+            entry(
+                "link.desktop",
+                "[Desktop Entry]\nType=Link\nName=Link\nURL=x\n",
+            ),
+            entry(
+                "noexec.desktop",
+                "[Desktop Entry]\nType=Application\nName=No\n",
+            ),
+        ];
+        let apps = listed(&entries, &["niri"]);
+        assert_eq!(ids(&apps), ["shown", "tryexec"]);
+        let apps = listed(&entries, &["GNOME"]);
+        assert_eq!(ids(&apps), ["gnome", "notniri", "shown", "tryexec"]);
+        // No desktop: OnlyShowIn hides, NotShowIn doesn't.
+        assert_eq!(ids(&listed(&entries, &[])), ["notniri", "shown", "tryexec"]);
+    }
+
+    #[test]
+    fn first_of_an_id_wins() {
+        let user = app("dup", "Dup", "NoDisplay=true");
+        let system = app("dup", "Dup", "");
+        assert!(listed(&[user.clone(), system.clone()], &[]).is_empty());
+        assert_eq!(ids(&listed(&[system, user], &[])), ["dup"]);
+    }
+
+    #[test]
+    fn sorted_by_name_ignoring_case_and_accents() {
+        let entries = [
+            app("z", "zeta", ""),
+            app("e", "Éclair", ""),
+            app("a", "alpha", ""),
+            app("d", "Delta", ""),
+        ];
+        let names: Vec<String> = listed(&entries, &[]).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["alpha", "Delta", "Éclair", "zeta"]);
+        assert_eq!(fold("Éclair À"), "eclair a");
+    }
+
+    #[test]
+    fn fields() {
+        let e = entry(
+            "org.gnome.Nautilus.desktop",
+            "[Desktop Entry]\nType=Application\nName=Files\nName[de]=Dateien\n\
+             GenericName=File Manager\nKeywords=folder;manager; explore;\n\
+             Categories=GTK;Utility;Core;\nStartupWMClass=nautilus\n\
+             Exec=env GDK_BACKEND=wayland /usr/bin/nautilus --new-window %U\nIcon=org.gnome.Nautilus\n",
+        );
+        let apps = listed(&[e], &[]);
+        let a = &apps[0];
+        assert_eq!(
+            (a.id.as_str(), a.short_id()),
+            ("org.gnome.Nautilus", "Nautilus")
+        );
+        assert_eq!(a.name, "Dateien");
+        assert_eq!(a.generic_name.as_deref(), Some("File Manager"));
+        assert_eq!(a.keywords, ["folder", "manager", "explore"]);
+        assert_eq!(a.categories, ["GTK", "Utility", "Core"]);
+        assert_eq!(a.wm_class.as_deref(), Some("nautilus"));
+        assert_eq!(a.program.as_deref(), Some("nautilus"));
+        assert_eq!(a.entry.desktop_id, "org.gnome.Nautilus.desktop");
+        assert_eq!(a.entry.icon.as_deref(), Some("org.gnome.Nautilus"));
+        let firefox = listed(&[app("firefox", "Firefox", "")], &[]);
+        assert_eq!(firefox[0].short_id(), "firefox");
+        assert_eq!(firefox[0].program.as_deref(), Some("firefox"));
     }
 }
 

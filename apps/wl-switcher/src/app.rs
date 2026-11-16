@@ -137,8 +137,11 @@ impl WlSwitcher {
                     overlay.pill_ready(tag, request, pill);
                 }
             }
-            Done::Entry { .. } | Done::Named { .. } | Done::Bubble { .. } | Done::Folder { .. } => {
-            }
+            Done::Entry { .. }
+            | Done::Named { .. }
+            | Done::Bubble { .. }
+            | Done::Folder { .. }
+            | Done::Apps(_) => {}
         }
     }
 

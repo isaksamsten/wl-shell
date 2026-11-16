@@ -1047,6 +1047,7 @@ impl Overlay {
         let max_width = (card.w - 2.0 * TITLE_INSET) as i32;
         let request = PillRequest {
             text: title,
+            spans: Vec::new(),
             max_width: max_width.max(text::MIN_PILL_WIDTH),
             scale: self.scale,
             style: self.style.title.clone(),

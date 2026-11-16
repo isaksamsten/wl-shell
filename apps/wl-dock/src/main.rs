@@ -5,14 +5,20 @@ mod autohide;
 mod config;
 mod dock;
 mod drag;
+mod drum;
 mod folder;
+mod history;
+mod ipc;
 mod launch;
+mod launcher;
+mod launcherview;
 mod layout;
 mod menu;
 mod menuview;
 mod options;
 mod pins;
 mod row;
+mod search;
 mod stack;
 mod strip;
 mod stripview;
@@ -26,6 +32,7 @@ use wl_shell_core::{Error, Shell};
 use wl_shell_log::warn;
 
 use crate::app::WlDock;
+use crate::ipc::DockRequest;
 use crate::options::{Cmd, Options};
 
 fn main() -> ExitCode {
@@ -36,6 +43,10 @@ fn main() -> ExitCode {
     };
     if let Some(cmd) = &opts.command {
         return pins_command(cmd);
+    }
+    if opts.launcher {
+        let missing = "wl-dock isn't running (start it with the compositor)";
+        return wl_shell_daemon::client_to(&DockRequest::Launcher, missing);
     }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
@@ -72,7 +83,8 @@ fn pins_command(cmd: &Cmd) -> ExitCode {
 }
 
 /// The dock is always shown, so unlike wl-switcher it has no client/show
-/// cycle: it runs its own loop until the connection fails.
+/// cycle: it runs its own loop until the connection fails, and listens
+/// on its socket for `--launcher`.
 fn run(opts: &Options) -> Result<(), Error> {
     let dock = WlDock::new(opts.config.clone())?;
     let (mut shell, mut event_loop) = Shell::connect(dock)?;

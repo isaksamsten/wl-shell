@@ -5,23 +5,18 @@
 //! program (`Daemon::busy`). A client that disconnects cancels its show.
 
 pub mod ipc;
+pub mod listen;
 
-use std::cell::RefCell;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::rc::Rc;
 
-use wl_shell_core::reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+use wl_shell_core::reexports::calloop::EventLoop;
 use wl_shell_core::{Core, Error, Program, Shell};
 use wl_shell_log::warn;
 
 pub use ipc::{Reply, Request};
-
-/// Requests are tiny; anything bigger is not a client.
-const MAX_REQUEST: usize = 1 << 20;
+pub use listen::{Client, Incoming, Listener};
 
 /// How a show ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,23 +80,18 @@ pub trait Daemon: Program {
     }
 }
 
-/// Client events, queued by the socket sources for the daemon loop.
-enum Incoming<R> {
-    /// A complete request; `stream` is for the replies.
-    Request {
-        client: u64,
-        stream: UnixStream,
-        req: R,
-    },
-    /// The client closed its connection.
-    Gone(u64),
-}
-
-type Inbox<R> = Rc<RefCell<Vec<Incoming<R>>>>;
-
 /// Hand `req` to the running daemon and relay its answer: the picked ID on
 /// stdout and exit 0; exit 1 when cancelled or on errors.
 pub fn client(req: &impl Request) -> ExitCode {
+    let name = wl_shell_log::name();
+    client_to(
+        req,
+        &format!("no daemon is running (start one with `{name} --daemon`)"),
+    )
+}
+
+/// `client`, saying `missing` if nothing listens on the socket.
+pub fn client_to(req: &impl Request, missing: &str) -> ExitCode {
     let name = wl_shell_log::name();
     let fail = |m: &str| {
         warn!("{m}");
@@ -111,9 +101,7 @@ pub fn client(req: &impl Request) -> ExitCode {
         return fail("XDG_RUNTIME_DIR is not set (or not absolute)");
     };
     let Ok(mut stream) = UnixStream::connect(&path) else {
-        return fail(&format!(
-            "no daemon is running (start one with `{name} --daemon`)"
-        ));
+        return fail(missing);
     };
     if let Err(e) = stream.write_all(req.encode().as_bytes()) {
         return fail(&format!("daemon: {e}"));
@@ -141,44 +129,13 @@ pub fn client(req: &impl Request) -> ExitCode {
 
 /// Run the daemon for `program` until the connection fails.
 pub fn run<P: Daemon>(program: P) -> Result<(), Error> {
-    let name = wl_shell_log::name();
-    let path = ipc::socket_path(name).ok_or("XDG_RUNTIME_DIR is not set (or not absolute)")?;
     let (mut shell, mut event_loop): (Shell<P>, EventLoop<Shell<P>>) = Shell::connect(program)?;
     shell.program.started(&mut shell.core);
-
-    let inbox: Inbox<P::Request> = Rc::default();
-    let listener = bind(&path)?;
-    let _socket = SocketFile(path.clone());
-    listener.set_nonblocking(true)?;
-    let mut next_client = 0;
-    let accept_inbox = inbox.clone();
-    event_loop.handle().insert_source(
-        Generic::new(listener, Interest::READ, Mode::Level),
-        move |_, listener, shell| {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        next_client += 1;
-                        let inbox = accept_inbox.clone();
-                        if let Err(e) = watch_client(&shell.core, stream, next_client, inbox) {
-                            warn!("client: {e}");
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => {
-                        warn!("accept: {e}");
-                        break;
-                    }
-                }
-            }
-            Ok(PostAction::Continue)
-        },
-    )?;
-    warn!("daemon listening on {}", path.display());
+    let listener: Listener<P::Request> = Listener::bind(&shell.core)?;
+    warn!("daemon listening on {}", listener.path().display());
 
     // The client of the current show.
-    let mut active: Option<(u64, UnixStream)> = None;
+    let mut active: Option<Client> = None;
     loop {
         event_loop
             .dispatch(None, &mut shell)
@@ -186,29 +143,24 @@ pub fn run<P: Daemon>(program: P) -> Result<(), Error> {
         let Shell { core, program } = &mut shell;
         program.after_dispatch(core);
 
-        let incoming = std::mem::take(&mut *inbox.borrow_mut());
-        for incoming in incoming {
+        for incoming in listener.take() {
             match incoming {
-                Incoming::Request { stream, .. } if active.is_some() || program.showing() => {
-                    answer(stream, program.busy(core));
+                Incoming::Request { client, .. } if active.is_some() || program.showing() => {
+                    client.answer(program.busy(core));
                 }
-                Incoming::Request {
-                    client,
-                    stream,
-                    req,
-                } => {
-                    let mut warn = |m: String| send(&stream, &Reply::Warn(m));
+                Incoming::Request { client, req } => {
+                    let mut warn = |m: String| client.send(&Reply::Warn(m));
                     program.refresh(core, &mut warn);
                     match program.show(core, req, &mut warn) {
-                        Ok(()) => active = Some((client, stream)),
+                        Ok(()) => active = Some(client),
                         Err(e) => {
                             program.end_show(core);
-                            answer(stream, Reply::Error(e));
+                            client.answer(Reply::Error(e));
                         }
                     }
                 }
-                Incoming::Gone(client) => {
-                    if active.as_ref().is_some_and(|(c, _)| *c == client) {
+                Incoming::Gone(id) => {
+                    if active.as_ref().is_some_and(|c| c.id() == id) {
                         program.client_gone(core);
                     }
                 }
@@ -220,14 +172,11 @@ pub fn run<P: Daemon>(program: P) -> Result<(), Error> {
             // Make sure the show is gone, or closing without keyboard focus
             // and input, before the client acts on the result.
             core.conn.roundtrip()?;
-            if let Some((_, stream)) = active.take() {
-                answer(
-                    stream,
-                    match outcome {
-                        Outcome::Picked(id) => Reply::Picked(id),
-                        Outcome::Cancelled => Reply::Cancelled,
-                    },
-                );
+            if let Some(client) = active.take() {
+                client.answer(match outcome {
+                    Outcome::Picked(id) => Reply::Picked(id),
+                    Outcome::Cancelled => Reply::Cancelled,
+                });
             }
             program.after_show(core);
         }
@@ -235,110 +184,5 @@ pub fn run<P: Daemon>(program: P) -> Result<(), Error> {
         if active.is_none() {
             program.idle(core);
         }
-    }
-}
-
-/// Read the client's request, then watch for it hanging up.
-fn watch_client<P: Program, R: Request + 'static>(
-    core: &Core<P>,
-    stream: UnixStream,
-    client: u64,
-    inbox: Inbox<R>,
-) -> std::io::Result<()> {
-    stream.set_nonblocking(true)?;
-    // Some(..) until the request is complete.
-    let mut reply_stream = Some(stream.try_clone()?);
-    let mut buf = Vec::new();
-    let source = Generic::new(stream, Interest::READ, Mode::Level);
-    let result = core.loop_handle.insert_source(source, move |_, stream, _| {
-        let mut chunk = [0; 4096];
-        loop {
-            match (&**stream).read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) if reply_stream.is_some() => buf.extend_from_slice(&chunk[..n]),
-                Ok(_) => {} // nothing is expected after the request
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    if let Some(reply) = reply_stream.take() {
-                        reply_stream = take_request(&inbox, client, reply, &mut buf);
-                    }
-                    return Ok(PostAction::Continue);
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-            if buf.len() > MAX_REQUEST {
-                if let Some(reply) = reply_stream.take() {
-                    answer(reply, Reply::Error("request too large".into()));
-                }
-                return Ok(PostAction::Remove);
-            }
-        }
-        // End of stream (or an error): the client is gone.
-        if reply_stream.is_none() {
-            inbox.borrow_mut().push(Incoming::Gone(client));
-        }
-        Ok(PostAction::Remove)
-    });
-    result
-        .map(|_| ())
-        .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-/// Queue the request in `buf` if complete. Gives `reply` back if not.
-fn take_request<R: Request>(
-    inbox: &Inbox<R>,
-    client: u64,
-    reply: UnixStream,
-    buf: &mut Vec<u8>,
-) -> Option<UnixStream> {
-    match R::decode(buf) {
-        Ok(Some(req)) => {
-            buf.clear();
-            inbox.borrow_mut().push(Incoming::Request {
-                client,
-                stream: reply,
-                req,
-            });
-            None
-        }
-        Ok(None) => Some(reply),
-        Err(e) => {
-            answer(reply, Reply::Error(format!("bad request: {e}")));
-            None
-        }
-    }
-}
-
-/// Best effort: replies are tiny, and a client that went away needs none.
-fn send(stream: &UnixStream, reply: &Reply) {
-    let _ = (&*stream).write_all(reply.encode().as_bytes());
-}
-
-/// Send the final reply and close, which also ends the client's watch.
-fn answer(stream: UnixStream, reply: Reply) {
-    send(&stream, &reply);
-    let _ = stream.shutdown(Shutdown::Both);
-}
-
-/// Bind the socket, replacing a stale one left by a daemon that died.
-fn bind(path: &Path) -> Result<UnixListener, Error> {
-    match UnixListener::bind(path) {
-        Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            if UnixStream::connect(path).is_ok() {
-                return Err(format!("a daemon is already listening on {}", path.display()).into());
-            }
-            std::fs::remove_file(path)?;
-            Ok(UnixListener::bind(path)?)
-        }
-        other => Ok(other?),
-    }
-}
-
-/// Removes the socket on exit.
-struct SocketFile(PathBuf);
-
-impl Drop for SocketFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }

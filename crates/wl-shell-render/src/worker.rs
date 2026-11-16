@@ -36,6 +36,8 @@ enum Job {
     Bubble { tag: u64, bubble: Bubble },
     /// What it takes to launch an app.
     Entry(String),
+    /// Every installed app to list.
+    Apps,
     /// Reload the desktop entries if they changed.
     Refresh,
     /// A folder's entries.
@@ -61,6 +63,8 @@ pub struct LabelKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PillRequest {
     pub text: String,
+    /// Byte ranges of `text` in other colors than the style's.
+    pub spans: Vec<(std::ops::Range<usize>, u32)>,
     /// Logical pixels.
     pub max_width: i32,
     pub scale: i32,
@@ -89,6 +93,8 @@ pub enum Done {
         app_id: String,
         entry: Option<icons::AppEntry>,
     },
+    /// Every installed app to list (`Assets::apps`), sorted by name.
+    Apps(Arc<Vec<icons::IndexedApp>>),
     /// A pill or a line of text (`Assets::line`).
     Pill {
         tag: u64,
@@ -210,6 +216,11 @@ impl Assets {
         self.send(Job::Refresh);
     }
 
+    /// List the installed apps; arrives as `Done::Apps`.
+    pub fn apps(&self) {
+        self.send(Job::Apps);
+    }
+
     /// Forget all decoded icons in the worker.
     pub fn clear_icons(&self) {
         self.send(Job::ClearIcons);
@@ -222,8 +233,11 @@ impl Assets {
             Done::Named { key, .. } => self.named.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
             Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
-            Done::IconsReloaded | Done::Pill { .. } | Done::Bubble { .. } | Done::Folder { .. } => {
-            }
+            Done::IconsReloaded
+            | Done::Pill { .. }
+            | Done::Bubble { .. }
+            | Done::Folder { .. }
+            | Done::Apps(_) => {}
         }
     }
 }
@@ -293,8 +307,9 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 Done::Label { key, pill }
             }
             Job::Pill { tag, request } => {
-                let pill = text.get_or_insert_with(Text::new).pill(
+                let pill = text.get_or_insert_with(Text::new).pill_spans(
                     &request.text,
+                    &request.spans,
                     &request.style,
                     request.max_width,
                     request.scale,
@@ -302,8 +317,9 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 Done::Pill { tag, request, pill }
             }
             Job::Line { tag, request } => {
-                let pill = text.get_or_insert_with(Text::new).line(
+                let pill = text.get_or_insert_with(Text::new).line_spans(
                     &request.text,
+                    &request.spans,
                     &request.style,
                     request.max_width,
                     request.scale,
@@ -318,6 +334,7 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 let entry = icons.entry(&app_id);
                 Done::Entry { app_id, entry }
             }
+            Job::Apps => Done::Apps(Arc::new(icons.index())),
             Job::Refresh => {
                 if !icons.refresh() {
                     continue;

@@ -33,6 +33,29 @@ Pins live in `$XDG_STATE_HOME/wl-dock/pinned` (normally
 line. You can edit this file too; changes are picked up automatically. Folders
 appear after apps; individual files cannot be pinned.
 
+### Launcher
+
+`wl-dock --launcher` turns a bottom dock into a search bar for apps. Bind it to
+a key, for example on niri:
+
+```kdl
+Mod+Space { spawn "wl-dock" "--launcher"; }
+```
+
+It opens on the focused output, whose dock must be at the bottom. Type to search
+the installed apps by name, generic name, keywords, desktop ID and command;
+acronyms work (`vsc` finds Visual Studio Code), and apps you open often rank
+higher. The best matches stand on a drum above the bar: Up or Ctrl+N rolls the
+next one to the front, Down or Ctrl+P rolls back, and scrolling rolls it too.
+Enter activates the selected app's most recent window, or launches it if it
+isn't running; Ctrl+Enter does the other. Backspace, Ctrl+W and Ctrl+U delete a
+character, a word or everything. Escape clears the query, then closes the
+launcher, as do a click outside it and running `--launcher` again. It exits 0
+once something was opened and 1 otherwise.
+
+Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches
+(`history = false` turns that off).
+
 ## Configuration
 
 Edit `~/.config/wl-dock/config.toml` (or
@@ -76,6 +99,14 @@ previews = "live"               # live, static (one frame), off
 zoom = 1.04                     # Highlighted card scale; 1 disables it
 windows = "all"                 # all, output (needs output-event-stream)
 output-grace = 250              # Wait for the stream to place new windows
+
+launcher-width = 0.4            # Fraction of output width; at least the dock
+launcher-icon-scale = 1.25      # Selected app's icon, times icon-size; 1–3
+# launcher-font-size = 20       # Default: from icon-size
+launcher-matches = 5            # Matches on the drum; 0–12, 0 shows only one
+launcher-far-scale = 0.5        # Farthest match's size; 0.25–1
+launcher-enter = "activate"     # activate, launch (Ctrl+Enter does the other)
+history = true                  # Record launches to rank matches
 ```
 
 ### Commands and desktop integration
@@ -222,6 +253,11 @@ menu-max-width = 320
 menu-shadow-color = "00000066"
 menu-shadow-softness = 18
 menu-shadow-offset = [0, 4]
+
+launcher-background = "262626e6"
+launcher-text = "ffffffff"
+launcher-completion = "ffffff73" # The rest of the selected name, and the placeholder
+launcher-caret = "ffffffcc"
 ```
 
 Put any theme keys in `[appearance.dark]` or `[appearance.light]` to override

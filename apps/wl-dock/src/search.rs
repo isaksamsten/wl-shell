@@ -1,0 +1,270 @@
+//! Ranking the launcher's matches. Pure, unit tested.
+//!
+//! Every installed app (the index, `wl_shell_render::icons::index`) is a
+//! candidate. Each is matched by its name, generic name, keywords, desktop
+//! ID (without a reverse-DNS prefix) and the program its `Exec=` runs,
+//! with the name weighted most: the best of the name's score (plus a bonus
+//! when the name starts with the query) and the others' scores, scaled
+//! down. Scores are `nucleo-matcher`'s fuzzy subsequence scores, ignoring
+//! case and accents, with bonuses at word starts, so acronyms work (`vsc`:
+//! Visual Studio Code). Every word of the query has to match.
+//!
+//! The history (history.rs) adds to the score. Ties go to the shorter
+//! name, then alphabetically (ignoring case and accents), then the index
+//! order, so the results don't reshuffle while typing.
+
+use std::ops::Range;
+
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+use wl_shell_render::icons::{IndexedApp, fold};
+
+/// What matching another field than the name is worth, of the name's.
+const OTHER_WEIGHT: f64 = 0.6;
+/// The bonus for a name that starts with the query.
+const PREFIX_BONUS: f64 = 40.0;
+
+/// A matcher, kept for its allocations.
+pub struct Search {
+    matcher: Matcher,
+    buf: Vec<char>,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        let mut config = Config::DEFAULT;
+        config.prefer_prefix = true;
+        Self {
+            matcher: Matcher::new(config),
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl Search {
+    /// The indices of the `apps` that match `query`, best first. `boost`
+    /// adds to an app's score (its history). An empty query matches
+    /// nothing.
+    pub fn rank(
+        &mut self,
+        apps: &[IndexedApp],
+        query: &str,
+        boost: &dyn Fn(&IndexedApp) -> f64,
+    ) -> Vec<usize> {
+        // Folded, so accents in the query match without them too.
+        let folded = fold(query.trim());
+        let pattern = Pattern::new(
+            &folded,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        if pattern.atoms.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(f64, usize, String, usize)> = Vec::new();
+        for (i, app) in apps.iter().enumerate() {
+            let Some(score) = self.score(&pattern, &folded, app) else {
+                continue;
+            };
+            let name = fold(&app.name);
+            scored.push((score + boost(app), name.chars().count(), name, i));
+        }
+        scored.sort_by(|a, b| {
+            (b.0.total_cmp(&a.0))
+                .then(a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        scored.into_iter().map(|(.., i)| i).collect()
+    }
+
+    /// How well `app` matches; None if it doesn't.
+    fn score(&mut self, pattern: &Pattern, folded: &str, app: &IndexedApp) -> Option<f64> {
+        let name = self.field(pattern, &app.name).map(|s| {
+            let prefix = fold(&app.name).starts_with(folded);
+            s + if prefix { PREFIX_BONUS } else { 0.0 }
+        });
+        let others = (app.generic_name.iter())
+            .chain(&app.keywords)
+            .map(String::as_str)
+            .chain(std::iter::once(app.short_id()))
+            .chain(app.program.as_deref())
+            .filter_map(|text| self.field(pattern, text))
+            .map(|s| s * OTHER_WEIGHT)
+            .reduce(f64::max);
+        match (name, others) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn field(&mut self, pattern: &Pattern, text: &str) -> Option<f64> {
+        let haystack = Utf32Str::new(text, &mut self.buf);
+        pattern.score(haystack, &mut self.matcher).map(f64::from)
+    }
+
+    /// The parts of `name` that `query` matches, as byte ranges, in
+    /// order: each word of the query that matches the name marks its
+    /// characters (a match by another field may mark none).
+    pub fn highlight(&mut self, name: &str, query: &str) -> Vec<Range<usize>> {
+        let pattern = Pattern::new(
+            &fold(query.trim()),
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        // By chars, so the indices are easy to map back.
+        let chars: Vec<(usize, char)> = name.char_indices().collect();
+        self.buf.clear();
+        self.buf.extend(chars.iter().map(|(_, c)| *c));
+        let haystack = Utf32Str::Unicode(&self.buf);
+        let mut indices = Vec::new();
+        for atom in &pattern.atoms {
+            let mut found = Vec::new();
+            if atom
+                .indices(haystack, &mut self.matcher, &mut found)
+                .is_some()
+            {
+                indices.extend(found);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for i in indices {
+            let Some(&(start, c)) = chars.get(i as usize) else {
+                continue;
+            };
+            let end = start + c.len_utf8();
+            match ranges.last_mut() {
+                Some(last) if last.end == start => last.end = end,
+                _ => ranges.push(start..end),
+            }
+        }
+        ranges
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wl_shell_render::icons::AppEntry;
+
+    fn app(id: &str, name: &str) -> IndexedApp {
+        IndexedApp {
+            id: id.into(),
+            name: name.into(),
+            generic_name: None,
+            keywords: Vec::new(),
+            categories: Vec::new(),
+            wm_class: None,
+            program: Some(id.rsplit('.').next().unwrap().to_lowercase()),
+            entry: AppEntry::default(),
+        }
+    }
+
+    fn names(apps: &[IndexedApp], query: &str, boost: &dyn Fn(&IndexedApp) -> f64) -> Vec<String> {
+        let ranked = Search::default().rank(apps, query, boost);
+        ranked.into_iter().map(|i| apps[i].name.clone()).collect()
+    }
+
+    fn plain(apps: &[IndexedApp], query: &str) -> Vec<String> {
+        names(apps, query, &|_| 0.0)
+    }
+
+    #[test]
+    fn empty_query_matches_nothing() {
+        let apps = [app("firefox", "Firefox")];
+        assert!(plain(&apps, "").is_empty());
+        assert!(plain(&apps, "   ").is_empty());
+        assert!(plain(&apps, "xyz").is_empty());
+    }
+
+    #[test]
+    fn prefix_beats_subsequence() {
+        let apps = [
+            app("a.Fir", "Fast Image Resizer"),
+            app("b.Profiler", "Profiler"),
+            app("firefox", "Firefox"),
+        ];
+        assert_eq!(plain(&apps, "fir")[0], "Firefox");
+        assert_eq!(plain(&apps, "Fi")[0], "Firefox");
+    }
+
+    #[test]
+    fn acronyms() {
+        let apps = [
+            app("a.Movies", "Moviestar Scanner"),
+            app("com.visualstudio.code", "Visual Studio Code"),
+            app("b.Calc", "Calculator"),
+        ];
+        assert_eq!(
+            plain(&apps, "vsc"),
+            ["Visual Studio Code", "Moviestar Scanner"]
+        );
+    }
+
+    #[test]
+    fn accents_and_case() {
+        let apps = [app("a.Eclair", "Éclair"), app("b.Eclipse", "eclipse")];
+        assert_eq!(plain(&apps, "ECLA"), ["Éclair"]);
+        assert_eq!(plain(&apps, "écli"), ["eclipse", "Éclair"]);
+    }
+
+    #[test]
+    fn other_fields_match_below_the_name() {
+        let mut files = app("org.gnome.Nautilus", "Files");
+        files.generic_name = Some("File Manager".into());
+        files.keywords = vec!["folder".into()];
+        let nautilus = app("x.Naut", "Nautical Charts");
+        let apps = [files, nautilus];
+        assert_eq!(plain(&apps, "folder"), ["Files"]);
+        assert_eq!(plain(&apps, "manager"), ["Files"]);
+        // By its desktop ID, but the name matching counts more.
+        assert_eq!(plain(&apps, "nauti"), ["Nautical Charts", "Files"]);
+        // Every word has to match.
+        assert_eq!(plain(&apps, "file man"), ["Files"]);
+        assert!(plain(&apps, "file zzz").is_empty());
+    }
+
+    #[test]
+    fn history_orders_equal_matches() {
+        let apps = [app("a.One", "Term One"), app("b.Two", "Term Two")];
+        assert_eq!(plain(&apps, "term"), ["Term One", "Term Two"]);
+        let boost = |a: &IndexedApp| if a.id == "b.Two" { 10.0 } else { 0.0 };
+        assert_eq!(names(&apps, "term", &boost), ["Term Two", "Term One"]);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn highlights() {
+        let mut s = Search::default();
+        assert_eq!(s.highlight("Firefox", "fir"), [0..3]);
+        assert_eq!(
+            s.highlight("Visual Studio Code", "vsc"),
+            [0..1, 7..8, 14..15]
+        );
+        // Accents, multibyte characters, and every word that matches.
+        assert_eq!(s.highlight("Éclair", "ecl"), [0..4]);
+        assert_eq!(s.highlight("Term Two", "two term"), [0..4, 5..8]);
+        assert!(s.highlight("Files", "manager").is_empty());
+        assert!(s.highlight("Files", "").is_empty());
+    }
+
+    #[test]
+    fn stable_ties() {
+        let apps = [
+            app("c.Tc", "Tool C"),
+            app("a.Ta", "Tool A"),
+            app("l.Long", "Tool Longer"),
+            app("b.Tb", "tool b"),
+        ];
+        let ranked = plain(&apps, "tool");
+        assert_eq!(ranked, ["Tool A", "tool b", "Tool C", "Tool Longer"]);
+        // The same in any input order.
+        let mut reversed = apps.to_vec();
+        reversed.reverse();
+        assert_eq!(plain(&reversed, "tool"), ranked);
+    }
+}

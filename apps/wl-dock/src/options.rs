@@ -8,11 +8,17 @@ use clap::{Parser, Subcommand};
 /// subcommands edit the pins ($XDG_STATE_HOME/wl-dock/pinned), which a
 /// running dock picks up.
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(version, args_conflicts_with_subcommands = true)]
 pub struct Options {
     /// Config file (default: $XDG_CONFIG_HOME/wl-dock/config.toml)
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Turn the running dock on the focused output into a search bar for
+    /// apps (or close it if open). Exits 0 once an app was opened, 1 if
+    /// cancelled. Needs a bottom dock there.
+    #[arg(long, conflicts_with = "config")]
+    pub launcher: bool,
 
     #[command(subcommand)]
     pub command: Option<Cmd>,
@@ -67,6 +73,15 @@ mod tests {
         let o = parse(&["--config", "c.toml"]).unwrap();
         assert_eq!(o.config.as_deref(), Some(std::path::Path::new("c.toml")));
         assert!(parse(&["next"]).is_err());
+    }
+
+    #[test]
+    fn launcher() {
+        let o = parse(&["--launcher"]).unwrap();
+        assert!(o.launcher && o.command.is_none());
+        assert!(!parse(&[]).unwrap().launcher);
+        assert!(parse(&["--launcher", "--config", "c.toml"]).is_err());
+        assert!(parse(&["--launcher", "pins"]).is_err());
     }
 
     #[test]

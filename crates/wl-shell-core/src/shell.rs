@@ -113,6 +113,9 @@ pub trait Program: Sized + 'static {
 
     fn scale_factor_changed(&mut self, core: &mut Core<Self>, surface: &WlSurface, factor: i32) {}
 
+    /// `surface` is now (also) shown on `output` (`wl_surface.enter`).
+    fn surface_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface, output: &WlOutput) {}
+
     /// A frame callback of `surface` fired.
     fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface) {}
 
@@ -428,9 +431,10 @@ impl<P: Program> CompositorHandler for Shell<P> {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlSurface,
-        _: &WlOutput,
+        surface: &WlSurface,
+        output: &WlOutput,
     ) {
+        self.program.surface_enter(&mut self.core, surface, output);
     }
 
     fn surface_leave(

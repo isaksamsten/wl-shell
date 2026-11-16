@@ -6,6 +6,8 @@
 //! swash. It has no ellipsizing, so titles are cut at the longest prefix that
 //! still fits with a trailing "…".
 
+use std::ops::Range;
+
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 
 use crate::image::Image;
@@ -70,16 +72,67 @@ impl Text {
 
     /// Shape one line of `text` (physical pixels); returns it and its width.
     fn shape(&mut self, text: &str, font: &str, size: f32, line_h: f32) -> (Buffer, f32) {
+        self.shape_spans(&[(text, None)], font, size, line_h)
+    }
+
+    /// Shape one line of `spans`, each with its color (None: the color
+    /// drawn with); returns it and its width.
+    fn shape_spans(
+        &mut self,
+        spans: &[(&str, Option<u32>)],
+        font: &str,
+        size: f32,
+        line_h: f32,
+    ) -> (Buffer, f32) {
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, line_h));
         buffer.set_wrap(&mut self.fonts, Wrap::None);
         buffer.set_size(&mut self.fonts, None, None);
         let attrs = Attrs::new().family(family(font));
-        buffer.set_text(&mut self.fonts, text, &attrs, Shaping::Advanced, None);
+        let rich = spans.iter().map(|(text, color)| {
+            let attrs = match color {
+                Some(c) => {
+                    let [r, g, b, a] = c.to_be_bytes();
+                    attrs.clone().color(Color::rgba(r, g, b, a))
+                }
+                None => attrs.clone(),
+            };
+            (*text, attrs)
+        });
+        buffer.set_rich_text(&mut self.fonts, rich, &attrs, Shaping::Advanced, None);
         let width = buffer
             .layout_runs()
             .map(|run| run.line_w)
             .fold(0.0, f32::max);
         (buffer, width)
+    }
+
+    /// `text` cleaned and ellipsized to `max` (physical pixels), split at
+    /// the `spans` (byte ranges of `text` in other colors), and shaped.
+    fn shape_line(
+        &mut self,
+        text: &str,
+        spans: &[(Range<usize>, u32)],
+        font: &str,
+        size: f32,
+        line_h: f32,
+        max: f32,
+    ) -> (Buffer, f32) {
+        let pieces = split(text, spans);
+        let full: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+        let mut measure = |t: &str| self.shape(t, font, size, line_h).1;
+        let cut = ellipsize(&full, max, &mut measure);
+        let pieces = match cut == full {
+            true => pieces,
+            false => {
+                let keep = cut.len() - "…".len();
+                let mut out = truncate(pieces, keep);
+                out.push(("…".to_string(), None));
+                out
+            }
+        };
+        let spans: Vec<(&str, Option<u32>)> =
+            pieces.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+        self.shape_spans(&spans, font, size, line_h)
     }
 
     /// Draw `buffer` at (`x`, `y`) onto `img`, blending over its pixels.
@@ -109,14 +162,23 @@ impl Text {
     /// The title in a fully rounded pill, at most `max_width` logical pixels
     /// wide, rendered at `scale`.
     pub fn pill(&mut self, title: &str, style: &Style, max_width: i32, scale: i32) -> Pill {
+        self.pill_spans(title, &[], style, max_width, scale)
+    }
+
+    /// A pill whose `spans` (byte ranges of `title`) are in other colors.
+    pub fn pill_spans(
+        &mut self,
+        title: &str,
+        spans: &[(Range<usize>, u32)],
+        style: &Style,
+        max_width: i32,
+        scale: i32,
+    ) -> Pill {
         let s = scale.max(1);
         let size = (style.size * s as f64) as f32;
         let line_h = (line_height(style.size) * s) as f32;
         let max_text = ((max_width - 2 * PAD_X).max(1) * s) as f32;
-        let title = clean(title);
-        let mut measure = |t: &str| self.shape(t, &style.font, size, line_h).1;
-        let text = ellipsize(&title, max_text, &mut measure);
-        let (buffer, text_w) = self.shape(&text, &style.font, size, line_h);
+        let (buffer, text_w) = self.shape_line(title, spans, &style.font, size, line_h, max_text);
 
         let width = ((text_w / s as f32).ceil() as i32 + 2 * PAD_X).min(max_width.max(2 * PAD_X));
         let height = pill_height(style.size);
@@ -145,14 +207,24 @@ impl Text {
     /// pixels wide (ellipsized), as tall as `line_height`, rendered at
     /// `scale`. The background shows only if it isn't transparent.
     pub fn line(&mut self, text: &str, style: &Style, max_width: i32, scale: i32) -> Pill {
+        self.line_spans(text, &[], style, max_width, scale)
+    }
+
+    /// A line whose `spans` (byte ranges of `text`) are in other colors.
+    pub fn line_spans(
+        &mut self,
+        text: &str,
+        spans: &[(Range<usize>, u32)],
+        style: &Style,
+        max_width: i32,
+        scale: i32,
+    ) -> Pill {
         let s = scale.max(1);
         let max_width = max_width.max(1);
         let size = (style.size * s as f64) as f32;
         let line_h = (line_height(style.size) * s) as f32;
-        let text = clean(text);
-        let mut measure = |t: &str| self.shape(t, &style.font, size, line_h).1;
-        let text = ellipsize(&text, (max_width * s) as f32, &mut measure);
-        let (buffer, text_w) = self.shape(&text, &style.font, size, line_h);
+        let max = (max_width * s) as f32;
+        let (buffer, text_w) = self.shape_line(text, spans, &style.font, size, line_h, max);
         let width = ((text_w / s as f32).ceil() as i32).clamp(1, max_width);
         let height = line_height(style.size);
         let (bw, bh) = (width * s, height * s);
@@ -213,12 +285,51 @@ fn blend(dst: &mut [u8], src: [f64; 3], alpha: f64) {
 }
 
 /// One line: control characters (newlines, tabs) become spaces.
+#[cfg(test)]
 fn clean(title: &str) -> String {
-    let s: String = title
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+    split(title, &[]).into_iter().map(|(t, _)| t).collect()
+}
+
+/// `text` cleaned (one line, trimmed) in pieces of one color each: the
+/// `spans` (byte ranges of `text`) in theirs, the rest in None.
+fn split(text: &str, spans: &[(Range<usize>, u32)]) -> Vec<(String, Option<u32>)> {
+    let chars: Vec<(char, Option<u32>)> = text
+        .char_indices()
+        .map(|(i, c)| {
+            let c = if c.is_control() { ' ' } else { c };
+            let color = spans.iter().find(|(r, _)| r.contains(&i)).map(|(_, c)| *c);
+            (c, color)
+        })
         .collect();
-    s.trim().to_string()
+    let start = chars.iter().position(|(c, _)| !c.is_whitespace());
+    let end = chars.iter().rposition(|(c, _)| !c.is_whitespace());
+    let (Some(start), Some(end)) = (start, end) else {
+        return Vec::new();
+    };
+    let mut pieces: Vec<(String, Option<u32>)> = Vec::new();
+    for &(c, color) in &chars[start..=end] {
+        match pieces.last_mut() {
+            Some((t, last)) if *last == color => t.push(c),
+            _ => pieces.push((c.to_string(), color)),
+        }
+    }
+    pieces
+}
+
+/// The first `keep` bytes of `pieces`.
+fn truncate(pieces: Vec<(String, Option<u32>)>, mut keep: usize) -> Vec<(String, Option<u32>)> {
+    let mut out = Vec::new();
+    for (mut t, color) in pieces {
+        if keep == 0 {
+            break;
+        }
+        if t.len() > keep {
+            t.truncate(keep);
+        }
+        keep -= t.len();
+        out.push((t, color));
+    }
+    out
 }
 
 /// `text`, or its longest prefix with "…" appended whose `measure` fits in
@@ -327,6 +438,30 @@ mod tests {
     #[test]
     fn cleaned() {
         assert_eq!(clean(" a\tb\nc "), "a b c");
+    }
+
+    #[test]
+    fn colored_pieces() {
+        let piece = |t: &str, c: Option<u32>| (t.to_string(), c);
+        // Byte ranges of the text as given, though it is trimmed.
+        let spans = [(1..2, 7), (3..5, 7)];
+        assert_eq!(
+            split(" Firé\tx ", &spans),
+            [
+                piece("F", Some(7)),
+                piece("i", None),
+                piece("ré", Some(7)),
+                piece(" x", None)
+            ]
+        );
+        assert!(split("  ", &spans).is_empty());
+        let pieces = split("abcd", &[(1..3, 7)]);
+        assert_eq!(
+            truncate(pieces.clone(), 2),
+            [piece("a", None), piece("b", Some(7))]
+        );
+        assert_eq!(truncate(pieces.clone(), 4), pieces);
+        assert!(truncate(pieces, 0).is_empty());
     }
 
     #[test]

@@ -77,7 +77,8 @@ impl Assets {
             | Done::Entry { .. }
             | Done::Named { .. }
             | Done::Bubble { .. }
-            | Done::Folder { .. } => {}
+            | Done::Folder { .. }
+            | Done::Apps(_) => {}
         }
     }
 }
