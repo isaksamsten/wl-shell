@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/3ff2300a-503c-4ec4-87d3-740abe513767
+
 # wl-dock
 
 A Wayland dock for pinned and running apps, with magnifying icons, window
