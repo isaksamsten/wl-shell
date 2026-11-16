@@ -143,7 +143,8 @@
 #menu-shadow-offset = [0, 4]
 #launcher-background = "262626e6"
 #launcher-text = "ffffffff"
-#launcher-completion = "ffffff73"
+#launcher-completion = "ffffff8c"
+#launcher-match = "81d0ffff"
 #launcher-caret = "ffffffcc"
 
 # Any appearance key can be overridden for just light or dark mode (example):

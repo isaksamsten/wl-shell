@@ -299,7 +299,8 @@ menu-shadow-offset = [0, 4]
 
 launcher-background = "262626e6"
 launcher-text = "ffffffff"
-launcher-completion = "ffffff73" # The rest of the selected name, and the placeholder
+launcher-completion = "ffffff8c" # The rest of the selected name, and the placeholder
+launcher-match = "81d0ffff" # What the query matched
 launcher-caret = "ffffffcc"
 ```
 

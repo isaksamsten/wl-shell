@@ -725,6 +725,9 @@ pub struct Theme {
     /// The rest of the selected app's name, and the placeholder.
     #[serde(deserialize_with = "de::color")]
     pub launcher_completion: u32,
+    /// What the query matched in the names and paths shown.
+    #[serde(deserialize_with = "de::color")]
+    pub launcher_match: u32,
     #[serde(deserialize_with = "de::color")]
     pub launcher_caret: u32,
 }
@@ -767,7 +770,10 @@ impl Default for Theme {
             separator_color: 0xffffff40,
             launcher_background: 0x262626e6,
             launcher_text: 0xffffffff,
-            launcher_completion: 0xffffff73,
+            // Adwaita's dark style: the dim opacity (55%), and the blue
+            // accent's standalone color for the matches.
+            launcher_completion: 0xffffff8c,
+            launcher_match: 0x81d0ffff,
             launcher_caret: 0xffffffcc,
         }
     }

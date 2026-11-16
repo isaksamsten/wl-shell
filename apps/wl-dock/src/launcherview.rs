@@ -135,6 +135,8 @@ pub struct LauncherStyle {
     pub font_size: f64,
     pub text: u32,
     pub completion: u32,
+    /// What the query matched.
+    pub matched: u32,
     pub caret: u32,
     pub icon_theme: Option<String>,
     pub icon_shadow: Option<shadow::IconShadow>,
@@ -160,6 +162,7 @@ impl LauncherStyle {
             font_size: config.launcher_font_size(),
             text: theme.launcher_text,
             completion: theme.launcher_completion,
+            matched: theme.launcher_match,
             caret: theme.launcher_caret,
             icon_theme: theme.icon_theme.clone(),
             icon_shadow: config.icon_shadow(),
@@ -1017,7 +1020,7 @@ impl LauncherView {
                     // Not the query's continuation: at the bar's end, with
                     // what the query matched brighter.
                     (Completion::After(name), Some((m, _))) => {
-                        let spans = m.matched.iter().map(|r| (r.clone(), style.text)).collect();
+                        let spans = m.matched.iter().map(|r| (r.clone(), style.matched)).collect();
                         (None, Some(spanned(name, spans, style.completion)))
                     }
                     _ => (None, None),
@@ -1444,7 +1447,7 @@ fn path_request(f: &FileMatch, style: &LauncherStyle, max: i32, scale: i32) -> P
     let name_at = text.rfind('/').map_or(0, |i| i + 1);
     // The first span holding a character colors it.
     let mut spans: Vec<(Range<usize>, u32)> =
-        matched.into_iter().map(|r| (r, style.text)).collect();
+        matched.into_iter().map(|r| (r, style.matched)).collect();
     spans.push((name_at..text.len(), style.completion));
     PillRequest {
         text,
@@ -1459,7 +1462,7 @@ fn path_request(f: &FileMatch, style: &LauncherStyle, max: i32, scale: i32) -> P
 /// brighter, and for a file its parent directory's name, dimmer.
 fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
     let mut spans: Vec<(Range<usize>, u32)> =
-        m.matched.iter().map(|r| (r.clone(), style.text)).collect();
+        m.matched.iter().map(|r| (r.clone(), style.matched)).collect();
     let mut text = m.name.clone();
     if let Some(f) = m.file.as_ref().filter(|f| !f.parent.is_empty()) {
         text.push_str("  ");
@@ -1469,7 +1472,7 @@ fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> Pill
         let matched = f
             .parent_matched
             .iter()
-            .map(|r| (r.start + at..r.end + at, style.completion));
+            .map(|r| (r.start + at..r.end + at, style.matched));
         spans.extend(matched);
         spans.push((at..text.len(), dimmer(style.completion)));
     }
