@@ -44,6 +44,8 @@ enum Job {
     Folder { tag: u64, request: FolderRequest },
     /// The icons of a file (or folder): its thumbnail, or its type's.
     FileIcons { path: std::path::PathBuf, dir: bool },
+    /// A file's type, its parents, and the apps associated with types.
+    FileType { path: std::path::PathBuf, dir: bool },
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -119,6 +121,14 @@ pub enum Done {
     FileIcons {
         path: std::path::PathBuf,
         icons: Vec<String>,
+    },
+    /// A file's type (`Assets::file_type`): the type and every type it
+    /// is a kind of, nearest first (empty if unknown), and the
+    /// `mimeapps.list` associations.
+    FileType {
+        path: std::path::PathBuf,
+        types: Vec<String>,
+        assoc: Arc<crate::mimeapps::MimeApps>,
     },
 }
 
@@ -228,6 +238,15 @@ impl Assets {
         });
     }
 
+    /// Look up the type of `path` (a folder if `dir`) and the apps
+    /// associated with types; arrives as `Done::FileType`.
+    pub fn file_type(&self, path: &std::path::Path, dir: bool) {
+        self.send(Job::FileType {
+            path: path.to_path_buf(),
+            dir,
+        });
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -255,6 +274,7 @@ impl Assets {
             | Done::Bubble { .. }
             | Done::Folder { .. }
             | Done::FileIcons { .. }
+            | Done::FileType { .. }
             | Done::Apps(_) => {}
         }
     }
@@ -373,6 +393,20 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 let mime = mime.get_or_insert_with(MimeDb::load);
                 let icons = files::icons(&path, dir, mime);
                 Done::FileIcons { path, icons }
+            }
+            Job::FileType { path, dir } => {
+                let mime = mime.get_or_insert_with(MimeDb::load);
+                let types = (mime.type_of_path(&path, dir))
+                    .map(|t| mime.lineage(&t))
+                    .unwrap_or_default();
+                let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP")
+                    .unwrap_or_default()
+                    .split(':')
+                    .filter(|d| !d.is_empty())
+                    .map(String::from)
+                    .collect();
+                let assoc = Arc::new(crate::mimeapps::MimeApps::load(&desktops));
+                Done::FileType { path, types, assoc }
             }
             Job::ClearIcons => {
                 icons.clear();

@@ -1,6 +1,7 @@
 //! The launch history: which apps were opened from the dock or the
-//! launcher, how often and when last, to rank the launcher's matches by.
-//! The parsing and the scores are pure, unit tested.
+//! launcher, how often and when last, to rank the launcher's matches by,
+//! and which app each launcher query meant. The parsing and the scores
+//! are pure, unit tested.
 //!
 //! ```text
 //! $XDG_STATE_HOME/wl-dock/history      (default ~/.local/state/wl-dock/history)
@@ -8,22 +9,34 @@
 //!
 //! One app per line: `<count> <last> <id>`, where `last` is in seconds
 //! since the epoch and `id` is the app's desktop ID without `.desktop`
-//! (its app ID if it has no desktop entry). Lines that don't parse are
-//! skipped. The file is written atomically after every launch.
+//! (its app ID if it has no desktop entry). A learned query is a line
+//! `query<TAB><last><TAB><id><TAB><query>`, the query folded (lowercase,
+//! no accents). Lines that don't parse are skipped. The file is written
+//! atomically after every launch.
 //!
 //! An app's frecency is its count, halved for every week since it was
 //! last opened; its boost is logarithmic in that, so a few launches
 //! matter and a thousand don't drown the match itself.
+//!
+//! The app last picked for a query is what that query, and every prefix
+//! of it, meant (`meant`): picking Firefox after typing `fire` puts it
+//! first for `f`, `fi`, `fir` and `fire`. Of several learned queries
+//! that start with the typed one, the most recent wins. Only the latest
+//! `MAX_QUERIES` are kept.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use wl_shell_render::icons::fold;
+
 /// The frecency's half-life, seconds.
 const HALF_LIFE: f64 = 7.0 * 24.0 * 3600.0;
 /// Score points per e-fold of frecency.
 const WEIGHT: f64 = 12.0;
+/// Learned queries kept at most.
+const MAX_QUERIES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -35,6 +48,8 @@ pub struct Record {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
     apps: BTreeMap<String, Record>,
+    /// Folded query to (when, app ID).
+    queries: BTreeMap<String, (u64, String)>,
 }
 
 /// Now, in seconds since the epoch.
@@ -42,11 +57,28 @@ pub fn now() -> u64 {
     (SystemTime::now().duration_since(UNIX_EPOCH)).map_or(0, |d| d.as_secs())
 }
 
+/// A query as it is learned: folded and trimmed.
+fn key(query: &str) -> String {
+    fold(query.trim())
+}
+
 impl History {
     /// The history in a file's text.
     pub fn parse(text: &str) -> Self {
         let mut apps = BTreeMap::new();
+        let mut queries = BTreeMap::new();
         for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("query\t") {
+                let mut parts = rest.splitn(3, '\t');
+                if let (Some(Ok(last)), Some(id), Some(query)) =
+                    (parts.next().map(str::parse), parts.next(), parts.next())
+                    && !id.is_empty()
+                    && !key(query).is_empty()
+                {
+                    queries.insert(key(query), (last, id.to_string()));
+                }
+                continue;
+            }
             let mut parts = line.trim().splitn(3, ' ');
             let (Some(count), Some(last), Some(id)) = (parts.next(), parts.next(), parts.next())
             else {
@@ -60,7 +92,7 @@ impl History {
                 apps.insert(id.to_string(), Record { count, last });
             }
         }
-        Self { apps }
+        Self { apps, queries }
     }
 
     /// The file's text.
@@ -68,6 +100,9 @@ impl History {
         let mut out = String::from("# wl-dock: launches, as <count> <last> <app>\n");
         for (id, r) in &self.apps {
             out.push_str(&format!("{} {} {id}\n", r.count, r.last));
+        }
+        for (query, (last, id)) in &self.queries {
+            out.push_str(&format!("query\t{last}\t{id}\t{query}\n"));
         }
         out
     }
@@ -85,6 +120,37 @@ impl History {
         r.last = r.last.max(now);
     }
 
+    /// `id` was picked for `query` at `now`.
+    pub fn learn(&mut self, query: &str, id: &str, now: u64) {
+        let query = key(query);
+        if query.is_empty() || id.is_empty() || (query.clone() + id).contains(['\n', '\t']) {
+            return;
+        }
+        self.queries.insert(query, (now, id.to_string()));
+        while self.queries.len() > MAX_QUERIES {
+            let oldest = (self.queries.iter())
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(q, _)| q.clone());
+            match oldest {
+                Some(q) => self.queries.remove(&q),
+                None => break,
+            };
+        }
+    }
+
+    /// The app `query` meant: the one last picked for it, or for a query
+    /// it is the start of.
+    pub fn meant(&self, query: &str) -> Option<&str> {
+        let query = key(query);
+        if query.is_empty() {
+            return None;
+        }
+        (self.queries.range(query.clone()..))
+            .take_while(|(q, _)| q.starts_with(&query))
+            .max_by_key(|(_, (last, _))| *last)
+            .map(|(_, (_, id))| id.as_str())
+    }
+
     pub fn get(&self, id: &str) -> Option<Record> {
         self.apps.get(id).copied()
     }
@@ -100,6 +166,14 @@ impl History {
     /// What `id`'s history adds to its match score.
     pub fn boost(&self, id: &str, now: u64) -> f64 {
         WEIGHT * self.frecency(id, now).ln_1p()
+    }
+}
+
+/// `ranked` (indices) with the one `is_meant` first, if it is among them.
+pub fn meant_first(ranked: &mut Vec<usize>, is_meant: impl Fn(usize) -> bool) {
+    if let Some(at) = ranked.iter().position(|&i| is_meant(i)) {
+        let i = ranked.remove(at);
+        ranked.insert(0, i);
     }
 }
 
@@ -178,5 +252,53 @@ mod tests {
             many.record("x", 0);
         }
         assert!(many.boost("x", 0) < 100.0);
+    }
+
+    #[test]
+    fn learned_queries() {
+        let mut h = History::default();
+        h.learn("Fire ", "firefox", 10);
+        h.learn("files", "org.gnome.Nautilus", 5);
+        h.learn("", "x", 1);
+        h.learn("a\tb", "x", 1);
+        // The query and every start of it.
+        assert_eq!(h.meant("fire"), Some("firefox"));
+        assert_eq!(h.meant("FIR"), Some("firefox"));
+        assert_eq!(h.meant("files"), Some("org.gnome.Nautilus"));
+        assert_eq!(h.meant("fil"), Some("org.gnome.Nautilus"));
+        // Of several, the most recent.
+        assert_eq!(h.meant("f"), Some("firefox"));
+        h.learn("fi", "org.gnome.Nautilus", 20);
+        assert_eq!(h.meant("f"), Some("org.gnome.Nautilus"));
+        assert_eq!(h.meant("fir"), Some("firefox"));
+        // Not a longer query, nor nothing.
+        assert_eq!(h.meant("firefox"), None);
+        assert_eq!(h.meant(" "), None);
+        // Picking another app for a query replaces it.
+        h.learn("fire", "librewolf", 30);
+        assert_eq!(h.meant("fire"), Some("librewolf"));
+        assert_eq!(History::parse(&h.format()), h);
+        // Old versions skip the lines; old files have none.
+        assert_eq!(History::parse("1 2 a\n").queries.len(), 0);
+    }
+
+    #[test]
+    fn learned_queries_are_bounded() {
+        let mut h = History::default();
+        for i in 0..MAX_QUERIES as u64 + 10 {
+            h.learn(&format!("q{i}"), "app", i);
+        }
+        assert_eq!(h.queries.len(), MAX_QUERIES);
+        assert_eq!(h.meant("q0"), None);
+        assert_eq!(h.meant(&format!("q{}", MAX_QUERIES + 9)), Some("app"));
+    }
+
+    #[test]
+    fn the_meant_app_comes_first() {
+        let mut ranked = vec![3, 1, 2];
+        meant_first(&mut ranked, |i| i == 2);
+        assert_eq!(ranked, [2, 3, 1]);
+        meant_first(&mut ranked, |i| i == 9);
+        assert_eq!(ranked, [2, 3, 1]);
     }
 }

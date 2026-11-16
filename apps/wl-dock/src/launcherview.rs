@@ -49,6 +49,21 @@
 //! (`stream_matches`): until the drum is rolled the best is in front;
 //! after, the selection stays in front while it is among them.
 //!
+//! Actions (Tab on a file match): the match is the subject, and its icon
+//! flies out of the front on a spring into the context pill, a small
+//! pill of the bar's color just above the bar at its right edge (the drum
+//! grows from the left, so that is free). The pill holds the subject's
+//! icon at the labels' size and its name with its parent directory
+//! dimmed; each level entered past it adds the chosen action's icon at
+//! its right end (a crumb), flying in the same way, the deepest bright
+//! and the earlier ones dimmer. Clicking the subject or a crumb goes back
+//! to its level. The bar stays one clean line, as for apps, with the
+//! level's placeholder. Entering a level slides the old texts out to the
+//! left as the new ones come in from the right; going back slides them
+//! the other way. The choices fill the whole drum. Going back flies the
+//! crumb (or the subject) back into the front of the drum, which is
+//! hidden until it lands, and restores what the drum showed (`leave`).
+//!
 //! Texts (the query, the completion, the name) are lines from the worker;
 //! a line shows its last text until the new one arrives. Icons come from
 //! the shared cache.
@@ -80,11 +95,12 @@ use wl_shell_ui::cache::{self, Cache};
 use wl_shell_ui::shapes::{self, Axis, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub};
 
+use crate::actions::Level;
 use crate::app::WlDock;
 use crate::config::{Config, DockLayout};
 use crate::drum::{self, Drum};
 use crate::filesearch;
-use crate::launcher::{Completion, Query, Scope, completion};
+use crate::launcher::{Completion, Nav, Query, Scope, Selection, completion};
 use crate::view::Handover;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -94,6 +110,12 @@ const FADE_RESPONSE: f64 = 120.0;
 /// Shown while nothing was typed.
 const PLACEHOLDER: &str = "Search apps";
 const FILES_PLACEHOLDER: &str = "Search files";
+/// How far the texts slide when a level is entered or left, of the
+/// bar's width, at most `SLIDE_MAX` pixels.
+const SLIDE: f64 = 0.12;
+const SLIDE_MAX: f64 = 120.0;
+/// The crumbs before the deepest, of its alpha.
+const CRUMB_DIM: f64 = 0.5;
 /// The front's icon with an empty query.
 const SEARCH_ICON: &str = "system-search";
 /// Stand-ins for a file's icon, and a folder's.
@@ -212,6 +234,20 @@ impl LauncherStyle {
             background: 0,
         }
     }
+
+    /// The context pill's icons: as tall as its name's line.
+    fn pill_icon(&self) -> f64 {
+        text::line_height(self.path_size()) as f64
+    }
+
+    /// The space around and between what the pill holds.
+    fn pill_pad(&self) -> f64 {
+        (self.padding / 2.0).round().max(2.0)
+    }
+
+    fn pill_height(&self) -> f64 {
+        self.pill_icon() + 2.0 * self.pill_pad()
+    }
 }
 
 /// A match as the launcher shows it.
@@ -224,6 +260,10 @@ pub struct Match {
     pub name: String,
     /// Its `Icon=`.
     pub icon: Option<String>,
+    /// The app whose icon it shows, if not the one `id` names.
+    pub app: Option<String>,
+    /// Theme icon names it shows instead, best first (an action's).
+    pub named: Vec<String>,
     /// The parts of the name the query matched, as byte ranges.
     pub matched: Vec<Range<usize>>,
     /// What a file match has besides.
@@ -258,6 +298,9 @@ pub enum LauncherInput {
     None,
     /// The match at this ring index was clicked.
     Open(usize),
+    /// A crumb (or the subject) in the context pill was clicked: back to
+    /// this depth.
+    Back(usize),
     /// A click outside the bar and the matches.
     Close,
 }
@@ -400,6 +443,92 @@ impl Drop for Line {
     }
 }
 
+/// The bar's texts: the query and what completes it, and for files the
+/// path under them. The launcher has two sets: the one shown, and the one
+/// sliding out as a level is entered or left.
+struct Texts {
+    query: Line,
+    inline: Line,
+    after: Line,
+    /// A file search's second line: the selected file's path.
+    path: Line,
+    /// Laid out as two lines (files).
+    two_lines: bool,
+}
+
+impl Texts {
+    fn new(sub: &dyn Fn() -> Sub) -> Self {
+        Self {
+            inline: Line::new(sub()),
+            query: Line::new(sub()),
+            path: Line::new(sub()),
+            after: Line::new(sub()),
+            two_lines: false,
+        }
+    }
+
+    fn lines(&mut self) -> [&mut Line; 4] {
+        [
+            &mut self.query,
+            &mut self.inline,
+            &mut self.after,
+            &mut self.path,
+        ]
+    }
+
+    /// Stop waiting for texts; with `shown`, drop what is shown too.
+    fn forget(&mut self, shown: bool, stale: &mut Vec<WlBuffer>) {
+        for line in self.lines() {
+            line.pending = None;
+            if shown && let Some((_, buffer, ..)) = line.shown.take() {
+                stale.push(buffer);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        for line in self.lines() {
+            line.sub.clear();
+        }
+    }
+
+    /// Lay them out in `bar`, moved `dx` to the right but cut at the
+    /// text's edges: the query, the completion inline after it or at the
+    /// bar's end, and the path under them, the two lines centered
+    /// together. Returns the caret's rect.
+    fn place(&mut self, bar: Rect, style: &LauncherStyle, dx: f64, alpha: f64) -> Rect {
+        let line_h = text::line_height(style.font_size) as f64;
+        let x0 = bar.x + text_x(style);
+        let x1 = bar.right() - 2.0 * style.padding;
+        let clip = (x0, x1);
+        let block_h = match self.two_lines {
+            true => line_h + text::line_height(style.path_size()) as f64,
+            false => line_h,
+        };
+        let ty = (bar.y + (bar.h - block_h) / 2.0).round();
+        match self.two_lines {
+            true => (self.path).present_clipped(x0 + dx, ty + line_h, clip, alpha),
+            false => self.path.sub.clear(),
+        }
+        // A text box's viewport: what doesn't fit scrolls out on the
+        // left, keeping the caret (always at the query's end) in view;
+        // the completion after it is cut at the right edge.
+        let query_w = self.query.width();
+        let caret_w = (style.font_size / 12.0).round().max(1.0);
+        let scroll = (query_w + caret_w - (x1 - x0)).max(0.0);
+        let caret_x = x0 + dx + query_w - scroll;
+        (self.query).present_clipped(x0 + dx - scroll, ty, clip, alpha);
+        (self.inline).present_clipped(caret_x, ty, clip, alpha);
+        // At the bar's end, unless it would run into the query.
+        let after_x = x1 - self.after.width() + dx;
+        match after_x >= caret_x + 1.5 * style.padding {
+            true => self.after.present_clipped(after_x, ty, clip, alpha),
+            false => self.after.sub.clear(),
+        }
+        Rect::new(caret_x, ty, caret_w, line_h)
+    }
+}
+
 /// An icon on the drum: an app's, or one by name (a file's).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum IconKey {
@@ -471,6 +600,101 @@ struct Fly {
     t: Spring,
 }
 
+/// In the context pill: the subject of the actions, or a crumb (the
+/// action a level was entered with).
+struct Pinned {
+    m: Match,
+    /// Its icon at the front's size, which it flies with.
+    key: IconKey,
+    standin: Option<IconKey>,
+    /// The same at the pill's size, shown once it got there.
+    small: IconKey,
+    small_standin: Option<IconKey>,
+    /// The depth it was entered from, which it drops back into: 0 for
+    /// the subject.
+    depth: usize,
+    /// 0 in the front of the drum, 1 in the pill.
+    t: Spring,
+    /// Dropping back into the drum, after which it goes.
+    leaving: bool,
+}
+
+impl Pinned {
+    /// The icon to draw, and its pad of its size: the small one once it
+    /// is in the pill (and there), a stand-in only without the real one.
+    fn icon(&self, cache: &Cache) -> Option<(WlBuffer, f64)> {
+        let shown = |k: &IconKey| k.buffer(cache).map(|b| (b, k.pad()));
+        let in_pill = self.t.settled() && self.t.value >= 1.0;
+        let small = in_pill.then_some(&self.small);
+        let small_standin = self.small_standin.as_ref().filter(|_| in_pill);
+        (small.and_then(shown))
+            .or_else(|| shown(&self.key))
+            .or_else(|| small_standin.and_then(shown))
+            .or_else(|| self.standin.as_ref().and_then(shown))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &IconKey> {
+        [Some(&self.key), self.standin.as_ref()]
+            .into_iter()
+            .chain([Some(&self.small), self.small_standin.as_ref()])
+            .flatten()
+    }
+}
+
+/// Where the context pill and what it holds go, for a name `name_w`
+/// wide and crumbs each in by its weight (0 to 1: its slot grows as it
+/// flies in).
+#[derive(Clone, Debug, PartialEq)]
+struct PillLayout {
+    pill: Rect,
+    /// The subject's icon, then each crumb's.
+    icons: Vec<Rect>,
+    /// Where the name's line starts.
+    name_x: f64,
+    /// Between the name and the crumbs, and how much it shows.
+    divider: Option<(Rect, f64)>,
+}
+
+/// The pill just above `bar`, right-aligned to its right edge: the
+/// subject's icon and name, then a divider and the crumbs.
+fn pill_layout(style: &LauncherStyle, bar: Rect, name_w: f64, crumbs: &[f64]) -> PillLayout {
+    let (icon, pad, h) = (style.pill_icon(), style.pill_pad(), style.pill_height());
+    // Laid out from 0, then moved into place.
+    let mut icons = vec![pad];
+    let mut x = pad + icon;
+    let name_x = x + pad;
+    if name_w > 0.0 {
+        x = name_x + name_w;
+    }
+    let shown = crumbs.iter().fold(0.0f64, |a, &w| a.max(w.clamp(0.0, 1.0)));
+    let mut divider = None;
+    if shown > 0.0 {
+        x += 1.5 * pad * shown;
+        divider = Some((x, shown));
+        x += (1.0 + 1.5 * pad) * shown;
+    }
+    for &w in crumbs {
+        icons.push(x);
+        x += (icon + pad) * w.clamp(0.0, 1.0);
+    }
+    // The last crumb's gap is the end's.
+    let end = match crumbs.last() {
+        Some(&w) => pad * (1.0 - w.clamp(0.0, 1.0)),
+        None => pad,
+    };
+    let w = (x + end).max(h);
+    let pill = Rect::new(bar.right() - w, bar.y - style.padding - h, w, h);
+    let icon_y = pill.y + pad;
+    PillLayout {
+        icons: (icons.into_iter())
+            .map(|ix| Rect::new(pill.x + ix, icon_y, icon, icon))
+            .collect(),
+        name_x: pill.x + name_x,
+        divider: divider.map(|(dx, a)| (Rect::new(pill.x + dx, icon_y, 1.0, icon), a)),
+        pill,
+    }
+}
+
 /// Where the dock is, on the launcher's surface.
 struct Attached {
     output: WlOutput,
@@ -485,26 +709,36 @@ struct Attached {
     bar_shape: Option<Shape>,
     /// The size the panel shapes were rendered for.
     rendered: (f64, f64),
+    /// The context pill, and the size it was rendered for.
+    pill_shape: Option<Shape>,
+    pill_rendered: (f64, f64),
 }
 
 pub struct LauncherView {
     // Field order is drop order: children before their parent surface.
     ring_subs: Vec<RingSubs>,
+    /// The context pill's icons: the subject's, then the crumbs'.
+    pinned_subs: Vec<Sub>,
     fly_sub: Sub,
     panel: [Sub; 3],
     bar: [Sub; 3],
+    pill: [Sub; 3],
+    /// The subject's name in the pill, and the line before the crumbs.
+    pill_name: Line,
+    divider: Sub,
     search: Sub,
-    query_line: Line,
-    /// A file search's second line: the selected file's path.
-    path_line: Line,
-    inline: Line,
-    after: Line,
+    /// The bar's texts, and those sliding out.
+    texts: Texts,
+    ghost: Texts,
     caret: Sub,
+    /// The ring's subsurfaces go right below it: under the texts.
+    ring_below: WlSurface,
     no_input: Region,
     viewport: WpViewport,
     layer: LayerSurface,
     transparent: WlBuffer,
     caret_buffer: Option<WlBuffer>,
+    divider_buffer: Option<WlBuffer>,
 
     g: Rc<Globals>,
     qh: Qh,
@@ -517,7 +751,17 @@ pub struct LauncherView {
     configured: bool,
     attached: Option<Attached>,
 
-    query: Query,
+    /// The query of the search or the level entered, and the levels.
+    nav: Nav<Level, Vec<Match>>,
+    /// The subject of the actions and the crumbs, while shown (or
+    /// dropping back), by depth.
+    pinned: Vec<Pinned>,
+    /// The pill shows, 0 to 1.
+    pill_in: Spring,
+    /// The texts' slide: 0 as a level was entered or left, to 1; and
+    /// its direction (1: entered, the old texts go left).
+    slide: Spring,
+    slide_dir: f64,
     ring: Vec<Ringed>,
     /// The drum's roll; the selection is where it is headed.
     roll: Spring,
@@ -538,6 +782,10 @@ pub struct LauncherView {
     fly: Option<Fly>,
     /// Where the matches were drawn, for clicks: ring index and rect.
     hits: Vec<(usize, Rect)>,
+    /// Where the pill's icons were drawn, for clicks: the depth each
+    /// goes back to, and its rect; and the pill.
+    pill_hits: Vec<(usize, Rect)>,
+    pill_at: Option<Rect>,
     /// The bar as drawn.
     bar_at: Rect,
     /// Buffers replaced by new texts, destroyed after the next commit.
@@ -574,30 +822,36 @@ impl LauncherView {
         let sub = || Sub::new(&g, layer.wl_surface(), &no_input, &qh);
         let panel = [sub(), sub(), sub()];
         let bar = [sub(), sub(), sub()];
+        let pill = [sub(), sub(), sub()];
         let search = sub();
-        let inline = Line::new(sub());
-        let query_line = Line::new(sub());
-        let path_line = Line::new(sub());
-        let after = Line::new(sub());
+        let texts = Texts::new(&sub);
+        let ghost = Texts::new(&sub);
+        let ring_below = texts.inline.sub.surface().clone();
         let caret = sub();
+        let divider = sub();
+        let pill_name = Line::new(sub());
         let fly_sub = sub();
         layer.commit();
         Ok(Self {
             ring_subs: Vec::new(),
+            pinned_subs: Vec::new(),
             fly_sub,
             panel,
             bar,
+            pill,
+            pill_name,
+            divider,
             search,
-            query_line,
-            path_line,
-            inline,
-            after,
+            texts,
+            ghost,
             caret,
+            ring_below,
             no_input,
             viewport,
             layer,
             transparent,
             caret_buffer: None,
+            divider_buffer: None,
             g,
             qh,
             assets,
@@ -607,7 +861,11 @@ impl LauncherView {
             scale: 1,
             configured: false,
             attached: None,
-            query: Query::default(),
+            nav: Nav::default(),
+            pinned: Vec::new(),
+            pill_in: Spring::new(0.0, response),
+            slide: Spring::new(1.0, response),
+            slide_dir: 1.0,
             ring: Vec::new(),
             roll: Spring::new(0.0, response),
             rolled: false,
@@ -620,6 +878,8 @@ impl LauncherView {
             closing: false,
             fly: None,
             hits: Vec::new(),
+            pill_hits: Vec::new(),
+            pill_at: None,
             bar_at: Rect::default(),
             stale: Vec::new(),
             frame_pending: false,
@@ -691,6 +951,8 @@ impl LauncherView {
             panel_shape: None,
             bar_shape: None,
             rendered: (1.0, 1.0),
+            pill_shape: None,
+            pill_rendered: (1.0, 1.0),
         });
         self.relayout();
         self.sync_texts();
@@ -704,9 +966,14 @@ impl LauncherView {
         self.scale = scale;
         self.relayout();
         let attached = self.attached.as_ref();
+        let fi = &self.file_icons;
         for r in &mut self.ring {
-            (r.key, r.standin) = Self::icon_keys(attached, &r.m, scale, &self.file_icons);
+            (r.key, r.standin) = Self::icon_keys(attached, &r.m, scale, fi, false);
             r.old = None;
+        }
+        for p in &mut self.pinned {
+            (p.key, p.standin) = Self::icon_keys(attached, &p.m, scale, fi, false);
+            (p.small, p.small_standin) = Self::icon_keys(attached, &p.m, scale, fi, true);
         }
         self.request_icons();
         self.sync_texts();
@@ -732,41 +999,63 @@ impl LauncherView {
         };
         a.panel_shape = cache.shape(&self.g, key(a.style.panel_color), &self.qh);
         a.bar_shape = cache.shape(&self.g, key(a.style.background), &self.qh);
+        // The pill: round ends, the bar's color and shadow.
+        let h = a.style.pill_height();
+        let radius = (h / 2.0).floor();
+        let length = 2.0 * radius + 4.0;
+        a.pill_rendered = (length, h);
+        let pill = ShapeKey::Panel {
+            w: length as i32,
+            h: h as i32,
+            radius: radius as i32,
+            color: a.style.background,
+            shadow: a.style.shadow,
+            scale,
+        };
+        a.pill_shape = cache.shape(&self.g, pill, &self.qh);
         drop(cache);
-        let caret = a.style.caret;
-        if let Some(old) = self.caret_buffer.take() {
-            self.stale.push(old);
+        let (caret, divider) = (a.style.caret, dimmer(a.style.completion));
+        for old in [self.caret_buffer.take(), self.divider_buffer.take()] {
+            self.stale.extend(old);
         }
         self.caret_buffer = cache::color_buffer(&self.g, caret, &self.qh).ok();
+        self.divider_buffer = cache::color_buffer(&self.g, divider, &self.qh).ok();
         for scope in [Scope::Apps, Scope::Files] {
             self.search_key(scope)
                 .inspect(|k| self.assets.named_icon(k));
         }
     }
 
-    /// The icon `names` (the first found) at the front's size.
-    fn front_named(a: &Attached, scale: i32, names: Vec<String>) -> Option<NamedIcon> {
+    /// The icon `names` (the first found) at the front's size, or with
+    /// `small` the pill's (without a shadow).
+    fn named(a: &Attached, scale: i32, small: bool, names: Vec<String>) -> Option<NamedIcon> {
         let mut names = names.into_iter();
+        let (size, shadow) = match small {
+            true => (a.style.pill_icon(), None),
+            false => (a.style.front(), a.style.icon_shadow),
+        };
         Some(NamedIcon {
             name: names.next()?,
             fallbacks: names.collect(),
-            size: a.style.front().ceil() as u32 * scale as u32,
+            size: size.ceil() as u32 * scale as u32,
             theme: a.style.icon_theme.clone(),
-            shadow: a.style.icon_shadow,
+            shadow,
             scale,
         })
     }
 
-    /// The icon of `m`, and what stands in for it until it is there: a
-    /// file's thumbnail or type icon (once `file_icons` has it), else a
-    /// generic one.
+    /// The icon of `m` (at the front's size, or with `small` the pill's),
+    /// and what stands in for it until it is there: a file's thumbnail or
+    /// type icon (once `file_icons` has it), else a generic one.
     fn icon_keys(
         attached: Option<&Attached>,
         m: &Match,
         scale: i32,
         file_icons: &HashMap<PathBuf, Vec<String>>,
+        small: bool,
     ) -> (IconKey, Option<IconKey>) {
         let (size, theme, shadow) = match attached {
+            Some(a) if small => (a.style.pill_icon(), a.style.icon_theme.clone(), None),
             Some(a) => (
                 a.style.front(),
                 a.style.icon_theme.clone(),
@@ -775,9 +1064,15 @@ impl LauncherView {
             None => (60.0, None, None),
         };
         let app = || {
-            let key = icons::Key::new(&m.id, size.ceil() as u32, theme.clone(), shadow, scale);
+            let id = m.app.as_deref().unwrap_or(&m.id);
+            let key = icons::Key::new(id, size.ceil() as u32, theme.clone(), shadow, scale);
             IconKey::App(key.with_icon(m.icon.clone()))
         };
+        let named = (attached.filter(|_| !m.named.is_empty()))
+            .and_then(|a| Self::named(a, scale, small, m.named.clone()));
+        if let Some(named) = named {
+            return (IconKey::Named(named), None);
+        }
         let (Some(f), Some(a)) = (&m.file, attached) else {
             return (app(), None);
         };
@@ -786,9 +1081,9 @@ impl LauncherView {
             false => &FILE_ICONS[..],
         };
         let generic = generic.iter().map(|s| s.to_string()).collect();
-        let standin = Self::front_named(a, scale, generic).map(IconKey::Named);
+        let standin = Self::named(a, scale, small, generic).map(IconKey::Named);
         let own = (file_icons.get(&f.path).cloned())
-            .and_then(|names| Self::front_named(a, scale, names))
+            .and_then(|names| Self::named(a, scale, small, names))
             .map(IconKey::Named);
         match (own, standin) {
             (Some(own), standin) => (own, standin),
@@ -802,11 +1097,11 @@ impl LauncherView {
     fn search_key(&self, scope: Scope) -> Option<NamedIcon> {
         let a = self.attached.as_ref()?;
         let names: &[&str] = match scope {
-            Scope::Apps => &[SEARCH_ICON, "edit-find", "search"],
+            Scope::Apps | Scope::Actions => &[SEARCH_ICON, "edit-find", "search"],
             Scope::Files => &files::FOLDER_ICONS,
         };
         let names = names.iter().map(|s| s.to_string()).collect();
-        Self::front_named(a, self.scale, names)
+        Self::named(a, self.scale, false, names)
     }
 
     /// Have the worker render the ring's icons, and look up those of its
@@ -817,12 +1112,15 @@ impl LauncherView {
             .attached
             .as_ref()
             .map_or("sans-serif", |a| a.style.font.as_str());
-        for r in &self.ring {
-            r.key.request(&cache, &self.assets, font);
-            if let Some(standin) = &r.standin {
-                standin.request(&cache, &self.assets, font);
-            }
-            if let Some(f) = &r.m.file
+        let pinned = self.pinned.iter().flat_map(Pinned::keys);
+        let ringed = (self.ring.iter())
+            .flat_map(|r| [Some(&r.key), r.standin.as_ref()].into_iter().flatten());
+        for key in ringed.chain(pinned) {
+            key.request(&cache, &self.assets, font);
+        }
+        let ms = (self.ring.iter().map(|r| &r.m)).chain(self.pinned.iter().map(|p| &p.m));
+        for m in ms {
+            if let Some(f) = &m.file
                 && !self.file_icons.contains_key(&f.path)
                 && self.asked_icons.insert(f.path.clone())
             {
@@ -837,11 +1135,16 @@ impl LauncherView {
         let mut changed = false;
         self.file_icons.insert(path.clone(), names);
         let attached = self.attached.as_ref();
-        for r in &mut self.ring {
-            if r.m.file.as_ref().is_some_and(|f| f.path == path) {
-                (r.key, r.standin) = Self::icon_keys(attached, &r.m, self.scale, &self.file_icons);
-                changed = true;
-            }
+        let (fi, scale) = (&self.file_icons, self.scale);
+        let is = |m: &Match| m.file.as_ref().is_some_and(|f| f.path == path);
+        for r in self.ring.iter_mut().filter(|r| is(&r.m)) {
+            (r.key, r.standin) = Self::icon_keys(attached, &r.m, scale, fi, false);
+            changed = true;
+        }
+        for p in self.pinned.iter_mut().filter(|p| is(&p.m)) {
+            (p.key, p.standin) = Self::icon_keys(attached, &p.m, scale, fi, false);
+            (p.small, p.small_standin) = Self::icon_keys(attached, &p.m, scale, fi, true);
+            changed = true;
         }
         if changed {
             self.request_icons();
@@ -852,11 +1155,112 @@ impl LauncherView {
     // -- the query and the matches -------------------------------------------
 
     pub fn query(&self) -> &Query {
-        &self.query
+        self.nav.query()
     }
 
     pub fn query_mut(&mut self) -> &mut Query {
-        &mut self.query
+        self.nav.query_mut()
+    }
+
+    /// Levels entered: 0 while searching.
+    pub fn depth(&self) -> usize {
+        self.nav.depth()
+    }
+
+    /// The level entered, unless searching.
+    pub fn level(&self) -> Option<&Level> {
+        self.nav.level()
+    }
+
+    /// The subject of the actions, while entered.
+    pub fn subject(&self) -> Option<&Match> {
+        (self.pinned.first())
+            .filter(|p| p.depth == 0 && !p.leaving)
+            .map(|p| &p.m)
+    }
+
+    /// Enter `level` from the selection: its query starts empty, and the
+    /// drum is emptied for its choices (`set_matches`). The selection
+    /// flies out of the front into the pill: from the search it is the
+    /// subject, else a crumb.
+    pub fn enter(&mut self, level: Level) {
+        let depth = self.nav.depth();
+        let selected = self.selected().and_then(|i| self.ring.get(i));
+        let from = Selection {
+            selected: selected.map(|r| r.m.id.clone()),
+            rolled: self.rolled,
+            shown: self.ring.iter().map(|r| r.m.clone()).collect(),
+        };
+        // Any still dropping back into this level (or deeper) are gone.
+        self.pinned.retain(|p| !(p.leaving && p.depth >= depth));
+        if let Some(r) = selected {
+            let a = self.attached.as_ref();
+            let response = a.map_or(150.0, |a| a.style.response);
+            let mut t = Spring::new(0.0, response);
+            t.retarget(1.0);
+            let (small, small_standin) =
+                Self::icon_keys(a, &r.m, self.scale, &self.file_icons, true);
+            self.pinned.push(Pinned {
+                m: r.m.clone(),
+                key: r.key.clone(),
+                standin: r.standin.clone(),
+                small,
+                small_standin,
+                depth,
+                t,
+                leaving: false,
+            });
+        }
+        self.pill_in.retarget(1.0);
+        self.nav.enter(from, level);
+        self.slide_texts(1.0);
+        // The choices come in fresh: nothing cross-fades into them.
+        self.ring.clear();
+        self.roll.snap(0.0);
+        self.rolled = false;
+        self.request_icons();
+        self.sync_texts();
+        self.kick();
+    }
+
+    /// Go back out of the level: its query, matches and selection are
+    /// the ones before again, and what it was entered with (the crumb,
+    /// or the subject back in the search) drops into the front of the
+    /// drum and stays selected. False while searching.
+    pub fn leave(&mut self) -> bool {
+        let Some(from) = self.nav.leave() else {
+            return false;
+        };
+        let front = (from.selected.as_deref())
+            .and_then(|id| from.shown.iter().position(|m| m.id == id))
+            .unwrap_or(0);
+        let depth = self.nav.depth();
+        for p in self.pinned.iter_mut().filter(|p| p.depth >= depth) {
+            p.leaving = true;
+            p.t.retarget(0.0);
+        }
+        if depth == 0 {
+            self.pill_in.retarget(0.0);
+        }
+        self.slide_texts(-1.0);
+        self.ring.clear();
+        self.roll.snap(0.0);
+        // The selection stays while results stream in.
+        self.rolled = from.rolled || (depth == 0 && from.selected.is_some());
+        self.replace(from.shown, front);
+        true
+    }
+
+    /// Slide the texts shown out (`dir` 1: to the left, as a level is
+    /// entered; −1: to the right), and the next ones in after them.
+    fn slide_texts(&mut self, dir: f64) {
+        std::mem::swap(&mut self.texts, &mut self.ghost);
+        // The old texts stay as they are; the new ones start blank.
+        self.ghost.forget(false, &mut self.stale);
+        self.texts.forget(true, &mut self.stale);
+        self.slide.snap(0.0);
+        self.slide.retarget(1.0);
+        self.slide_dir = dir;
     }
 
     /// Show `matches`, best first: the best in front, without rolling.
@@ -898,7 +1302,7 @@ impl LauncherView {
     /// unfinished roll carries on. Each slot whose match changed
     /// cross-fades its icon.
     fn replace(&mut self, matches: Vec<Match>, front: usize) {
-        let slots = self.attached.as_ref().map_or(1, |a| a.style.matches);
+        let slots = self.attached.as_ref().map_or(1, |a| a.style.matches).max(1);
         // What each slot shows now: slot `k` holds the match `k` past the
         // one in front.
         let old_front = self.selected().unwrap_or(0);
@@ -912,7 +1316,8 @@ impl LauncherView {
         let attached = self.attached.as_ref();
         let ring: Vec<Ringed> = (matches.into_iter().enumerate())
             .map(|(i, m)| {
-                let (key, standin) = Self::icon_keys(attached, &m, self.scale, &self.file_icons);
+                let (key, standin) =
+                    Self::icon_keys(attached, &m, self.scale, &self.file_icons, false);
                 let prev = old.get((i + n - front) % n).cloned();
                 let same = prev.as_ref() == Some(&key);
                 let mut fade = Spring::new(if same { 1.0 } else { 0.0 }, FADE_RESPONSE);
@@ -964,6 +1369,21 @@ impl LauncherView {
         self.kick();
     }
 
+    /// Roll the match at ring index `i` to the front, the short way.
+    pub fn select(&mut self, i: usize) {
+        let n = self.ring.len() as i64;
+        let Some(at) = self.selected().filter(|_| (i as i64) < n) else {
+            return;
+        };
+        let mut by = (i as i64 - at as i64).rem_euclid(n);
+        if by > n / 2 {
+            by -= n;
+        }
+        if by != 0 {
+            self.roll(by as i32);
+        }
+    }
+
     /// The ring index of the selection.
     pub fn selected(&self) -> Option<usize> {
         (!self.ring.is_empty()).then(|| drum::selected(self.roll.target, self.ring.len()))
@@ -992,10 +1412,15 @@ impl LauncherView {
             .map(|r| label_request(&r.m, style, max, scale))
             .collect();
         let selected = self.selected().and_then(|i| self.ring.get(i)).map(|r| &r.m);
-        let q = self.query.text();
+        let q = self.nav.query().text();
         // Zero-width spaces keep the query's own spaces at its ends.
         let query = (!q.is_empty()).then(|| line(format!("\u{200b}{q}\u{200b}"), style.text));
-        let (path, inline, after) = match self.query.scope() {
+        // The subject's name in the pill (while it is there at all).
+        let pill_name = (self.pinned.first())
+            .filter(|p| p.depth == 0)
+            .map(|p| name_request(&p.m, style, max / 2, scale));
+        let scope = self.nav.query().scope();
+        let (path, inline, after) = match scope {
             Scope::Files => {
                 let file = selected.and_then(|m| Some((m, m.file.as_ref()?)));
                 // Under the query: the selection's path, else the progress.
@@ -1020,17 +1445,25 @@ impl LauncherView {
                     // Not the query's continuation: at the bar's end, with
                     // what the query matched brighter.
                     (Completion::After(name), Some((m, _))) => {
-                        let spans = m.matched.iter().map(|r| (r.clone(), style.matched)).collect();
+                        let spans = m
+                            .matched
+                            .iter()
+                            .map(|r| (r.clone(), style.matched))
+                            .collect();
                         (None, Some(spanned(name, spans, style.completion)))
                     }
                     _ => (None, None),
                 };
                 (path, inline, after)
             }
-            Scope::Apps => {
+            Scope::Apps | Scope::Actions => {
+                let placeholder = match scope {
+                    Scope::Actions => self.nav.level().map_or("", |l| l.placeholder),
+                    _ => PLACEHOLDER,
+                };
                 let name = selected.map(|m| m.name.as_str());
                 let (inline, after) = match completion(q, name) {
-                    Completion::None if q.is_empty() => (Some(PLACEHOLDER.to_string()), None),
+                    Completion::None if q.is_empty() => (Some(placeholder.to_string()), None),
                     Completion::None => (None, None),
                     Completion::Inline(rest) if rest.is_empty() => (None, None),
                     Completion::Inline(rest) => (Some(rest), None),
@@ -1043,14 +1476,22 @@ impl LauncherView {
         };
         // The query and what continues it scroll in the bar instead of
         // being cut: they are rendered whole (up to a sanity bound).
-        let whole = |r: Option<PillRequest>| r.map(|r| PillRequest { max_width: SCROLLED_MAX, ..r });
+        let whole = |r: Option<PillRequest>| {
+            r.map(|r| PillRequest {
+                max_width: SCROLLED_MAX,
+                ..r
+            })
+        };
         let (query, inline) = (whole(query), whole(inline));
         let assets = self.assets.clone();
         // The query first, so its width is there when the rest arrives.
-        self.query_line.want(&assets, query, &mut self.stale);
-        self.inline.want(&assets, inline, &mut self.stale);
-        self.after.want(&assets, after, &mut self.stale);
-        self.path_line.want(&assets, path, &mut self.stale);
+        let texts = &mut self.texts;
+        texts.two_lines = scope == Scope::Files;
+        texts.query.want(&assets, query, &mut self.stale);
+        texts.inline.want(&assets, inline, &mut self.stale);
+        texts.after.want(&assets, after, &mut self.stale);
+        texts.path.want(&assets, path, &mut self.stale);
+        (self.pill_name).want(&assets, pill_name, &mut self.stale);
         self.grow_ring_subs(labels.len());
         let mut labels = labels.into_iter();
         for subs in &mut self.ring_subs {
@@ -1067,9 +1508,9 @@ impl LauncherView {
                 old: sub(),
                 label: Line::pill(sub()),
             };
-            subs.icon.place_below(self.query_line.sub.surface());
-            subs.old.place_below(self.query_line.sub.surface());
-            subs.label.sub.place_below(self.query_line.sub.surface());
+            subs.icon.place_below(&self.ring_below);
+            subs.old.place_below(&self.ring_below);
+            subs.label.sub.place_below(&self.ring_below);
             self.ring_subs.push(subs);
         }
     }
@@ -1078,12 +1519,8 @@ impl LauncherView {
     pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
         let _ = request;
         let (g, qh) = (self.g.clone(), self.qh.clone());
-        let lines = [
-            &mut self.path_line,
-            &mut self.query_line,
-            &mut self.inline,
-            &mut self.after,
-        ];
+        let [query, inline, after, path] = self.texts.lines();
+        let lines = [query, inline, after, path, &mut self.pill_name];
         let ours = (lines.into_iter())
             .chain(self.ring_subs.iter_mut().map(|s| &mut s.label))
             .any(|l| l.ready(&g, &qh, tag, pill, &mut self.stale));
@@ -1158,10 +1595,14 @@ impl LauncherView {
         let (x, y) = event.position;
         match event.kind {
             PointerEventKind::Release { .. } => {
+                if let Some((to, _)) = self.pill_hits.iter().find(|(_, r)| r.contains(x, y)) {
+                    return LauncherInput::Back(*to);
+                }
                 if let Some((i, _)) = self.hits.iter().find(|(_, r)| r.contains(x, y)) {
                     return LauncherInput::Open(*i);
                 }
-                if self.bar_at.contains(x, y) || self.attached.is_none() {
+                let on_pill = self.pill_at.is_some_and(|r| r.contains(x, y));
+                if self.bar_at.contains(x, y) || on_pill || self.attached.is_none() {
                     return LauncherInput::None;
                 }
                 LauncherInput::Close
@@ -1213,6 +1654,9 @@ impl LauncherView {
             || !self.searching.settled()
             || self.ring.iter().any(|r| !r.fade.settled())
             || self.fly.is_some()
+            || !self.pill_in.settled()
+            || !self.slide.settled()
+            || self.pinned.iter().any(|p| !p.t.settled())
     }
 
     pub fn frame_done(&mut self) {
@@ -1233,6 +1677,17 @@ impl LauncherView {
             if fly.t.settled() {
                 self.fly = None;
             }
+        }
+        moving |= self.pill_in.advance(dt);
+        for p in &mut self.pinned {
+            moving |= p.t.advance(dt);
+        }
+        // Those dropped back are gone, the subject once the pill is too.
+        let pill_out = self.pill_in.settled();
+        (self.pinned).retain(|p| !(p.leaving && p.t.settled() && (p.depth > 0 || pill_out)));
+        moving |= self.slide.advance(dt);
+        if self.slide.settled() {
+            self.ghost.forget(true, &mut self.stale);
         }
         self.last_frame = moving.then_some(now);
         self.render();
@@ -1285,6 +1740,7 @@ impl LauncherView {
         // The panel turns into the bar.
         let (panel_shape, bar_shape, rendered) =
             (a.panel_shape.clone(), a.bar_shape.clone(), a.rendered);
+        let (pill_shape, pill_rendered) = (a.pill_shape.clone(), a.pill_rendered);
         let (pa, ba) = (self.gate(1.0 - m), self.gate(m));
         for (subs, shape, alpha) in [
             (&mut self.panel, panel_shape, pa),
@@ -1310,10 +1766,16 @@ impl LauncherView {
         let open = m;
         let n = self.ring.len();
         self.grow_ring_subs(n.max(1));
+        self.grow_pinned_subs(self.pinned.len());
         let cache = self.cache.borrow();
         let fly_key = self.fly.as_ref().map(|f| f.key.clone());
         self.hits.clear();
         let present = 1.0 - self.searching.value.clamp(0.0, 1.0);
+        // What drops back into the front hides the match it lands on.
+        let depth = self.nav.depth();
+        let dropping = (self.pinned.iter())
+            .find(|p| p.leaving && p.depth == depth)
+            .map(|p| p.m.id.clone());
         for (i, subs) in self.ring_subs.iter_mut().enumerate() {
             let Some(r) = self.ring.get(i) else {
                 subs.icon.clear();
@@ -1326,8 +1788,10 @@ impl LauncherView {
             let size = p.size;
             let center = (cx, cy - p.rise * open);
             let rect = Rect::new(center.0 - size / 2.0, center.1 - size / 2.0, size, size);
-            // The front one is flying to the dock.
-            let flying = fly_key.as_ref() == Some(&r.key) && t < 0.5;
+            // The front one is flying to the dock, or what was entered
+            // with is dropping back into its place.
+            let flying =
+                (fly_key.as_ref() == Some(&r.key) || dropping.as_ref() == Some(&r.m.id)) && t < 0.5;
             let gate = |a: f64| match self.g.alpha_modifier {
                 Some(_) => a.clamp(0.0, 1.0),
                 None if a >= 0.5 => 1.0,
@@ -1366,9 +1830,104 @@ impl LauncherView {
             }
         }
 
+        // The context pill, just above the bar at its right end, coming
+        // up a little as it fades in.
+        let gate = |a: f64| match self.g.alpha_modifier {
+            Some(_) => a.clamp(0.0, 1.0),
+            None if a >= 0.5 => 1.0,
+            None => 0.0,
+        };
+        let pill_in = self.pill_in.value.clamp(0.0, 1.0);
+        let pill_alpha = gate(pill_in * open);
+        let has_subject = self.pinned.first().is_some_and(|p| p.depth == 0);
+        let weights: Vec<f64> = (self.pinned.iter())
+            .filter(|p| p.depth > 0)
+            .map(|p| p.t.value)
+            .collect();
+        let layout = pill_layout(&style, bar, self.pill_name.width(), &weights);
+        let rise = ((1.0 - pill_in) * style.pill_pad()).round();
+        let shift = |r: Rect| Rect::new(r.x, r.y + rise, r.w, r.h);
+        let pill = shift(layout.pill);
+        self.pill_hits.clear();
+        self.pill_at = None;
+        let round = &IRect::round;
+        let shown = !self.pinned.is_empty();
+        let shape = pill_shape.as_ref().filter(|_| shown);
+        let (sp, pr) = (scale, pill_rendered);
+        shapes::place_panel(
+            &mut self.pill,
+            shape,
+            pill,
+            pr,
+            Axis::Horizontal,
+            sp,
+            round,
+            pill_alpha,
+        );
+        if shown && pill_alpha > 0.3 {
+            self.pill_at = Some(pill);
+        }
+        // The subject's name fades in as its icon gets there.
+        let subject_t = (self.pinned.first().filter(|_| has_subject)).map_or(0.0, |p| p.t.value);
+        let name_alpha = match shown {
+            true => gate(pill_alpha * subject_t),
+            false => 0.0,
+        };
+        let name_y = (pill.y + (pill.h - self.pill_name.height()) / 2.0).round();
+        (self.pill_name).present(layout.name_x.round(), name_y, name_alpha);
+        match (layout.divider, &self.divider_buffer) {
+            (Some((r, a)), Some(buffer)) if shown => {
+                (self.divider).present(Some(buffer), shift(r), gate(pill_alpha * a))
+            }
+            _ => self.divider.clear(),
+        }
+        // Its icons, flying between the front and their places in it. A
+        // crumb dims as the next one comes in; a click on one goes back
+        // to where it was chosen.
+        let mut crumb = 0;
+        for (k, sub) in self.pinned_subs.iter_mut().enumerate() {
+            let Some(p) = self.pinned.get(k) else {
+                sub.clear();
+                continue;
+            };
+            let slot = match p.depth {
+                0 => 0,
+                _ => {
+                    crumb += 1;
+                    crumb
+                }
+            };
+            let Some(&to) = layout.icons.get(slot) else {
+                sub.clear();
+                continue;
+            };
+            let to = shift(to);
+            let r = front.lerp(to, p.t.value);
+            let later = (self.pinned[k + 1..].iter())
+                .filter(|q| q.depth > 0)
+                .fold(0.0f64, |a, q| a.max(q.t.value.clamp(0.0, 1.0)));
+            let dim = match p.depth {
+                0 => 1.0,
+                _ => 1.0 - (1.0 - CRUMB_DIM) * later,
+            };
+            match p.icon(&cache) {
+                Some((buffer, pad)) => {
+                    sub.present(Some(&buffer), r.outset(pad * r.w), gate(open * dim))
+                }
+                None => sub.clear(),
+            }
+            if !p.leaving && p.depth < depth && p.t.value > 0.9 && pill_alpha > 0.3 {
+                self.pill_hits.push((p.depth, to));
+                if p.depth == 0 {
+                    let name = Rect::new(layout.name_x, pill.y, self.pill_name.width(), pill.h);
+                    self.pill_hits.push((0, name));
+                }
+            }
+        }
+
         // The search icon (or a folder, for files), with nothing found.
         let search = self
-            .search_key(self.query.scope())
+            .search_key(self.nav.query().scope())
             .and_then(|k| Some((cache.named_icon(&k)??, k)));
         let search_alpha = self.gate(self.searching.value * open);
         match &search {
@@ -1395,46 +1954,33 @@ impl LauncherView {
         drop(cache);
 
         // The query, the completion and the caret; for files, the path
-        // under them, the two lines centered together.
+        // under them. Entering or leaving a level slides the old texts
+        // out and the new ones in after them.
         let text_alpha = self.gate((m - 0.5) / 0.5);
-        let line_h = text::line_height(style.font_size) as f64;
-        let files = self.query.scope() == Scope::Files;
-        let x0 = bar.x + text_x(&style);
-        let block_h = match files {
-            true => line_h + text::line_height(style.path_size()) as f64,
-            false => line_h,
-        };
-        let ty = (bar.y + (bar.h - block_h) / 2.0).round();
-        match files {
-            true => self.path_line.present(x0, ty + line_h, text_alpha),
-            false => self.path_line.sub.clear(),
+        let g = self.slide.value.clamp(0.0, 1.0);
+        let dist = (bar.w * SLIDE).min(SLIDE_MAX) * self.slide_dir;
+        let alpha = self.gate(text_alpha * g);
+        let caret = self
+            .texts
+            .place(bar, &style, (dist * (1.0 - g)).round(), alpha);
+        match self.slide.settled() {
+            true => self.ghost.clear(),
+            false => {
+                let alpha = self.gate(text_alpha * (1.0 - g));
+                self.ghost.place(bar, &style, (-dist * g).round(), alpha);
+            }
         }
-        let query_w = match self.query.is_empty() {
-            true => 0.0,
-            false => self.query_line.width(),
-        };
-        // A text box's viewport: what doesn't fit scrolls out on the left,
-        // keeping the caret (always at the query's end) in view; the
-        // completion after it is cut at the right edge.
-        let x1 = bar.right() - 2.0 * style.padding;
-        let caret_w = (style.font_size / 12.0).round().max(1.0);
-        let scroll = (query_w + caret_w - (x1 - x0)).max(0.0);
-        let caret_x = x0 + query_w - scroll;
-        match self.query.is_empty() {
-            true => self.query_line.sub.clear(),
-            false => (self.query_line).present_clipped(x0 - scroll, ty, (x0, x1), text_alpha),
-        }
-        (self.inline).present_clipped(caret_x, ty, (x0, x1), text_alpha);
-        // At the bar's end, unless it would run into the query.
-        let after_x = x1 - self.after.width();
-        match after_x >= caret_x + 1.5 * style.padding {
-            true => self.after.present(after_x, ty, text_alpha),
-            false => self.after.sub.clear(),
-        }
-        let caret = Rect::new(caret_x, ty, caret_w, line_h);
-        let caret_alpha = if self.closing { 0.0 } else { text_alpha };
+        let caret_alpha = if self.closing { 0.0 } else { alpha };
         self.caret
             .present(self.caret_buffer.as_ref(), caret, caret_alpha);
+    }
+
+    /// At least `n` subsurfaces for the pill's icons.
+    fn grow_pinned_subs(&mut self, n: usize) {
+        while self.pinned_subs.len() < n {
+            let sub = Sub::new(&self.g, self.layer.wl_surface(), &self.no_input, &self.qh);
+            self.pinned_subs.push(sub);
+        }
     }
 }
 
@@ -1461,8 +2007,11 @@ fn path_request(f: &FileMatch, style: &LauncherStyle, max: i32, scale: i32) -> P
 /// A match's pill on the drum: its name, with what the query matched
 /// brighter, and for a file its parent directory's name, dimmer.
 fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
-    let mut spans: Vec<(Range<usize>, u32)> =
-        m.matched.iter().map(|r| (r.clone(), style.matched)).collect();
+    let mut spans: Vec<(Range<usize>, u32)> = m
+        .matched
+        .iter()
+        .map(|r| (r.clone(), style.matched))
+        .collect();
     let mut text = m.name.clone();
     if let Some(f) = m.file.as_ref().filter(|f| !f.parent.is_empty()) {
         text.push_str("  ");
@@ -1482,6 +2031,26 @@ fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> Pill
         max_width: max,
         scale,
         style: style.label_style(),
+    }
+}
+
+/// The subject's name in the context pill: bare, in the labels' size,
+/// with a file's parent directory dimmed after it.
+fn name_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
+    let mut text = m.name.clone();
+    let mut spans = Vec::new();
+    if let Some(f) = m.file.as_ref().filter(|f| !f.parent.is_empty()) {
+        text.push_str("  ");
+        let at = text.len();
+        text.push_str(&f.parent);
+        spans.push((at..text.len(), dimmer(style.completion)));
+    }
+    PillRequest {
+        text,
+        spans,
+        max_width: max.max(1),
+        scale,
+        style: style.path_style(style.text),
     }
 }
 
@@ -1547,5 +2116,49 @@ mod tests {
         assert_eq!(f.bottom(), bar.bottom() - s.padding);
         assert!(f.y < bar.y);
         assert!(text_x(&s) > f.right() - bar.x);
+    }
+
+    #[test]
+    fn the_pill_sits_above_the_bar_at_its_right_end() {
+        let s = style();
+        let bar = bar_rect(&s, 0.0, 1920.0, 1080.0);
+        let (icon, pad) = (s.pill_icon(), s.pill_pad());
+        let l = pill_layout(&s, bar, 100.0, &[]);
+        assert_eq!(l.pill.right(), bar.right());
+        assert_eq!(l.pill.bottom(), bar.y - s.padding);
+        assert_eq!(l.pill.h, icon + 2.0 * pad);
+        // The subject's icon, then its name, with the pad around them.
+        assert_eq!(
+            l.icons,
+            [Rect::new(l.pill.x + pad, l.pill.y + pad, icon, icon)]
+        );
+        assert_eq!(l.name_x, l.icons[0].right() + pad);
+        assert_eq!(l.pill.right(), l.name_x + 100.0 + pad);
+        assert_eq!(l.divider, None);
+        // A crumb: the divider, then its icon at the right end.
+        let one = pill_layout(&s, bar, 100.0, &[1.0]);
+        assert_eq!(one.pill.right(), bar.right());
+        assert!(one.pill.w > l.pill.w);
+        let (divider, shown) = one.divider.unwrap();
+        assert_eq!(shown, 1.0);
+        assert!(divider.x > one.name_x + 100.0 && divider.right() < one.icons[1].x);
+        assert_eq!(one.icons[1].right(), one.pill.right() - pad);
+        // Two: the newer one last.
+        let two = pill_layout(&s, bar, 100.0, &[1.0, 1.0]);
+        assert_eq!(two.icons[2].x, two.icons[1].right() + pad);
+        assert_eq!(two.icons[2].right(), two.pill.right() - pad);
+    }
+
+    #[test]
+    fn the_pill_grows_with_a_crumb_flying_in() {
+        let s = style();
+        let bar = bar_rect(&s, 0.0, 1920.0, 1080.0);
+        let w = |crumbs: &[f64]| pill_layout(&s, bar, 80.0, crumbs).pill.w;
+        assert_eq!(w(&[0.0]), w(&[]));
+        let steps: Vec<f64> = (0..=10).map(|k| w(&[k as f64 / 10.0])).collect();
+        assert!(steps.windows(2).all(|p| p[1] > p[0]), "{steps:?}");
+        assert_eq!(*steps.last().unwrap(), w(&[1.0]));
+        // Never narrower than round.
+        assert!(pill_layout(&s, bar, 0.0, &[]).pill.w >= s.pill_height());
     }
 }

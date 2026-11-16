@@ -145,6 +145,7 @@ impl Expose {
             | Done::Bubble { .. }
             | Done::Folder { .. }
             | Done::FileIcons { .. }
+            | Done::FileType { .. }
             | Done::Apps(_) => {}
         }
     }

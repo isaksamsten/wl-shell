@@ -144,6 +144,30 @@ impl Search {
         }
         ranges
     }
+
+    /// The indices of `names` that match `query`, best first; equal
+    /// scores keep their order. An empty query keeps them all, in order.
+    pub fn rank_names(&mut self, names: &[&str], query: &str) -> Vec<usize> {
+        let folded = fold(query.trim());
+        let pattern = Pattern::new(
+            &folded,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        if pattern.atoms.is_empty() {
+            return (0..names.len()).collect();
+        }
+        let mut scored: Vec<(f64, usize)> = (names.iter().enumerate())
+            .filter_map(|(i, name)| {
+                let prefix = fold(name).starts_with(&folded);
+                let score = self.field(&pattern, name)?;
+                Some((score + if prefix { PREFIX_BONUS } else { 0.0 }, i))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +184,7 @@ mod tests {
             categories: Vec::new(),
             wm_class: None,
             program: Some(id.rsplit('.').next().unwrap().to_lowercase()),
+            mime_types: Vec::new(),
             entry: AppEntry::default(),
         }
     }
@@ -266,5 +291,19 @@ mod tests {
         let mut reversed = apps.to_vec();
         reversed.reverse();
         assert_eq!(plain(&reversed, "tool"), ranked);
+    }
+
+    #[test]
+    fn names_in_their_order() {
+        let names = ["Open file", "Open with…", "Open containing directory"];
+        let mut s = Search::default();
+        assert_eq!(s.rank_names(&names, ""), [0, 1, 2]);
+        assert_eq!(s.rank_names(&names, " "), [0, 1, 2]);
+        assert_eq!(s.rank_names(&names, "ow"), [1]);
+        assert_eq!(s.rank_names(&names, "ocd"), [2]);
+        assert_eq!(s.rank_names(&names, "with")[0], 1);
+        // Equal scores keep the order given.
+        assert_eq!(s.rank_names(&names, "open"), [0, 1, 2]);
+        assert!(s.rank_names(&names, "zz").is_empty());
     }
 }

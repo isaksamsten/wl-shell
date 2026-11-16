@@ -653,6 +653,8 @@ pub struct IndexedApp {
     pub wm_class: Option<String>,
     /// The file name of the program `Exec=` runs.
     pub program: Option<String>,
+    /// `MimeType=`: the file types it opens.
+    pub mime_types: Vec<String>,
     pub entry: AppEntry,
 }
 
@@ -719,6 +721,7 @@ pub fn index(
             categories: list(e.categories()),
             wm_class: e.startup_wm_class().and_then(text),
             program: program(exec),
+            mime_types: list(e.mime_type()),
             entry,
         });
     }
@@ -841,6 +844,7 @@ mod index_tests {
             "[Desktop Entry]\nType=Application\nName=Files\nName[de]=Dateien\n\
              GenericName=File Manager\nKeywords=folder;manager; explore;\n\
              Categories=GTK;Utility;Core;\nStartupWMClass=nautilus\n\
+             MimeType=inode/directory;application/x-7z-compressed;\n\
              Exec=env GDK_BACKEND=wayland /usr/bin/nautilus --new-window %U\nIcon=org.gnome.Nautilus\n",
         );
         let apps = listed(&[e], &[]);
@@ -855,6 +859,10 @@ mod index_tests {
         assert_eq!(a.categories, ["GTK", "Utility", "Core"]);
         assert_eq!(a.wm_class.as_deref(), Some("nautilus"));
         assert_eq!(a.program.as_deref(), Some("nautilus"));
+        assert_eq!(
+            a.mime_types,
+            ["inode/directory", "application/x-7z-compressed"]
+        );
         assert_eq!(a.entry.desktop_id, "org.gnome.Nautilus.desktop");
         assert_eq!(a.entry.icon.as_deref(), Some("org.gnome.Nautilus"));
         let firefox = listed(&[app("firefox", "Firefox", "")], &[]);

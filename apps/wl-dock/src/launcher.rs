@@ -1,5 +1,5 @@
-//! The launcher's keys and query. Pure, unit tested; launcherview.rs
-//! shows it and app.rs acts on it.
+//! The launcher's keys, query and levels. Pure, unit tested;
+//! launcherview.rs shows it and app.rs acts on it.
 //!
 //! | Key                       | Effect                                     |
 //! | ------------------------- | ------------------------------------------ |
@@ -10,7 +10,8 @@
 //! | Ctrl+Enter                | the other of activating and launching      |
 //! | Up, Ctrl+N                | the next match: the drum rolls toward you  |
 //! | Down, Ctrl+P              | the previous match: the drum rolls back    |
-//! | Shift+Tab                 | from files back to the apps                |
+//! | Tab                       | a file's actions; an action's choices      |
+//! | Shift+Tab                 | back: out of a level, or files to apps     |
 //! | Escape                    | clear the query; with an empty one, close  |
 //!
 //! The trigger, typed into an empty app query, becomes a token in the
@@ -19,8 +20,11 @@
 //! Shift+Tab, goes back to the apps with the query empty. A trigger typed
 //! in the file query is a plain character (nucleo's exact-match prefix).
 //!
-//! Tab (the selection's actions) comes later. The caret is always at the
-//! end of the query.
+//! Tab on a file match enters its actions, a level with a query of its
+//! own (`Nav`), and Tab (or Enter) on an action with choices (Open
+//! with…) enters those. In a level, Escape, Shift+Tab, or Backspace on an
+//! empty query go back one level, restoring its query and selection
+//! (`act`). The caret is always at the end of the query.
 
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 use wl_shell_render::icons::fold;
@@ -40,7 +44,9 @@ pub enum Key {
     Open {
         other: bool,
     },
-    /// Shift+Tab: out of files, back to the apps.
+    /// Tab: into the selection's actions or choices.
+    Tab,
+    /// Shift+Tab: back out of a level, or out of files to the apps.
     Back,
     Escape,
 }
@@ -59,6 +65,7 @@ impl Key {
             Keysym::Down | Keysym::KP_Down => Key::Roll(-1),
             Keysym::ISO_Left_Tab => Key::Back,
             Keysym::Tab if mods.shift => Key::Back,
+            Keysym::Tab if !mods.ctrl && !mods.alt && !mods.logo => Key::Tab,
             Keysym::n if ctrl => Key::Roll(1),
             Keysym::p if ctrl => Key::Roll(-1),
             Keysym::w if ctrl => Key::DeleteWord,
@@ -76,7 +83,7 @@ impl Key {
 
     /// Whether holding it down repeats it.
     pub fn repeats(&self) -> bool {
-        !matches!(self, Key::Open { .. } | Key::Escape | Key::Back)
+        !matches!(self, Key::Open { .. } | Key::Escape | Key::Back | Key::Tab)
     }
 }
 
@@ -86,6 +93,8 @@ pub enum Scope {
     #[default]
     Apps,
     Files,
+    /// A level's choices (a subject's actions, or an action's choices).
+    Actions,
 }
 
 /// The query: what was typed, with the caret at its end, and what it
@@ -97,6 +106,14 @@ pub struct Query {
 }
 
 impl Query {
+    /// An empty query for a level's choices.
+    pub fn actions() -> Self {
+        Self {
+            text: String::new(),
+            scope: Scope::Actions,
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -117,7 +134,7 @@ impl Query {
         match key {
             Key::Text(t) => {
                 let rest = (trigger.filter(|c| !c.is_whitespace()))
-                    .filter(|_| !files && self.text.is_empty())
+                    .filter(|_| self.scope == Scope::Apps && self.text.is_empty())
                     .and_then(|c| t.strip_prefix(c));
                 match rest {
                     Some(rest) => {
@@ -144,10 +161,116 @@ impl Query {
                 self.text.truncate(start);
             }
             Key::Clear => self.text.clear(),
-            Key::Roll(_) | Key::Open { .. } | Key::Back | Key::Escape => {}
+            Key::Roll(_) | Key::Open { .. } | Key::Tab | Key::Back | Key::Escape => {}
         }
         // Every edit of the text changes its length.
         (self.text.len(), self.scope) != before
+    }
+}
+
+/// What a key does to the launcher, given how deep it is in levels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Act {
+    Nothing,
+    /// Edit the query.
+    Edit(Key),
+    /// Clear the query.
+    Clear,
+    /// Close the launcher.
+    Close,
+    Roll(i32),
+    /// Open (or run) the selection.
+    Open {
+        other: bool,
+    },
+    /// Into the selection's actions or choices.
+    Into,
+    /// Back out of the level.
+    Out,
+}
+
+/// What `key` does with the launcher `depth` levels deep (0: searching)
+/// and `query` typed.
+pub fn act(key: Key, depth: usize, query: &Query) -> Act {
+    match key {
+        Key::Roll(by) => Act::Roll(by),
+        Key::Open { other } => Act::Open { other },
+        Key::Escape | Key::Back if depth > 0 => Act::Out,
+        Key::Backspace | Key::DeleteWord if depth > 0 && query.is_empty() => Act::Out,
+        Key::Tab if depth > 0 || query.scope() == Scope::Files => Act::Into,
+        Key::Tab => Act::Nothing,
+        Key::Escape if query.is_empty() => Act::Close,
+        Key::Escape => Act::Clear,
+        key => Act::Edit(key),
+    }
+}
+
+/// Where the launcher was when it entered a level, to go back to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection<S> {
+    /// The selected match's ID.
+    pub selected: Option<String>,
+    /// The drum had been rolled to it.
+    pub rolled: bool,
+    /// What was shown.
+    pub shown: S,
+}
+
+/// The levels the launcher went into (each `T`), with the query of each
+/// and where it was (`S`, what it showed), so going back restores them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nav<T, S> {
+    query: Query,
+    levels: Vec<(Query, Selection<S>, T)>,
+}
+
+impl<T, S> Default for Nav<T, S> {
+    fn default() -> Self {
+        Self {
+            query: Query::default(),
+            levels: Vec::new(),
+        }
+    }
+}
+
+impl<T, S> Nav<T, S> {
+    /// The current level's query.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    pub fn query_mut(&mut self) -> &mut Query {
+        &mut self.query
+    }
+
+    /// Levels entered: 0 while searching.
+    pub fn depth(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// The current level, unless searching.
+    pub fn level(&self) -> Option<&T> {
+        self.levels.last().map(|(_, _, t)| t)
+    }
+
+    /// Every level entered, the first first.
+    #[cfg(test)]
+    pub fn levels(&self) -> impl Iterator<Item = &T> {
+        self.levels.iter().map(|(_, _, t)| t)
+    }
+
+    /// Enter `level`, leaving from `from`; its query starts empty.
+    pub fn enter(&mut self, from: Selection<S>, level: T) {
+        let query = std::mem::replace(&mut self.query, Query::actions());
+        self.levels.push((query, from, level));
+    }
+
+    /// Go back out of the current level: its query is the one before
+    /// again; returns where it was. None while searching.
+    pub fn leave(&mut self) -> Option<Selection<S>> {
+        let (query, from, _) = self.levels.pop()?;
+        self.query = query;
+        Some(from)
     }
 }
 
@@ -228,7 +351,8 @@ mod tests {
         assert_eq!(k(Keysym::Escape, Some("\x1b"), false), Some(Key::Escape));
         // Other shortcuts and control characters type nothing.
         assert_eq!(k(Keysym::a, Some("\x01"), true), None);
-        assert_eq!(k(Keysym::Tab, Some("\t"), false), None);
+        assert_eq!(k(Keysym::Tab, Some("\t"), false), Some(Key::Tab));
+        assert_eq!(k(Keysym::Tab, Some("\t"), true), None);
         assert_eq!(k(Keysym::Shift_L, None, false), None);
         assert_eq!(k(Keysym::ISO_Left_Tab, None, false), Some(Key::Back));
         let shift = Modifiers {
@@ -238,7 +362,7 @@ mod tests {
         assert_eq!(Key::from(Keysym::Tab, Some("\t"), &shift), Some(Key::Back));
         assert!(Key::Backspace.repeats() && Key::Roll(1).repeats());
         assert!(!Key::Open { other: false }.repeats() && !Key::Escape.repeats());
-        assert!(!Key::Back.repeats());
+        assert!(!Key::Back.repeats() && !Key::Tab.repeats());
     }
 
     #[test]
@@ -307,6 +431,148 @@ mod tests {
         edit(&mut q, t("'abc"));
         assert!(edit(&mut q, Key::Back));
         assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+    }
+
+    #[test]
+    fn no_trigger_among_actions() {
+        let mut q = Query::actions();
+        assert!(q.edit(&Key::Text("'o".into()), Some('\'')));
+        assert_eq!((q.scope(), q.text()), (Scope::Actions, "'o"));
+        q.edit(&Key::Clear, Some('\''));
+        assert!(!q.edit(&Key::Back, Some('\'')) && !q.edit(&Key::Backspace, None));
+        assert_eq!(q.scope(), Scope::Actions);
+    }
+
+    /// A launcher's levels, as app.rs drives them: `S` is what the drum
+    /// showed, by name.
+    struct Launcher {
+        nav: Nav<&'static str, Vec<&'static str>>,
+        shown: Vec<&'static str>,
+        selected: usize,
+        rolled: bool,
+    }
+
+    impl Launcher {
+        fn files(query: &str, shown: Vec<&'static str>) -> Self {
+            let mut nav = Nav::default();
+            nav.query_mut()
+                .edit(&Key::Text(format!("'{query}")), Some('\''));
+            Self {
+                nav,
+                shown,
+                selected: 0,
+                rolled: false,
+            }
+        }
+
+        fn key(&mut self, key: Key) -> Act {
+            let act = act(key, self.nav.depth(), self.nav.query());
+            match &act {
+                Act::Into => {
+                    let from = Selection {
+                        selected: Some(self.shown[self.selected].to_string()),
+                        rolled: self.rolled,
+                        shown: std::mem::take(&mut self.shown),
+                    };
+                    let (level, choices) = match self.nav.depth() {
+                        0 => ("actions", vec!["open", "open-with", "open-directory"]),
+                        _ => ("open-with", vec!["firefox", "xournal"]),
+                    };
+                    self.nav.enter(from, level);
+                    (self.shown, self.selected, self.rolled) = (choices, 0, false);
+                }
+                Act::Out => {
+                    let from = self.nav.leave().unwrap();
+                    let at = from
+                        .shown
+                        .iter()
+                        .position(|s| Some(*s) == from.selected.as_deref());
+                    (self.shown, self.selected, self.rolled) =
+                        (from.shown, at.unwrap(), from.rolled);
+                }
+                Act::Edit(key) => {
+                    self.nav.query_mut().edit(key, Some('\''));
+                }
+                Act::Roll(by) => {
+                    let n = self.shown.len() as i32;
+                    self.selected = (self.selected as i32 + by).rem_euclid(n) as usize;
+                    self.rolled = true;
+                }
+                _ => {}
+            }
+            act
+        }
+
+        fn front(&self) -> &str {
+            self.shown[self.selected]
+        }
+    }
+
+    #[test]
+    fn into_actions_and_back() {
+        let t = |s: &str| Key::Text(s.into());
+        let mut l = Launcher::files("rep", vec!["report.pdf", "repo", "reply.txt"]);
+        l.key(Key::Roll(1));
+        assert_eq!(l.front(), "repo");
+        // Tab: the actions, with a query of their own.
+        assert_eq!(l.key(Key::Tab), Act::Into);
+        assert_eq!((l.nav.depth(), l.nav.level()), (1, Some(&"actions")));
+        assert_eq!(
+            (l.nav.query().scope(), l.nav.query().text()),
+            (Scope::Actions, "")
+        );
+        assert_eq!(l.front(), "open");
+        // `ow`, Tab: Open with's apps.
+        l.key(t("o"));
+        l.key(t("w"));
+        assert_eq!(l.nav.query().text(), "ow");
+        l.selected = 1;
+        assert_eq!(l.key(Key::Tab), Act::Into);
+        assert_eq!(
+            l.nav.levels().collect::<Vec<_>>(),
+            [&"actions", &"open-with"]
+        );
+        assert_eq!(l.front(), "firefox");
+        l.key(t("x"));
+        assert_eq!(
+            l.key(Key::Open { other: false }),
+            Act::Open { other: false }
+        );
+        // Escape: back to the actions as they were, query and all.
+        assert_eq!(l.key(Key::Escape), Act::Out);
+        assert_eq!((l.nav.depth(), l.nav.query().text()), (1, "ow"));
+        assert_eq!(l.front(), "open-with");
+        // Backspace edits a query; on an empty one, it goes back.
+        assert_eq!(l.key(Key::Backspace), Act::Edit(Key::Backspace));
+        assert_eq!(l.key(Key::DeleteWord), Act::Edit(Key::DeleteWord));
+        assert_eq!(l.key(Key::Backspace), Act::Out);
+        // Back in the file search, with its query and the subject selected.
+        assert_eq!(l.nav.depth(), 0);
+        assert_eq!(
+            (l.nav.query().scope(), l.nav.query().text()),
+            (Scope::Files, "rep")
+        );
+        assert_eq!((l.front(), l.rolled), ("repo", true));
+        // Escape there clears the file query, then closes.
+        assert_eq!(l.key(Key::Escape), Act::Clear);
+        l.nav.query_mut().edit(&Key::Clear, None);
+        assert_eq!(l.key(Key::Escape), Act::Close);
+    }
+
+    #[test]
+    fn shift_tab_goes_back_one_level() {
+        let mut l = Launcher::files("rep", vec!["report.pdf"]);
+        l.key(Key::Tab);
+        l.key(Key::Text("x".into()));
+        assert_eq!(l.key(Key::Back), Act::Out);
+        assert_eq!((l.nav.depth(), l.nav.query().text()), (0, "rep"));
+        assert_eq!((l.front(), l.rolled), ("report.pdf", false));
+        // In files, Shift+Tab is an edit: back to the apps.
+        assert_eq!(l.key(Key::Back), Act::Edit(Key::Back));
+        assert_eq!(l.nav.query().scope(), Scope::Apps);
+        // Tab does nothing on an app.
+        assert_eq!(l.key(Key::Tab), Act::Nothing);
+        assert_eq!(l.nav.leave(), None);
     }
 
     #[test]

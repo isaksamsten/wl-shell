@@ -6,9 +6,18 @@
 //! Only simple globs are used: literal names (`Makefile`) and `*.<suffix>`
 //! patterns; the longest matching suffix wins, then the highest weight.
 //! Case-sensitive globs (`:cs`) match as written, the rest ignoring case.
+//!
+//! A type's parents come from `subclasses` (and `aliases` name the
+//! canonical type); every `text/*` type is also a `text/plain`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// The type of folders.
+pub const DIRECTORY: &str = "inode/directory";
+/// What a file's start is read for to tell text from the rest, bytes.
+const SNIFF: usize = 512;
 
 #[derive(Debug, Default)]
 pub struct MimeDb {
@@ -21,6 +30,10 @@ pub struct MimeDb {
     /// Type to icon name.
     icons: HashMap<String, String>,
     generic: HashMap<String, String>,
+    /// Type to its direct parents.
+    parents: HashMap<String, Vec<String>>,
+    /// Alias to the canonical type.
+    aliases: HashMap<String, String>,
 }
 
 /// The data directories, most important first.
@@ -71,8 +84,79 @@ impl MimeDb {
             if let Some(text) = read("generic-icons") {
                 add_pairs(&mut db.generic, &text);
             }
+            if let Some(text) = read("subclasses") {
+                db.add_subclasses(&text);
+            }
+            if let Some(text) = read("aliases") {
+                db.add_aliases(&text);
+            }
         }
         db
+    }
+
+    /// Add the lines of a `subclasses` file: `<type> <parent>`.
+    pub fn add_subclasses(&mut self, text: &str) {
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            if let Some((mime, parent)) = line.trim().split_once(' ') {
+                let parents = self.parents.entry(mime.to_string()).or_default();
+                let parent = parent.trim().to_string();
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+        }
+    }
+
+    /// Add the lines of an `aliases` file: `<alias> <type>`; the first
+    /// seen wins.
+    pub fn add_aliases(&mut self, text: &str) {
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            if let Some((alias, mime)) = line.trim().split_once(' ') {
+                (self.aliases.entry(alias.to_string())).or_insert_with(|| mime.trim().to_string());
+            }
+        }
+    }
+
+    /// The canonical name of `mime`.
+    pub fn canonical<'a>(&'a self, mime: &'a str) -> &'a str {
+        self.aliases.get(mime).map_or(mime, String::as_str)
+    }
+
+    /// `mime` (made canonical) and every type it is a kind of, nearest
+    /// first: `text/x-csrc`, `text/plain`, ...
+    pub fn lineage(&self, mime: &str) -> Vec<String> {
+        let mut out = vec![self.canonical(mime).to_string()];
+        let mut i = 0;
+        while i < out.len() {
+            let mut parents: Vec<String> = self.parents.get(&out[i]).cloned().unwrap_or_default();
+            if out[i].starts_with("text/") {
+                parents.push("text/plain".into());
+            }
+            for p in parents {
+                let p = self.canonical(&p).to_string();
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The type of the file at `path` (a folder if `dir`): by its name,
+    /// else `text/plain` if it starts with text. None if unknown.
+    pub fn type_of_path(&self, path: &Path, dir: bool) -> Option<String> {
+        if dir {
+            return Some(DIRECTORY.into());
+        }
+        let name = path.file_name()?.to_string_lossy();
+        if let Some(mime) = self.type_of(&name) {
+            return Some(mime.to_string());
+        }
+        let mut start = Vec::with_capacity(SNIFF);
+        let file = std::fs::File::open(path).ok()?;
+        file.take(SNIFF as u64).read_to_end(&mut start).ok()?;
+        looks_like_text(&start).then(|| "text/plain".into())
     }
 
     /// Add the globs of a `globs2` file: `weight:type:glob[:flags]`.
@@ -163,6 +247,19 @@ fn add_pairs(map: &mut HashMap<String, String>, text: &str) {
     }
 }
 
+/// Whether a file starting with `start` is text: valid UTF-8 (but for a
+/// character cut at the end) without NULs.
+fn looks_like_text(start: &[u8]) -> bool {
+    if start.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(start) {
+        Ok(_) => true,
+        // Cut in the middle of a character at the end.
+        Err(e) => e.error_len().is_none() && start.len() >= SNIFF,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +316,60 @@ mod tests {
             ["package-x-generic", "application-gzip"]
         );
         assert_eq!(db.icons(None)[0], "application-x-generic");
+    }
+
+    #[test]
+    fn lineage() {
+        let mut db = db();
+        db.add_subclasses(
+            "application/x-shellscript application/x-executable\n\
+             application/x-shellscript text/plain\n\
+             text/x-csrc text/plain\n\
+             image/svg+xml application/xml\n\
+             application/xml text/plain\n",
+        );
+        db.add_aliases("text/x-c text/x-csrc\n");
+        assert_eq!(db.lineage("text/x-csrc"), ["text/x-csrc", "text/plain"]);
+        // Aliases name the canonical type.
+        assert_eq!(db.lineage("text/x-c"), ["text/x-csrc", "text/plain"]);
+        assert_eq!(
+            db.lineage("image/svg+xml"),
+            ["image/svg+xml", "application/xml", "text/plain"]
+        );
+        assert_eq!(
+            db.lineage("application/x-shellscript"),
+            [
+                "application/x-shellscript",
+                "application/x-executable",
+                "text/plain"
+            ]
+        );
+        // Every text type is plain text.
+        assert_eq!(db.lineage("text/markdown"), ["text/markdown", "text/plain"]);
+        assert_eq!(db.lineage("image/png"), ["image/png"]);
+    }
+
+    #[test]
+    fn types_of_paths() {
+        let dir = std::env::temp_dir().join(format!("wl-shell-mime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes"), "hello\n").unwrap();
+        std::fs::write(dir.join("blob"), [0u8, 1, 2]).unwrap();
+        std::fs::write(dir.join("a.png"), [0u8]).unwrap();
+        let db = db();
+        assert_eq!(db.type_of_path(&dir, true).as_deref(), Some(DIRECTORY));
+        assert_eq!(
+            db.type_of_path(&dir.join("a.png"), false).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            db.type_of_path(&dir.join("notes"), false).as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(db.type_of_path(&dir.join("blob"), false), None);
+        assert_eq!(db.type_of_path(&dir.join("missing"), false), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(looks_like_text("é".as_bytes()));
+        assert!(!looks_like_text(&[0xff, 0xfe]));
     }
 }

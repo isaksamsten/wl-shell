@@ -53,8 +53,9 @@ character, a word or everything. Escape clears the query, then closes the
 launcher, as do a click outside it and running `--launcher` again. It exits 0
 once something was opened and 1 otherwise.
 
-Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches
-(`launcher.history = false` turns that off).
+Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches,
+and so is the app you picked for a query: it comes first for that query (and
+the start of it) next time. `launcher.history = false` turns both off.
 
 Start the query with `'` to search files instead, as in Alfred: `'plan`
 finds `PLAN.md`. There is no index; the launcher walks your home directory
@@ -67,6 +68,16 @@ terms, `^` and `$` anchor, `!` excludes, and `'` asks for an exact substring
 file query, or Shift+Tab, goes back to the apps. Hidden files, `.gitignore`d
 files and `launcher.files.exclude` are skipped, symlinks aren't followed, and
 the walk stays on one file system.
+
+Tab on a file shows what you can do with it: its icon flies into a small pill
+above the bar's right end, with its name and folder, and the drum fills with
+Open file, Open with… and Open containing directory. Type to filter them (`ow`
+finds Open with…) and press Enter to run the front one. Open with… (Enter or
+Tab) lists the apps that take the file's type, from their `MimeType=` and your
+`mimeapps.list`, the default first, and adds its icon to the pill; Enter opens
+the file with the front one. Escape, Shift+Tab, or Backspace on an empty query
+go back a step, to where you were; clicking an icon in the pill goes back to
+where it was chosen.
 
 ## Configuration
 
