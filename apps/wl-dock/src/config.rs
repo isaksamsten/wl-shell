@@ -4,8 +4,9 @@
 //! `~/.config/wl-dock/config.toml`) unless `--config` names a file. A
 //! missing default file means the defaults; every key is optional.
 //!
-//! Layout keys can be overridden per output in `[output.<name>]` tables
-//! (see `OutputOverride`); `outputs` picks the outputs that get a dock.
+//! General dock keys live at the root; feature settings have their own
+//! tables. Output overrides mirror that structure under `[output.<name>]`.
+//! `outputs` picks the outputs that get a dock.
 //! Per-app settings (menu actions, middle click and scroll commands, the
 //! icon, name and launch command, and what dropping files does) live in
 //! `[app."<app-id>"]` tables (see `AppConfig`), and per-folder ones (how
@@ -24,156 +25,46 @@ use serde::{Deserialize, Deserializer};
 use wl_shell_config::{ConfigFile, Scheme, de};
 use wl_shell_render::{files, shadow, text};
 
-pub type Appearance = wl_shell_config::Appearance<Theme>;
-
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
     /// The outputs that get a dock.
     pub outputs: Outputs,
-    /// The screen edge the dock sits on.
     pub position: Position,
-    /// The layer-shell layer of the dock.
     pub layer: DockLayer,
     /// App icon size at rest.
     #[serde(deserialize_with = "icon_size")]
     pub icon_size: u32,
-    /// Space between icons.
     #[serde(deserialize_with = "de::px")]
     pub icon_gap: u32,
     /// Space between the dock and its screen edge.
     #[serde(deserialize_with = "de::px")]
     pub margin: u32,
-    /// Space between the panel's edges and the icons.
     #[serde(deserialize_with = "de::px")]
     pub padding: u32,
-    /// Scale of the icon under the pointer; 1 disables magnification.
     #[serde(deserialize_with = "magnification")]
     pub magnification: f64,
-    /// How many icons on each side of the pointer grow with it.
     #[serde(deserialize_with = "magnification_range")]
     pub magnification_range: f64,
-    /// Keep windows out of the resting dock's area (exclusive zone).
+    /// Keep windows out of the resting dock's area.
     pub reserve: bool,
-    /// Slide off the edge while the pointer is elsewhere.
-    pub autohide: bool,
-    /// Milliseconds the pointer rests on the edge before a hidden dock
-    /// comes back.
-    #[serde(deserialize_with = "de::duration")]
-    pub reveal_delay: u32,
-    /// Milliseconds after the pointer leaves before the dock hides.
-    #[serde(deserialize_with = "de::duration")]
-    pub hide_delay: u32,
-    /// The band along the edge that reveals a hidden dock, px.
-    #[serde(deserialize_with = "autohide_trigger")]
-    pub autohide_trigger: u32,
-    /// Milliseconds the pointer rests on an app before its name shows.
     #[serde(deserialize_with = "de::duration")]
     pub hover_delay: u32,
-    /// The hovered app's name.
     pub labels: bool,
-    /// Clicking an app with `strip-min-windows` windows opens the strip
-    /// of its windows; false: the click activates the most recent one.
-    pub strip: bool,
-    /// Apps with fewer windows activate one on a click instead of opening
-    /// the strip.
-    #[serde(deserialize_with = "strip_min_windows")]
-    pub strip_min_windows: u32,
-    /// Cards per row of the strip, along the dock; 0: no limit.
-    #[serde(deserialize_with = "strip_cap")]
-    pub strip_max_columns: u32,
-    /// Rows of the strip, stacked away from the dock; 0: no limit.
-    #[serde(deserialize_with = "strip_cap")]
-    pub strip_max_rows: u32,
-    /// Strip card height, as a fraction of the output height.
-    #[serde(deserialize_with = "de::fraction")]
-    pub strip_card_height: f64,
-    /// Longest a strip gets along the dock, as a fraction of the output's
-    /// length there; also the widest a card gets, of the output's width.
-    #[serde(deserialize_with = "de::fraction")]
-    pub strip_max_width: f64,
-    /// Window previews in the strip.
-    pub previews: Previews,
-    /// Zoom factor of the highlighted card; 1 disables zooming.
-    #[serde(deserialize_with = "de::zoom")]
-    pub zoom: f64,
-    /// What marks running apps.
     pub indicator: Indicator,
-    /// Mark the focused app (needs `mru-event-stream`).
     pub active_indicator: bool,
-    /// Spring response for movement, in milliseconds.
-    #[serde(deserialize_with = "response")]
-    pub response: u32,
-    /// Font family for labels (and letter icons).
-    pub font: String,
-    #[serde(deserialize_with = "de::font_size")]
-    pub font_size: u32,
-    /// Focuses a window: `{id}` is its ext toplevel identifier.
-    pub activate_command: Option<String>,
-    /// Closes a window: `{id}`. Without it, the menu has no Close rows.
-    pub close_command: Option<String>,
-    /// Launches apps instead of their desktop entry's `Exec=`: `{exec}`,
-    /// `{desktop-id}`, `{app-id}`.
-    pub launch_command: Option<String>,
-    /// Runs `Terminal=true` entries: their command is appended.
-    pub terminal: String,
-    /// Milliseconds a launched app's icon bounces at most.
-    #[serde(deserialize_with = "launch_timeout")]
-    pub launch_timeout: u32,
-    /// Prints the ID of each window that gains focus, one per line.
-    pub mru_event_stream: Option<String>,
-    /// Prints `<output> <id>` whenever a window opens on or moves to an
-    /// output.
-    pub output_event_stream: Option<String>,
-    /// Which windows a dock shows.
-    pub windows: Windows,
-    /// Milliseconds a new window the output stream hasn't placed yet is
-    /// held back.
-    #[serde(deserialize_with = "de::duration")]
-    pub output_grace: u32,
-    /// Pixels a press on an icon moves before it drags the icon.
     #[serde(deserialize_with = "drag_threshold")]
     pub drag_threshold: u32,
-    /// The Trash at the end of the dock.
-    pub trash: bool,
-    /// Opens files, folders and the Trash: `{path}` (`trash:///` for the
-    /// Trash).
-    pub open_command: String,
-    /// Empties the Trash.
-    pub trash_empty_command: String,
-    /// Moves files dropped on the Trash to it: `{paths}`.
-    pub trash_command: String,
-    /// Copies files dropped on a folder into it: `{paths}`, `{dest}`.
-    pub copy_command: String,
-    /// Moves files dropped on a folder into it: `{paths}`, `{dest}`.
-    pub move_command: String,
-    /// The launcher's bar, as a fraction of the output's width (at least
-    /// the resting dock's length).
-    #[serde(deserialize_with = "de::fraction")]
-    pub launcher_width: f64,
-    /// The bar's icon, times `icon-size`.
-    #[serde(deserialize_with = "launcher_icon_scale")]
-    pub launcher_icon_scale: f64,
-    /// The query's font size; default: from the icon size.
-    #[serde(deserialize_with = "some_font_size")]
-    pub launcher_font_size: Option<u32>,
-    /// Matches on the launcher's drum; 0 shows only the selection.
-    #[serde(deserialize_with = "launcher_matches")]
-    pub launcher_matches: u32,
-    /// The farthest match's size, times the front one's.
-    #[serde(deserialize_with = "launcher_far_scale")]
-    pub launcher_far_scale: f64,
-    /// What Enter does in the launcher (Ctrl+Enter does the other).
-    pub launcher_enter: LauncherEnter,
-    /// Record launches, to rank the launcher's matches by.
-    pub history: bool,
-    /// Per-output overrides, by output name.
-    pub output: BTreeMap<String, OutputOverride>,
-    /// Per-app settings, by app ID.
-    pub app: BTreeMap<String, AppConfig>,
-    /// Per-folder settings, by path (`~/` allowed).
-    pub folder: BTreeMap<String, FolderConfig>,
+    pub autohide: AutohideConfig,
+    pub windows: WindowsConfig,
+    pub launcher: LauncherConfig,
+    pub integration: IntegrationConfig,
+    pub files: FilesConfig,
+    pub trash: TrashConfig,
     pub appearance: Appearance,
+    pub output: BTreeMap<String, OutputOverride>,
+    pub app: BTreeMap<String, AppConfig>,
+    pub folder: BTreeMap<String, FolderConfig>,
 }
 
 impl Default for Config {
@@ -189,25 +80,142 @@ impl Default for Config {
             magnification: 1.8,
             magnification_range: 3.0,
             reserve: true,
-            autohide: false,
-            reveal_delay: 150,
-            hide_delay: 500,
-            autohide_trigger: 2,
             hover_delay: 300,
             labels: true,
-            strip: true,
-            strip_min_windows: 2,
-            strip_max_columns: 3,
-            strip_max_rows: 3,
-            strip_card_height: 0.18,
-            strip_max_width: 0.6,
-            previews: Previews::default(),
-            zoom: 1.04,
             indicator: Indicator::default(),
             active_indicator: true,
-            response: 150,
-            font: "sans-serif".into(),
-            font_size: 13,
+            drag_threshold: 6,
+            autohide: AutohideConfig::default(),
+            windows: WindowsConfig::default(),
+            launcher: LauncherConfig::default(),
+            integration: IntegrationConfig::default(),
+            files: FilesConfig::default(),
+            trash: TrashConfig::default(),
+            appearance: Appearance::default(),
+            output: BTreeMap::new(),
+            app: BTreeMap::new(),
+            folder: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AutohideConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "de::duration")]
+    pub reveal_delay: u32,
+    #[serde(deserialize_with = "de::duration")]
+    pub hide_delay: u32,
+    /// Width of the edge reveal band in pixels.
+    #[serde(deserialize_with = "autohide_trigger")]
+    pub trigger: u32,
+}
+
+impl Default for AutohideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reveal_delay: 150,
+            hide_delay: 500,
+            trigger: 2,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WindowsConfig {
+    pub scope: Windows,
+    #[serde(deserialize_with = "de::duration")]
+    pub output_grace: u32,
+    /// Clicking an app opens the strip instead of activating its latest window.
+    pub strip: bool,
+    #[serde(deserialize_with = "strip_min_windows")]
+    pub min_windows: u32,
+    /// Cards along the dock; 0 means unlimited.
+    #[serde(deserialize_with = "strip_cap")]
+    pub max_columns: u32,
+    /// Rows away from the dock; 0 means unlimited.
+    #[serde(deserialize_with = "strip_cap")]
+    pub max_rows: u32,
+    /// Fraction of output height.
+    #[serde(deserialize_with = "de::fraction")]
+    pub card_height: f64,
+    /// Fraction of output length; also caps individual card width.
+    #[serde(deserialize_with = "de::fraction")]
+    pub max_width: f64,
+    pub previews: Previews,
+    #[serde(deserialize_with = "de::zoom")]
+    pub zoom: f64,
+}
+
+impl Default for WindowsConfig {
+    fn default() -> Self {
+        Self {
+            scope: Windows::default(),
+            output_grace: 250,
+            strip: true,
+            min_windows: 2,
+            max_columns: 3,
+            max_rows: 3,
+            card_height: 0.18,
+            max_width: 0.6,
+            previews: Previews::default(),
+            zoom: 1.04,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct LauncherConfig {
+    #[serde(deserialize_with = "de::fraction")]
+    pub width: f64,
+    #[serde(deserialize_with = "launcher_icon_scale")]
+    pub icon_scale: f64,
+    #[serde(deserialize_with = "some_font_size")]
+    pub font_size: Option<u32>,
+    #[serde(deserialize_with = "launcher_matches")]
+    pub matches: u32,
+    #[serde(deserialize_with = "launcher_far_scale")]
+    pub far_scale: f64,
+    pub enter: LauncherEnter,
+    pub history: bool,
+}
+
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        Self {
+            width: 0.4,
+            icon_scale: 1.25,
+            font_size: None,
+            matches: 5,
+            far_scale: 0.5,
+            enter: LauncherEnter::default(),
+            history: true,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct IntegrationConfig {
+    /// Window commands accept `{id}`.
+    pub activate_command: Option<String>,
+    pub close_command: Option<String>,
+    /// Accepts `{exec}`, `{desktop-id}`, and `{app-id}`.
+    pub launch_command: Option<String>,
+    pub terminal: String,
+    #[serde(deserialize_with = "launch_timeout")]
+    pub launch_timeout: u32,
+    pub mru_event_stream: Option<String>,
+    pub output_event_stream: Option<String>,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self {
             activate_command: None,
             close_command: None,
             launch_command: None,
@@ -215,26 +223,69 @@ impl Default for Config {
             launch_timeout: 10_000,
             mru_event_stream: None,
             output_event_stream: None,
-            windows: Windows::default(),
-            output_grace: 250,
-            drag_threshold: 6,
-            trash: true,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FilesConfig {
+    /// Opens files, folders, or `trash:///`: `{path}`.
+    pub open_command: String,
+    /// Drop commands accept `{paths}` and `{dest}`.
+    pub copy_command: String,
+    pub move_command: String,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
             open_command: "xdg-open {path}".into(),
-            trash_empty_command: "gio trash --empty".into(),
-            trash_command: "gio trash -- {paths}".into(),
             copy_command: "cp -rn -- {paths} {dest}".into(),
             move_command: "mv -n -- {paths} {dest}".into(),
-            launcher_width: 0.4,
-            launcher_icon_scale: 1.25,
-            launcher_font_size: None,
-            launcher_matches: 5,
-            launcher_far_scale: 0.5,
-            launcher_enter: LauncherEnter::default(),
-            history: true,
-            output: BTreeMap::new(),
-            app: BTreeMap::new(),
-            folder: BTreeMap::new(),
-            appearance: Appearance::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TrashConfig {
+    pub enabled: bool,
+    /// Moves dropped files to the Trash: `{paths}`.
+    pub command: String,
+    pub empty_command: String,
+}
+
+impl Default for TrashConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: "gio trash -- {paths}".into(),
+            empty_command: "gio trash --empty".into(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Appearance {
+    pub font: String,
+    #[serde(deserialize_with = "de::font_size")]
+    pub font_size: u32,
+    #[serde(deserialize_with = "response")]
+    pub response: u32,
+    // The shared parser validates theme keys, including dark/light overrides.
+    #[serde(flatten)]
+    pub theme: wl_shell_config::Appearance<Theme>,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            font: "sans-serif".into(),
+            font_size: 13,
+            response: 150,
+            theme: wl_shell_config::Appearance::default(),
         }
     }
 }
@@ -356,14 +407,26 @@ pub struct OutputOverride {
     #[serde(deserialize_with = "some_magnification")]
     pub magnification: Option<f64>,
     pub reserve: Option<bool>,
-    pub autohide: Option<bool>,
     #[serde(deserialize_with = "some_px")]
     pub margin: Option<u32>,
-    pub windows: Option<Windows>,
+    pub autohide: OutputAutohide,
+    pub windows: OutputWindows,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputAutohide {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct OutputWindows {
+    pub scope: Option<Windows>,
     #[serde(deserialize_with = "some_strip_cap")]
-    pub strip_max_columns: Option<u32>,
+    pub max_columns: Option<u32>,
     #[serde(deserialize_with = "some_strip_cap")]
-    pub strip_max_rows: Option<u32>,
+    pub max_rows: Option<u32>,
 }
 
 /// An `[app."<app-id>"]` table.
@@ -663,7 +726,7 @@ impl Default for Theme {
 impl Config {
     /// The colors in use.
     pub fn theme(&self) -> &Theme {
-        self.appearance.theme()
+        self.appearance.theme.theme()
     }
 
     /// The layout of the dock on the output named `name`; None if that
@@ -682,11 +745,11 @@ impl Config {
             icon_size: o.icon_size.unwrap_or(self.icon_size),
             magnification: o.magnification.unwrap_or(self.magnification),
             reserve: o.reserve.unwrap_or(self.reserve),
-            autohide: o.autohide.unwrap_or(self.autohide),
+            autohide: o.autohide.enabled.unwrap_or(self.autohide.enabled),
             margin: o.margin.unwrap_or(self.margin),
-            windows: o.windows.unwrap_or(self.windows),
-            strip_max_columns: o.strip_max_columns.unwrap_or(self.strip_max_columns),
-            strip_max_rows: o.strip_max_rows.unwrap_or(self.strip_max_rows),
+            windows: o.windows.scope.unwrap_or(self.windows.scope),
+            strip_max_columns: o.windows.max_columns.unwrap_or(self.windows.max_columns),
+            strip_max_rows: o.windows.max_rows.unwrap_or(self.windows.max_rows),
         })
     }
 
@@ -714,8 +777,8 @@ impl Config {
     /// The style of the hovered app's name; None if labels are disabled.
     pub fn label_style(&self) -> Option<text::Style> {
         self.labels.then(|| text::Style {
-            font: self.font.clone(),
-            size: self.font_size as f64,
+            font: self.appearance.font.clone(),
+            size: self.appearance.font_size as f64,
             color: self.theme().label_color,
             background: self.theme().label_background,
         })
@@ -724,8 +787,8 @@ impl Config {
     /// The style of a window's title pill in the strip.
     pub fn title_style(&self) -> text::Style {
         text::Style {
-            font: self.font.clone(),
-            size: self.font_size as f64,
+            font: self.appearance.font.clone(),
+            size: self.appearance.font_size as f64,
             color: self.theme().title_color,
             background: self.theme().title_background,
         }
@@ -764,8 +827,8 @@ impl Config {
     /// The style of the menu's rows (no background: the bubble has it).
     pub fn menu_text_style(&self) -> text::Style {
         text::Style {
-            font: self.font.clone(),
-            size: self.font_size as f64,
+            font: self.appearance.font.clone(),
+            size: self.appearance.font_size as f64,
             color: self.theme().menu_text,
             background: 0,
         }
@@ -773,11 +836,11 @@ impl Config {
 
     /// The launcher's query font size.
     pub fn launcher_font_size(&self) -> f64 {
-        match self.launcher_font_size {
+        match self.launcher.font_size {
             Some(size) => size as f64,
             None => (self.icon_size as f64 * 0.42)
                 .round()
-                .max(self.font_size as f64),
+                .max(self.appearance.font_size as f64),
         }
     }
 }
@@ -786,7 +849,7 @@ impl ConfigFile for Config {
     const DIR: &'static str = "wl-dock";
 
     fn apply_scheme(&mut self, desktop: &mut dyn FnMut() -> Scheme) {
-        self.appearance.apply(desktop);
+        self.appearance.theme.apply(desktop);
     }
 }
 
@@ -938,35 +1001,41 @@ mod tests {
             magnification = 2.5
             magnification-range = 2
             reserve = false
-            autohide = true
-            reveal-delay = 0
-            hide-delay = 1000
-            autohide-trigger = 4
             hover-delay = 100
             labels = false
             indicator = "dots"
-            response = 200
-            font = "Inter"
-            font-size = 12
             active-indicator = false
+
+            [autohide]
+            enabled = true
+            reveal-delay = 0
+            hide-delay = 1000
+            trigger = 4
+
+            [integration]
             activate-command = "niri msg action focus-window --id {id}"
             launch-command = "uwsm app -- {desktop-id}"
             terminal = "alacritty -e"
             launch-timeout = 5000
             mru-event-stream = "focus.sh"
             output-event-stream = "outputs.sh"
-            windows = "output"
+
+            [windows]
+            scope = "output"
             output-grace = 100
             strip = false
-            strip-min-windows = 3
-            strip-max-columns = 4
-            strip-max-rows = 0
-            strip-card-height = 0.25
-            strip-max-width = 0.5
+            min-windows = 3
+            max-columns = 4
+            max-rows = 0
+            card-height = 0.25
+            max-width = 0.5
             previews = "static"
             zoom = 1
 
             [appearance]
+            response = 200
+            font = "Inter"
+            font-size = 12
             panel-color = "00000080"
             panel-radius = 20
             indicator-color = "ffffff"
@@ -990,37 +1059,60 @@ mod tests {
         );
         assert_eq!((c.magnification, c.magnification_range), (2.5, 2.0));
         assert!(!c.reserve && !c.labels && c.label_style().is_none());
-        assert!(c.autohide);
+        assert!(c.autohide.enabled);
         assert_eq!(
-            (c.reveal_delay, c.hide_delay, c.autohide_trigger),
+            (
+                c.autohide.reveal_delay,
+                c.autohide.hide_delay,
+                c.autohide.trigger
+            ),
             (0, 1000, 4)
         );
-        assert_eq!((c.hover_delay, c.response), (100, 200));
+        assert_eq!((c.hover_delay, c.appearance.response), (100, 200));
         assert_eq!(c.indicator, Indicator::Dots);
-        assert_eq!((c.font.as_str(), c.font_size), ("Inter", 12));
+        assert_eq!(
+            (c.appearance.font.as_str(), c.appearance.font_size),
+            ("Inter", 12)
+        );
         assert!(!c.active_indicator);
         assert_eq!(
-            c.activate_command.as_deref(),
+            c.integration.activate_command.as_deref(),
             Some("niri msg action focus-window --id {id}")
         );
         assert_eq!(
-            c.launch_command.as_deref(),
+            c.integration.launch_command.as_deref(),
             Some("uwsm app -- {desktop-id}")
         );
         assert_eq!(
-            (c.terminal.as_str(), c.launch_timeout),
+            (
+                c.integration.terminal.as_str(),
+                c.integration.launch_timeout
+            ),
             ("alacritty -e", 5000)
         );
-        assert_eq!(c.mru_event_stream.as_deref(), Some("focus.sh"));
-        assert_eq!(c.output_event_stream.as_deref(), Some("outputs.sh"));
-        assert_eq!((c.windows, c.output_grace), (Windows::Output, 100));
-        assert!(!c.strip);
+        assert_eq!(c.integration.mru_event_stream.as_deref(), Some("focus.sh"));
         assert_eq!(
-            (c.strip_min_windows, c.strip_max_columns, c.strip_max_rows),
+            c.integration.output_event_stream.as_deref(),
+            Some("outputs.sh")
+        );
+        assert_eq!(
+            (c.windows.scope, c.windows.output_grace),
+            (Windows::Output, 100)
+        );
+        assert!(!c.windows.strip);
+        assert_eq!(
+            (
+                c.windows.min_windows,
+                c.windows.max_columns,
+                c.windows.max_rows
+            ),
             (3, 4, 0)
         );
-        assert_eq!((c.strip_card_height, c.strip_max_width), (0.25, 0.5));
-        assert_eq!((c.previews, c.zoom), (Previews::Static, 1.0));
+        assert_eq!((c.windows.card_height, c.windows.max_width), (0.25, 0.5));
+        assert_eq!(
+            (c.windows.previews, c.windows.zoom),
+            (Previews::Static, 1.0)
+        );
         let t = c.theme();
         assert_eq!((t.panel_color, t.indicator_color), (0x00000080, 0xffffffff));
         assert_eq!(
@@ -1039,6 +1131,7 @@ mod tests {
     fn apps() {
         let c = parse(
             r#"
+            [integration]
             close-command = "niri msg action close-window --id {id}"
 
             [app.spotify]
@@ -1059,7 +1152,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            c.close_command.as_deref(),
+            c.integration.close_command.as_deref(),
             Some("niri msg action close-window --id {id}")
         );
         let s = c.app("spotify").unwrap();
@@ -1086,35 +1179,41 @@ mod tests {
     #[test]
     fn dragging_and_the_trash() {
         let d = Config::default();
-        assert_eq!((d.drag_threshold, d.trash), (6, true));
-        assert_eq!(d.open_command, "xdg-open {path}");
-        assert_eq!(d.trash_empty_command, "gio trash --empty");
+        assert_eq!((d.drag_threshold, d.trash.enabled), (6, true));
+        assert_eq!(d.files.open_command, "xdg-open {path}");
+        assert_eq!(d.trash.empty_command, "gio trash --empty");
         let c = parse(
             r#"
             drag-threshold = 10
-            trash = false
+            [trash]
+            enabled = false
+            empty-command = "trash-empty"
+
+            [files]
             open-command = "gio open {path}"
-            trash-empty-command = "trash-empty"
 
             [appearance]
             separator-color = "ff000080"
             "#,
         )
         .unwrap();
-        assert_eq!((c.drag_threshold, c.trash), (10, false));
-        assert_eq!(c.open_command, "gio open {path}");
-        assert_eq!(c.trash_empty_command, "trash-empty");
+        assert_eq!((c.drag_threshold, c.trash.enabled), (10, false));
+        assert_eq!(c.files.open_command, "gio open {path}");
+        assert_eq!(c.trash.empty_command, "trash-empty");
         assert_eq!(c.theme().separator_color, 0xff000080);
     }
 
     #[test]
     fn drops_and_folders() {
         let d = Config::default();
-        assert_eq!(d.trash_command, "gio trash -- {paths}");
-        assert!(d.copy_command.contains("{dest}") && d.move_command.contains("{dest}"));
+        assert_eq!(d.trash.command, "gio trash -- {paths}");
+        assert!(d.files.copy_command.contains("{dest}") && d.files.move_command.contains("{dest}"));
         let c = parse(
             r#"
-            trash-command = "trash-put -- {paths}"
+            [trash]
+            command = "trash-put -- {paths}"
+
+            [files]
             copy-command = "gio copy -- {paths} {dest}"
             move-command = "gio move -- {paths} {dest}"
 
@@ -1131,9 +1230,9 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(c.trash_command, "trash-put -- {paths}");
-        assert_eq!(c.copy_command, "gio copy -- {paths} {dest}");
-        assert_eq!(c.move_command, "gio move -- {paths} {dest}");
+        assert_eq!(c.trash.command, "trash-put -- {paths}");
+        assert_eq!(c.files.copy_command, "gio copy -- {paths} {dest}");
+        assert_eq!(c.files.move_command, "gio move -- {paths} {dest}");
         assert!(c.app("mpv").unwrap().drop.is_some());
         assert!(c.app("x").is_none_or(|a| a.drop.is_none()));
         // Matched with `~/` expanded and without trailing slashes.
@@ -1174,13 +1273,13 @@ mod tests {
             "#,
         )
         .unwrap();
-        let t = &c.appearance.dark;
+        let t = &c.appearance.theme.dark;
         assert_eq!((t.menu_background, t.menu_radius), (0x101010cc, 8));
         assert_eq!(t.menu_tail, [12, 6]);
         assert_eq!((t.menu_row_height, t.menu_max_width), (24, 400));
         assert_eq!((t.menu_padding, t.menu_group_gap), (6, 8));
         assert_eq!(t.menu_text, 0xffffffff);
-        assert_eq!(c.appearance.light.menu_text, 0x000000ff);
+        assert_eq!(c.appearance.theme.light.menu_text, 0x000000ff);
         assert!(c.menu_shadow().is_none());
         assert!(Config::default().menu_shadow().is_some());
     }
@@ -1188,21 +1287,22 @@ mod tests {
     #[test]
     fn launcher() {
         let d = Config::default();
-        assert_eq!((d.launcher_width, d.launcher_icon_scale), (0.4, 1.25));
-        assert_eq!((d.launcher_matches, d.launcher_far_scale), (5, 0.5));
+        assert_eq!((d.launcher.width, d.launcher.icon_scale), (0.4, 1.25));
+        assert_eq!((d.launcher.matches, d.launcher.far_scale), (5, 0.5));
         assert_eq!(
-            (d.launcher_enter, d.history),
+            (d.launcher.enter, d.launcher.history),
             (LauncherEnter::Activate, true)
         );
         assert_eq!(d.launcher_font_size(), 20.0);
         let c = parse(
             r#"
-            launcher-width = 0.5
-            launcher-icon-scale = 1.5
-            launcher-font-size = 24
-            launcher-matches = 0
-            launcher-far-scale = 0.75
-            launcher-enter = "launch"
+            [launcher]
+            width = 0.5
+            icon-scale = 1.5
+            font-size = 24
+            matches = 0
+            far-scale = 0.75
+            enter = "launch"
             history = false
 
             [appearance]
@@ -1211,11 +1311,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!((c.launcher_width, c.launcher_icon_scale), (0.5, 1.5));
-        assert_eq!((c.launcher_font_size(), c.launcher_matches), (24.0, 0));
-        assert_eq!(c.launcher_far_scale, 0.75);
+        assert_eq!((c.launcher.width, c.launcher.icon_scale), (0.5, 1.5));
+        assert_eq!((c.launcher_font_size(), c.launcher.matches), (24.0, 0));
+        assert_eq!(c.launcher.far_scale, 0.75);
         assert_eq!(
-            (c.launcher_enter, c.history),
+            (c.launcher.enter, c.launcher.history),
             (LauncherEnter::Launch, false)
         );
         let t = c.theme();
@@ -1225,11 +1325,11 @@ mod tests {
         );
         assert_eq!(t.launcher_text, 0xffffffff);
         let err = |s: &str| parse(s).is_err();
-        assert!(err("launcher-width = 0"));
-        assert!(err("launcher-matches = 13"));
-        assert!(err("launcher-far-scale = 0.1"));
-        assert!(err("launcher-icon-scale = 0.5"));
-        assert!(err("launcher-enter = \"open\""));
+        assert!(err("[launcher]\nwidth = 0"));
+        assert!(err("[launcher]\nmatches = 13"));
+        assert!(err("[launcher]\nfar-scale = 0.1"));
+        assert!(err("[launcher]\nicon-scale = 0.5"));
+        assert!(err("[launcher]\nenter = \"open\""));
     }
 
     #[test]
@@ -1243,9 +1343,11 @@ mod tests {
             position = "left"
             magnification = 1
             margin = 2
-            windows = "output"
-            autohide = true
-            strip-max-rows = 1
+            [output.eDP-1.autohide]
+            enabled = true
+            [output.eDP-1.windows]
+            scope = "output"
+            max-rows = 1
 
             [output.HDMI-A-1]
             enabled = false
@@ -1287,6 +1389,104 @@ mod tests {
     }
 
     #[test]
+    fn sections_are_optional_and_strict() {
+        let sections = [
+            "autohide",
+            "windows",
+            "launcher",
+            "integration",
+            "files",
+            "trash",
+            "appearance",
+        ];
+        let empty = sections
+            .iter()
+            .map(|name| format!("[{name}]\n"))
+            .collect::<String>();
+        assert_eq!(parse(&empty), Ok(Config::default()));
+        for section in sections {
+            assert!(
+                parse(&format!("[{section}]\nunknown = 1")).is_err(),
+                "{section}"
+            );
+            assert!(parse(&format!("{section} = 1")).is_err(), "{section}");
+        }
+        for field in [
+            "[output.X.autohide]\nreveal-delay = 10",
+            "[output.X.windows]\npreviews = 'off'",
+            "[output.X.windows]\nmax-columns = 101",
+            "[output.X.launcher]\nwidth = 0.5",
+            "[appearance]\nfont-size = 0",
+            "[appearance]\nresponse = 0",
+            "[files]\nopen-command = false",
+            "[integration]\nterminal = false",
+        ] {
+            assert!(parse(field).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn old_flat_keys_are_rejected() {
+        for old in [
+            "autohide = true",
+            "reveal-delay = 150",
+            "hide-delay = 500",
+            "autohide-trigger = 2",
+            "windows = 'all'",
+            "output-grace = 250",
+            "strip = true",
+            "strip-min-windows = 2",
+            "strip-max-columns = 3",
+            "strip-max-rows = 3",
+            "strip-card-height = 0.18",
+            "strip-max-width = 0.6",
+            "previews = 'live'",
+            "zoom = 1.04",
+            "launcher-width = 0.4",
+            "launcher-icon-scale = 1.25",
+            "launcher-font-size = 20",
+            "launcher-matches = 5",
+            "launcher-far-scale = 0.5",
+            "launcher-enter = 'activate'",
+            "history = true",
+            "activate-command = 'focus {id}'",
+            "close-command = 'close {id}'",
+            "launch-command = 'launch {exec}'",
+            "terminal = 'foot'",
+            "launch-timeout = 10000",
+            "mru-event-stream = 'focus.sh'",
+            "output-event-stream = 'outputs.sh'",
+            "open-command = 'xdg-open {path}'",
+            "copy-command = 'cp {paths} {dest}'",
+            "move-command = 'mv {paths} {dest}'",
+            "trash = true",
+            "trash-command = 'gio trash {paths}'",
+            "trash-empty-command = 'gio trash --empty'",
+            "font = 'sans-serif'",
+            "font-size = 13",
+            "response = 150",
+            "[output.X]\nautohide = true",
+            "[output.X]\nwindows = 'all'",
+            "[output.X]\nstrip-max-columns = 3",
+            "[output.X]\nstrip-max-rows = 3",
+        ] {
+            assert!(parse(old).is_err(), "accepted old key: {old}");
+        }
+        assert!(parse("launcher-width = 0.4\n[launcher]\nwidth = 0.5").is_err());
+    }
+
+    #[test]
+    fn readme_config_parses() {
+        let readme = include_str!("../README.md");
+        let mut config = String::new();
+        for block in readme.split("```toml\n").skip(1) {
+            config.push_str(block.split("```").next().unwrap());
+            config.push('\n');
+        }
+        parse(&config).unwrap();
+    }
+
+    #[test]
     fn invalid() {
         let err = |s: &str| parse(s).is_err();
         assert!(err("position = \"top-ish\""));
@@ -1297,19 +1497,19 @@ mod tests {
         assert!(err("magnification = 4"));
         assert!(err("magnification-range = 0"));
         assert!(err("indicator = \"bar\""));
-        assert!(err("windows = \"some\""));
-        assert!(err("launch-timeout = 100000"));
-        assert!(err("autohide-trigger = 0"));
+        assert!(err("[windows]\nscope = \"some\""));
+        assert!(err("[integration]\nlaunch-timeout = 100000"));
+        assert!(err("[autohide]\ntrigger = 0"));
         assert!(err("[output.X]\nhide-delay = 1"));
-        assert!(err("strip-min-windows = 0"));
+        assert!(err("[windows]\nmin-windows = 0"));
         assert!(err("drag-threshold = 0"));
-        assert!(err("trash = \"yes\""));
+        assert!(err("[trash]\nenabled = \"yes\""));
         assert!(err("strip-direction = \"vertical\""));
-        assert!(err("strip-max-rows = 101"));
-        assert!(err("strip-max-columns = -1"));
-        assert!(err("previews = \"sometimes\""));
-        assert!(err("zoom = 0.9"));
-        assert!(err("strip-card-height = 2"));
+        assert!(err("[windows]\nmax-rows = 101"));
+        assert!(err("[windows]\nmax-columns = -1"));
+        assert!(err("[windows]\npreviews = \"sometimes\""));
+        assert!(err("[windows]\nzoom = 0.9"));
+        assert!(err("[windows]\ncard-height = 2"));
         assert!(err("outputs = \"some\""));
         assert!(err("outputs = 1"));
         assert!(err("unknown = 1"));

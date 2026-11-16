@@ -417,7 +417,7 @@ impl WlDock {
     /// directories are created if missing (as any trash implementation
     /// does), so there is something to watch.
     fn watch_trash(&mut self, core: &Core<Self>) {
-        if !self.config.trash || self.trash_watch.is_some() {
+        if !self.config.trash.enabled || self.trash_watch.is_some() {
             return;
         }
         let Some(dir) = self.trash_dir.clone() else {
@@ -451,9 +451,12 @@ impl WlDock {
 
     /// Run the streams the config names (restarting changed ones).
     fn use_streams(&mut self, core: &mut Core<Self>) {
-        core.use_focus_stream(self.config.mru_event_stream.as_deref());
+        core.use_focus_stream(self.config.integration.mru_event_stream.as_deref());
         let handle = core.loop_handle.clone();
-        (self.output_stream).configure(self.config.output_event_stream.as_deref(), &handle);
+        (self.output_stream).configure(
+            self.config.integration.output_event_stream.as_deref(),
+            &handle,
+        );
     }
 
     /// After every event loop dispatch: follow config, pins and theme
@@ -535,7 +538,7 @@ impl WlDock {
         let Some(assets) = self.assets.clone() else {
             return client.answer(Reply::Error("not started yet".into()));
         };
-        let response = self.config.response as f64;
+        let response = self.config.appearance.response as f64;
         match LauncherView::new(core, assets, self.cache.clone(), response) {
             Ok(launcher) => {
                 self.close_popups(core);
@@ -599,13 +602,13 @@ impl WlDock {
             return;
         };
         let now = history::now();
-        let boost = |a: &IndexedApp| match config.history {
+        let boost = |a: &IndexedApp| match config.launcher.history {
             true => history.boost(&a.id, now),
             false => 0.0,
         };
         let query = launcher.query().text();
         let ranked = search.rank(apps, query, &boost);
-        let slots = (config.launcher_matches as usize).max(1);
+        let slots = (config.launcher.matches as usize).max(1);
         let matches = (ranked.into_iter().take(slots))
             .map(|i| &apps[i])
             .map(|a| Match {
@@ -656,7 +659,7 @@ impl WlDock {
         let Some(app) = self.apps.iter().find(|a| a.id == m.id).cloned() else {
             return;
         };
-        let launch = (self.config.launcher_enter == LauncherEnter::Launch) != other;
+        let launch = (self.config.launcher.enter == LauncherEnter::Launch) != other;
         let app_id = self.dock_app_id(core, &app);
         // Launching needs its entry, which the index has.
         if !matches!(self.entries.get(&app_id), Some(Some(_))) {
@@ -768,7 +771,7 @@ impl WlDock {
     /// `id` (a desktop ID, or an app ID) was opened: remember it for
     /// ranking.
     fn record(&mut self, id: &str) {
-        if !self.config.history {
+        if !self.config.launcher.history {
             return;
         }
         self.history.record(id, history::now());
@@ -939,7 +942,7 @@ impl WlDock {
                 Err(_) => Some((p, false)),
             })
             .collect();
-        let trash = self.config.trash.then_some(self.trash_full);
+        let trash = self.config.trash.enabled.then_some(self.trash_full);
         for dock in &mut self.docks {
             let by_output = streaming && dock.style().layout.windows == Windows::Output;
             let mut items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
@@ -976,7 +979,7 @@ impl WlDock {
             return;
         }
         self.placement.hold(id);
-        let grace = Duration::from_millis(self.config.output_grace.into());
+        let grace = Duration::from_millis(self.config.windows.output_grace.into());
         let held = id.to_string();
         let timer = core.timer(grace, move |app: &mut Self, _| {
             if app.placement.release(&held) {
@@ -1213,7 +1216,7 @@ impl WlDock {
     // -- the Trash -------------------------------------------------------------
 
     fn open_trash(&mut self, core: &Core<Self>) {
-        let command = launch::path_command(&self.config.open_command, trash::URI);
+        let command = launch::path_command(&self.config.files.open_command, trash::URI);
         let output = Output::Prefixed("open-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
             warn!("open-command: {e}");
@@ -1221,7 +1224,7 @@ impl WlDock {
     }
 
     fn empty_trash(&mut self, core: &Core<Self>) {
-        let command = &self.config.trash_empty_command;
+        let command = &self.config.trash.empty_command;
         let output = Output::Prefixed("trash-empty-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, command, output) {
             warn!("trash-empty-command: {e}");
@@ -1232,7 +1235,8 @@ impl WlDock {
 
     /// Run `open-command` for `path`.
     fn open_path(&mut self, core: &Core<Self>, path: &Path) {
-        let command = launch::path_command(&self.config.open_command, &path.to_string_lossy());
+        let command =
+            launch::path_command(&self.config.files.open_command, &path.to_string_lossy());
         let output = Output::Prefixed("open-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
             warn!("open-command: {e}");
@@ -1394,7 +1398,7 @@ impl WlDock {
             desktop,
             actions: app.map_or(&[], |a| &a.actions),
             can_launch: self.launch_command(&item.app_id, entry).is_ok(),
-            can_close: self.config.close_command.is_some(),
+            can_close: self.config.integration.close_command.is_some(),
         })
     }
 
@@ -1469,7 +1473,7 @@ impl WlDock {
     }
 
     fn close_window(&mut self, core: &Core<Self>, id: &str) {
-        let Some(template) = self.config.close_command.as_deref() else {
+        let Some(template) = self.config.integration.close_command.as_deref() else {
             return;
         };
         let command = launch::window_command(template, id);
@@ -1488,7 +1492,7 @@ impl WlDock {
     }
 
     fn activate(&mut self, core: &Core<Self>, id: &str) {
-        let Some(template) = self.config.activate_command.as_deref() else {
+        let Some(template) = self.config.integration.activate_command.as_deref() else {
             if !std::mem::replace(&mut self.warned_activate, true) {
                 warn!("set activate-command to focus windows from the dock");
             }
@@ -1508,8 +1512,8 @@ impl WlDock {
             .config
             .app(app_id)
             .and_then(|a| a.launch_command.as_deref());
-        let template = own.or(self.config.launch_command.as_deref());
-        launch::launch(app_id, entry, template, &self.config.terminal)
+        let template = own.or(self.config.integration.launch_command.as_deref());
+        launch::launch(app_id, entry, template, &self.config.integration.terminal)
     }
 
     /// Launch `app_id`, once its desktop entry is known.
@@ -1535,8 +1539,14 @@ impl WlDock {
             return warn!("cannot launch {app_id}: its desktop entry is gone");
         };
         let entry = entry.with_action(action);
-        let template = (self.config.launch_command.as_deref()).filter(|t| spawn::uses(t, "exec"));
-        let command = launch::launch(app_id, Some(&entry), template, &self.config.terminal);
+        let template =
+            (self.config.integration.launch_command.as_deref()).filter(|t| spawn::uses(t, "exec"));
+        let command = launch::launch(
+            app_id,
+            Some(&entry),
+            template,
+            &self.config.integration.terminal,
+        );
         self.run_launch(core, app_id, command);
     }
 
@@ -1557,7 +1567,7 @@ impl WlDock {
     /// Bounce `app_id`'s icon until a new window of it appears, or for
     /// `launch-timeout`.
     fn start_bounce(&mut self, core: &Core<Self>, app_id: &str) {
-        let timeout = Duration::from_millis(self.config.launch_timeout.into());
+        let timeout = Duration::from_millis(self.config.integration.launch_timeout.into());
         if timeout.is_zero() {
             return;
         }
@@ -1628,9 +1638,16 @@ impl WlDock {
         };
         let app = self.config.app(app_id);
         let own = app.and_then(|a| a.launch_command.as_deref());
-        let template = own.or(self.config.launch_command.as_deref());
+        let template = own.or(self.config.integration.launch_command.as_deref());
         let drop = app.and_then(|a| a.drop.as_deref());
-        launch::open_with(app_id, entry, drop, template, &self.config.terminal, paths)
+        launch::open_with(
+            app_id,
+            entry,
+            drop,
+            template,
+            &self.config.integration.terminal,
+            paths,
+        )
     }
 
     /// Whether the Trash takes `paths`: none is in it already.
@@ -1807,13 +1824,13 @@ impl WlDock {
                     return;
                 };
                 let (template, name) = match Self::moves(&dest, paths, action) {
-                    true => (&self.config.move_command, "move-command"),
-                    false => (&self.config.copy_command, "copy-command"),
+                    true => (&self.config.files.move_command, "move-command"),
+                    false => (&self.config.files.copy_command, "copy-command"),
                 };
                 run(&launch::paths_command(template, paths, Some(&dest)), name);
             }
             DropTarget::Trash => {
-                let command = launch::paths_command(&self.config.trash_command, paths, None);
+                let command = launch::paths_command(&self.config.trash.command, paths, None);
                 run(&command, "trash-command");
             }
         }

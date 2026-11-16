@@ -54,7 +54,7 @@ launcher, as do a click outside it and running `--launcher` again. It exits 0
 once something was opened and 1 otherwise.
 
 Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches
-(`history = false` turns that off).
+(`launcher.history = false` turns that off).
 
 ## Configuration
 
@@ -64,7 +64,10 @@ file. Every setting is optional. The reference below shows defaults; commented
 commands are optional examples, not enabled defaults. Sizes are pixels and
 times are milliseconds.
 
-### Dock and windows
+General dock settings stay at the root, before any table header. Feature
+settings live in the tables below; the old flat spellings are not supported.
+
+### Dock, autohide, windows and launcher
 
 ```toml
 outputs = "all"                 # Or ["DP-1", "eDP-1"]
@@ -77,35 +80,37 @@ padding = 6                     # Space inside the panel
 magnification = 1.8             # 1–3; 1 disables it
 magnification-range = 3.0       # Neighbours on each side; 1–10
 reserve = true                  # Keep windows out of the resting dock's area
-autohide = false
-reveal-delay = 150
-hide-delay = 500
-autohide-trigger = 2            # Edge reveal band; 1–50
 hover-delay = 300
 labels = true
 indicator = "dot"               # dot, dots (up to three), none
 active-indicator = true         # Needs mru-event-stream
-response = 150                  # Animation spring response; 1–10000
-font = "sans-serif"
-font-size = 13
+drag-threshold = 6              # Pixels before an icon starts dragging; 1–100
 
+[autohide]
+enabled = false
+reveal-delay = 150
+hide-delay = 500
+trigger = 2                    # Edge reveal band; 1–50
+
+[windows]
+scope = "all"                  # all, output (needs output-event-stream)
+output-grace = 250             # Wait for the stream to place new windows
 strip = true                    # Click an app to show its windows
-strip-min-windows = 2           # Below this, activate its most recent window
-strip-max-columns = 3           # Along the dock; 0 means unlimited
-strip-max-rows = 3              # Away from the dock; 0 means unlimited
-strip-card-height = 0.18        # Fraction of output height
-strip-max-width = 0.6           # Fraction of output length; also caps card width
+min-windows = 2                # Below this, activate its most recent window
+max-columns = 3                # Along the dock; 0 means unlimited
+max-rows = 3                   # Away from the dock; 0 means unlimited
+card-height = 0.18             # Fraction of output height
+max-width = 0.6                # Fraction of output length; also caps card width
 previews = "live"               # live, static (one frame), off
 zoom = 1.04                     # Highlighted card scale; 1 disables it
-windows = "all"                 # all, output (needs output-event-stream)
-output-grace = 250              # Wait for the stream to place new windows
 
-launcher-width = 0.4            # Fraction of output width; at least the dock
-launcher-icon-scale = 1.25      # Selected app's icon, times icon-size; 1–3
-# launcher-font-size = 20       # Default: from icon-size
-launcher-matches = 5            # Matches on the drum; 0–12, 0 shows only one
-launcher-far-scale = 0.5        # Farthest match's size; 0.25–1
-launcher-enter = "activate"     # activate, launch (Ctrl+Enter does the other)
+[launcher]
+width = 0.4                    # Fraction of output width; at least the dock
+icon-scale = 1.25              # Selected app's icon, times icon-size; 1–3
+# font-size = 20               # Default: from icon-size
+matches = 5                    # Matches on the drum; 0–12, 0 shows only one
+far-scale = 0.5                # Farthest match's size; 0.25–1
+enter = "activate"             # activate, launch (Ctrl+Enter does the other)
 history = true                  # Record launches to rank matches
 ```
 
@@ -117,6 +122,7 @@ Without `close-command`, the menu has no Close entries. Commands run through
 `sh -c`.
 
 ```toml
+[integration]
 # activate-command = "niri msg action focus-window --id {id}"
 # close-command = "niri msg action close-window --id {id}"
 # launch-command = "uwsm app -- {desktop-id}"
@@ -134,23 +140,25 @@ launch-timeout = 10000          # Maximum launch bounce; 0–60000
 - `mru-event-stream`: a long-running command printing one focused window ID per
   line. Enables focus ordering and the active indicator.
 - `output-event-stream`: a long-running command printing `<output> <id>` when
-  a window opens on or moves to an output. Used by `windows = "output"`.
+  a window opens on or moves to an output. Used by `windows.scope = "output"`.
 
 ### Files, folders and Trash
 
 ```toml
-drag-threshold = 6              # Pixels before an icon starts dragging; 1–100
-trash = true
+[trash]
+enabled = true
+command = "gio trash -- {paths}"
+empty-command = "gio trash --empty"
+
+[files]
 open-command = "xdg-open {path}" # Trash uses trash:/// as its path
-trash-empty-command = "gio trash --empty"
-trash-command = "gio trash -- {paths}"
 copy-command = "cp -rn -- {paths} {dest}"
 move-command = "mv -n -- {paths} {dest}"
 ```
 
-The last three commands handle files dropped onto the Trash or a folder.
-`{paths}` is the source list; `{dest}` is the destination folder. Install `gio`
-for the default Trash commands.
+`trash.command`, `files.copy-command` and `files.move-command` handle files
+dropped onto the Trash or a folder. `{paths}` is the source list; `{dest}` is
+the destination folder. Install `gio` for the default Trash commands.
 
 ### Per-output settings
 
@@ -164,11 +172,15 @@ position = "bottom"
 icon-size = 48
 magnification = 1.8
 reserve = true
-autohide = false
 margin = 6
-windows = "all"
-strip-max-columns = 3
-strip-max-rows = 3
+
+[output."eDP-1".autohide]
+enabled = false
+
+[output."eDP-1".windows]
+scope = "all"
+max-columns = 3
+max-rows = 3
 ```
 
 ### Per-app settings
@@ -217,6 +229,9 @@ An alpha of `00` disables the corresponding shadow. All defaults are below.
 
 ```toml
 [appearance]
+font = "sans-serif"
+font-size = 13
+response = 150                  # Animation spring response; 1–10000
 mode = "auto"                  # auto (desktop preference), dark, light
 # icon-theme = "Papirus"
 panel-color = "262626b3"
