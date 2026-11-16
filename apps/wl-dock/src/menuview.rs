@@ -30,6 +30,13 @@
 //! moves `drag-threshold` drags the file out (`MenuInput::Drag`). The
 //! menu then fades but is held (`hold`) until the drag ends, since the
 //! drag started on its surface.
+//!
+//! A folder's stack (`Look::Stack`, laid out by stack.rs) is the same
+//! rows shown another way: no bubble, but per row a large icon and its
+//! name in a pill, on the transparent popup. Its input region is the
+//! items. Opening, the items fly out of the folder's icon, growing as
+//! they go, the ones nearest the dock first; closing, they fly back in.
+//! The highlight is the hovered name's pill in the highlight color.
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +66,7 @@ use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 use crate::app::WlDock;
 use crate::config::Position;
 use crate::menu::{self, Action, Entry, Group, Layout, Mark, MenuKey, Metrics, Place};
+use crate::stack;
 
 type Qh = QueueHandle<Shell<WlDock>>;
 
@@ -66,6 +74,11 @@ type Qh = QueueHandle<Shell<WlDock>>;
 const OPEN_RESPONSE: f64 = 120.0;
 /// Closing: the fade, ms.
 const CLOSE_RESPONSE: f64 = 80.0;
+/// A stack's items flying out of the icon, and back, ms.
+const STACK_OPEN_RESPONSE: f64 = 260.0;
+const STACK_CLOSE_RESPONSE: f64 = 140.0;
+/// A stack's icons grow out of the folder's from this scale.
+const STACK_OPEN_SCALE: f64 = 0.4;
 /// The highlight sliding between rows, ms.
 const HIGHLIGHT_RESPONSE: f64 = 70.0;
 /// The picked row's flash, s.
@@ -96,6 +109,30 @@ pub struct MenuStyle {
     pub icon_theme: Option<String>,
     /// How far a press on a file's row moves before it drags the file.
     pub drag_threshold: f64,
+    /// A stack's icons (the dock's icon size), and the shadow under them
+    /// (the dock icons').
+    pub stack_icon: f64,
+    pub stack_shadow: Option<shadow::IconShadow>,
+}
+
+impl MenuStyle {
+    /// The sizes a stack is laid out with.
+    pub fn stack_metrics(&self) -> stack::Metrics {
+        stack::Metrics {
+            icon: self.stack_icon,
+            text_h: text::line_height(self.text.size) as f64,
+            shadow: self.stack_shadow.map_or(0, |s| s.pad()) as f64,
+        }
+    }
+}
+
+/// How the menu shows its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// In a speech bubble.
+    Menu,
+    /// As a folder's stack.
+    Stack,
 }
 
 /// What a pointer event or key on the menu asks for.
@@ -143,13 +180,14 @@ impl Drop for Text {
 struct Surface {
     // Field order is drop order: children before their parent.
     bubble: Sub,
+    /// A stack's name pills.
+    backs: Vec<Sub>,
     highlight: Sub,
     texts: Vec<Sub>,
     marks: Vec<Sub>,
     viewport: WpViewport,
     popup: Popup,
-    layout: Layout,
-    place: Place,
+    laid: Laid,
     /// The popup's position on the dock surface, once configured.
     at: Option<(f64, f64)>,
 }
@@ -157,6 +195,25 @@ struct Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         self.viewport.destroy();
+    }
+}
+
+/// Where the rows go on the popup.
+enum Laid {
+    Menu { layout: Layout, place: Place },
+    Stack(stack::Layout),
+}
+
+impl Laid {
+    /// The row at (`x`, `y`) on the popup's surface.
+    fn hit(&self, x: f64, y: f64) -> Option<usize> {
+        match self {
+            Laid::Menu { layout, place } => {
+                let (ox, oy) = place.body_origin();
+                layout.hit(x - ox, y - oy)
+            }
+            Laid::Stack(l) => l.hit(x, y),
+        }
     }
 }
 
@@ -179,6 +236,7 @@ pub struct MenuView {
     pub app_id: String,
     entries: Vec<Entry>,
     groups: Vec<Group>,
+    look: Look,
     style: MenuStyle,
     position: Position,
     /// The icon on the dock surface.
@@ -219,8 +277,8 @@ struct Press {
 
 impl MenuView {
     /// A menu of `groups` for `app_id`'s icon at `icon` on the dock
-    /// `layer` at `position`, grabbing `grab` (a seat and the serial of the
-    /// click). It shows once its rows are rendered.
+    /// `layer` at `position`, shown as `look`, grabbing `grab` (a seat
+    /// and the serial of the click). It shows once its rows are rendered.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         g: Rc<Globals>,
@@ -231,6 +289,7 @@ impl MenuView {
         grab: Option<(&WlSeat, u32)>,
         app_id: String,
         groups: Vec<Group>,
+        look: Look,
         style: MenuStyle,
         position: Position,
         icon: Rect,
@@ -241,7 +300,10 @@ impl MenuView {
         let no_input = Region::new(&g.compositor).map_err(|e| e.to_string())?;
         let entries: Vec<Entry> = menu::entries(&groups).into_iter().cloned().collect();
         let column = menu::column(&entries);
-        let max_width = style.metrics.text_max(column).floor() as i32;
+        let max_width = match look {
+            Look::Menu => style.metrics.text_max(column).floor() as i32,
+            Look::Stack => stack::TEXT_MAX as i32,
+        };
         let request = |color: u32, label: &str| PillRequest {
             text: label.to_string(),
             max_width,
@@ -269,7 +331,7 @@ impl MenuView {
             })
             .collect();
         for e in &entries {
-            if let Some((key, _)) = mark_key(&e.mark, scale, &style)
+            if let Some((key, _)) = mark_key(&e.mark, scale, &style, look)
                 && cache.named_icon(&key).is_none()
             {
                 assets.named_icon(&key);
@@ -290,6 +352,7 @@ impl MenuView {
             app_id,
             entries,
             groups,
+            look,
             style,
             position,
             icon,
@@ -298,7 +361,13 @@ impl MenuView {
             highlighted,
             confirms,
             armed: None,
-            open: Spring::new(0.0, OPEN_RESPONSE),
+            open: Spring::new(
+                0.0,
+                match look {
+                    Look::Menu => OPEN_RESPONSE,
+                    Look::Stack => STACK_OPEN_RESPONSE,
+                },
+            ),
             shown: false,
             closing: false,
             highlight: None,
@@ -338,7 +407,11 @@ impl MenuView {
         self.closing = true;
         self.pressed = None;
         // Faster out than in.
-        let mut fade = Spring::new(self.open.value, CLOSE_RESPONSE);
+        let response = match self.look {
+            Look::Menu => CLOSE_RESPONSE,
+            Look::Stack => STACK_CLOSE_RESPONSE,
+        };
+        let mut fade = Spring::new(self.open.value, response);
         fade.retarget(0.0);
         self.open = fade;
     }
@@ -371,9 +444,16 @@ impl MenuView {
         self.entries.get(i)
     }
 
-    /// Row `i`'s icon, if it has one there, and its logical size.
+    /// Row `i`'s icon, if it has one there, and its logical size (its
+    /// shadow included).
     pub fn mark_buffer(&self, i: usize, cache: &Cache) -> Option<(WlBuffer, f64)> {
-        let (key, size) = mark_key(&self.entries.get(i)?.mark, self.scale, &self.style)?;
+        let (key, size) = mark_key(
+            &self.entries.get(i)?.mark,
+            self.scale,
+            &self.style,
+            self.look,
+        )?;
+        let size = size + 2.0 * key.pad() as f64;
         Some((cache.named_icon(&key).flatten()?, size))
     }
 
@@ -463,28 +543,38 @@ impl MenuView {
         let widths: Vec<f64> = (self.texts.iter().zip(&self.confirms))
             .map(|(t, c)| width(t).max(c.as_ref().map_or(0.0, |(c, _)| width(c))))
             .collect();
-        let layout = menu::layout(&self.groups, &widths, &self.style.metrics);
-        let body = (layout.w, layout.h);
-        let bubble = self.bubble_for(&layout, None);
-        let place = Place {
-            position: self.position,
-            icon: self.icon,
-            bounds: bubble.bounds(),
-            body,
-            tail_height: self.style.metrics.tail.1,
+        let (laid, (w, h), (anchor, gravity, (dx, dy)), bubble) = match self.look {
+            Look::Menu => {
+                let layout = menu::layout(&self.groups, &widths, &self.style.metrics);
+                let body = (layout.w, layout.h);
+                let bubble = self.bubble_for(&layout, None);
+                let place = Place {
+                    position: self.position,
+                    icon: self.icon,
+                    bounds: bubble.bounds(),
+                    body,
+                    tail_height: self.style.metrics.tail.1,
+                };
+                let (size, at) = (place.size(), place.positioner());
+                (Laid::Menu { layout, place }, size, at, Some(bubble))
+            }
+            Look::Stack => {
+                let l = stack::layout(self.position, &widths, &self.style.stack_metrics());
+                let (size, at) = (l.size(), l.positioner());
+                (Laid::Stack(l), size, at, None)
+            }
         };
         let Some(positioner) = popup::positioner(&self.g) else {
             return self.close();
         };
-        let (w, h) = place.size();
         positioner.set_size(w, h);
         let a = IRect::round(self.icon);
         positioner.set_anchor_rect(a.x, a.y, a.w.max(1), a.h.max(1));
-        let (anchor, gravity, (dx, dy)) = place.positioner();
         positioner.set_anchor(anchor);
         positioner.set_gravity(gravity);
         positioner.set_offset(dx, dy);
-        // Along the dock only: across it, the tail would leave the icon.
+        // Along the dock only: across it, the tail (or the stack) would
+        // leave the icon.
         positioner.set_constraint_adjustment(match self.position {
             Position::Bottom => ConstraintAdjustment::SlideX,
             Position::Left | Position::Right => ConstraintAdjustment::SlideY,
@@ -499,22 +589,29 @@ impl MenuView {
         };
         let parent = popup.wl_surface();
         let sub = || Sub::new(&self.g, parent, &self.no_input, &self.qh);
-        let (bubble_sub, highlight) = (sub(), sub());
+        let bubble_sub = sub();
+        let backs = match self.look {
+            Look::Menu => Vec::new(),
+            Look::Stack => self.entries.iter().map(|_| sub()).collect(),
+        };
+        let highlight = sub();
         let texts = self.entries.iter().map(|_| sub()).collect();
         let marks = self.entries.iter().map(|_| sub()).collect();
         let viewport = self.g.viewporter.get_viewport(parent, &self.qh, Ignore);
         self.surface = Some(Surface {
             bubble: bubble_sub,
+            backs,
             highlight,
             texts,
             marks,
             viewport,
             popup,
-            layout,
-            place,
+            laid,
             at: None,
         });
-        self.request_bubble(bubble);
+        if let Some(bubble) = bubble {
+            self.request_bubble(bubble);
+        }
     }
 
     /// The bubble for `layout`, with its tail at `tail` along its edge
@@ -569,23 +666,36 @@ impl MenuView {
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         s.viewport.set_destination(w, h);
         s.popup.xdg_surface().set_window_geometry(0, 0, w, h);
+        let (layout, place) = match &s.laid {
+            Laid::Menu { layout, place } => (layout.clone(), *place),
+            Laid::Stack(l) => {
+                // Input on the items only (none once a drag left it).
+                if !self.held
+                    && let Ok(region) = Region::new(&self.g.compositor)
+                {
+                    for it in &l.items {
+                        let r = IRect::round(it.hit);
+                        region.add(r.x, r.y, r.w, r.h);
+                    }
+                    surface.set_input_region(Some(region.wl_region()));
+                }
+                return;
+            }
+        };
         let m = &self.style.metrics;
-        let radius = m.radius.min(s.layout.w.min(s.layout.h) / 2.0);
-        let tail = s
-            .place
-            .configured_tail((x as f64, y as f64), radius, m.tail.0);
+        let radius = m.radius.min(layout.w.min(layout.h) / 2.0);
+        let tail = place.configured_tail((x as f64, y as f64), radius, m.tail.0);
         // Input on the bubble, not on its shadow (none once a drag left it).
         if !self.held
             && let Ok(region) = Region::new(&self.g.compositor)
         {
-            let (ox, oy) = s.place.body_origin();
-            for r in input_rects(&s.layout, self.position, tail, m) {
+            let (ox, oy) = place.body_origin();
+            for r in input_rects(&layout, self.position, tail, m) {
                 let r = IRect::round(Rect::new(r.x + ox, r.y + oy, r.w, r.h));
                 region.add(r.x, r.y, r.w, r.h);
             }
             surface.set_input_region(Some(region.wl_region()));
         }
-        let layout = s.layout.clone();
         let bubble = self.bubble_for(&layout, Some(tail));
         self.request_bubble(bubble);
     }
@@ -600,8 +710,7 @@ impl MenuView {
         if self.closing || self.flash.is_some() {
             return MenuInput::None;
         }
-        let (ox, oy) = s.place.body_origin();
-        let hit = s.layout.hit(x - ox, y - oy);
+        let hit = s.laid.hit(x, y);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                 // A press on a file's row that moves far enough drags the
@@ -648,10 +757,15 @@ impl MenuView {
             return MenuInput::None;
         }
         let n = self.entries.len();
+        // Above a bottom dock, a stack starts at the bottom: Up goes on.
+        let onward = match (self.look, self.position) {
+            (Look::Stack, Position::Bottom) => MenuKey::Up,
+            _ => MenuKey::Down,
+        };
         match key {
             MenuKey::Close => MenuInput::Close,
             MenuKey::Up | MenuKey::Down => {
-                let next = menu::step(self.highlight, n, key == MenuKey::Down);
+                let next = menu::step(self.highlight, n, key == onward);
                 self.set_highlight(next);
                 MenuInput::None
             }
@@ -688,7 +802,11 @@ impl MenuView {
         self.highlight = highlight;
         let row = (self.surface.as_ref())
             .zip(highlight)
-            .and_then(|(s, i)| s.layout.row(i));
+            .and_then(|(s, i)| match &s.laid {
+                Laid::Menu { layout, .. } => layout.row(i),
+                // A stack's highlight moves to the item at once.
+                Laid::Stack(l) => l.items.get(i).map(|it| it.label),
+            });
         match row {
             Some(r) => {
                 // From nothing it appears in place; between rows it slides.
@@ -706,47 +824,63 @@ impl MenuView {
     // -- drawing -------------------------------------------------------------
 
     fn gate(&self, a: f64) -> f64 {
-        let a = a.clamp(0.0, 1.0);
-        match self.g.alpha_modifier {
-            Some(_) => a,
-            None if a >= 0.5 => 1.0,
-            None => 0.0,
-        }
+        gate(a, self.g.alpha_modifier.is_some())
     }
 
-    /// Draw it and commit, once it's configured and its bubble is there.
-    /// The first time, it starts opening, with the tail where the
-    /// configure put it.
+    /// Draw it and commit, once it's configured and (a menu) its bubble
+    /// is there. The first time, it starts opening, with the tail where
+    /// the configure put it.
     pub fn render(&mut self, cache: &mut Cache) {
         let configured = self.surface.as_ref().is_some_and(|s| s.at.is_some());
-        let ready = configured && self.bubble.is_some() && (self.shown || self.wanted.is_none());
-        if !ready {
+        let drawn = match self.look {
+            Look::Menu => self.bubble.is_some() && (self.shown || self.wanted.is_none()),
+            Look::Stack => true,
+        };
+        if !configured || !drawn {
             return;
         }
         if !self.shown && !self.closing {
             self.shown = true;
             self.open.retarget(1.0);
         }
+        match self.look {
+            Look::Menu => self.render_menu(cache),
+            Look::Stack => self.render_stack(cache),
+        }
+        if let Some(s) = &self.surface {
+            s.popup.wl_surface().commit();
+        }
+        for buffer in self.stale.drain(..) {
+            buffer.destroy();
+        }
+    }
+
+    /// How much the picked row's highlight shows while it flashes.
+    fn flash(&self) -> f64 {
+        (self.flash).map_or(1.0, |t| ((t / FLASH) * std::f64::consts::PI).cos().abs())
+    }
+
+    fn render_menu(&mut self, cache: &mut Cache) {
         let alpha = self.gate(self.open.value);
         let scale = match self.closing {
             true => 1.0,
             false => lerp(OPEN_SCALE, 1.0, self.open.value.clamp(0.0, 1.0)),
         };
-        let flash = self
-            .flash
-            .map_or(1.0, |t| ((t / FLASH) * std::f64::consts::PI).cos().abs());
-        let highlight_alpha = self.gate(self.highlight_alpha.value * flash) * alpha;
+        let highlight_alpha = self.gate(self.highlight_alpha.value * self.flash()) * alpha;
         let style = self.style.clone();
         let (Some(s), Some((bubble, buffer))) = (&mut self.surface, &self.bubble) else {
             return;
         };
-        let (ox, oy) = s.place.body_origin();
+        let Laid::Menu { layout, place } = &s.laid else {
+            return;
+        };
+        let (ox, oy) = place.body_origin();
         let (tx, ty) = bubble.tip();
         // Everything grows out of the tail's tip.
         let (tx, ty) = (ox + tx, oy + ty);
         let xf = |r: Rect| r.scaled(scale, tx, ty);
         let body = |r: Rect| xf(Rect::new(r.x + ox, r.y + oy, r.w, r.h));
-        let (bw, bh) = s.place.size();
+        let (bw, bh) = place.size();
         (s.bubble).present(
             Some(buffer),
             xf(Rect::new(0.0, 0.0, bw as f64, bh as f64)),
@@ -758,8 +892,8 @@ impl MenuView {
         let row = Rect::new(
             p,
             self.highlight_y.value,
-            s.layout.w - 2.0 * p,
-            s.layout.row_height,
+            layout.w - 2.0 * p,
+            layout.row_height,
         );
         let key = ShapeKey::Rect {
             w: row.w.round() as i32,
@@ -781,20 +915,16 @@ impl MenuView {
         let dot = cache.shape(&self.g, dot, &self.qh);
         for (i, e) in self.entries.iter().enumerate() {
             let lit = self.highlight == Some(i) && highlight_alpha > 0.0;
-            // An armed row asks its question instead of its label.
-            let (plain, highlighted) = match (self.armed == Some(i), self.confirms.get(i)) {
-                (true, Some(Some((t, t_lit)))) => (t, t_lit.as_ref()),
-                _ => (
-                    &self.texts[i],
-                    self.highlighted.get(i).and_then(Option::as_ref),
-                ),
-            };
-            let text = match (lit, highlighted) {
-                (true, Some(t)) if t.pill.is_some() => t,
-                _ => plain,
-            };
+            let text = row_text(
+                &self.texts,
+                &self.highlighted,
+                &self.confirms,
+                self.armed,
+                i,
+                lit,
+            );
             match &text.pill {
-                Some((buffer, w, h)) => match s.layout.text(i, *w, *h) {
+                Some((buffer, w, h)) => match layout.text(i, *w, *h) {
                     Some(r) => s.texts[i].present(Some(buffer), body(r), alpha),
                     None => s.texts[i].clear(),
                 },
@@ -803,18 +933,138 @@ impl MenuView {
             let mark = match &e.mark {
                 Mark::None => None,
                 Mark::Focused => (dot.as_ref()).map(|d| (d.buffer.clone(), DOT as f64)),
-                Mark::Icon(_) | Mark::File(_) => mark_key(&e.mark, self.scale, &style)
+                Mark::Icon(_) | Mark::File(_) => mark_key(&e.mark, self.scale, &style, self.look)
                     .and_then(|(key, size)| Some((cache.named_icon(&key).flatten()?, size))),
             };
-            match mark.and_then(|(b, size)| Some((b, s.layout.mark(i, size)?))) {
+            match mark.and_then(|(b, size)| Some((b, layout.mark(i, size)?))) {
                 Some((buffer, r)) => s.marks[i].present(Some(&buffer), body(r), alpha),
                 None => s.marks[i].clear(),
             }
         }
-        s.popup.wl_surface().commit();
-        for buffer in self.stale.drain(..) {
-            buffer.destroy();
+    }
+
+    /// The stack: each item on its way between the folder's icon and its
+    /// place, as far as the `open` spring says.
+    fn render_stack(&mut self, cache: &mut Cache) {
+        let modifier = self.g.alpha_modifier.is_some();
+        let t = self.open.value;
+        let highlight_alpha = self.gate(self.highlight_alpha.value * self.flash());
+        let lit_row = self.highlight.filter(|_| highlight_alpha > 0.0);
+        let style = self.style.clone();
+        let (cx, cy) = self.icon.center();
+        let Some(s) = &mut self.surface else { return };
+        let (Laid::Stack(l), Some(at)) = (&s.laid, s.at) else {
+            return;
+        };
+        // The folder's icon, on the popup.
+        let (ox, oy) = (cx - at.0, cy - at.1);
+        let n = l.items.len();
+        let pill = |r: Rect, color: u32, cache: &mut Cache| {
+            let key = ShapeKey::Rect {
+                w: r.w.round() as i32,
+                h: r.h.round() as i32,
+                radius: (r.h / 2.0).round() as i32,
+                color,
+                scale: self.scale,
+            };
+            cache.shape(&self.g, key, &self.qh)
+        };
+        let mut highlight = None;
+        for (i, it) in l.items.iter().enumerate() {
+            let p = stack::progress(t, i, n);
+            let (fx, fy) = it.icon.center();
+            let (x, y) = (lerp(ox, fx, p), lerp(oy, fy, p));
+            let size = it.icon.w * lerp(STACK_OPEN_SCALE, 1.0, p);
+            let icon = Rect::new(x - size / 2.0, y - size / 2.0, size, size);
+            // The name moves with its icon, and shows once it's most of
+            // the way out.
+            let label = Rect::new(
+                (it.label.x + x - fx).round(),
+                (it.label.y + y - fy).round(),
+                it.label.w,
+                it.label.h,
+            );
+            let icon_alpha = gate(2.0 * p, modifier);
+            let label_alpha = gate(p * p, modifier);
+
+            let back = pill(label, style.background, cache);
+            s.backs[i].present(back.as_ref().map(|b| &b.buffer), label, label_alpha);
+            let lit = lit_row == Some(i);
+            if lit {
+                highlight = Some((label, label_alpha));
+            }
+            let text = row_text(
+                &self.texts,
+                &self.highlighted,
+                &self.confirms,
+                self.armed,
+                i,
+                lit,
+            );
+            match &text.pill {
+                Some((buffer, w, h)) => {
+                    let r = Rect::new(
+                        (label.x + (label.w - w) / 2.0).round(),
+                        (label.y + (label.h - h) / 2.0).round(),
+                        *w,
+                        *h,
+                    );
+                    s.texts[i].present(Some(buffer), r, label_alpha);
+                }
+                None => s.texts[i].clear(),
+            }
+            let mark = (self.entries.get(i))
+                .and_then(|e| mark_key(&e.mark, self.scale, &style, Look::Stack))
+                .and_then(|(key, _)| Some((cache.named_icon(&key).flatten()?, key.pad())));
+            match mark {
+                // The image reaches past the icon by its shadow, which
+                // grows with it.
+                Some((buffer, pad)) => {
+                    let r = icon.outset(pad as f64 * size / it.icon.w);
+                    s.marks[i].present(Some(&buffer), r, icon_alpha);
+                }
+                None => s.marks[i].clear(),
+            }
         }
+        match highlight {
+            Some((label, alpha)) => {
+                let shape = pill(label, style.highlight, cache);
+                let a = highlight_alpha * alpha;
+                (s.highlight).present(shape.as_ref().map(|b| &b.buffer), label, a);
+            }
+            None => s.highlight.clear(),
+        }
+    }
+}
+
+/// An alpha as shown: without wp_alpha_modifier_v1 (`modifier`), things
+/// are either there or not.
+fn gate(a: f64, modifier: bool) -> f64 {
+    let a = a.clamp(0.0, 1.0);
+    match modifier {
+        true => a,
+        false if a >= 0.5 => 1.0,
+        false => 0.0,
+    }
+}
+
+/// The text row `i` shows: in the highlight's color if it is `lit`, and
+/// an `armed` row's question instead of its label.
+fn row_text<'a>(
+    texts: &'a [Text],
+    highlighted: &'a [Option<Text>],
+    confirms: &'a [Option<(Text, Option<Text>)>],
+    armed: Option<usize>,
+    i: usize,
+    lit: bool,
+) -> &'a Text {
+    let (plain, highlighted) = match (armed == Some(i), confirms.get(i)) {
+        (true, Some(Some((t, t_lit)))) => (t, t_lit.as_ref()),
+        _ => (&texts[i], highlighted.get(i).and_then(Option::as_ref)),
+    };
+    match (lit, highlighted) {
+        (true, Some(t)) if t.pill.is_some() => t,
+        _ => plain,
     }
 }
 
@@ -832,9 +1082,9 @@ impl Drop for MenuView {
     }
 }
 
-/// The key of a row's icon at `scale`, and its logical size; None for
-/// marks that aren't icons.
-fn mark_key(mark: &Mark, scale: i32, style: &MenuStyle) -> Option<(NamedIcon, f64)> {
+/// The key of a row's icon at `scale` as `look` shows it, and its logical
+/// size; None for marks that aren't icons.
+fn mark_key(mark: &Mark, scale: i32, style: &MenuStyle, look: Look) -> Option<(NamedIcon, f64)> {
     let (name, fallbacks, size) = match mark {
         Mark::Icon(name) => (name.clone(), Vec::new(), menu::ICON),
         Mark::File(names) => {
@@ -843,11 +1093,21 @@ fn mark_key(mark: &Mark, scale: i32, style: &MenuStyle) -> Option<(NamedIcon, f6
         }
         Mark::None | Mark::Focused => return None,
     };
+    // Every icon of a stack is large.
+    let size = match look {
+        Look::Menu => size,
+        Look::Stack => style.stack_icon.round().max(1.0),
+    };
     let key = NamedIcon {
         name,
         fallbacks,
         size: (size as u32) * scale.max(1) as u32,
         theme: style.icon_theme.clone(),
+        shadow: match look {
+            Look::Menu => None,
+            Look::Stack => style.stack_shadow,
+        },
+        scale: scale.max(1),
     };
     Some((key, size))
 }

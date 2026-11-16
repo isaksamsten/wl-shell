@@ -387,7 +387,7 @@ impl Default for FolderConfig {
     fn default() -> Self {
         Self {
             sort: FolderSort::default(),
-            count: 20,
+            count: 10,
             view: FolderView::default(),
             icon: None,
         }
@@ -416,12 +416,16 @@ impl From<FolderSort> for files::Sort {
     }
 }
 
-/// How a folder's popup shows its entries. Only a list so far.
+/// How a folder's popup shows its entries.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FolderView {
-    #[default]
+    /// A menu with a row per entry.
     List,
+    /// Large icons with their names, fanned out of the folder's icon
+    /// (stack.rs).
+    #[default]
+    Stack,
 }
 
 /// A row of an app's menu that runs a command.
@@ -1066,6 +1070,8 @@ mod tests {
         assert!(err("[folder.x]\ncount = 0"));
         assert!(err("[folder.x]\nsort = \"size\""));
         assert!(err("[folder.x]\nview = \"fan\""));
+        let stack = parse("[folder.x]\nview = \"stack\"").unwrap();
+        assert_eq!(stack.folder("x").unwrap().view, FolderView::Stack);
         assert!(err("[folder.x]\nnope = 1"));
     }
 

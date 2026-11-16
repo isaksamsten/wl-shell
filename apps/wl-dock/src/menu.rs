@@ -22,7 +22,10 @@
 //! A folder's menu (`folder`) has Open and Remove from Dock. Its popup
 //! (`folder_popup`) is a menu too: a row per entry, with the entry's
 //! thumbnail or type icon in a larger icon column, and Open in File
-//! Manager. Its entries' rows can be dragged out as files.
+//! Manager. Its entries' rows can be dragged out as files. A folder with
+//! `view = "stack"` gets the same rows as one group (`folder_stack`), cut
+//! to what fits, with the folder's icon on Open in File Manager; stack.rs
+//! lays them out instead.
 //!
 //! The layout is in logical pixels relative to the bubble's body: rows of
 //! one height inside `padding`, an icon column when any row has an icon,
@@ -301,6 +304,28 @@ pub fn folder_popup(path: &Path, files: &[FileEntry]) -> Vec<Group> {
         groups[0].line = false;
     }
     groups
+}
+
+/// A folder's stack: like its popup, a row per entry (at most `max - 1`
+/// of them), then Open in File Manager, here with `icons` (names, best
+/// first) since every item of a stack has one. One group: a stack has no
+/// hairlines.
+pub fn folder_stack(
+    path: &Path,
+    files: &[FileEntry],
+    max: usize,
+    icons: Vec<String>,
+) -> Vec<Group> {
+    let shown = &files[..files.len().min(max.saturating_sub(1))];
+    let mut groups = folder_popup(path, shown);
+    let mut entries: Vec<Entry> = groups.drain(..).flat_map(|g| g.entries).collect();
+    if let Some(open) = entries.last_mut() {
+        open.mark = Mark::File(icons);
+    }
+    vec![Group {
+        line: false,
+        entries,
+    }]
 }
 
 /// The rows of `groups`, in order.
@@ -952,6 +977,33 @@ mod tests {
         assert_eq!(row.file.as_deref(), Some(dir.join("a.txt").as_path()));
         assert!(matches!(row.mark, Mark::File(_)));
         assert_eq!(g[1].entries[0].file, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn folder_stacks() {
+        let dir = std::env::temp_dir().join(format!("wl-dock-stack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let request = wl_shell_render::files::FolderRequest {
+            dir: dir.clone(),
+            sort: wl_shell_render::files::Sort::Name,
+            count: 5,
+        };
+        let files = wl_shell_render::files::list(&request, &Default::default()).unwrap();
+        let icons = vec!["system-file-manager".to_string()];
+        let g = folder_stack(&dir, &files, 10, icons.clone());
+        assert_eq!(labels(&g), [vec!["a", "b", "c", "Open in File Manager"]]);
+        let open = &g[0].entries[3];
+        assert_eq!(open.mark, Mark::File(icons.clone()));
+        assert_eq!(open.action, Action::Open(dir.clone()));
+        // Cut to fit, Open in File Manager kept.
+        let g = folder_stack(&dir, &files, 3, icons.clone());
+        assert_eq!(labels(&g), [vec!["a", "b", "Open in File Manager"]]);
+        let g = folder_stack(&dir, &[], 1, icons);
+        assert_eq!(labels(&g), [vec!["Open in File Manager"]]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

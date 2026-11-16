@@ -272,7 +272,11 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 Done::Icon { key, image }
             }
             Job::Named(key) => {
-                let image = icons.named(&key);
+                // Decoded without the shadow, which is drawn on top.
+                let image = icons.named(&key.plain()).map(|image| match &key.shadow {
+                    Some(s) => Arc::new(crate::shadow::icon(&image, s, key.scale)),
+                    None => image,
+                });
                 Done::Named { key, image }
             }
             Job::Label(key) => {

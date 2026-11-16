@@ -174,7 +174,7 @@ This customizes a pinned folder; it does not pin it. Paths accept `~/`.
 [folder."~/Downloads"]
 sort = "modified"              # modified (newest first), added (newest), name
 count = 20                     # Maximum entries; 1–100
-view = "list"                  # Currently the only view
+view = "list"                  # list (a menu), or stack (large icons fanned out of the folder)
 # icon = "folder-download"     # Optional icon name or path
 ```
 

@@ -95,7 +95,7 @@ use wl_shell_render::icons::{AppEntry, DesktopAction};
 use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
-use crate::config::{Config, Windows};
+use crate::config::{Config, FolderView, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
 use crate::folder;
@@ -151,6 +151,7 @@ struct Incoming {
 struct PendingFolder {
     pressed: Pressed,
     tag: u64,
+    view: FolderView,
 }
 
 /// Tags of folder listings, unique in the process.
@@ -891,7 +892,11 @@ impl WlDock {
                 count: settings.count as usize,
             },
         );
-        self.pending_folder = Some(PendingFolder { pressed, tag });
+        self.pending_folder = Some(PendingFolder {
+            pressed,
+            tag,
+            view: settings.view,
+        });
     }
 
     /// A folder's listing arrived: open its popup, if it is still wanted.
@@ -917,11 +922,10 @@ impl WlDock {
                 dock.drop_menu(core);
             }
         }
-        let groups = menu::folder_popup(dir, &entries);
         let grab = core.input.seat().map(|seat| (seat, pending.pressed.serial));
         let key = pending.pressed.app_id.clone();
-        let opened =
-            (self.dock_mut(&output)).is_some_and(|d| d.open_menu(core, &key, groups, true, grab));
+        let opened = (self.dock_mut(&output))
+            .is_some_and(|d| d.open_folder(core, &key, dir, &entries, pending.view, grab));
         if !opened {
             self.release_keyboard(&output);
         }
@@ -1004,7 +1008,7 @@ impl WlDock {
         }
         let grab = core.input.seat().map(|seat| (seat, pressed.serial));
         let opened = (self.dock_mut(&pressed.output))
-            .is_some_and(|dock| dock.open_menu(core, &app_id, groups, false, grab));
+            .is_some_and(|dock| dock.open_menu(core, &app_id, groups, grab));
         if !opened {
             self.release_keyboard(&pressed.output);
         }

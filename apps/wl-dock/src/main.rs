@@ -13,6 +13,7 @@ mod menuview;
 mod options;
 mod pins;
 mod row;
+mod stack;
 mod strip;
 mod stripview;
 mod trash;

@@ -112,6 +112,7 @@ use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
 use wl_shell_render::bubble::Bubble;
+use wl_shell_render::files::FileEntry;
 use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
 use wl_shell_render::{Image, icons, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
@@ -121,15 +122,16 @@ use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
 use crate::app::WlDock;
 use crate::autohide;
-use crate::config::{Config, DockLayer, DockLayout, Indicator, Position, Previews};
+use crate::config::{Config, DockLayer, DockLayout, FolderView, Indicator, Position, Previews};
 use crate::dock::{self, Item, Kind, Window};
 use crate::drag::{self, Target};
 use crate::folder::{self, UserDirs};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
 use crate::menu::{self, MenuKey};
-use crate::menuview::{MenuInput, MenuStyle, MenuView};
+use crate::menuview::{Look, MenuInput, MenuStyle, MenuView};
 use crate::pins;
 use crate::row::{self, Slot};
+use crate::stack;
 use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
 use crate::trash;
@@ -154,6 +156,8 @@ const REMOVE_LABEL: &str = "Remove from Dock";
 const GAP_LABEL: &str = "\0gap";
 /// How visible a folder that doesn't exist is.
 const MISSING_ALPHA: f64 = 0.4;
+/// What a stack leaves free at the output's far edge (or both ends).
+const STACK_ROOM: f64 = 32.0;
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -249,6 +253,8 @@ impl Style {
                 shadow: config.menu_shadow(),
                 icon_theme: theme.icon_theme.clone(),
                 drag_threshold: config.drag_threshold as f64,
+                stack_icon: layout.icon_size as f64,
+                stack_shadow: config.icon_shadow(),
             },
             autohide: autohide::Settings {
                 enabled: layout.autohide,
@@ -2494,15 +2500,67 @@ impl DockView {
         self.menu_app().filter(|_| self.popup)
     }
 
-    /// Open `groups` as the menu of `app_id` (a folder's popup if
-    /// `popup`), grabbing `grab` (a seat and the serial of the click). The
-    /// strip and any other menu go at once. It shows once its rows are
-    /// rendered. Returns whether it opened.
+    /// Open `groups` as the menu of `app_id`, grabbing `grab` (a seat and
+    /// the serial of the click). The strip and any other menu go at once.
+    /// It shows once its rows are rendered. Returns whether it opened.
     pub fn open_menu(
         &mut self,
         core: &Core<WlDock>,
         app_id: &str,
         groups: Vec<menu::Group>,
+        grab: Option<(&WlSeat, u32)>,
+    ) -> bool {
+        self.open_popup(core, app_id, groups, Look::Menu, false, grab)
+    }
+
+    /// Open the popup of the folder `key` (at `dir`) with its `files`, as
+    /// `view` says: a menu, or a stack of as many files as fit. Like
+    /// `open_menu` otherwise.
+    pub fn open_folder(
+        &mut self,
+        core: &Core<WlDock>,
+        key: &str,
+        dir: &Path,
+        files: &[FileEntry],
+        view: FolderView,
+        grab: Option<(&WlSeat, u32)>,
+    ) -> bool {
+        let (groups, look) = match view {
+            FolderView::List => (menu::folder_popup(dir, files), Look::Menu),
+            FolderView::Stack => {
+                // Open in File Manager shows the folder's icon.
+                let icons = vec![self.style.folder_icon(dir), folder::ICON.to_string()];
+                let fits = self.stack_fits(key);
+                (menu::folder_stack(dir, files, fits, icons), Look::Stack)
+            }
+        };
+        self.open_popup(core, key, groups, look, true, grab)
+    }
+
+    /// How many items a stack out of `key`'s icon has room for.
+    fn stack_fits(&self, key: &str) -> usize {
+        let m = self.style.menu.stack_metrics();
+        let (_, out_h) = self.output_size.unwrap_or((1920.0, 1080.0));
+        let room = match self.style.layout.position {
+            // Above the icon, which is this far from the edge.
+            Position::Bottom => {
+                let reach = self.icon_place(key).map_or(self.style.reach(), |(_, r)| r);
+                out_h - reach - stack::DOCK_GAP - STACK_ROOM
+            }
+            // Centered on it, sliding along the edge to stay on the output.
+            Position::Left | Position::Right => out_h - 2.0 * STACK_ROOM,
+        };
+        stack::fits(&m, room)
+    }
+
+    /// Open `groups` as the menu of `app_id`, shown as `look` (a folder's
+    /// popup if `popup`).
+    fn open_popup(
+        &mut self,
+        core: &Core<WlDock>,
+        app_id: &str,
+        groups: Vec<menu::Group>,
+        look: Look,
         popup: bool,
         grab: Option<(&WlSeat, u32)>,
     ) -> bool {
@@ -2525,6 +2583,7 @@ impl DockView {
                 grab,
                 app_id.to_string(),
                 groups,
+                look,
                 self.style.menu.clone(),
                 self.style.layout.position,
                 icon,

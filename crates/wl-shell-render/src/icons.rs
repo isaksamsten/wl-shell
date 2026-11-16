@@ -52,6 +52,26 @@ pub struct NamedIcon {
     pub size: u32,
     /// The configured theme, if any.
     pub theme: Option<String>,
+    /// Drawn under the icon at buffer `scale`, which is then padded by
+    /// its `pad`.
+    pub shadow: Option<crate::shadow::IconShadow>,
+    /// The buffer scale `size` includes (for the shadow).
+    pub scale: i32,
+}
+
+impl NamedIcon {
+    /// The same icon without its shadow.
+    pub fn plain(&self) -> Self {
+        Self {
+            shadow: None,
+            ..self.clone()
+        }
+    }
+
+    /// Logical pixels the image reaches past the icon on every side.
+    pub fn pad(&self) -> i32 {
+        self.shadow.map_or(0, |s| s.pad())
+    }
 }
 
 impl Key {
