@@ -15,7 +15,10 @@
 //! The bar holds the selected match's icon (the front of the drum, larger
 //! than the dock's icons, so it rises out of the bar), the query with its
 //! caret, and the rest of the selected app's name: inline after the query
-//! if the query is the start of it, else dimmed at the bar's end. The
+//! if the query is the start of it, else dimmed at the bar's end (hidden
+//! while it doesn't fit beside the query). Like a text box, a query too
+//! long for the bar scrolls out on the left, keeping the caret in view,
+//! and the completion after it is cut at the bar's edge. The
 //! other matches stand on the drum (drum.rs) above the front icon, each
 //! with its name beside it in a pill (the query's matches brighter),
 //! scaled with the icon; the roll is a spring, and returning matches
@@ -32,8 +35,9 @@
 //!
 //! Files (the query's scope is files once the trigger was typed): the bar
 //! holds two lines. The first is the query and the selected file's name:
-//! inline after the caret if the query is the start of it, else after an
-//! arrow, with what the query matched brighter. The second, smaller and
+//! inline after the caret if the query is the start of it, else dimmed at
+//! the bar's end with what the query matched brighter (hidden while it
+//! doesn't fit beside the query). The second, smaller and
 //! dimmer, is the file's full path (`~` for home) with what the query
 //! matched brighter and its name brighter than its directories;
 //! directories the query didn't match are elided to fit. While nothing
@@ -94,10 +98,10 @@ const FILES_PLACEHOLDER: &str = "Search files";
 const SEARCH_ICON: &str = "system-search";
 /// Stand-ins for a file's icon, and a folder's.
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
-/// Before a file's name that doesn't continue the query.
-const NAME_MARK: &str = "→";
 /// A character's width, of the font size, at most (to fit paths).
 const CHAR_WIDTH: f64 = 0.55;
+/// The widest the query and its continuation are rendered (they scroll).
+const SCROLLED_MAX: i32 = 8192;
 /// Pixels of touchpad scrolling per roll step.
 const SCROLL_STEP: f64 = 50.0;
 /// The matches' names on the drum, of the query's font size.
@@ -342,6 +346,7 @@ impl Line {
     /// Present it `scale` times its size, with its top left at (`x`, `y`).
     fn present_scaled(&mut self, x: f64, y: f64, scale: f64, alpha: f64) -> Option<Rect> {
         let Self { sub, shown, .. } = self;
+        sub.crop(None);
         match shown {
             Some((_, buffer, w, h)) => {
                 let r = Rect::new(x, y, *w * scale, *h * scale);
@@ -353,6 +358,30 @@ impl Line {
                 None
             }
         }
+    }
+
+    /// Present it at (`x`, `y`), showing only what is between `left` and
+    /// `right`.
+    fn present_clipped(&mut self, x: f64, y: f64, (left, right): (f64, f64), alpha: f64) {
+        let Self { sub, shown, .. } = self;
+        let Some((request, buffer, w, h)) = shown else {
+            sub.clear();
+            return;
+        };
+        // Whole logical pixels, so the crop maps 1:1 onto the destination.
+        let (x, y) = (x.round(), y.round());
+        let l = left.round().max(x);
+        let r = right.round().min(x + *w);
+        if r <= l || alpha <= 0.0 {
+            sub.clear();
+            return;
+        }
+        let s = request.scale.max(1) as f64;
+        match l > x || r < x + *w {
+            true => sub.crop(Some([(l - x) * s, 0.0, (r - l) * s, *h * s])),
+            false => sub.crop(None),
+        }
+        sub.present(Some(buffer), Rect::new(l, y, r - l, *h), alpha);
     }
 
     fn height(&self) -> f64 {
@@ -466,9 +495,6 @@ pub struct LauncherView {
     /// A file search's second line: the selected file's path.
     path_line: Line,
     inline: Line,
-    /// The inline text stands apart from the query (a file's name that
-    /// doesn't continue it).
-    inline_apart: bool,
     after: Line,
     caret: Sub,
     no_input: Region,
@@ -562,7 +588,6 @@ impl LauncherView {
             query_line,
             path_line,
             inline,
-            inline_apart: false,
             after,
             caret,
             no_input,
@@ -967,7 +992,7 @@ impl LauncherView {
         let q = self.query.text();
         // Zero-width spaces keep the query's own spaces at its ends.
         let query = (!q.is_empty()).then(|| line(format!("\u{200b}{q}\u{200b}"), style.text));
-        let (path, inline, after, apart) = match self.query.scope() {
+        let (path, inline, after) = match self.query.scope() {
             Scope::Files => {
                 let file = selected.and_then(|m| Some((m, m.file.as_ref()?)));
                 // Under the query: the selection's path, else the progress.
@@ -982,25 +1007,22 @@ impl LauncherView {
                     }),
                 };
                 let name = file.map(|(m, _)| m.name.as_str());
-                let (inline, apart) = match (completion(q, name), file) {
+                let (inline, after) = match (completion(q, name), file) {
                     (Completion::None, _) if q.is_empty() => {
-                        (Some(line(FILES_PLACEHOLDER.into(), style.completion)), false)
+                        (Some(line(FILES_PLACEHOLDER.into(), style.completion)), None)
                     }
                     (Completion::Inline(rest), _) if !rest.is_empty() => {
-                        (Some(line(rest, style.completion)), false)
+                        (Some(line(rest, style.completion)), None)
                     }
-                    // Not the query's continuation: apart, after an arrow,
-                    // with what the query matched brighter.
+                    // Not the query's continuation: at the bar's end, with
+                    // what the query matched brighter.
                     (Completion::After(name), Some((m, _))) => {
-                        let at = NAME_MARK.len() + 1;
-                        let mut spans = vec![(0..NAME_MARK.len(), dimmer(style.completion))];
-                        spans.extend(m.matched.iter().map(|r| (r.start + at..r.end + at, style.text)));
-                        let text = format!("{NAME_MARK} {name}");
-                        (Some(spanned(text, spans, style.completion)), true)
+                        let spans = m.matched.iter().map(|r| (r.clone(), style.text)).collect();
+                        (None, Some(spanned(name, spans, style.completion)))
                     }
-                    _ => (None, false),
+                    _ => (None, None),
                 };
-                (path, inline, None, apart)
+                (path, inline, after)
             }
             Scope::Apps => {
                 let name = selected.map(|m| m.name.as_str());
@@ -1013,10 +1035,13 @@ impl LauncherView {
                 };
                 let inline = inline.map(|t| line(t, style.completion));
                 let after = after.map(|t| line(t, style.completion));
-                (None, inline, after, false)
+                (None, inline, after)
             }
         };
-        self.inline_apart = apart;
+        // The query and what continues it scroll in the bar instead of
+        // being cut: they are rendered whole (up to a sanity bound).
+        let whole = |r: Option<PillRequest>| r.map(|r| PillRequest { max_width: SCROLLED_MAX, ..r });
+        let (query, inline) = (whole(query), whole(inline));
         let assets = self.assets.clone();
         // The query first, so its width is there when the rest arrives.
         self.query_line.want(&assets, query, &mut self.stale);
@@ -1385,21 +1410,25 @@ impl LauncherView {
             true => 0.0,
             false => self.query_line.width(),
         };
+        // A text box's viewport: what doesn't fit scrolls out on the left,
+        // keeping the caret (always at the query's end) in view; the
+        // completion after it is cut at the right edge.
+        let x1 = bar.right() - 2.0 * style.padding;
+        let caret_w = (style.font_size / 12.0).round().max(1.0);
+        let scroll = (query_w + caret_w - (x1 - x0)).max(0.0);
+        let caret_x = x0 + query_w - scroll;
         match self.query.is_empty() {
             true => self.query_line.sub.clear(),
-            false => self.query_line.present(x0, ty, text_alpha),
+            false => (self.query_line).present_clipped(x0 - scroll, ty, (x0, x1), text_alpha),
         }
-        // A file's name that doesn't continue the query stands apart.
-        let gap = match self.inline_apart {
-            true => 1.5 * style.padding,
-            false => 0.0,
-        };
-        self.inline.present(x0 + query_w + gap, ty, text_alpha);
-        let after_x = bar.right() - 2.0 * style.padding - self.after.width();
-        let after_min = x0 + query_w + style.padding;
-        self.after.present(after_x.max(after_min), ty, text_alpha);
-        let caret_w = (style.font_size / 12.0).round().max(1.0);
-        let caret = Rect::new(x0 + query_w, ty, caret_w, line_h);
+        (self.inline).present_clipped(caret_x, ty, (x0, x1), text_alpha);
+        // At the bar's end, unless it would run into the query.
+        let after_x = x1 - self.after.width();
+        match after_x >= caret_x + 1.5 * style.padding {
+            true => self.after.present(after_x, ty, text_alpha),
+            false => self.after.sub.clear(),
+        }
+        let caret = Rect::new(caret_x, ty, caret_w, line_h);
         let caret_alpha = if self.closing { 0.0 } else { text_alpha };
         self.caret
             .present(self.caret_buffer.as_ref(), caret, caret_alpha);
