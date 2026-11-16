@@ -1487,6 +1487,23 @@ mod tests {
     }
 
     #[test]
+    fn example_config_parses() {
+        let example = include_str!("../config.example.toml");
+        // As shipped, everything is commented out: the defaults.
+        assert_eq!(parse(example), Ok(Config::default()));
+        // Settings are commented as `#key`, prose as `# text`; uncommenting
+        // every setting must still be a valid config.
+        let uncommented = (example.lines())
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if !rest.is_empty() && !rest.starts_with(' ') => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse(&uncommented).unwrap();
+    }
+
+    #[test]
     fn invalid() {
         let err = |s: &str| parse(s).is_err();
         assert!(err("position = \"top-ish\""));

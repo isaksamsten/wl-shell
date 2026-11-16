@@ -1,0 +1,193 @@
+# wl-dock example configuration
+#
+# Copy this file to ~/.config/wl-dock/config.toml (or
+# $XDG_CONFIG_HOME/wl-dock/config.toml) and uncomment what you want to change:
+#
+#   mkdir -p ~/.config/wl-dock
+#   cp config.example.toml ~/.config/wl-dock/config.toml
+#
+# Every setting is optional; the commented values are the defaults, except
+# where a comment says "example". Sizes are pixels, times are milliseconds.
+# Changes are picked up while the dock runs.
+
+# --- Dock -----------------------------------------------------------------
+# General settings stay at the root, before any [table] header.
+
+#outputs = "all"                 # Or a list, e.g. ["DP-1", "eDP-1"]
+#position = "bottom"             # bottom, left, right
+#layer = "top"                   # top, overlay
+#icon-size = 48                  # 16–256
+#icon-gap = 6
+#margin = 6                      # Distance from the screen edge
+#padding = 6                     # Space inside the panel
+#magnification = 1.8             # 1–3; 1 disables it
+#magnification-range = 3.0       # Neighbours on each side that grow; 1–10
+#reserve = true                  # Keep windows out of the resting dock's area
+#hover-delay = 300
+#labels = true                   # Show the hovered app's name
+#indicator = "dot"               # dot, dots (one per window, up to three), none
+#active-indicator = true         # Needs integration.mru-event-stream
+#drag-threshold = 6              # Pixels before an icon starts dragging; 1–100
+
+# --- Autohide -------------------------------------------------------------
+
+#[autohide]
+#enabled = false
+#reveal-delay = 150
+#hide-delay = 500
+#trigger = 2                     # Edge reveal band in pixels; 1–50
+
+# --- Windows strip --------------------------------------------------------
+# Clicking an app with several windows shows them as cards.
+
+#[windows]
+#scope = "all"                   # all, output (needs output-event-stream)
+#output-grace = 250              # Wait for the stream to place new windows
+#strip = true                    # false: clicking activates the latest window
+#min-windows = 2                 # Below this, activate the most recent window
+#max-columns = 3                 # Along the dock; 0 means unlimited
+#max-rows = 3                    # Away from the dock; 0 means unlimited
+#card-height = 0.18              # Fraction of output height
+#max-width = 0.6                 # Fraction of output length; also caps card width
+#previews = "live"               # live, static (one frame), off
+#zoom = 1.04                     # Highlighted card scale; 1 disables it
+
+# --- Launcher (wl-dock --launcher) ----------------------------------------
+
+#[launcher]
+#width = 0.4                     # Fraction of output width; at least the dock
+#icon-scale = 1.25               # Selected app's icon, times icon-size; 1–3
+#font-size = 20                  # Default: derived from icon-size
+#matches = 5                     # Matches on the drum; 0–12
+#far-scale = 0.5                 # Farthest match's size; 0.25–1
+#enter = "activate"              # activate, launch (Ctrl+Enter does the other)
+#history = true                  # Record launches to rank matches
+
+# --- Compositor integration -----------------------------------------------
+# Commands run through `sh -c`. The commands below are niri examples; replace
+# them with your compositor's equivalents. Without close-command, the menu has
+# no Close entries.
+
+#[integration]
+#activate-command = "niri msg action focus-window --id {id}"   # Example
+#close-command = "niri msg action close-window --id {id}"      # Example
+#launch-command = "uwsm app -- {desktop-id}"  # Example; also {exec}, {app-id}
+#terminal = "foot"               # For Terminal=true apps, e.g. "alacritty -e"
+#launch-timeout = 10000          # Maximum launch bounce; 0–60000
+#mru-event-stream = "~/.config/wl-dock/focus-stream.sh"     # Example
+#output-event-stream = "~/.config/wl-dock/output-stream.sh" # Example
+
+# --- Files, folders and Trash ---------------------------------------------
+# {paths} is the list of dropped files, {dest} the destination folder.
+
+#[trash]
+#enabled = true
+#command = "gio trash -- {paths}"
+#empty-command = "gio trash --empty"
+
+#[files]
+#open-command = "xdg-open {path}"    # The Trash opens trash:///
+#copy-command = "cp -rn -- {paths} {dest}"
+#move-command = "mv -n -- {paths} {dest}"
+
+# --- Appearance -----------------------------------------------------------
+# Colors are "RRGGBB" or "RRGGBBAA", optionally prefixed with #. An alpha of
+# 00 disables the corresponding shadow.
+
+#[appearance]
+#font = "sans-serif"
+#font-size = 13
+#response = 150                  # Animation spring response; 1–10000
+#mode = "auto"                   # auto (desktop preference), dark, light
+#icon-theme = "Papirus"          # Example; default: desktop setting, then hicolor
+#panel-color = "262626b3"
+#panel-radius = 16
+#indicator-color = "ffffffb3"
+#active-indicator-color = "ffffffff"
+#label-color = "ffffffff"
+#label-background = "262626e6"
+#title-color = "ffffffff"
+#title-background = "000000b3"
+#placeholder = "3a3a3aff"        # Strip card before its preview arrives
+#separator-color = "ffffff40"    # Between apps and Trash
+#shadow-color = "00000066"
+#shadow-softness = 24
+#shadow-spread = 0               # Grow/shrink the shadow box; may be negative
+#shadow-offset = [0, 4]          # [x, y]
+#icon-shadow-color = "00000059"
+#icon-shadow-softness = 6
+#icon-shadow-offset = [0, 2]
+#menu-background = "262626eb"
+#menu-border = "ffffff1f"
+#menu-radius = 12
+#menu-tail = [10, 7]             # [width, height]
+#menu-text = "ffffffff"
+#menu-highlight = "ffffff2e"
+#menu-highlight-text = "ffffffff"
+#menu-separator = "ffffff26"
+#menu-row-height = 28
+#menu-padding = 6
+#menu-group-gap = 8
+#menu-max-width = 320
+#menu-shadow-color = "00000066"
+#menu-shadow-softness = 18
+#menu-shadow-offset = [0, 4]
+#launcher-background = "262626e6"
+#launcher-text = "ffffffff"
+#launcher-completion = "ffffff73"
+#launcher-caret = "ffffffcc"
+
+# Any appearance key can be overridden for just light or dark mode (example):
+#[appearance.light]
+#panel-color = "eeeeeecc"
+#label-color = "202020"
+#label-background = "eeeeeeee"
+
+# --- Per-output overrides (example) ---------------------------------------
+# These are all the keys an output can override. enabled = true/false
+# includes or excludes the output regardless of `outputs`.
+
+#[output."eDP-1"]
+#enabled = true
+#position = "left"
+#icon-size = 40
+#magnification = 1.5
+#reserve = true
+#margin = 4
+#[output."eDP-1".autohide]
+#enabled = true
+#[output."eDP-1".windows]
+#scope = "output"
+#max-columns = 2
+#max-rows = 2
+
+# --- Per-app settings (examples) ------------------------------------------
+# Tables are keyed by Wayland app ID. Commands can use {app-id}, {id} (most
+# recent window) and {ids} (all of the app's windows); drop uses {files}.
+
+#[app."org.gnome.Nautilus"]
+#name = "Files"
+#icon = "system-file-manager"    # Icon theme name or file path
+#launch-command = "nautilus --new-window"
+#desktop-actions = true          # Show the desktop entry's actions
+#drop = "nautilus {files}"
+#actions = [{ name = "New window", command = "nautilus --new-window", icon = "window-new" }]
+
+#[app.spotify]
+#middle-click = "playerctl play-pause"
+#scroll-up = "playerctl next"
+#scroll-down = "playerctl previous"
+#actions = [
+#{ name = "Play/Pause", command = "playerctl play-pause", when = "running" },
+#{ name = "Next", command = "playerctl next", icon = "media-skip-forward", when = "running" },
+#]
+
+# --- Per-folder settings (example) ----------------------------------------
+# Customizes a pinned folder (`wl-dock pin ~/Downloads`); it does not pin it.
+
+#[folder."~/Downloads"]
+#sort = "modified"               # modified, added, name
+#count = 10                      # Maximum entries; 1–100
+#view = "stack"                  # stack (fanned icons), list (a menu)
+#icon = "folder-download"        # Example
+

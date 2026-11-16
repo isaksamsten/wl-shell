@@ -64,6 +64,14 @@ file. Every setting is optional. The reference below shows defaults; commented
 commands are optional examples, not enabled defaults. Sizes are pixels and
 times are milliseconds.
 
+To start from a template, copy [`config.example.toml`](config.example.toml),
+where every setting is commented out with its default:
+
+```sh
+mkdir -p ~/.config/wl-dock
+cp apps/wl-dock/config.example.toml ~/.config/wl-dock/config.toml
+```
+
 General dock settings stay at the root, before any table header. Feature
 settings live in the tables below; the old flat spellings are not supported.
 
