@@ -14,8 +14,8 @@
 //! The ring is closed: past the last used slot (`t` between n − 1 and n
 //! for n matches), the drum's back runs over the top and down behind the
 //! bar to the front. A match there fades out over the top, and the one
-//! leaving the front sinks into the bar (stacked below it) as it fades,
-//! so it disappears into the bar and reappears over the top.
+//! leaving the front sinks toward the bar as it fades. Both remain
+//! stacked in front of the bar so reverse rolls slide up without a pop.
 //!
 //! Rolling is a spring on the roll `r`: match `i` is at `t = (i − r) mod
 //! n`, and the selection is the one the roll is headed for.
@@ -58,7 +58,7 @@ pub struct Placed {
     pub rise: f64,
     pub size: f64,
     pub alpha: f64,
-    /// Stacked below the bar.
+    /// On the hidden return stretch, with no name beside the icon.
     pub behind: bool,
 }
 
@@ -254,7 +254,7 @@ mod tests {
             }
             // Back around at the front.
             assert_eq!(at(steps), at(0));
-            // Just before the front again, it is in the bar, behind it.
+            // Just before the front again, it is on the return stretch.
             let leaving = d.place(ring as f64 - 0.01, ring);
             assert!(leaving.behind && leaving.rise < 0.0);
             // Just past the last slot, it goes over the top.

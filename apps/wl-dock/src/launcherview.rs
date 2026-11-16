@@ -8,8 +8,8 @@
 //! bar starts as the dock's panel (drawn here from then on, in the panel's
 //! color, cross-fading to the bar's) and its rect moves to the bar's on a
 //! spring, while the dock's icons shrink into it. The icon and the query
-//! fade in as it settles, and the matches roll up onto the drum from
-//! behind the bar. The keyboard is the launcher's from its first frame,
+//! fade in as it settles, and the matches slide up onto the drum in
+//! front of the bar. The keyboard is the launcher's from its first frame,
 //! so nothing typed early is lost.
 //!
 //! The bar holds the selected match's icon (the front of the drum, larger
@@ -18,13 +18,13 @@
 //! if the query is the start of it, else dimmed at the bar's end. The
 //! other matches stand on the drum (drum.rs) above the front icon, each
 //! with its name beside it in a pill (the query's matches brighter),
-//! scaled with the icon; the roll is a spring, and a match on its way
-//! around the back is restacked below the bar. A re-ranking shows the new
+//! scaled with the icon; the roll is a spring, and returning matches
+//! fade in and out in front of the bar. A re-ranking shows the new
 //! best match in front without rolling, cross-fading the icons of the
 //! slots whose match changed. With an empty query, the front shows
 //! `system-search`.
 //!
-//! Closing runs it backwards: the matches roll back behind the bar and
+//! Closing runs it backwards: the matches slide down in front of the bar and
 //! the bar becomes the dock's panel again. If an app was opened, its icon
 //! flies from the front of the drum to its place in the dock. Closing
 //! gives up the keyboard and the input at once, so the app opened gets
@@ -318,8 +318,6 @@ struct RingSubs {
     old: Sub,
     /// The match's name, beside its icon.
     label: Line,
-    /// Stacked below the bar.
-    behind: bool,
 }
 
 /// The opened app's icon on its way to the dock.
@@ -753,7 +751,6 @@ impl LauncherView {
                 icon: sub(),
                 old: sub(),
                 label: Line::pill(sub()),
-                behind: false,
             };
             subs.icon.place_below(self.query_line.sub.surface());
             subs.old.place_below(self.query_line.sub.surface());
@@ -989,7 +986,7 @@ impl LauncherView {
         // The drum.
         let front = front_rect(&style, bar);
         let (cx, cy) = front.center();
-        // The matches roll up from behind the bar as it opens.
+        // The matches slide up in front of the bar as it opens.
         let open = m;
         let n = self.ring.len();
         self.grow_ring_subs(n.max(1));
@@ -1009,16 +1006,6 @@ impl LauncherView {
             let size = p.size;
             let center = (cx, cy - p.rise * open);
             let rect = Rect::new(center.0 - size / 2.0, center.1 - size / 2.0, size, size);
-            let behind = p.behind || open < 0.5;
-            if behind != subs.behind {
-                let below = match behind {
-                    true => self.panel[0].surface(),
-                    false => self.query_line.sub.surface(),
-                };
-                subs.icon.place_below(below);
-                subs.old.place_below(below);
-                subs.behind = behind;
-            }
             // The front one is flying to the dock.
             let flying = fly_key.as_ref() == Some(&r.key) && t < 0.5;
             let gate = |a: f64| match self.g.alpha_modifier {
