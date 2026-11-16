@@ -12,20 +12,19 @@
 //! For files, in this order:
 //!
 //! - **Open file** (Open folder) with `open-command`; its icon is the
-//!   default app's for the file's type.
+//!   default app's for the file's type (a folder's is `folder-open`).
 //! - **Open with…**: the apps for the file's type (mimeapps.rs: its
 //!   `MimeType=` apps and parents, with the `mimeapps.list`
 //!   associations), the default first, then by history. A folder only
 //!   gets it if an app besides the default (the file manager) takes it.
 //! - **Open containing directory**: `open-command` on the parent; its icon
-//!   is the default app's for folders, else `folder-open`.
+//!   is the generic `folder-open`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use wl_shell_render::files::FOLDER_ICONS;
 use wl_shell_render::icons::IndexedApp;
-use wl_shell_render::mime::DIRECTORY;
 use wl_shell_render::mimeapps::MimeApps;
 
 /// What the actions act on.
@@ -68,12 +67,6 @@ impl Context<'_> {
     /// The apps that open the subject's type, the default first.
     fn candidates(&self) -> Vec<usize> {
         (self.file_type.assoc).candidates(&self.file_type.types, self.apps)
-    }
-
-    /// The default app for `types`, by desktop ID.
-    fn default_for(&self, types: &[String]) -> Option<String> {
-        let i = self.file_type.assoc.default_app(types, self.apps)?;
-        Some(self.apps[i].id.clone())
     }
 }
 
@@ -140,10 +133,12 @@ const ACTIONS: &[Action] = &[
             Subject::File { dir: true, .. } => "Open folder".into(),
             Subject::File { .. } => "Open file".into(),
         },
-        icon: |s, cx| match (cx.candidates().first(), s) {
-            (Some(&i), _) => Icon::App(cx.apps[i].id.clone()),
-            (None, Subject::File { dir: true, .. }) => names(&["folder-open", FOLDER_ICONS[0]]),
-            (None, _) => names(&["document-open", "text-x-generic"]),
+        // A folder's default app is the file manager, whose icon says
+        // little: a folder instead.
+        icon: |s, cx| match (s, cx.candidates().first()) {
+            (Subject::File { dir: true, .. }, _) => names(&["folder-open", FOLDER_ICONS[0]]),
+            (_, Some(&i)) => Icon::App(cx.apps[i].id.clone()),
+            (_, None) => names(&["document-open", "text-x-generic"]),
         },
         applies: |_, _| true,
         does: |s, _| match s {
@@ -170,10 +165,7 @@ const ACTIONS: &[Action] = &[
     Action {
         id: "open-directory",
         name: |_| "Open containing directory".into(),
-        icon: |_, cx| match cx.default_for(&[DIRECTORY.to_string()]) {
-            Some(id) => Icon::App(id),
-            None => names(&["folder-open", FOLDER_ICONS[0]]),
-        },
+        icon: |_, _| names(&["folder-open", FOLDER_ICONS[0]]),
         applies: |s, _| match s {
             Subject::File { path, .. } => parent(path).is_some(),
         },
@@ -233,6 +225,7 @@ fn open_with(path: &Path, cx: &Context) -> Vec<Choice> {
 mod tests {
     use super::*;
     use wl_shell_render::icons::AppEntry;
+    use wl_shell_render::mime::DIRECTORY;
     use wl_shell_render::mimeapps::List;
 
     fn app(id: &str, types: &[&str]) -> IndexedApp {
@@ -304,10 +297,13 @@ mod tests {
             names,
             ["Open file", "Open with…", "Open containing directory"]
         );
-        // Open file shows what will open it; the directory, the file manager.
+        // Open file shows what will open it; the directory, a folder.
         assert_eq!(l.choices[0].icon, Icon::App("firefox".into()));
         assert_eq!(l.choices[0].does, Does::Open("/d/report.pdf".into()));
-        assert_eq!(l.choices[2].icon, Icon::App("nautilus".into()));
+        assert_eq!(
+            l.choices[2].icon,
+            super::names(&["folder-open", FOLDER_ICONS[0]])
+        );
         assert_eq!(l.choices[2].does, Does::Open("/d".into()));
     }
 
@@ -340,7 +336,10 @@ mod tests {
         assert_eq!(ids(&l), ["open", "open-directory"]);
         assert_eq!(l.choices[0].name, "Open folder");
         assert_eq!(l.placeholder, "Open folder");
-        assert_eq!(l.choices[0].icon, Icon::App("nautilus".into()));
+        assert_eq!(
+            l.choices[0].icon,
+            super::names(&["folder-open", FOLDER_ICONS[0]])
+        );
         // Another app that takes folders brings it back.
         let mut more = apps.clone();
         more.push(app("code", &[DIRECTORY]));

@@ -1457,11 +1457,15 @@ impl LauncherView {
                 (path, inline, after)
             }
             Scope::Apps | Scope::Actions => {
+                let name = selected.map(|m| m.name.as_str());
+                // With nothing typed: among actions, the selected choice's
+                // name (the default's at first); else the placeholder.
                 let placeholder = match scope {
-                    Scope::Actions => self.nav.level().map_or("", |l| l.placeholder.as_str()),
+                    Scope::Actions => (name.filter(|n| !n.is_empty()))
+                        .or_else(|| self.nav.level().map(|l| l.placeholder.as_str()))
+                        .unwrap_or(""),
                     _ => PLACEHOLDER,
                 };
-                let name = selected.map(|m| m.name.as_str());
                 let (inline, after) = match completion(q, name) {
                     Completion::None if q.is_empty() => (Some(placeholder.to_string()), None),
                     Completion::None => (None, None),
