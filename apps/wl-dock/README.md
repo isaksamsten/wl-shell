@@ -25,6 +25,8 @@ instance. Right-click for its menu. Drag icons to reorder pins.
 
 ### Launcher
 
+https://github.com/user-attachments/assets/7cb773d0-a193-48e1-876c-1e897a82b2c6
+
 `wl-dock --launcher` turns a bottom dock into a search bar for apps. Bind it to
 a key, for example on niri:
 
@@ -59,6 +61,8 @@ the walk stays on one file system.
 Tab on a file or application shows what you can do with it.
 
 ### Keyboard activation
+
+https://github.com/user-attachments/assets/538fb920-f13e-497d-9d29-795251ed81d4
 
 Holding Super (or another modifier), the number keys reach the first ten dock
 items, as on the Windows taskbar. Bind them to `wl-dock --activate N`, for
