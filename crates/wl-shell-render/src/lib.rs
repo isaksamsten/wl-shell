@@ -9,6 +9,7 @@ pub mod icons;
 pub mod image;
 pub mod mime;
 pub mod mimeapps;
+pub mod paper;
 pub mod shadow;
 pub mod text;
 pub mod worker;

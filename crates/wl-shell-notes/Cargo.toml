@@ -1,0 +1,12 @@
+[package]
+name = "wl-shell-notes"
+description = "Notes for wl-shell programs: markdown files with TOML frontmatter, matched to windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+globset.workspace = true
+toml_edit.workspace = true
+

@@ -1,7 +1,7 @@
 //! A worker thread for everything slow: loading fonts, desktop entries and
-//! icons, and rendering labels, title pills, text lines, letter tiles and
-//! speech bubbles. Results come back through a calloop channel, and the
-//! main thread turns them into shm buffers.
+//! icons, and rendering labels, title pills, text lines, letter tiles,
+//! speech bubbles and sheets of paper. Results come back through a calloop
+//! channel, and the main thread turns them into shm buffers.
 //!
 //! The worker lives as long as the daemon, so its caches (font system,
 //! desktop entries, decoded icons) stay warm. The daemon asks it for every
@@ -19,6 +19,7 @@ use crate::files::{self, FileEntry, FolderRequest};
 use crate::icons::{self, Icons};
 use crate::image::Image;
 use crate::mime::MimeDb;
+use crate::paper;
 use crate::text::{self, Text};
 
 enum Job {
@@ -46,6 +47,8 @@ enum Job {
     FileIcons { path: std::path::PathBuf, dir: bool },
     /// A file's type, its parents, and the apps associated with types.
     FileType { path: std::path::PathBuf, dir: bool },
+    /// A sheet of paper (wl-note).
+    Paper(paper::Paper),
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -129,6 +132,11 @@ pub enum Done {
         path: std::path::PathBuf,
         types: Vec<String>,
         assoc: Arc<crate::mimeapps::MimeApps>,
+    },
+    /// A sheet of paper (`Assets::paper`).
+    Paper {
+        paper: paper::Paper,
+        rendered: paper::Rendered,
     },
 }
 
@@ -247,6 +255,11 @@ impl Assets {
         });
     }
 
+    /// Render a sheet of paper; arrives as `Done::Paper`.
+    pub fn paper(&self, paper: &paper::Paper) {
+        self.send(Job::Paper(paper.clone()));
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -275,7 +288,8 @@ impl Assets {
             | Done::Folder { .. }
             | Done::FileIcons { .. }
             | Done::FileType { .. }
-            | Done::Apps(_) => {}
+            | Done::Apps(_)
+            | Done::Paper { .. } => {}
         }
     }
 }
@@ -407,6 +421,10 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     .collect();
                 let assoc = Arc::new(crate::mimeapps::MimeApps::load(&desktops));
                 Done::FileType { path, types, assoc }
+            }
+            Job::Paper(paper) => {
+                let rendered = paper::render(&paper);
+                Done::Paper { paper, rendered }
             }
             Job::ClearIcons => {
                 icons.clear();

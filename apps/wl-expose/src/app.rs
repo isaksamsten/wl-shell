@@ -146,7 +146,8 @@ impl Expose {
             | Done::Folder { .. }
             | Done::FileIcons { .. }
             | Done::FileType { .. }
-            | Done::Apps(_) => {}
+            | Done::Apps(_)
+            | Done::Paper { .. } => {}
         }
     }
 

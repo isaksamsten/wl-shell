@@ -1367,6 +1367,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.19+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1746,9 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wl-dock"
@@ -1768,6 +1784,23 @@ dependencies = [
  "wl-shell-daemon",
  "wl-shell-log",
  "wl-shell-render",
+]
+
+[[package]]
+name = "wl-note"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "smithay-client-toolkit",
+ "wayland-client",
+ "wayland-protocols",
+ "wl-shell-config",
+ "wl-shell-core",
+ "wl-shell-log",
+ "wl-shell-notes",
+ "wl-shell-render",
+ "wl-shell-ui",
 ]
 
 [[package]]
@@ -1808,6 +1841,14 @@ dependencies = [
 [[package]]
 name = "wl-shell-log"
 version = "0.1.0"
+
+[[package]]
+name = "wl-shell-notes"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "toml_edit",
+]
 
 [[package]]
 name = "wl-shell-render"
