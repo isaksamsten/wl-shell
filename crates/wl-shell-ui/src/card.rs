@@ -1,6 +1,7 @@
-//! Window preview cards, as wl-switcher's strip and wl-dock's strip show
-//! them: a window's capture on a subsurface, with its shadow in four strips
-//! around it (shapes.rs) that scale with the card.
+//! Window preview cards, as wl-switcher's strip and wl-dock's strip (and
+//! its launcher's Windows…) show them: a window's capture on a
+//! subsurface, with its shadow in four strips around it (shapes.rs) that
+//! scale with the card.
 //!
 //! - [`Preview`] is a window's capture and its latest frame. A capture
 //!   starts static (one frame, so a strip can open without placeholders),

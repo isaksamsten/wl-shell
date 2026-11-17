@@ -49,7 +49,7 @@
 //! (`stream_matches`): until the drum is rolled the best is in front;
 //! after, the selection stays in front while it is among them.
 //!
-//! Actions (Tab on a file match): the match is the subject, and its icon
+//! Actions (Tab on a match): the match is the subject, and its icon
 //! flies out of the front on a spring into the context pill, a small
 //! pill of the bar's color just above the bar at its right edge (the drum
 //! grows from the left, so that is free). The pill holds the subject's
@@ -63,6 +63,15 @@
 //! the other way. The choices fill the whole drum. Going back flies the
 //! crumb (or the subject) back into the front of the drum, which is
 //! hidden until it lands, and restores what the drum showed (`leave`).
+//!
+//! Windows (an app's Windows…): a window's match shows its capture
+//! (`set_previews`, `wl_shell_ui::card`) in place of the app's icon,
+//! fitted into the icon's square with the icons' shadow, once it has a
+//! frame; the app's icon until then, and when it flies to the dock. The
+//! captures start (one frame each) when the app becomes the subject, go
+//! live while their matches are on the ring (with `previews = "live"`),
+//! pause when they leave it or the launcher closes, and go when the
+//! search is back.
 //!
 //! Texts (the query, the completion, the name) are lines from the worker;
 //! a line shows its last text until the new one arrives. Icons come from
@@ -83,8 +92,10 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use wayland_client::QueueHandle;
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_surface::WlSurface};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
+use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
@@ -92,6 +103,7 @@ use wl_shell_render::icons::{self, NamedIcon};
 use wl_shell_render::worker::{Assets, PillRequest};
 use wl_shell_render::{files, shadow, text};
 use wl_shell_ui::cache::{self, Cache};
+use wl_shell_ui::card::{self, Card, Content, Preview};
 use wl_shell_ui::shapes::{self, Axis, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub};
 
@@ -268,6 +280,9 @@ pub struct Match {
     pub matched: Vec<Range<usize>>,
     /// What a file match has besides.
     pub file: Option<FileMatch>,
+    /// The window (its ID) whose capture it shows instead of its icon,
+    /// once there is a frame (`set_previews`).
+    pub window: Option<String>,
 }
 
 /// A file match.
@@ -588,8 +603,26 @@ impl Ringed {
 struct RingSubs {
     icon: Sub,
     old: Sub,
+    /// A window's capture and its shadow, in place of `icon`.
+    card: Card,
+    /// `card` shows something (so it is cleared once).
+    card_shown: bool,
     /// The match's name, beside its icon.
     label: Line,
+}
+
+/// A card's shadow sides, and the card size they were rendered for.
+type CardShadow = ((f64, f64), [Option<Shape>; 4]);
+
+/// Where a window `aspect` wide (of its height) goes in a square icon
+/// `rect`: as large as fits, centered.
+fn fit(rect: Rect, aspect: f64) -> Rect {
+    let (w, h) = match aspect >= 1.0 {
+        true => (rect.w, rect.w / aspect),
+        false => (rect.h * aspect, rect.h),
+    };
+    let (cx, cy) = rect.center();
+    Rect::new(cx - w / 2.0, cy - h / 2.0, w, h)
 }
 
 /// The opened app's icon on its way to the dock.
@@ -717,6 +750,12 @@ struct Attached {
 pub struct LauncherView {
     // Field order is drop order: children before their parent surface.
     ring_subs: Vec<RingSubs>,
+    /// Captures of the subject's windows (Windows…), while it is an app
+    /// with several; their frames show on the ring in their matches'
+    /// place of an icon. After the subsurfaces that show them.
+    previews: Vec<Preview>,
+    /// Capture them live while on the ring (else one frame each).
+    live: bool,
     /// The context pill's icons: the subject's, then the crumbs'.
     pinned_subs: Vec<Sub>,
     fly_sub: Sub,
@@ -834,6 +873,8 @@ impl LauncherView {
         layer.commit();
         Ok(Self {
             ring_subs: Vec::new(),
+            previews: Vec::new(),
+            live: false,
             pinned_subs: Vec::new(),
             fly_sub,
             panel,
@@ -1241,6 +1282,8 @@ impl LauncherView {
         }
         if depth == 0 {
             self.pill_in.retarget(0.0);
+            // Back in the search: the subject's windows aren't needed.
+            self.previews.clear();
         }
         self.slide_texts(-1.0);
         self.ring.clear();
@@ -1307,8 +1350,10 @@ impl LauncherView {
         // one in front.
         let old_front = self.selected().unwrap_or(0);
         let n_old = self.ring.len();
-        let old: Vec<IconKey> = (0..n_old)
-            .map(|k| self.ring[(k + old_front) % n_old].key.clone())
+        // A window's preview counts: its app's other windows share its icon.
+        let old: Vec<(IconKey, Option<String>)> = (0..n_old)
+            .map(|k| &self.ring[(k + old_front) % n_old])
+            .map(|r| (r.key.clone(), r.m.window.clone()))
             .collect();
         let matches: Vec<Match> = matches.into_iter().take(slots).collect();
         let n = matches.len();
@@ -1319,19 +1364,22 @@ impl LauncherView {
                 let (key, standin) =
                     Self::icon_keys(attached, &m, self.scale, &self.file_icons, false);
                 let prev = old.get((i + n - front) % n).cloned();
-                let same = prev.as_ref() == Some(&key);
+                let same = prev.as_ref() == Some(&(key.clone(), m.window.clone()));
                 let mut fade = Spring::new(if same { 1.0 } else { 0.0 }, FADE_RESPONSE);
                 fade.retarget(1.0);
                 Ringed {
                     m,
                     key,
                     standin,
-                    old: prev.filter(|_| !same),
+                    // A window's card has no icon to fade out: the new
+                    // one only fades in.
+                    old: (prev.filter(|(_, window)| !same && window.is_none())).map(|(key, _)| key),
                     fade,
                 }
             })
             .collect();
         self.ring = ring;
+        self.sync_live();
         match front {
             0 if !self.rolled => self.roll.snap(0.0),
             _ => {
@@ -1506,13 +1554,23 @@ impl LauncherView {
     /// At least `n` ring slots' subsurfaces.
     fn grow_ring_subs(&mut self, n: usize) {
         while self.ring_subs.len() < n {
-            let sub = || Sub::new(&self.g, self.layer.wl_surface(), &self.no_input, &self.qh);
+            let (g, parent) = (&self.g, self.layer.wl_surface());
+            let sub = || Sub::new(g, parent, &self.no_input, &self.qh);
+            let card =
+                (card::cards(g, parent, &self.no_input, 1, &self.qh).pop()).expect("one card");
             let subs = RingSubs {
                 icon: sub(),
                 old: sub(),
+                card,
+                card_shown: false,
                 label: Line::pill(sub()),
             };
+            // Each goes right below the texts, so the last is on top: the
+            // card over the icon, the old icon over both (it fades out).
             subs.icon.place_below(&self.ring_below);
+            for s in subs.card.shadow.iter().chain([&subs.card.preview]) {
+                s.place_below(&self.ring_below);
+            }
             subs.old.place_below(&self.ring_below);
             subs.label.sub.place_below(&self.ring_below);
             self.ring_subs.push(subs);
@@ -1539,6 +1597,97 @@ impl LauncherView {
         self.kick();
     }
 
+    // -- window previews -------------------------------------------------------
+
+    /// Capture `windows` (their IDs and handles) for the subject's
+    /// Windows…, `live` while on the ring; captures of other windows go.
+    /// Empty: none (no previews, or the subject isn't such an app).
+    pub fn set_previews(&mut self, windows: Vec<(String, ExtForeignToplevelHandleV1)>, live: bool) {
+        self.live = live;
+        self.previews
+            .retain(|p| windows.iter().any(|(id, _)| *id == p.window));
+        for (id, handle) in windows {
+            if !self.previews.iter().any(|p| p.window == id) {
+                // One frame first: it goes live once it is on the ring.
+                let p = Preview::new(id, &handle, &self.g, false, &self.qh);
+                self.previews.push(p);
+            }
+        }
+        self.sync_live();
+        self.kick();
+    }
+
+    /// Capture the windows on the ring live (with `live`), and pause the
+    /// rest after the frame they have.
+    fn sync_live(&mut self) {
+        let ring = &self.ring;
+        for p in &mut self.previews {
+            let shown = ring.iter().any(|r| r.m.window.as_ref() == Some(&p.window));
+            p.set_live(self.live && shown && !self.closing, &self.g, &self.qh);
+        }
+    }
+
+    pub fn has_capture(&self, id: CaptureId) -> bool {
+        self.previews.iter().any(|p| p.id == id)
+    }
+
+    /// An event of capture `id`: a new frame shows at the next one.
+    pub fn capture_update(
+        &mut self,
+        id: CaptureId,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
+    ) {
+        let Some(p) = self.previews.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        let update = p.update(&self.g, &self.qh, f);
+        let window = p.window.clone();
+        let shown = (self.ring.iter()).any(|r| r.m.window.as_ref() == Some(&window));
+        if shown && (update.shown || update.resized) {
+            self.kick();
+        }
+    }
+
+    /// The cards' shadows for the windows on the ring with a frame: each
+    /// rendered for its card at the front's size (and scaled with it).
+    fn card_shadows(&self, front: f64) -> HashMap<String, CardShadow> {
+        let mut shadows = HashMap::new();
+        let Some(shadow) = (self.attached.as_ref()).and_then(|a| a.style.icon_shadow) else {
+            return shadows;
+        };
+        // As the icons' shadow, so cards and icons look alike.
+        let settings = shadow::Settings {
+            color: shadow.color,
+            softness: shadow.softness as f64,
+            spread: 0,
+            offset: shadow.offset,
+        };
+        let mut cache = self.cache.borrow_mut();
+        let square = Rect::new(0.0, 0.0, front, front);
+        for r in &self.ring {
+            let Some(p) = (r.m.window.as_ref())
+                .and_then(|w| self.previews.iter().find(|p| p.window == *w))
+                .filter(|p| p.frame().is_some())
+            else {
+                continue;
+            };
+            let card = fit(
+                square,
+                card::aspect(p.aspect().unwrap_or(card::DEFAULT_ASPECT)),
+            );
+            let size = (card.w.round().max(1.0), card.h.round().max(1.0));
+            let sides = (cache).card_shadow(
+                &self.g,
+                (size.0 as i32, size.1 as i32),
+                settings,
+                self.scale,
+                &self.qh,
+            );
+            shadows.insert(p.window.clone(), (size, sides));
+        }
+        shadows
+    }
+
     // -- closing ---------------------------------------------------------------
 
     pub fn closing(&self) -> bool {
@@ -1553,6 +1702,7 @@ impl LauncherView {
             return;
         }
         self.closing = true;
+        self.sync_live();
         self.layer
             .set_keyboard_interactivity(KeyboardInteractivity::None);
         (self.layer.wl_surface()).set_input_region(Some(self.no_input.wl_region()));
@@ -1771,6 +1921,7 @@ impl LauncherView {
         let n = self.ring.len();
         self.grow_ring_subs(n.max(1));
         self.grow_pinned_subs(self.pinned.len());
+        let card_shadows = self.card_shadows(drum.front);
         let cache = self.cache.borrow();
         let fly_key = self.fly.as_ref().map(|f| f.key.clone());
         self.hits.clear();
@@ -1785,6 +1936,9 @@ impl LauncherView {
                 subs.icon.clear();
                 subs.old.clear();
                 subs.label.sub.clear();
+                if std::mem::take(&mut subs.card_shown) {
+                    subs.card.clear();
+                }
                 continue;
             };
             let t = drum::position(i, self.roll.value, n);
@@ -1807,9 +1961,35 @@ impl LauncherView {
                 Some((buffer, pad)) => sub.present(Some(&buffer), rect.outset(pad * size), a),
                 None => sub.clear(),
             };
-            match flying {
-                true => subs.icon.clear(),
-                false => place(&mut subs.icon, r.icon(&cache), alpha * fade),
+            // A window shows its capture, once it has a frame, as a card
+            // fitted into the icon's square; else (and flying) its icon.
+            let preview = (r.m.window.as_ref())
+                .and_then(|w| self.previews.iter_mut().find(|p| p.window == *w))
+                .filter(|p| p.frame().is_some() && !flying);
+            match preview {
+                Some(preview) => {
+                    let shadow = card_shadows.get(&preview.window);
+                    let aspect = card::aspect(preview.aspect().unwrap_or(card::DEFAULT_ASPECT));
+                    let card = fit(rect, aspect);
+                    let rendered = shadow.map_or((card.w, card.h), |(size, _)| *size);
+                    let content = Content::Preview {
+                        preview: Some(preview),
+                        placeholder: &self.transparent,
+                    };
+                    let (sides, a) = (shadow.map(|(_, s)| s), alpha * fade);
+                    (subs.card).place(Some(content), card, sides, rendered, scale, a, None);
+                    subs.card_shown = true;
+                    subs.icon.clear();
+                }
+                None => {
+                    if std::mem::take(&mut subs.card_shown) {
+                        subs.card.clear();
+                    }
+                    match flying {
+                        true => subs.icon.clear(),
+                        false => place(&mut subs.icon, r.icon(&cache), alpha * fade),
+                    }
+                }
             }
             match (&r.old, flying) {
                 (Some(old), false) => {
@@ -2109,6 +2289,16 @@ mod tests {
             bar_rect(&s, 5000.0, 1920.0, 1080.0).w,
             1920.0 - 2.0 * s.margin
         );
+    }
+
+    #[test]
+    fn a_window_fits_into_the_icons_square() {
+        let square = Rect::new(10.0, 20.0, 80.0, 80.0);
+        // Wide: as wide as the icon, centered top to bottom.
+        assert_eq!(fit(square, 2.0), Rect::new(10.0, 40.0, 80.0, 40.0));
+        // Tall: as tall, centered across.
+        assert_eq!(fit(square, 0.5), Rect::new(30.0, 20.0, 40.0, 80.0));
+        assert_eq!(fit(square, 1.0), square);
     }
 
     #[test]

@@ -76,10 +76,11 @@
 //!
 //! Tab on a file match asks the worker for its type (once per launcher
 //! session), then enters its actions (actions.rs) as a level of the
-//! launcher; Tab on an app enters its actions at once (Keep in Dock).
-//! The level's query filters them (`rank_choices`). Running one opens
-//! a path with `open-command`, opens the file with an app (Open with…,
-//! recorded in the history), pins or unpins, or enters its choices. An app
+//! launcher; Tab on an app enters its actions at once (its dock menu's,
+//! but its windows). The level's query filters them (`rank_choices`).
+//! Running one opens a path with `open-command`, opens the file with an
+//! app (Open with…, recorded in the history), launches or runs an app's
+//! action, pins or unpins, closes windows, or enters its choices. An app
 //! picked for a query is learned (history.rs), and comes first for that
 //! query and its prefixes from then on.
 
@@ -124,7 +125,7 @@ use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
 use crate::actions::{self, Does, FileType, Icon, Subject};
-use crate::config::{Config, FolderView, LauncherEnter, Windows};
+use crate::config::{Config, FolderView, LauncherEnter, Previews, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
 use crate::filesearch::{self, FileSearch, Found};
@@ -216,6 +217,23 @@ struct PendingWith {
     path: PathBuf,
 }
 
+/// What the launcher runs for an app (its actions), once it gave up the
+/// keyboard, so a new window gets it.
+struct PendingApp {
+    /// The app as the dock knows it.
+    app_id: String,
+    run: AppRun,
+    /// What the launcher's client is told.
+    picked: String,
+}
+
+enum AppRun {
+    Desktop(DesktopAction),
+    Command(String),
+    NewWindow,
+    Activate(String),
+}
+
 /// The launcher's file search, from the trigger until the launcher
 /// closes. Dropping it cancels the walk and frees the items.
 struct Files {
@@ -262,6 +280,7 @@ fn file_match(search: &mut FileSearch, root: &Path, home: Option<&Path>, found: 
         named: Vec::new(),
         matched: parts.name_matched,
         file: Some(file),
+        window: None,
         id: found.rel,
     }
 }
@@ -365,6 +384,8 @@ pub struct WlDock {
     /// A folder the launcher opens a terminal in, and the path its
     /// client is told; run once it gave up the keyboard.
     pending_terminal: Option<(PathBuf, String)>,
+    /// An app's action the launcher runs.
+    pending_app: Option<PendingApp>,
     files: Option<Files>,
     /// Files' types for the launcher's actions, for its session.
     file_types: HashMap<PathBuf, FileType>,
@@ -436,6 +457,7 @@ impl WlDock {
             pending_path: None,
             pending_with: None,
             pending_terminal: None,
+            pending_app: None,
             files: None,
             file_types: HashMap::new(),
             pending_tab: None,
@@ -755,6 +777,7 @@ impl WlDock {
                 named: Vec::new(),
                 matched: search.highlight(&a.name, query),
                 file: None,
+                window: None,
             })
             .collect();
         launcher.set_matches(matches);
@@ -782,7 +805,7 @@ impl WlDock {
             .map(|i| &level.choices[i])
             .map(|c| {
                 let (icon, app, named) = match &c.icon {
-                    Icon::App(id) => {
+                    Icon::App(id) | Icon::Window { app: id, .. } => {
                         let entry = apps.iter().find(|a| a.id == *id).map(|a| &a.entry);
                         (
                             entry.and_then(|e| e.icon.clone()),
@@ -791,6 +814,12 @@ impl WlDock {
                         )
                     }
                     Icon::Names(names) => (None, None, names.clone()),
+                    // The icon key falls back to the app's own.
+                    Icon::Entry { app, icon } => (icon.clone(), Some(app.clone()), Vec::new()),
+                };
+                let window = match &c.icon {
+                    Icon::Window { window, .. } => Some(window.clone()),
+                    _ => None,
                 };
                 Match {
                     id: c.id.clone(),
@@ -800,6 +829,7 @@ impl WlDock {
                     named,
                     matched: search.highlight(&c.name, &query),
                     file: None,
+                    window,
                 }
             })
             .collect();
@@ -1066,9 +1096,18 @@ impl WlDock {
                     return;
                 };
                 let app_id = self.dock_app_id(core, app);
+                // As the dock's menu (`menu_groups`).
+                let config = self.config.app(&app_id);
                 let subject = Subject::App(actions::App {
                     id: app.id.clone(),
                     name: app.name.clone(),
+                    desktop: match config.is_none_or(|a| a.desktop_actions) {
+                        true => app.entry.actions.clone(),
+                        false => Vec::new(),
+                    },
+                    commands: config.map_or_else(Vec::new, |a| a.actions.clone()),
+                    windows: Self::launcher_windows(core, &app_id),
+                    launchable: self.launch_command(&app_id, Some(&app.entry)).is_ok(),
                 });
                 (subject, None, self.pins.contains(&Pin::App(app_id)), false)
             }
@@ -1095,10 +1134,24 @@ impl WlDock {
                 .trim()
                 .is_empty(),
             clipboard: core.dnd.available(),
+            close: self.config.integration.close_command.is_some(),
         };
         let level = actions::actions(&subject, &cx);
+        // Windows… shows the windows' captures: start them now (a frame
+        // each), so they are there by the time it is entered.
+        let previews = self.config.windows.previews;
+        let windows: Vec<(String, _)> = match &subject {
+            Subject::App(a) if a.windows.len() > 1 && previews != Previews::Off => {
+                (core.toplevels().into_iter())
+                    .filter(|(_, t)| a.windows.iter().any(|w| w.id == t.identifier))
+                    .map(|(handle, t)| (t.identifier, handle))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         self.pending_tab = None;
         if let Some(l) = &mut self.launcher {
+            l.set_previews(windows, previews == Previews::Live);
             l.enter(level);
         }
         self.rank_choices();
@@ -1196,6 +1249,22 @@ impl WlDock {
                 self.finish_launcher(core, picked);
                 self.keep(Pin::App(app_id), pinned);
             }
+            Does::Desktop { app, action } => {
+                self.launcher_runs(core, &app, AppRun::Desktop(action), picked);
+            }
+            Does::Command { app, command } => {
+                self.launcher_runs(core, &app, AppRun::Command(command), picked);
+            }
+            Does::NewWindow(app) => self.launcher_runs(core, &app, AppRun::NewWindow, picked),
+            Does::Activate { app, window } => {
+                self.launcher_runs(core, &app, AppRun::Activate(window), picked);
+            }
+            Does::Close(ids) => {
+                self.finish_launcher(core, picked);
+                for id in ids {
+                    self.close_window(core, &id);
+                }
+            }
             Does::Trash(path) => {
                 self.finish_launcher(core, picked);
                 let paths = std::slice::from_ref(&path);
@@ -1206,6 +1275,28 @@ impl WlDock {
                 }
             }
         }
+    }
+
+    /// Close the launcher and run `run` for the app `app` (a desktop ID)
+    /// once it gave up the keyboard, as the app itself would be: a new
+    /// window gets it.
+    fn launcher_runs(&mut self, core: &Core<Self>, app: &str, run: AppRun, picked: String) {
+        let Some(app) = self.apps.iter().find(|a| a.id == app).cloned() else {
+            return;
+        };
+        let app_id = self.dock_app_id(core, &app);
+        // Launching needs its entry, which the index has.
+        if !matches!(self.entries.get(&app_id), Some(Some(_))) {
+            self.entries.insert(app_id.clone(), Some(app.entry.clone()));
+        }
+        // A command needn't open anything: no icon flies for it.
+        let opened = (!matches!(run, AppRun::Command(_))).then(|| app_id.clone());
+        self.close_launcher(core, opened);
+        self.pending_app = Some(PendingApp {
+            app_id,
+            run,
+            picked,
+        });
     }
 
     /// Close the launcher after an action that opens nothing, and tell
@@ -1299,7 +1390,8 @@ impl WlDock {
         let pending = self.pending_open.is_some()
             || self.pending_path.is_some()
             || self.pending_with.is_some()
-            || self.pending_terminal.is_some();
+            || self.pending_terminal.is_some()
+            || self.pending_app.is_some();
         // The compositor has given the keyboard back before the app is
         // activated (or the file opened), so the app keeps it.
         if pending && let Err(e) = core.conn.roundtrip() {
@@ -1325,6 +1417,22 @@ impl WlDock {
             self.open_with(core, &with);
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(with.path.to_string_lossy().into_owned()));
+            }
+        }
+        if let Some(PendingApp {
+            app_id,
+            run,
+            picked,
+        }) = self.pending_app.take()
+        {
+            match run {
+                AppRun::Desktop(action) => self.launch_action(core, &app_id, &action),
+                AppRun::Command(command) => self.app_command(core, &app_id, &command, "action"),
+                AppRun::NewWindow => self.launch(core, &app_id),
+                AppRun::Activate(window) => self.activate(core, &window),
+            }
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(picked));
             }
         }
         if let Some((dir, picked)) = self.pending_terminal.take() {
@@ -2055,6 +2163,20 @@ impl WlDock {
             }
             None => warn!("no state directory: pins are not kept"),
         }
+    }
+
+    /// `app_id`'s windows for the launcher's actions, the most recently
+    /// focused first.
+    fn launcher_windows(core: &Core<Self>, app_id: &str) -> Vec<actions::Window> {
+        let mut windows: Vec<actions::Window> = (Self::toplevels(core, None).into_iter())
+            .filter(|t| t.app_id == app_id)
+            .map(|t| actions::Window {
+                id: t.identifier,
+                title: t.title,
+            })
+            .collect();
+        core.mru.sort(&mut windows, |w| &w.id);
+        windows
     }
 
     /// The IDs of `app_id`'s windows, and the most recent of them.
@@ -2796,8 +2918,11 @@ impl Program for WlDock {
         id: CaptureId,
         f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
     ) {
-        // Events of captures a dock dropped find nothing.
-        if let Some(dock) = self.docks.iter_mut().find(|d| d.has_capture(id)) {
+        // Events of captures a dock (or the launcher) dropped find
+        // nothing.
+        if let Some(l) = (self.launcher.as_mut()).filter(|l| l.has_capture(id)) {
+            l.capture_update(id, f);
+        } else if let Some(dock) = self.docks.iter_mut().find(|d| d.has_capture(id)) {
             dock.capture_update(id, f);
         }
     }

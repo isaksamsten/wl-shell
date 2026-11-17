@@ -26,17 +26,31 @@
 //! - **Keep in Dock** (Remove from Dock, if it is): folders only.
 //! - **Move to Trash**: `trash-command`, unless it is in the Trash.
 //!
-//! For apps:
+//! For apps, as in the dock's menu (menu.rs), in this order:
 //!
+//! - **Windows…**, with several: its windows, by title, the most recently
+//!   focused first; Enter activates one.
+//! - The desktop entry's actions (`[Desktop Action …]`, e.g. New Private
+//!   Window), unless the app's `desktop-actions` is off.
+//! - The app actions of its `[app.<id>]` table (`when = "running"` ones
+//!   only while it has windows).
 //! - **Keep in Dock** (Remove from Dock, if it is).
+//! - **New Window**, while it has windows and can be launched.
+//! - **Close** (Close All Windows, with several) while it has windows,
+//!   with `close-command`.
+//!
+//! The desktop and `[app.<id>]` actions aren't in a table: they are the
+//! app's own. Windows… is the table `APP_WINDOWS`, ahead of them; the
+//! rest is `APP_ACTIONS`, after them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use wl_shell_render::files::FOLDER_ICONS;
-use wl_shell_render::icons::IndexedApp;
+use wl_shell_render::icons::{DesktopAction, IndexedApp};
 use wl_shell_render::mimeapps::MimeApps;
 
+use crate::config::{AppAction, When};
 use crate::trash::EMPTY_ICON;
 
 /// What the actions act on.
@@ -59,6 +73,31 @@ pub struct App {
     /// Its desktop ID (without `.desktop`).
     pub id: String,
     pub name: String,
+    /// Its desktop entry's actions to offer (none if turned off).
+    pub desktop: Vec<DesktopAction>,
+    /// The actions of its `[app.<id>]` table.
+    pub commands: Vec<AppAction>,
+    /// Its windows, the most recently focused first.
+    pub windows: Vec<Window>,
+    /// It has a desktop entry or a launch command.
+    pub launchable: bool,
+}
+
+/// One of an app's windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub id: String,
+    pub title: String,
+}
+
+impl App {
+    fn running(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    fn window_ids(&self) -> Vec<String> {
+        self.windows.iter().map(|w| w.id.clone()).collect()
+    }
 }
 
 impl Subject {
@@ -98,6 +137,8 @@ pub struct Context<'a> {
     pub terminal: bool,
     /// Whether the clipboard can be set.
     pub clipboard: bool,
+    /// Whether there is a `close-command`.
+    pub close: bool,
 }
 
 impl Context<'_> {
@@ -114,6 +155,11 @@ pub enum Icon {
     Names(Vec<String>),
     /// The app's (a desktop ID).
     App(String),
+    /// An `Icon=` (a theme name or a path), else the app's.
+    Entry { app: String, icon: Option<String> },
+    /// The window's capture (its ID), the app's (a desktop ID) icon until
+    /// it has a frame or without previews.
+    Window { app: String, window: String },
 }
 
 /// What a choice does.
@@ -132,6 +178,18 @@ pub enum Does {
     /// Keep the app (a desktop ID) in the dock (true) or not; closes the
     /// launcher.
     PinApp { app: String, pinned: bool },
+    /// Launch the app's (a desktop ID) desktop action; closes the
+    /// launcher.
+    Desktop { app: String, action: DesktopAction },
+    /// Run an `[app.<id>]` action's command for the app (a desktop ID);
+    /// closes the launcher.
+    Command { app: String, command: String },
+    /// Launch the app (a desktop ID) again; closes the launcher.
+    NewWindow(String),
+    /// Close these windows (with `close-command`); closes the launcher.
+    Close(Vec<String>),
+    /// Activate the app's (a desktop ID) window; closes the launcher.
+    Activate { app: String, window: String },
     /// `trash-command` on the path; closes the launcher.
     Trash(PathBuf),
     /// Further choices, a level deeper.
@@ -266,17 +324,52 @@ const FILE_ACTIONS: &[Action<File>] = &[
     },
 ];
 
-/// An app's actions, in the order they are shown.
-const APP_ACTIONS: &[Action<App>] = &[Action {
-    id: "pin",
-    name: |_, cx| keep_name(cx),
-    icon: |_, cx| keep_icon(cx),
-    applies: |_, _| true,
-    does: |a, cx| Does::PinApp {
-        app: a.id.clone(),
-        pinned: !cx.pinned,
+/// An app's actions ahead of its own.
+const APP_WINDOWS: &[Action<App>] = &[Action {
+    id: "windows",
+    name: |_, _| "Windows…".into(),
+    icon: |_, _| names(&["preferences-system-windows", "window", "view-grid"]),
+    // One is what Enter on the app activates already.
+    applies: |a, _| a.windows.len() > 1,
+    does: |a, _| {
+        Does::Choose(Level {
+            name: "Windows".into(),
+            placeholder: "Windows".into(),
+            choices: windows(a),
+        })
     },
 }];
+
+/// An app's actions, in the order they are shown, after its own.
+const APP_ACTIONS: &[Action<App>] = &[
+    Action {
+        id: "pin",
+        name: |_, cx| keep_name(cx),
+        icon: |_, cx| keep_icon(cx),
+        applies: |_, _| true,
+        does: |a, cx| Does::PinApp {
+            app: a.id.clone(),
+            pinned: !cx.pinned,
+        },
+    },
+    Action {
+        id: "new-window",
+        name: |_, _| "New Window".into(),
+        icon: |_, _| names(&["window-new", "list-add", "document-new"]),
+        applies: |a, _| a.running() && a.launchable,
+        does: |a, _| Does::NewWindow(a.id.clone()),
+    },
+    Action {
+        id: "close",
+        name: |a, _| match a.windows.len() {
+            1 => "Close".into(),
+            _ => "Close All Windows".into(),
+        },
+        icon: |_, _| names(&["window-close", "application-exit", "process-stop"]),
+        applies: |a, cx| cx.close && a.running(),
+        does: |a, _| Does::Close(a.window_ids()),
+    },
+];
 
 /// `path`'s directory, if it has one.
 fn parent(path: &Path) -> Option<&Path> {
@@ -295,13 +388,83 @@ fn terminal_dir(file: &File) -> Option<&Path> {
 pub fn actions(subject: &Subject, cx: &Context) -> Level {
     let choices = match subject {
         Subject::File(f) => choices(FILE_ACTIONS, f, cx),
-        Subject::App(a) => choices(APP_ACTIONS, a, cx),
+        Subject::App(a) => {
+            let mut all = choices(APP_WINDOWS, a, cx);
+            all.extend(desktop_actions(a));
+            all.extend(commands(a));
+            all.extend(choices(APP_ACTIONS, a, cx));
+            all
+        }
     };
     Level {
         name: subject.name(),
         placeholder: choices.first().map(|c| c.name.clone()).unwrap_or_default(),
         choices,
     }
+}
+
+/// `app`'s windows, in its order (the most recently focused first), by
+/// title (an untitled one by the app's name).
+fn windows(app: &App) -> Vec<Choice> {
+    (app.windows.iter())
+        .map(|w| Choice {
+            id: format!("window:{}", w.id),
+            name: match w.title.trim() {
+                "" => app.name.clone(),
+                title => title.to_string(),
+            },
+            icon: Icon::Window {
+                app: app.id.clone(),
+                window: w.id.clone(),
+            },
+            does: Does::Activate {
+                app: app.id.clone(),
+                window: w.id.clone(),
+            },
+        })
+        .collect()
+}
+
+/// `app`'s desktop actions. Their IDs are prefixed, so they never meet
+/// the table's.
+fn desktop_actions(app: &App) -> Vec<Choice> {
+    (app.desktop.iter())
+        .map(|a| Choice {
+            id: format!("desktop:{}", a.id),
+            name: a.name.clone(),
+            icon: Icon::Entry {
+                app: app.id.clone(),
+                icon: a.icon.clone(),
+            },
+            does: Does::Desktop {
+                app: app.id.clone(),
+                action: a.clone(),
+            },
+        })
+        .collect()
+}
+
+/// `app`'s `[app.<id>]` actions that can run now, as the menu's: named,
+/// with a command, and `when = "running"` ones only while it runs.
+/// Their IDs are prefixed and numbered (names needn't be unique).
+fn commands(app: &App) -> Vec<Choice> {
+    (app.commands.iter())
+        .filter(|a| app.running() || a.when == When::Always)
+        .filter(|a| !a.name.trim().is_empty() && !a.command.trim().is_empty())
+        .enumerate()
+        .map(|(i, a)| Choice {
+            id: format!("command:{i}"),
+            name: a.name.trim().to_string(),
+            icon: Icon::Entry {
+                app: app.id.clone(),
+                icon: a.icon.clone(),
+            },
+            does: Does::Command {
+                app: app.id.clone(),
+                command: a.command.clone(),
+            },
+        })
+        .collect()
 }
 
 /// The entries of `table` that apply to `s`.
@@ -386,6 +549,7 @@ mod tests {
         pinned: bool,
         terminal: bool,
         clipboard: bool,
+        close: bool,
     }
 
     fn level(subject: &Subject, apps: &[IndexedApp], ft: &FileType) -> Level {
@@ -411,6 +575,7 @@ mod tests {
             pinned: env.pinned,
             terminal: env.terminal,
             clipboard: env.clipboard,
+            close: env.close,
         };
         actions(subject, &cx)
     }
@@ -420,6 +585,7 @@ mod tests {
         pinned: false,
         terminal: true,
         clipboard: true,
+        close: true,
     };
 
     fn does<'a>(level: &'a Level, id: &str) -> &'a Does {
@@ -608,13 +774,22 @@ mod tests {
         assert_eq!(ids(&l).last(), Some(&"trash"));
     }
 
+    /// Firefox, not running, with nothing of its own.
+    fn firefox() -> App {
+        App {
+            id: "firefox".into(),
+            name: "Firefox".into(),
+            desktop: Vec::new(),
+            commands: Vec::new(),
+            windows: Vec::new(),
+            launchable: true,
+        }
+    }
+
     #[test]
     fn keeping_an_app_in_the_dock() {
         let apps = apps();
-        let firefox = Subject::App(App {
-            id: "firefox".into(),
-            name: "Firefox".into(),
-        });
+        let firefox = Subject::App(firefox());
         let l = level_of(&firefox, &apps, None, ALL);
         assert_eq!(
             (l.name.as_str(), l.placeholder.as_str()),
@@ -637,5 +812,133 @@ mod tests {
         assert_eq!(l.choices[0].icon, unpin_icon);
         let (app, pinned) = ("firefox".into(), false);
         assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
+    }
+
+    #[test]
+    fn an_apps_desktop_actions_come_first() {
+        let apps = apps();
+        let action = |id: &str, name: &str, icon: Option<&str>| DesktopAction {
+            id: id.into(),
+            name: name.into(),
+            icon: icon.map(Into::into),
+            exec: format!("firefox --{id}"),
+        };
+        let private = action("private", "New Private Window", Some("private"));
+        let firefox = Subject::App(App {
+            desktop: vec![action("new-window", "New Window", None), private.clone()],
+            ..firefox()
+        });
+        let l = level_of(&firefox, &apps, None, ALL);
+        assert_eq!(ids(&l), ["desktop:new-window", "desktop:private", "pin"]);
+        // Tab, Enter runs the first.
+        assert_eq!(l.placeholder, "New Window");
+        let app = String::from("firefox");
+        assert_eq!(
+            does(&l, "desktop:private"),
+            &Does::Desktop {
+                app: app.clone(),
+                action: private
+            }
+        );
+        // Its own icon, else the app's.
+        let icon = |icon: Option<&str>| Icon::Entry {
+            app: app.clone(),
+            icon: icon.map(Into::into),
+        };
+        assert_eq!(l.choices[0].icon, icon(None));
+        assert_eq!(l.choices[1].icon, icon(Some("private")));
+    }
+
+    #[test]
+    fn an_apps_commands_and_windows() {
+        let apps = apps();
+        let command = |name: &str, when| AppAction {
+            name: name.into(),
+            command: format!("{name} {{app-id}}"),
+            icon: None,
+            when,
+        };
+        let stopped = App {
+            commands: vec![
+                command("profile", When::Always),
+                command("hide", When::Running),
+                // Nothing to run: never shown.
+                AppAction {
+                    command: " ".into(),
+                    ..command("blank", When::Always)
+                },
+            ],
+            ..firefox()
+        };
+        let l = level_of(&Subject::App(stopped.clone()), &apps, None, ALL);
+        // Not running: no running-only commands, New Window or Close.
+        assert_eq!(ids(&l), ["command:0", "pin"]);
+        assert_eq!(l.placeholder, "profile");
+        let app = String::from("firefox");
+        assert_eq!(
+            does(&l, "command:0"),
+            &Does::Command {
+                app: app.clone(),
+                command: "profile {app-id}".into()
+            }
+        );
+        // Running: all of it.
+        let one = App {
+            windows: vec![window("w1", "Inbox")],
+            ..stopped.clone()
+        };
+        let l = level_of(&Subject::App(one.clone()), &apps, None, ALL);
+        assert_eq!(
+            ids(&l),
+            ["command:0", "command:1", "pin", "new-window", "close"]
+        );
+        assert_eq!(does(&l, "new-window"), &Does::NewWindow(app));
+        let close = l.choices.iter().find(|c| c.id == "close").unwrap();
+        assert_eq!(close.name, "Close");
+        assert_eq!(close.does, Does::Close(vec!["w1".into()]));
+        let two = App {
+            windows: vec![window("w1", "Inbox"), window("w2", "")],
+            ..one.clone()
+        };
+        let l = level_of(&Subject::App(two.clone()), &apps, None, ALL);
+        let close = l.choices.iter().find(|c| c.id == "close").unwrap();
+        assert_eq!(close.name, "Close All Windows");
+        assert_eq!(close.does, Does::Close(vec!["w1".into(), "w2".into()]));
+        // With several, Windows… comes first.
+        assert_eq!(ids(&l)[0], "windows");
+        let Does::Choose(windows) = does(&l, "windows") else {
+            panic!("Windows… has choices");
+        };
+        assert_eq!(ids(windows), ["window:w1", "window:w2"]);
+        // An untitled one goes by the app's name.
+        let names: Vec<&str> = windows.choices.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Inbox", "Firefox"]);
+        let (app, window) = (String::from("firefox"), String::from("w2"));
+        assert_eq!(
+            windows.choices[1].icon,
+            Icon::Window {
+                app: app.clone(),
+                window: window.clone()
+            }
+        );
+        assert_eq!(windows.choices[1].does, Does::Activate { app, window });
+        // Without a launch, or `close-command`, those go.
+        let unlaunchable = App {
+            launchable: false,
+            ..one.clone()
+        };
+        let no_close = Env {
+            close: false,
+            ..ALL
+        };
+        let l = level_of(&Subject::App(unlaunchable), &apps, None, no_close);
+        assert_eq!(ids(&l), ["command:0", "command:1", "pin"]);
+    }
+
+    fn window(id: &str, title: &str) -> Window {
+        Window {
+            id: id.into(),
+            title: title.into(),
+        }
     }
 }

@@ -81,8 +81,13 @@ with… (Enter or Tab) lists the apps that take the file's type, from their
 `MimeType=` and your `mimeapps.list`, the default first, and adds its icon to
 the pill; Enter opens the file with the front one. Escape, Shift+Tab, or
 Backspace on an empty query go back a step, to where you were; clicking an icon
-in the pill goes back to where it was chosen. Tab on an app offers Keep in Dock
-(or Remove from Dock).
+in the pill goes back to where it was chosen. Tab on an app offers what its
+dock menu does: Windows… (with several: its windows by title, the most recent
+first, each shown as its live preview, or a still with `[windows] previews =
+"static"`, or the app's icon with `"off"`; Enter activates one), its desktop
+entry's actions (New Private Window and the like, unless `desktop-actions =
+false`), its `[app.<id>]` actions, Keep in Dock (or Remove from Dock), and
+while it runs New Window and Close (with `close-command`).
 
 ## Configuration
 
