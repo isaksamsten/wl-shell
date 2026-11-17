@@ -76,9 +76,10 @@
 //!
 //! Tab on a file match asks the worker for its type (once per launcher
 //! session), then enters its actions (actions.rs) as a level of the
-//! launcher; the level's query filters them (`rank_choices`). Running
-//! one opens a path with `open-command`, opens the file with an app
-//! (Open with…, recorded in the history), or enters its choices. An app
+//! launcher; Tab on an app enters its actions at once (Keep in Dock).
+//! The level's query filters them (`rank_choices`). Running one opens
+//! a path with `open-command`, opens the file with an app (Open with…,
+//! recorded in the history), pins or unpins, or enters its choices. An app
 //! picked for a query is learned (history.rs), and comes first for that
 //! query and its prefixes from then on.
 
@@ -934,7 +935,6 @@ impl WlDock {
         let trigger = self.config.launcher.files.trigger;
         let Some(l) = &mut self.launcher else { return };
         match launcher::act(key, l.depth(), l.query()) {
-            Act::Nothing => {}
             Act::Close => self.cancel_launcher(core),
             Act::Clear => {
                 l.query_mut().edit(&launcher::Key::Clear, trigger);
@@ -1018,8 +1018,8 @@ impl WlDock {
     }
 
     /// Tab on the launcher's match at ring index `index` (None: the
-    /// selection): a file's actions (once its type is known), or an
-    /// action's choices.
+    /// selection): an app's or a file's actions (a file's once its type
+    /// is known), or an action's choices.
     fn launcher_into(&mut self, core: &Core<Self>, index: Option<usize>) {
         let Some(l) = &mut self.launcher else { return };
         if let Some(i) = index {
@@ -1040,16 +1040,38 @@ impl WlDock {
             }
             return;
         }
-        let Some(f) = l.match_at(i).and_then(|m| m.file.clone()) else {
-            return; // apps have no actions (yet)
-        };
-        let Some(file_type) = self.file_types.get(&f.path) else {
-            // Its actions depend on its type: on the worker's answer.
-            if let Some(assets) = &self.assets {
-                assets.file_type(&f.path, f.dir);
-            }
-            self.pending_tab = Some(f.path);
+        let Some(m) = l.match_at(i).cloned() else {
             return;
+        };
+        let (subject, file_type, pinned, trash) = match &m.file {
+            Some(f) => {
+                let Some(file_type) = self.file_types.get(&f.path) else {
+                    // Its actions depend on its type: on the worker's answer.
+                    if let Some(assets) = &self.assets {
+                        assets.file_type(&f.path, f.dir);
+                    }
+                    self.pending_tab = Some(f.path.clone());
+                    return;
+                };
+                let subject = Subject::File(actions::File {
+                    path: f.path.clone(),
+                    dir: f.dir,
+                });
+                let pinned = f.dir && self.pins.contains(&pins::for_path(&f.path));
+                let trash = self.trash_takes(std::slice::from_ref(&f.path));
+                (subject, Some(file_type), pinned, trash)
+            }
+            None => {
+                let Some(app) = self.apps.iter().find(|a| a.id == m.id) else {
+                    return;
+                };
+                let app_id = self.dock_app_id(core, app);
+                let subject = Subject::App(actions::App {
+                    id: app.id.clone(),
+                    name: app.name.clone(),
+                });
+                (subject, None, self.pins.contains(&Pin::App(app_id)), false)
+            }
         };
         let now = history::now();
         let learn = self.config.launcher.history;
@@ -1060,16 +1082,12 @@ impl WlDock {
                 0.0
             }
         };
-        let subject = Subject::File {
-            path: f.path.clone(),
-            dir: f.dir,
-        };
         let cx = actions::Context {
             apps: &self.apps,
             file_type,
             history: &history,
-            trash: self.trash_takes(std::slice::from_ref(&f.path)),
-            pinned: f.dir && self.pins.contains(&pins::for_path(&f.path)),
+            trash,
+            pinned,
             terminal: !self
                 .config
                 .integration
@@ -1118,8 +1136,12 @@ impl WlDock {
         let Some(does) = choice.map(|c| c.does.clone()) else {
             return;
         };
-        let picked = (l.subject().and_then(|m| m.file.as_ref()))
-            .map(|f| f.path.to_string_lossy().into_owned())
+        // A file's path, or an app's desktop ID.
+        let picked = (l.subject())
+            .map(|m| match &m.file {
+                Some(f) => f.path.to_string_lossy().into_owned(),
+                None => m.id.clone(),
+            })
             .unwrap_or_default();
         match does {
             Does::Choose(_) => self.launcher_into(core, Some(i)),
@@ -1165,6 +1187,14 @@ impl WlDock {
             Does::Pin { path, pinned } => {
                 self.finish_launcher(core, picked);
                 self.keep(pins::for_path(&path), pinned);
+            }
+            Does::PinApp { app, pinned } => {
+                let Some(app) = self.apps.iter().find(|a| a.id == app).cloned() else {
+                    return;
+                };
+                let app_id = self.dock_app_id(core, &app);
+                self.finish_launcher(core, picked);
+                self.keep(Pin::App(app_id), pinned);
             }
             Does::Trash(path) => {
                 self.finish_launcher(core, picked);

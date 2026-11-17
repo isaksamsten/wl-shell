@@ -10,7 +10,7 @@
 //! | Ctrl+Enter                | the other of activating and launching      |
 //! | Up, Ctrl+N                | the next match: the drum rolls toward you  |
 //! | Down, Ctrl+P              | the previous match: the drum rolls back    |
-//! | Tab                       | a file's actions; an action's choices      |
+//! | Tab                       | a match's actions; an action's choices     |
 //! | Shift+Tab                 | back: out of a level, or files to apps     |
 //! | Escape                    | clear the query; with an empty one, close  |
 //!
@@ -20,11 +20,11 @@
 //! Shift+Tab, goes back to the apps with the query empty. A trigger typed
 //! in the file query is a plain character (nucleo's exact-match prefix).
 //!
-//! Tab on a file match enters its actions, a level with a query of its
-//! own (`Nav`), and Tab (or Enter) on an action with choices (Open
-//! with…) enters those. In a level, Escape, Shift+Tab, or Backspace on an
-//! empty query go back one level, restoring its query and selection
-//! (`act`). The caret is always at the end of the query.
+//! Tab on a match (a file or an app) enters its actions, a level with a
+//! query of its own (`Nav`), and Tab (or Enter) on an action with
+//! choices (Open with…) enters those. In a level, Escape, Shift+Tab, or
+//! Backspace on an empty query go back one level, restoring its query
+//! and selection (`act`). The caret is always at the end of the query.
 
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 use wl_shell_render::icons::fold;
@@ -171,7 +171,6 @@ impl Query {
 /// What a key does to the launcher, given how deep it is in levels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Act {
-    Nothing,
     /// Edit the query.
     Edit(Key),
     /// Clear the query.
@@ -197,8 +196,7 @@ pub fn act(key: Key, depth: usize, query: &Query) -> Act {
         Key::Open { other } => Act::Open { other },
         Key::Escape | Key::Back if depth > 0 => Act::Out,
         Key::Backspace | Key::DeleteWord if depth > 0 && query.is_empty() => Act::Out,
-        Key::Tab if depth > 0 || query.scope() == Scope::Files => Act::Into,
-        Key::Tab => Act::Nothing,
+        Key::Tab => Act::Into,
         Key::Escape if query.is_empty() => Act::Close,
         Key::Escape => Act::Clear,
         key => Act::Edit(key),
@@ -570,9 +568,9 @@ mod tests {
         // In files, Shift+Tab is an edit: back to the apps.
         assert_eq!(l.key(Key::Back), Act::Edit(Key::Back));
         assert_eq!(l.nav.query().scope(), Scope::Apps);
-        // Tab does nothing on an app.
-        assert_eq!(l.key(Key::Tab), Act::Nothing);
-        assert_eq!(l.nav.leave(), None);
+        // Tab on an app enters its actions too.
+        assert_eq!(l.key(Key::Tab), Act::Into);
+        assert_eq!(l.nav.depth(), 1);
     }
 
     #[test]

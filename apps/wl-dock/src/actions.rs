@@ -1,13 +1,14 @@
-//! What the launcher can do to a subject (Tab on a file match). Pure,
-//! unit tested; launcher.rs keeps the levels and app.rs runs the choice.
+//! What the launcher can do to a subject (Tab on a match: a file or an
+//! app). Pure, unit tested; launcher.rs keeps the levels and app.rs runs
+//! the choice.
 //!
-//! The actions are a table (`ACTIONS`), one entry each: an ID, a name,
-//! an icon (fixed, or looked up from the subject), whether it applies to
-//! a subject, and what it does, which is either something that closes
-//! the launcher (opening a path with `open-command`, or opening the file
-//! with an app) or a list of further choices, a level deeper. Adding an
-//! action is adding an entry; nothing else in the launcher knows the
-//! list.
+//! The actions are a table per kind of subject (`FILE_ACTIONS`,
+//! `APP_ACTIONS`), one entry each: an ID, a name, an icon (fixed, or
+//! looked up from the subject), whether it applies to a subject, and
+//! what it does, which is either something that closes the launcher
+//! (opening a path with `open-command`, or opening the file with an app)
+//! or a list of further choices, a level deeper. Adding an action is
+//! adding an entry; nothing else in the launcher knows the list.
 //!
 //! For files, in this order:
 //!
@@ -24,6 +25,10 @@
 //! - **Copy path** to the clipboard, if the compositor has one.
 //! - **Keep in Dock** (Remove from Dock, if it is): folders only.
 //! - **Move to Trash**: `trash-command`, unless it is in the Trash.
+//!
+//! For apps:
+//!
+//! - **Keep in Dock** (Remove from Dock, if it is).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,16 +42,33 @@ use crate::trash::EMPTY_ICON;
 /// What the actions act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
-    File { path: PathBuf, dir: bool },
+    File(File),
+    App(App),
+}
+
+/// A file or folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct File {
+    pub path: PathBuf,
+    pub dir: bool,
+}
+
+/// An installed app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct App {
+    /// Its desktop ID (without `.desktop`).
+    pub id: String,
+    pub name: String,
 }
 
 impl Subject {
-    /// Its name: the file's.
+    /// Its name: the file's, or the app's.
     pub fn name(&self) -> String {
         match self {
-            Subject::File { path, .. } => (path.file_name())
+            Subject::File(File { path, .. }) => (path.file_name())
                 .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy())
                 .into_owned(),
+            Subject::App(app) => app.name.clone(),
         }
     }
 }
@@ -64,8 +86,8 @@ pub struct FileType {
 pub struct Context<'a> {
     /// The installed apps.
     pub apps: &'a [IndexedApp],
-    /// The subject's type.
-    pub file_type: &'a FileType,
+    /// The subject's type; None for an app.
+    pub file_type: Option<&'a FileType>,
     /// What an app's history (by desktop ID) is worth, for ordering.
     pub history: &'a dyn Fn(&str) -> f64,
     /// Whether the Trash takes the subject (it isn't in it).
@@ -81,7 +103,7 @@ pub struct Context<'a> {
 impl Context<'_> {
     /// The apps that open the subject's type, the default first.
     fn candidates(&self) -> Vec<usize> {
-        (self.file_type.assoc).candidates(&self.file_type.types, self.apps)
+        (self.file_type).map_or_else(Vec::new, |ft| ft.assoc.candidates(&ft.types, self.apps))
     }
 }
 
@@ -107,6 +129,9 @@ pub enum Does {
     CopyPath(PathBuf),
     /// Keep the folder in the dock (true) or not; closes the launcher.
     Pin { path: PathBuf, pinned: bool },
+    /// Keep the app (a desktop ID) in the dock (true) or not; closes the
+    /// launcher.
+    PinApp { app: String, pinned: bool },
     /// `trash-command` on the path; closes the launcher.
     Trash(PathBuf),
     /// Further choices, a level deeper.
@@ -135,149 +160,161 @@ pub struct Level {
     pub choices: Vec<Choice>,
 }
 
-/// An entry of the table.
-struct Action {
+/// An entry of a table, for subjects `S`.
+struct Action<S> {
     id: &'static str,
-    name: fn(&Subject, &Context) -> String,
-    icon: fn(&Subject, &Context) -> Icon,
-    applies: fn(&Subject, &Context) -> bool,
-    does: fn(&Subject, &Context) -> Does,
+    name: fn(&S, &Context) -> String,
+    icon: fn(&S, &Context) -> Icon,
+    applies: fn(&S, &Context) -> bool,
+    does: fn(&S, &Context) -> Does,
 }
 
 fn names(names: &[&str]) -> Icon {
     Icon::Names(names.iter().map(|n| n.to_string()).collect())
 }
 
-/// The actions, in the order they are shown.
-const ACTIONS: &[Action] = &[
+/// Keep in Dock's name, for a file or an app.
+fn keep_name(cx: &Context) -> String {
+    match cx.pinned {
+        true => "Remove from Dock".into(),
+        false => "Keep in Dock".into(),
+    }
+}
+
+/// Keep in Dock's icon, for a file or an app.
+fn keep_icon(cx: &Context) -> Icon {
+    match cx.pinned {
+        true => names(&["view-unpin", "list-remove", "builtin:unpin"]),
+        false => names(&["view-pin", "pin", "builtin:pin"]),
+    }
+}
+
+/// A file's actions, in the order they are shown.
+const FILE_ACTIONS: &[Action<File>] = &[
     Action {
         id: "open",
-        name: |s, _| match s {
-            Subject::File { dir: true, .. } => "Open folder".into(),
-            Subject::File { .. } => "Open file".into(),
+        name: |f, _| match f.dir {
+            true => "Open folder".into(),
+            false => "Open file".into(),
         },
         // A folder's default app is the file manager, whose icon says
         // little: a folder instead.
-        icon: |s, cx| match (s, cx.candidates().first()) {
-            (Subject::File { dir: true, .. }, _) => names(&["folder-open", FOLDER_ICONS[0]]),
+        icon: |f, cx| match (f.dir, cx.candidates().first()) {
+            (true, _) => names(&["folder-open", FOLDER_ICONS[0]]),
             (_, Some(&i)) => Icon::App(cx.apps[i].id.clone()),
             (_, None) => names(&["document-open", "text-x-generic"]),
         },
         applies: |_, _| true,
-        does: |s, _| match s {
-            Subject::File { path, .. } => Does::Open(path.clone()),
-        },
+        does: |f, _| Does::Open(f.path.clone()),
     },
     Action {
         id: "open-with",
         name: |_, _| "Open with…".into(),
         icon: |_, _| names(&["document-open", "system-run", "application-x-executable"]),
-        applies: |s, cx| match s {
+        applies: |f, cx| match f.dir {
             // Something besides the file manager.
-            Subject::File { dir: true, .. } => cx.candidates().len() > 1,
-            Subject::File { .. } => !cx.candidates().is_empty(),
+            true => cx.candidates().len() > 1,
+            false => !cx.candidates().is_empty(),
         },
-        does: |s, cx| match s {
-            Subject::File { path, .. } => Does::Choose(Level {
+        does: |f, cx| {
+            Does::Choose(Level {
                 name: "Open with".into(),
                 placeholder: "Apps".into(),
-                choices: open_with(path, cx),
-            }),
+                choices: open_with(&f.path, cx),
+            })
         },
     },
     Action {
         id: "open-directory",
         name: |_, _| "Open containing directory".into(),
         icon: |_, _| names(&["folder-open", FOLDER_ICONS[0]]),
-        applies: |s, _| match s {
-            Subject::File { path, .. } => parent(path).is_some(),
-        },
-        does: |s, _| match s {
-            Subject::File { path, .. } => Does::Open(parent(path).unwrap_or(path).to_path_buf()),
-        },
+        applies: |f, _| parent(&f.path).is_some(),
+        does: |f, _| Does::Open(parent(&f.path).unwrap_or(&f.path).to_path_buf()),
     },
     Action {
         id: "open-terminal",
         name: |_, _| "Open terminal here".into(),
         icon: |_, _| names(&["utilities-terminal", "terminal", "org.gnome.Terminal"]),
-        applies: |s, cx| cx.terminal && terminal_dir(s).is_some(),
-        does: |s, _| match s {
-            Subject::File { path, .. } => {
-                Does::Terminal(terminal_dir(s).unwrap_or(path).to_path_buf())
-            }
-        },
+        applies: |f, cx| cx.terminal && terminal_dir(f).is_some(),
+        does: |f, _| Does::Terminal(terminal_dir(f).unwrap_or(&f.path).to_path_buf()),
     },
     Action {
         id: "copy-path",
         name: |_, _| "Copy path".into(),
         icon: |_, _| names(&["edit-copy", "xclipboard", "edit-copy-symbolic"]),
         applies: |_, cx| cx.clipboard,
-        does: |s, _| match s {
-            Subject::File { path, .. } => Does::CopyPath(path.clone()),
-        },
+        does: |f, _| Does::CopyPath(f.path.clone()),
     },
     Action {
         id: "pin",
-        name: |_, cx| match cx.pinned {
-            true => "Remove from Dock".into(),
-            false => "Keep in Dock".into(),
-        },
-        icon: |_, cx| match cx.pinned {
-            true => names(&["view-unpin", "list-remove", "builtin:unpin"]),
-            false => names(&["view-pin", "pin", "builtin:pin"]),
-        },
+        name: |_, cx| keep_name(cx),
+        icon: |_, cx| keep_icon(cx),
         // Only folders are kept.
-        applies: |s, _| matches!(s, Subject::File { dir: true, .. }),
-        does: |s, cx| match s {
-            Subject::File { path, .. } => Does::Pin {
-                path: path.clone(),
-                pinned: !cx.pinned,
-            },
+        applies: |f, _| f.dir,
+        does: |f, cx| Does::Pin {
+            path: f.path.clone(),
+            pinned: !cx.pinned,
         },
     },
     Action {
         id: "trash",
         name: |_, _| "Move to Trash".into(),
         icon: |_, _| names(&[EMPTY_ICON]),
-        applies: |s, cx| match s {
-            // Not the root.
-            Subject::File { path, .. } => cx.trash && parent(path).is_some(),
-        },
-        does: |s, _| match s {
-            Subject::File { path, .. } => Does::Trash(path.clone()),
-        },
+        // Not the root.
+        applies: |f, cx| cx.trash && parent(&f.path).is_some(),
+        does: |f, _| Does::Trash(f.path.clone()),
     },
 ];
+
+/// An app's actions, in the order they are shown.
+const APP_ACTIONS: &[Action<App>] = &[Action {
+    id: "pin",
+    name: |_, cx| keep_name(cx),
+    icon: |_, cx| keep_icon(cx),
+    applies: |_, _| true,
+    does: |a, cx| Does::PinApp {
+        app: a.id.clone(),
+        pinned: !cx.pinned,
+    },
+}];
 
 /// `path`'s directory, if it has one.
 fn parent(path: &Path) -> Option<&Path> {
     path.parent().filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Where a terminal opens for `subject`: a folder, or a file's directory.
-fn terminal_dir(subject: &Subject) -> Option<&Path> {
-    match subject {
-        Subject::File { path, dir: true } => Some(path),
-        Subject::File { path, .. } => parent(path),
+/// Where a terminal opens for `file`: a folder, or a file's directory.
+fn terminal_dir(file: &File) -> Option<&Path> {
+    match file.dir {
+        true => Some(&file.path),
+        false => parent(&file.path),
     }
 }
 
 /// The actions that apply to `subject`.
 pub fn actions(subject: &Subject, cx: &Context) -> Level {
-    let choices: Vec<Choice> = (ACTIONS.iter())
-        .filter(|a| (a.applies)(subject, cx))
-        .map(|a| Choice {
-            id: a.id.to_string(),
-            name: (a.name)(subject, cx),
-            icon: (a.icon)(subject, cx),
-            does: (a.does)(subject, cx),
-        })
-        .collect();
+    let choices = match subject {
+        Subject::File(f) => choices(FILE_ACTIONS, f, cx),
+        Subject::App(a) => choices(APP_ACTIONS, a, cx),
+    };
     Level {
         name: subject.name(),
         placeholder: choices.first().map(|c| c.name.clone()).unwrap_or_default(),
         choices,
     }
+}
+
+/// The entries of `table` that apply to `s`.
+fn choices<S>(table: &[Action<S>], s: &S, cx: &Context) -> Vec<Choice> {
+    (table.iter())
+        .filter(|a| (a.applies)(s, cx))
+        .map(|a| Choice {
+            id: a.id.to_string(),
+            name: (a.name)(s, cx),
+            icon: (a.icon)(s, cx),
+            does: (a.does)(s, cx),
+        })
+        .collect()
 }
 
 /// The apps that open `path`: the default first, then by history (ties
@@ -356,10 +393,19 @@ mod tests {
     }
 
     fn level_in(subject: &Subject, apps: &[IndexedApp], ft: &FileType, env: Env) -> Level {
+        level_of(subject, apps, Some(ft), env)
+    }
+
+    fn level_of(
+        subject: &Subject,
+        apps: &[IndexedApp],
+        file_type: Option<&FileType>,
+        env: Env,
+    ) -> Level {
         let history = |id: &str| if id == "xournal" { 5.0 } else { 0.0 };
         let cx = Context {
             apps,
-            file_type: ft,
+            file_type,
             history: &history,
             trash: env.trash,
             pinned: env.pinned,
@@ -386,10 +432,10 @@ mod tests {
     }
 
     fn file(path: &str, dir: bool) -> Subject {
-        Subject::File {
+        Subject::File(File {
             path: path.into(),
             dir,
-        }
+        })
     }
 
     const PDF_DEFAULT: &str = "[Default Applications]\napplication/pdf=firefox.desktop\n\
@@ -560,5 +606,36 @@ mod tests {
         assert_eq!(pin.does, Does::Pin { path, pinned });
         // The trash comes last.
         assert_eq!(ids(&l).last(), Some(&"trash"));
+    }
+
+    #[test]
+    fn keeping_an_app_in_the_dock() {
+        let apps = apps();
+        let firefox = Subject::App(App {
+            id: "firefox".into(),
+            name: "Firefox".into(),
+        });
+        let l = level_of(&firefox, &apps, None, ALL);
+        assert_eq!(
+            (l.name.as_str(), l.placeholder.as_str()),
+            ("Firefox", "Keep in Dock")
+        );
+        assert_eq!(ids(&l), ["pin"]);
+        let app = String::from("firefox");
+        let pinned = true;
+        assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
+        let pin_icon = super::names(&["view-pin", "pin", "builtin:pin"]);
+        assert_eq!(l.choices[0].icon, pin_icon);
+        // A kept one comes off.
+        let env = Env {
+            pinned: true,
+            ..ALL
+        };
+        let l = level_of(&firefox, &apps, None, env);
+        assert_eq!(l.choices[0].name, "Remove from Dock");
+        let unpin_icon = super::names(&["view-unpin", "list-remove", "builtin:unpin"]);
+        assert_eq!(l.choices[0].icon, unpin_icon);
+        let (app, pinned) = ("firefox".into(), false);
+        assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
     }
 }
