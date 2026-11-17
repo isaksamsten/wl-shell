@@ -23,18 +23,6 @@ and `ext-image-copy-capture-v1` (including when previews are off).
 Click an app to launch it or select its windows; middle-click launches another
 instance. Right-click for its menu. Drag icons to reorder pins.
 
-```sh
-wl-dock pin firefox
-wl-dock pin ~/Downloads
-wl-dock unpin firefox
-wl-dock pins
-```
-
-Pins live in `$XDG_STATE_HOME/wl-dock/pinned` (normally
-`~/.local/state/wl-dock/pinned`), one app ID or absolute/`~/` folder path per
-line. You can edit this file too; changes are picked up automatically. Folders
-appear after apps; individual files cannot be pinned.
-
 ### Launcher
 
 `wl-dock --launcher` turns a bottom dock into a search bar for apps. Bind it to
@@ -52,17 +40,14 @@ next one to the front, Down or Ctrl+P rolls back, and scrolling rolls it too.
 Enter activates the selected app's most recent window, or launches it if it
 isn't running; Ctrl+Enter does the other. Backspace, Ctrl+W and Ctrl+U delete a
 character, a word or everything. Escape clears the query, then closes the
-launcher, as do a click outside it and running `--launcher` again. It exits 0
-once something was opened and 1 otherwise.
+launcher, as do a click outside it and running `--launcher` again.
 
 Launches are recorded in `$XDG_STATE_HOME/wl-dock/history` to rank matches,
 and so is the app you picked for a query: it comes first for that query (and
 the start of it) next time. `launcher.history = false` turns both off.
 
 Start the query with `'` to search files instead, as in Alfred: `'plan`
-finds `PLAN.md`. There is no index; the launcher walks your home directory
-while you type and the best matches stream onto the drum, each with its
-thumbnail or type icon and its folder. The query uses
+finds files matching that. The query uses
 [nucleo's syntax](https://github.com/helix-editor/nucleo): spaces separate
 terms, `^` and `$` anchor, `!` excludes, and `'` asks for an exact substring
 (`''file.pdf`). Enter opens the selected file or folder with
@@ -71,28 +56,13 @@ file query, or Shift+Tab, goes back to the apps. Hidden files, `.gitignore`d
 files and `launcher.files.exclude` are skipped, symlinks aren't followed, and
 the walk stays on one file system.
 
-Tab on a file shows what you can do with it: its icon flies into a small pill
-above the bar's right end, with its name and folder, and the drum fills with
-Open file, Open with…, Open containing directory, Open terminal here
-(`open-terminal-command`, in a file's folder), Copy path, Keep in Dock (or
-Remove from Dock; folders only) and Move to Trash (`trash-command`). Type to
-filter them (`ow` finds Open with…) and press Enter to run the front one. Open
-with… (Enter or Tab) lists the apps that take the file's type, from their
-`MimeType=` and your `mimeapps.list`, the default first, and adds its icon to
-the pill; Enter opens the file with the front one. Escape, Shift+Tab, or
-Backspace on an empty query go back a step, to where you were; clicking an icon
-in the pill goes back to where it was chosen. Tab on an app offers what its
-dock menu does: Windows… (with several: its windows by title, the most recent
-first, each shown as its live preview, or a still with `[windows] previews =
-"static"`, or the app's icon with `"off"`; Enter activates one), its desktop
-entry's actions (New Private Window and the like, unless `desktop-actions =
-false`), its `[app.<id>]` actions, Keep in Dock (or Remove from Dock), and
-while it runs New Window and Close (with `close-command`).
+Tab on a file or application shows what you can do with it.
 
 ### Keyboard activation
 
-Holding Super, the number keys reach the first ten dock items, as on the
-Windows taskbar. Bind them to `wl-dock --activate N`, for example on niri:
+Holding Super (or another modifier), the number keys reach the first ten dock
+items, as on the Windows taskbar. Bind them to `wl-dock --activate N`, for
+example on niri:
 
 ```kdl
 Mod+1 { spawn "wl-dock" "--activate" "1"; }
@@ -101,9 +71,9 @@ Mod+2 { spawn "wl-dock" "--activate" "2"; }
 Mod+0 { spawn "wl-dock" "--activate" "0"; }
 ```
 
-Items are numbered 1–9, then 0, in dock order: the apps, then the folders (the
-Trash has no number). Super+N acts on item N: an app with one window is picked
-(nothing switches until you let go); an app with several opens its strip on its
+Items are numbered 1–9, then 0, in dock order: the apps, then the folders.
+Super+N acts on item N: an app with one window is picked (nothing switches
+until you let go); an app with several opens its strip on its
 previous window, and each further press of N moves to the next one, most
 recently used first (Shift+N goes back); an app that isn't running launches; a
 folder opens its popup with the first entry highlighted, and N again moves
@@ -112,13 +82,9 @@ activates the picked or highlighted window, or opens the highlighted entry;
 Escape closes without activating, Enter activates at once, and the arrow keys
 move the highlight.
 
-Nothing shows for quick switches: only once the modifier is held for
-`activate.delay` does the dock come out (if hidden), number its icons
-(`activate.badges = false` hides the numbers), magnify the item and open its
-strip. After a quick tap of an app with several windows, its strip opens and
-stays with the keyboard until Enter or Escape. `wl-dock --activate` without a
-number only shows the numbers, for compositors that can bind the modifier
-alone. The command exits as soon as the dock has the request.
+`wl-dock --activate` without a number only shows the numbers, for compositors
+that can bind the modifier alone. The command exits as soon as the dock has the
+request.
 
 ## Configuration
 
@@ -375,4 +341,3 @@ panel-color = "eeeeeecc"
 label-color = "202020"
 label-background = "eeeeeeee"
 ```
-
