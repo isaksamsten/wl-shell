@@ -613,6 +613,10 @@ impl MenuView {
         if let Some(bubble) = bubble {
             self.request_bubble(bubble);
         }
+        // A highlight set before (from the keyboard) shows from the start.
+        if let Some(i) = self.highlight.take() {
+            self.set_highlight(Some(i));
+        }
     }
 
     /// The bubble for `layout`, with its tail at `tail` along its edge
@@ -775,6 +779,17 @@ impl MenuView {
                 None => MenuInput::None,
             },
         }
+    }
+
+    /// Highlight the next row on, from the icon outward (back: toward
+    /// it), as Down (or Up over a bottom dock's stack) does; from none,
+    /// the first.
+    pub fn step(&mut self, back: bool) {
+        if self.closing || self.flash.is_some() {
+            return;
+        }
+        let next = menu::step(self.highlight, self.entries.len(), !back);
+        self.set_highlight(next);
     }
 
     /// Row `i` was picked: it flashes, then the menu fades out. A row that

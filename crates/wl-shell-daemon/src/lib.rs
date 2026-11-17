@@ -81,7 +81,8 @@ pub trait Daemon: Program {
 }
 
 /// Hand `req` to the running daemon and relay its answer: the picked ID on
-/// stdout and exit 0; exit 1 when cancelled or on errors.
+/// stdout and exit 0; exit 0 when done (nothing to wait for); exit 1 when
+/// cancelled or on errors.
 pub fn client(req: &impl Request) -> ExitCode {
     let name = wl_shell_log::name();
     client_to(
@@ -121,6 +122,7 @@ pub fn client_to(req: &impl Request, missing: &str) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Ok(Reply::Cancelled) => return ExitCode::FAILURE,
+            Ok(Reply::Done) => return ExitCode::SUCCESS,
             Ok(Reply::Error(m)) => return fail(&m),
             Err(e) => return fail(&format!("daemon: {e}")),
         }

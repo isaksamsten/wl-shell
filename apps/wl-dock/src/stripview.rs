@@ -705,6 +705,27 @@ impl StripView {
         }
     }
 
+    /// The highlighted card's window.
+    pub fn highlighted(&self) -> Option<&str> {
+        let i = self.highlight?;
+        self.windows.get(i).map(|w| w.id.as_str())
+    }
+
+    /// Highlight the card of window `id` (scrolled into view).
+    pub fn highlight_window(&mut self, id: &str) {
+        if self.closing {
+            return;
+        }
+        let Some(i) = self.windows.iter().position(|w| w.id == id) else {
+            return;
+        };
+        if i < self.layout.len() {
+            self.set_highlight(Some(i));
+            let s = self.layout.reveal(i, self.scroll.target);
+            self.scroll.retarget(s);
+        }
+    }
+
     fn set_highlight(&mut self, highlight: Option<usize>) {
         if highlight == self.highlight {
             return;

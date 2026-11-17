@@ -77,11 +77,19 @@
 //! label says what a drop does, and folders that can be pinned open a
 //! gap among the folders, labelled over the gap. A hidden dock comes back
 //! for a drag on its trigger band and stays while the drag is over it.
+//!
+//! Keyboard activation (activate.rs, driven by app.rs): while it is on,
+//! the numbered items show their number in a badge at the icon's corner
+//! (a dot and a worker line, on subsurfaces above the icons), the dock
+//! comes out if it is hidden, and the item acted on magnifies as if
+//! hovered. Its strip and its folders' popups open without a grab; the
+//! highlight steps through the strip's windows in MRU order.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -120,6 +128,7 @@ use wl_shell_ui::card::{self, Preview};
 use wl_shell_ui::shapes::{self, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
+use crate::activate;
 use crate::app::WlDock;
 use crate::autohide;
 use crate::config::{Config, DockLayer, DockLayout, FolderView, Indicator, Position, Previews};
@@ -158,6 +167,40 @@ const GAP_LABEL: &str = "\0gap";
 const MISSING_ALPHA: f64 = 0.4;
 /// What a stack leaves free at the output's far edge (or both ends).
 const STACK_ROOM: f64 = 32.0;
+/// How far a badge's center is in from the icon's corner, in badge sizes.
+const BADGE_INSET: f64 = 0.3;
+
+/// Tags of badge requests, unique in the process.
+fn next_tag() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 50);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How the badges look.
+#[derive(Clone, Debug, PartialEq)]
+struct BadgeStyle {
+    /// The digit's.
+    text: text::Style,
+    /// The dot's diameter.
+    size: f64,
+    background: u32,
+}
+
+/// One badge's digit, rendered by the worker.
+struct BadgeText {
+    tag: u64,
+    request: PillRequest,
+    /// The rendered line and its logical size.
+    pill: Option<(WlBuffer, f64, f64)>,
+}
+
+impl Drop for BadgeText {
+    fn drop(&mut self) {
+        if let Some((buffer, ..)) = self.pill.take() {
+            buffer.destroy();
+        }
+    }
+}
 
 /// Everything a dock takes from the config, for its output.
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +238,8 @@ pub struct Style {
     folder_icons: Vec<(PathBuf, String)>,
     /// The XDG user directories, for their folders' icons.
     user_dirs: UserDirs,
+    /// None: no badges during keyboard activation.
+    badge: Option<BadgeStyle>,
 }
 
 impl Style {
@@ -274,6 +319,11 @@ impl Style {
                 .filter_map(|(path, f)| Some((pins::expand(path), f.icon.clone()?)))
                 .collect(),
             user_dirs: UserDirs::load(),
+            badge: config.badge_style().map(|text| BadgeStyle {
+                size: (text::line_height(text.size) + 2) as f64,
+                background: theme.badge_background,
+                text,
+            }),
         }
     }
 
@@ -485,6 +535,9 @@ pub struct DockView {
     panel: [Sub; 3],
     /// Per slot, at least; extra ones stay hidden.
     slot_subs: Vec<SlotSubs>,
+    /// Per number, a badge's dot and digit, above the icons; made the
+    /// first time keyboard activation shows them.
+    badge_subs: Vec<(Sub, Sub)>,
     label_sub: Sub,
     /// The dragged (or flying) icon, on top.
     drag_sub: Sub,
@@ -518,6 +571,10 @@ pub struct DockView {
     ring_shape: Option<Shape>,
     /// The separator's line.
     separator_shape: Option<Shape>,
+    /// A badge's dot.
+    badge_shape: Option<Shape>,
+    /// The badges' digits, per number.
+    badge_texts: Vec<BadgeText>,
     /// The apps launching: their icons bounce.
     launching: Vec<String>,
     /// The input region last set.
@@ -581,6 +638,10 @@ pub struct DockView {
     popup: bool,
     /// The launcher is open on this dock's output.
     launcher: Option<Launcher>,
+    /// Keyboard activation is on, from this dock: the badges show.
+    keys: bool,
+    /// The badges' fade, 0 to 1.
+    badge_alpha: Spring,
 }
 
 impl DockView {
@@ -638,6 +699,7 @@ impl DockView {
             strip: None,
             panel,
             slot_subs: Vec::new(),
+            badge_subs: Vec::new(),
             label_sub,
             drag_sub,
             no_input,
@@ -663,6 +725,8 @@ impl DockView {
             active_dot_shapes: Vec::new(),
             ring_shape: None,
             separator_shape: None,
+            badge_shape: None,
+            badge_texts: Vec::new(),
             launching: Vec::new(),
             input: Vec::new(),
             pointer: 0.0,
@@ -692,6 +756,8 @@ impl DockView {
             incoming: None,
             popup: false,
             launcher: None,
+            keys: false,
+            badge_alpha: Spring::new(0.0, LABEL_RESPONSE),
         };
         dock.apply_size();
         dock.relayout();
@@ -799,10 +865,15 @@ impl DockView {
         }
         let qh = &self.qh;
         let parent = self.layer.wl_surface();
+        // Below the badges (if made yet) and the label.
+        let above = match self.badge_subs.first() {
+            Some((dot, _)) => dot.surface(),
+            None => self.label_sub.surface(),
+        };
         while self.slot_subs.len() < self.slots.len() {
             let sub = || {
                 let sub = Sub::new(&self.g, parent, &self.no_input, qh);
-                sub.place_below(self.label_sub.surface());
+                sub.place_below(above);
                 sub
             };
             let indicator = sub();
@@ -1003,6 +1074,139 @@ impl DockView {
             scale,
         };
         self.separator_shape = cache.shape(&self.g, line, &self.qh);
+        self.badge_shape = (self.style.badge.as_ref()).and_then(|b| {
+            let dot = ShapeKey::Dots {
+                count: 1,
+                size: b.size as i32,
+                color: b.background,
+                scale,
+            };
+            cache.shape(&self.g, dot, &self.qh)
+        });
+        drop(cache);
+        if self.keys || !self.badge_texts.is_empty() {
+            self.request_badges();
+        }
+    }
+
+    // -- keyboard activation -------------------------------------------------
+
+    /// Ask the worker for the badges' digits not rendered for the style
+    /// and scale yet. A badge shows its old digit until the new one is
+    /// there.
+    fn request_badges(&mut self) {
+        let Some(style) = self.style.badge.clone() else {
+            self.badge_texts.clear();
+            return;
+        };
+        for n in 1..=activate::MAX {
+            let request = PillRequest {
+                text: activate::label(n),
+                spans: Vec::new(),
+                max_width: (2.0 * style.size).ceil() as i32,
+                scale: self.scale,
+                style: style.text.clone(),
+            };
+            match self.badge_texts.get_mut(n - 1) {
+                Some(t) if t.request == request => {}
+                Some(t) => {
+                    t.tag = next_tag();
+                    t.request = request;
+                    self.assets.line(t.tag, t.request.clone());
+                }
+                None => {
+                    let tag = next_tag();
+                    self.assets.line(tag, request.clone());
+                    self.badge_texts.push(BadgeText {
+                        tag,
+                        request,
+                        pill: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Keyboard activation began on this dock: number the items, and come
+    /// out if hidden.
+    pub fn begin_keys(&mut self) {
+        self.keys = true;
+        if self.badge_subs.is_empty() {
+            // Above the icons, below the label.
+            let parent = self.layer.wl_surface();
+            for _ in 0..activate::MAX {
+                let sub = || {
+                    let sub = Sub::new(&self.g, parent, &self.no_input, &self.qh);
+                    sub.place_below(self.label_sub.surface());
+                    sub
+                };
+                let dot = sub();
+                let digit = sub();
+                self.badge_subs.push((dot, digit));
+            }
+        }
+        self.request_badges();
+        self.badge_alpha.retarget(1.0);
+        self.cancel_autohide_timer();
+        self.set_shown(true);
+        self.kick();
+    }
+
+    /// Keyboard activation ended: the badges go, and so does the
+    /// magnification unless the pointer (or a popup) holds it.
+    pub fn end_keys(&mut self, core: &Core<WlDock>) {
+        if !std::mem::replace(&mut self.keys, false) {
+            return;
+        }
+        self.badge_alpha.retarget(0.0);
+        if !self.pointer_in && !self.strip_open() && !self.menu_open() {
+            self.unhover(core);
+        }
+        self.sync_autohide();
+        self.kick();
+    }
+
+    /// Magnify the item `key` as if the pointer were on it.
+    pub fn point_at(&mut self, core: &Core<WlDock>, key: &str) {
+        if !self.configured || self.drag.is_some() || self.launcher.is_some() {
+            return;
+        }
+        let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == key) else {
+            return;
+        };
+        // At rest, the layout doesn't depend on the pointer.
+        let rest = self.lay(self.pointer, 0.0, true);
+        let Some(center) = rest.cell(i).map(|c| c.center) else {
+            return;
+        };
+        self.frozen = false;
+        self.pointer = center;
+        self.hover.retarget(1.0);
+        self.set_hovered(core, Some(key.to_string()));
+        self.kick();
+    }
+
+    /// The open strip's highlighted window.
+    pub fn strip_highlighted(&self) -> Option<&str> {
+        let strip = self.strip.as_ref().filter(|s| !s.closing())?;
+        strip.highlighted()
+    }
+
+    /// Highlight the open strip's card of window `id`.
+    pub fn strip_highlight(&mut self, id: &str) {
+        if let Some(strip) = self.strip.as_mut().filter(|s| !s.closing()) {
+            strip.highlight_window(id);
+            self.kick();
+        }
+    }
+
+    /// Highlight the open menu's (or folder popup's) next row (the
+    /// previous one, `back`).
+    pub fn menu_step(&mut self, back: bool) {
+        if let Some(menu) = self.menu.as_mut().filter(|m| !m.closing()) {
+            menu.step(back);
+            self.kick();
+        }
     }
 
     // -- pointer -----------------------------------------------------------
@@ -1612,8 +1816,11 @@ impl DockView {
     /// Start (or keep, or cancel) the timer for where autohide wants the
     /// dock, or show or hide it at once if there is no delay.
     fn sync_autohide(&mut self) {
-        let held =
-            self.strip_open() || self.menu_open() || self.drag.is_some() || self.launcher.is_some();
+        let held = self.strip_open()
+            || self.menu_open()
+            || self.drag.is_some()
+            || self.launcher.is_some()
+            || self.keys;
         // A drag from outside counts as the pointer.
         let pointer_in = self.pointer_in || self.incoming.is_some();
         let next = autohide::next(&self.style.autohide, self.showing(), pointer_in, held);
@@ -1830,6 +2037,7 @@ impl DockView {
             || self.fly.is_some()
             || !self.grow.settled()
             || (self.launcher.as_ref()).is_some_and(|l| !l.morph.settled())
+            || !self.badge_alpha.settled()
     }
 
     /// The frame callback: advance the springs and draw.
@@ -1842,6 +2050,7 @@ impl DockView {
         moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
         moving |= self.grow.advance(dt);
+        moving |= self.badge_alpha.advance(dt);
         if let Some(l) = &mut self.launcher {
             moving |= l.morph.advance(dt);
         }
@@ -1952,6 +2161,8 @@ impl DockView {
         let lifted = self.lifted().map(str::to_string);
         // Where the flying icon's slot has its icon.
         let mut landing = None;
+        // Each slot's icon as drawn, for the badges.
+        let mut icons: Vec<Option<Rect>> = vec![None; self.slots.len()];
         let cache = self.cache.borrow();
         for (i, subs) in self.slot_subs.iter_mut().enumerate() {
             let (Some(slot), Some(cell)) = (self.slots.get(i), laid.cell(i)) else {
@@ -1986,6 +2197,9 @@ impl DockView {
             let room = (frame.across() - m.icon_v() - d).max(0.0);
             let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
             let r = frame.rect(into(cell.center) - d / 2.0, m.icon_v() + hop - slide, d, d);
+            if let Some(at) = icons.get_mut(i) {
+                *at = Some(r);
+            }
             // The dragged or flying icon is drawn on its own, and so is the
             // one the launcher sends here.
             let landing_here = landing_app.as_deref() == Some(item.app_id.as_str());
@@ -2063,6 +2277,44 @@ impl DockView {
                 (self.drag_sub).present(cache.icon(&key).as_ref(), padded, seen);
             }
             _ => self.drag_sub.clear(),
+        }
+
+        // The numbers at the icons' corners, during keyboard activation:
+        // toward the output's middle from a right dock.
+        let badge_alpha = self.gate(self.badge_alpha.value) * seen * (1.0 - morph);
+        let numbered = match (badge_alpha > 0.0, &self.style.badge) {
+            (true, Some(_)) => activate::numbered(self.items()),
+            _ => Vec::new(),
+        };
+        let size = self.style.badge.as_ref().map_or(0.0, |b| b.size);
+        let inset = size * BADGE_INSET;
+        let left = self.style.layout.position == Position::Right;
+        for (k, (dot, digit)) in self.badge_subs.iter_mut().enumerate() {
+            let icon = (numbered.get(k))
+                .and_then(|key| {
+                    (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == *key)
+                })
+                .and_then(|i| icons.get(i).copied().flatten());
+            let Some(r) = icon else {
+                dot.clear();
+                digit.clear();
+                continue;
+            };
+            let cx = if left { r.x + inset } else { r.right() - inset };
+            let cy = r.y + inset;
+            let back = Rect::new(cx - size / 2.0, cy - size / 2.0, size, size);
+            dot.present(
+                self.badge_shape.as_ref().map(|s| &s.buffer),
+                back,
+                badge_alpha,
+            );
+            match self.badge_texts.get(k).and_then(|t| t.pill.as_ref()) {
+                Some((buffer, w, h)) => {
+                    let at = Rect::new((cx - w / 2.0).round(), (cy - h / 2.0).round(), *w, *h);
+                    digit.present(Some(buffer), at, badge_alpha);
+                }
+                None => digit.clear(),
+            }
         }
 
         // The label above (or beside) the hovered icon, following it.
@@ -2602,6 +2854,22 @@ impl DockView {
 
     /// A text from the worker; true if it was the strip's or the menu's.
     pub fn pill_ready(&mut self, tag: u64, request: &PillRequest, pill: &text::Pill) -> bool {
+        if let Some(t) = (self.badge_texts.iter_mut()).find(|t| t.tag == tag) {
+            if t.request != *request {
+                return false;
+            }
+            match cache::shm_buffer(&self.g, &pill.image, &self.qh) {
+                Ok(buffer) => {
+                    let size = (pill.width as f64, pill.height as f64);
+                    if let Some((old, ..)) = t.pill.replace((buffer, size.0, size.1)) {
+                        old.destroy();
+                    }
+                    self.kick();
+                }
+                Err(e) => warn!("badge buffer: {e}"),
+            }
+            return true;
+        }
         let ours = (self.strip.as_mut()).is_some_and(|s| s.pill_ready(tag, request, pill))
             || (self.menu.as_mut()).is_some_and(|m| m.pill_ready(tag, request, pill));
         if ours {

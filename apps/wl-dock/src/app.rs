@@ -83,6 +83,17 @@
 //! action, pins or unpins, closes windows, or enters its choices. An app
 //! picked for a query is learned (history.rs), and comes first for that
 //! query and its prefixes from then on.
+//!
+//! Keyboard activation (activate.rs, activateview.rs): `wl-dock
+//! --activate n` asks over the socket and is answered at once. The dock
+//! maps the activate surface, which takes the keyboard on the focused
+//! output; its `wl_surface.enter` picks the dock, whose item n is acted
+//! on (its window picked, launched, or its strip or folder popup opened
+//! without a grab). The keys and modifiers come through that surface: n
+//! again steps the highlight, another number switches items, and letting
+//! go of the modifiers held when the keyboard came activates the picked
+//! or highlighted window (or opens the entry). What it activates runs
+//! once the surface is gone, so the window gets the keyboard.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -95,7 +106,7 @@ use std::time::Duration;
 
 use smithay_client_toolkit::{
     seat::{
-        keyboard::KeyEvent,
+        keyboard::{KeyEvent, Modifiers},
         pointer::{AxisScroll, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind},
     },
     shell::{
@@ -125,6 +136,8 @@ use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
 use crate::actions::{self, Does, FileType, Icon, Subject};
+use crate::activate::{self, Press, Release};
+use crate::activateview::ActivateView;
 use crate::config::{Config, FolderView, LauncherEnter, Previews, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
@@ -140,13 +153,14 @@ use crate::launcherview::{
 use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin};
 use crate::search::Search;
-use crate::strip::Key;
+use crate::strip::{self, Key};
 use crate::trash;
 use crate::view::{DockView, MenuEvent, Offer, Style};
 
-/// How long the launcher waits for the compositor to say which output it
-/// is on before it takes the first bottom dock.
-const LAUNCHER_PLACE_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the launcher (or the activate surface) waits for the
+/// compositor to say which output it is on before it takes the first
+/// (bottom) dock.
+const PLACE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The mime type of dropped (and dragged out) files.
 const URI_LIST: &str = "text/uri-list";
@@ -191,9 +205,44 @@ struct Incoming {
 
 /// A folder's popup waiting for its listing.
 struct PendingFolder {
-    pressed: Pressed,
+    output: WlOutput,
+    /// The folder's key.
+    key: String,
+    /// The click's serial, for the popup's grab; None from the keyboard,
+    /// without a grab.
+    serial: Option<u32>,
     tag: u64,
     view: FolderView,
+    /// From the keyboard: highlight the first entry, then step on this
+    /// many more.
+    steps: Option<usize>,
+}
+
+/// Keyboard activation, while it is on.
+struct Keys {
+    view: ActivateView,
+    mode: activate::Mode,
+    /// The dock acting, once the surface's output is known.
+    output: Option<WlOutput>,
+    /// The item asked for before that, acted on then.
+    first: Option<usize>,
+    /// The window a press picked, or the strip's highlighted one: what
+    /// letting go activates.
+    window: Option<String>,
+    /// The item acted on, magnified once the dock shows the mode.
+    item: Option<String>,
+    /// The dock shows the mode (the badges, the magnification, the
+    /// strip): after `activate.delay`, so quick switches show nothing.
+    shown: bool,
+    /// Shows it when it fires.
+    timer: Option<RegistrationToken>,
+}
+
+/// What keyboard activation does once its surface gave up the keyboard,
+/// so the window gets it.
+enum KeysRun {
+    Activate(String),
+    Menu(String, Action),
 }
 
 /// An app the launcher opened, run once it gave up the keyboard.
@@ -397,6 +446,10 @@ pub struct WlDock {
     /// Launches, for ranking; None without a state directory.
     history_path: Option<PathBuf>,
     history: History,
+    /// Keyboard activation, while it is on.
+    keys: Option<Keys>,
+    /// What it activates or opens, once its surface is gone.
+    pending_keys: Vec<KeysRun>,
 }
 
 impl WlDock {
@@ -472,6 +525,8 @@ impl WlDock {
                 })
                 .unwrap_or_default(),
             history_path: history::path(),
+            keys: None,
+            pending_keys: Vec::new(),
         })
     }
 
@@ -633,6 +688,394 @@ impl WlDock {
         self.sync_accept(core);
         self.serve(core);
         self.launcher_after(core);
+        self.keys_after(core);
+    }
+
+    // -- keyboard activation -----------------------------------------------------
+
+    /// `--activate [n]`: start the mode (on item n, if any), or, while it
+    /// is on, press n.
+    fn activate_request(&mut self, core: &Core<Self>, n: Option<usize>) {
+        // The launcher has the keyboard.
+        if self.launcher.as_ref().is_some_and(|l| !l.closing()) {
+            return;
+        }
+        if let Some(keys) = &mut self.keys {
+            match (keys.output.is_some(), n) {
+                (true, Some(n)) => self.keys_press(core, n, false),
+                (false, Some(n)) => keys.first = Some(n),
+                (_, None) => {}
+            }
+            return;
+        }
+        if self.docks.is_empty() {
+            return;
+        }
+        let view = match ActivateView::new(core) {
+            Ok(view) => view,
+            Err(e) => return warn!("keyboard activation: {e}"),
+        };
+        self.close_popups(core);
+        self.cancel_drags();
+        self.keys = Some(Keys {
+            view,
+            mode: activate::Mode::default(),
+            output: None,
+            first: n,
+            window: None,
+            item: None,
+            shown: false,
+            timer: None,
+        });
+        // Should the compositor not say where it is, it takes the first
+        // dock.
+        let timer = core.timer(PLACE_TIMEOUT, |app: &mut Self, core| {
+            let unplaced = app.keys.as_ref().is_some_and(|k| k.output.is_none());
+            let first = app.docks.first().map(|d| d.output.clone());
+            if let (true, Some(output)) = (unplaced, first) {
+                app.attach_keys(core, &output);
+            }
+        });
+        if let Err(e) = timer {
+            warn!("{e}");
+        }
+    }
+
+    /// The activate surface is on `output`: its dock (else the first)
+    /// numbers its items and acts on the item asked for.
+    fn attach_keys(&mut self, core: &Core<Self>, output: &WlOutput) {
+        let Some(keys) = &mut self.keys else { return };
+        if keys.output.is_some() {
+            return;
+        }
+        let dock = (self.docks.iter())
+            .find(|d| d.output == *output)
+            .or(self.docks.first());
+        let Some(output) = dock.map(|d| d.output.clone()) else {
+            return self.end_keys(core);
+        };
+        keys.output = Some(output.clone());
+        if let Some(n) = keys.first.take() {
+            self.keys_press(core, n, false);
+        }
+        let Some(keys) = &mut self.keys else { return };
+        keys.mode.start();
+        // Shown once the modifier was held a moment: quick switches show
+        // nothing.
+        let delay = Duration::from_millis(self.config.activate.delay.into());
+        if delay.is_zero() {
+            self.keys_show(core);
+        } else {
+            let due = |app: &mut Self, core: &mut Core<Self>| {
+                if let Some(keys) = &mut app.keys {
+                    keys.timer = None;
+                }
+                app.keys_show(core);
+            };
+            match core.timer(delay, due) {
+                Ok(token) => keys.timer = Some(token),
+                Err(e) => {
+                    warn!("{e}");
+                    self.keys_show(core);
+                }
+            }
+        }
+        self.keys_due(core);
+    }
+
+    /// The delay passed (or a tap left something to use): the dock shows
+    /// the mode, with the strip or popup of the item acted on.
+    fn keys_show(&mut self, core: &Core<Self>) {
+        let Some(keys) = &mut self.keys else { return };
+        if let Some(token) = keys.timer.take() {
+            core.loop_handle.remove(token);
+        }
+        if std::mem::replace(&mut keys.shown, true) {
+            return;
+        }
+        let (open, item, window) = (keys.mode.open(), keys.item.clone(), keys.window.clone());
+        let Some(output) = keys.output.clone() else {
+            return;
+        };
+        let Some(dock) = self.dock_mut(&output) else {
+            return;
+        };
+        dock.begin_keys();
+        let Some(key) = item else { return };
+        dock.point_at(core, &key);
+        match open {
+            activate::Open::Strip => {
+                let opened = dock.open_strip(core, &key, None);
+                if let Some(id) = window.filter(|_| opened) {
+                    dock.strip_highlight(&id);
+                }
+                if !opened && let Some(keys) = &mut self.keys {
+                    keys.mode.closed();
+                }
+            }
+            activate::Open::Popup => {
+                let item = dock.item(&key).cloned();
+                if let Some(item) = item {
+                    self.list_folder(&item, &output, None, Some(0));
+                }
+            }
+            activate::Open::Window | activate::Open::Nothing => {}
+        }
+    }
+
+    /// Press item `n` (from 1) of the mode's dock, `back` with Shift.
+    fn keys_press(&mut self, core: &Core<Self>, n: usize, back: bool) {
+        let Some(output) = self.keys.as_ref().and_then(|k| k.output.clone()) else {
+            return;
+        };
+        let Some(dock) = self.docks.iter().find(|d| d.output == output) else {
+            return;
+        };
+        let key = (activate::numbered(dock.items()))
+            .get(n.wrapping_sub(1))
+            .cloned();
+        let item = key.as_deref().and_then(|k| dock.item(k)).cloned();
+        let subject = (item.as_ref()).map_or(activate::Subject::Nothing, |i| {
+            activate::Subject::of(i, dock.can_strip(i))
+        });
+        let Some(keys) = &mut self.keys else { return };
+        let open = keys.mode.open();
+        let press = keys.mode.press(n, subject, back);
+        let shown = keys.shown;
+        let (Some(key), Some(item)) = (key, item) else {
+            return;
+        };
+        // A new item: magnified (once shown), and the next to act on.
+        if !matches!(press, Press::Nothing | Press::Step { .. }) {
+            self.close_popups(core);
+            if let Some(keys) = &mut self.keys {
+                keys.item = Some(key.clone());
+                keys.window = None;
+            }
+            if shown && let Some(dock) = self.dock_mut(&output) {
+                dock.point_at(core, &key);
+            }
+        }
+        match press {
+            Press::Nothing => {}
+            Press::Step { back } => match open {
+                activate::Open::Strip => self.keys_step(core, &output, &item, back),
+                activate::Open::Popup => {
+                    // Still being listed: it steps on once it opens.
+                    let pending = (self.pending_folder.as_mut()).filter(|p| p.key == key);
+                    match pending.and_then(|p| p.steps.as_mut()) {
+                        Some(steps) if !back => *steps += 1,
+                        Some(steps) => *steps = steps.saturating_sub(1),
+                        None => {
+                            if let Some(dock) = self.dock_mut(&output) {
+                                dock.menu_step(back);
+                            }
+                        }
+                    }
+                }
+                activate::Open::Window | activate::Open::Nothing => {}
+            },
+            Press::Select => {
+                if let (Some(keys), Click::Activate(id)) = (&mut self.keys, item.click(&core.mru)) {
+                    keys.window = Some(id);
+                }
+            }
+            Press::Strip => {
+                // On the app's previous window, as a click does.
+                let ids: Vec<&str> = item.windows.iter().map(|w| w.id.as_str()).collect();
+                let focused = (core.focus_stream.running())
+                    .then(|| core.mru.first())
+                    .flatten();
+                let first = strip::first_highlight(&ids, &core.mru, focused);
+                let window = ids.get(first).map(|id| id.to_string());
+                if let Some(keys) = &mut self.keys {
+                    keys.window = window.clone();
+                }
+                if shown {
+                    let opened = self.dock_mut(&output).is_some_and(|dock| {
+                        let opened = dock.open_strip(core, &key, None);
+                        if let Some(id) = window.filter(|_| opened) {
+                            dock.strip_highlight(&id);
+                        }
+                        opened
+                    });
+                    if !opened && let Some(keys) = &mut self.keys {
+                        keys.mode.closed();
+                    }
+                }
+            }
+            Press::Launch => self.launch(core, &key),
+            Press::Popup => {
+                if shown {
+                    self.list_folder(&item, &output, None, Some(0));
+                }
+            }
+        }
+        self.keys_due(core);
+    }
+
+    /// Pressing the strip's item again: its next window in MRU order (the
+    /// previous one, `back`), from the one highlighted; in card order
+    /// without focus history.
+    fn keys_step(&mut self, core: &Core<Self>, output: &WlOutput, item: &Item, back: bool) {
+        let mut order: Vec<&str> = item.windows.iter().map(|w| w.id.as_str()).collect();
+        core.mru.sort(&mut order, |id| id);
+        let lit = (self.docks.iter())
+            .find(|d| d.output == *output)
+            .and_then(DockView::strip_highlighted)
+            .map(str::to_string);
+        let Some(keys) = &mut self.keys else { return };
+        let current = lit.or(keys.window.clone());
+        let next = activate::step(&order, current.as_deref(), back).map(str::to_string);
+        keys.window = next.clone();
+        if let (Some(id), Some(dock)) = (next, self.dock_mut(output)) {
+            dock.strip_highlight(&id);
+        }
+    }
+
+    /// A key on the activate surface.
+    fn keys_key(&mut self, core: &Core<Self>, event: &KeyEvent, repeat: bool) {
+        let shift = core.input.modifiers.shift;
+        let Some(key) = activate::Key::from(event.raw_code, event.keysym, shift) else {
+            return;
+        };
+        if repeat && !key.repeats() {
+            return;
+        }
+        let Some(keys) = &self.keys else { return };
+        let open = keys.mode.open();
+        let output = keys.output.clone();
+        match key {
+            activate::Key::Number { n, back } => self.keys_press(core, n, back),
+            activate::Key::Escape => self.cancel_keys(core),
+            activate::Key::Enter => {
+                let release = keys.mode.enter();
+                self.keys_release(core, release);
+            }
+            activate::Key::Arrow(arrow) => {
+                let Some(dock) = output.and_then(|o| self.dock_mut(&o)) else {
+                    return;
+                };
+                match (open, arrow) {
+                    (activate::Open::Strip, _) => {
+                        dock.strip_key(core, Key::Move(arrow));
+                    }
+                    (activate::Open::Popup, strip::Arrow::Up) => {
+                        dock.menu_key(core, MenuKey::Up);
+                    }
+                    (activate::Open::Popup, strip::Arrow::Down) => {
+                        dock.menu_key(core, MenuKey::Down);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The modifiers changed on the activate surface.
+    fn keys_modifiers(&mut self, core: &Core<Self>, modifiers: &Modifiers) {
+        if let Some(keys) = &mut self.keys {
+            keys.mode.modifiers(activate::Mods::from(modifiers));
+        }
+        self.keys_due(core);
+    }
+
+    /// Do what the mode does by itself now, if anything. A tap that left
+    /// a strip or popup to use shows it at once.
+    fn keys_due(&mut self, core: &Core<Self>) {
+        if let Some(release) = self.keys.as_mut().and_then(|k| k.mode.due()) {
+            return self.keys_release(core, release);
+        }
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.mode.kept() && !k.shown)
+        {
+            self.keys_show(core);
+        }
+    }
+
+    /// The mode ends: activate the picked window or the strip's
+    /// highlighted one (the one stepped to, if the strip isn't shown),
+    /// or open the popup's highlighted entry, or just end.
+    fn keys_release(&mut self, core: &Core<Self>, release: Release) {
+        let window = self.keys.as_ref().and_then(|k| k.window.clone());
+        let output = self.keys.as_ref().and_then(|k| k.output.clone());
+        let dock = output.and_then(|o| self.dock_mut(&o));
+        let run = match (release, dock) {
+            (Release::Window, _) => window.map(KeysRun::Activate),
+            (Release::Activate, Some(dock)) if dock.strip_highlighted().is_some() => {
+                dock.strip_key(core, Key::Activate).map(KeysRun::Activate)
+            }
+            (Release::Activate, _) => window.map(KeysRun::Activate),
+            (Release::Open, Some(dock)) => (dock.menu_key(core, MenuKey::Pick))
+                .map(|(app_id, action)| KeysRun::Menu(app_id, action)),
+            _ => None,
+        };
+        if run.is_none() {
+            self.close_popups(core);
+        }
+        self.end_keys(core);
+        self.pending_keys.extend(run);
+    }
+
+    /// Escape, or the keyboard went: close what the mode opened, and end
+    /// it.
+    fn cancel_keys(&mut self, core: &Core<Self>) {
+        if self.keys.is_some() {
+            self.close_popups(core);
+            self.end_keys(core);
+        }
+    }
+
+    /// End the mode: the badges go, and so does its surface, which gives
+    /// the keyboard back.
+    fn end_keys(&mut self, core: &Core<Self>) {
+        let Some(keys) = self.keys.take() else { return };
+        if let Some(token) = keys.timer {
+            core.loop_handle.remove(token);
+        }
+        if let Some(output) = &keys.output
+            && let Some(dock) = self.dock_mut(output)
+        {
+            dock.end_keys(core);
+        }
+        // A popup still being listed isn't wanted anymore.
+        if self
+            .pending_folder
+            .as_ref()
+            .is_some_and(|p| p.steps.is_some())
+        {
+            self.pending_folder = None;
+        }
+    }
+
+    /// After a dispatch: run what the mode activated or opened, now that
+    /// its surface is gone and the compositor gave the keyboard back.
+    fn keys_after(&mut self, core: &Core<Self>) {
+        if self.pending_keys.is_empty() {
+            return;
+        }
+        if let Err(e) = core.conn.roundtrip() {
+            warn!("{e}");
+        }
+        for run in std::mem::take(&mut self.pending_keys) {
+            match run {
+                KeysRun::Activate(id) => self.activate(core, &id),
+                KeysRun::Menu(app_id, action) => self.menu_action(core, &app_id, action),
+            }
+        }
+    }
+
+    /// A row of a menu was picked: do it now, or once keyboard activation
+    /// gave the keyboard back.
+    fn menu_pick(&mut self, core: &Core<Self>, app_id: String, action: Action) {
+        if self.keys.is_some() {
+            self.end_keys(core);
+            self.pending_keys.push(KeysRun::Menu(app_id, action));
+            return;
+        }
+        self.menu_action(core, &app_id, action);
     }
 
     // -- the launcher ------------------------------------------------------------
@@ -647,6 +1090,10 @@ impl WlDock {
                 SocketEvent::Request { client, req } => match req {
                     DockRequest::Nothing => client.answer(Reply::Error("nothing asked".into())),
                     DockRequest::Launcher => self.toggle_launcher(core, client),
+                    DockRequest::Activate(n) => {
+                        client.answer(Reply::Done);
+                        self.activate_request(core, n.map(usize::from));
+                    }
                 },
                 SocketEvent::Gone(id) => {
                     // Closing the client cancels.
@@ -661,6 +1108,7 @@ impl WlDock {
 
     /// `--launcher`: open the launcher, or close it if it is open.
     fn toggle_launcher(&mut self, core: &mut Core<Self>, client: Client) {
+        self.cancel_keys(core);
         if self.launcher.as_ref().is_some_and(|l| !l.closing()) {
             self.cancel_launcher(core);
             return client.answer(Reply::Cancelled);
@@ -683,7 +1131,7 @@ impl WlDock {
                 self.launcher_client = Some(client);
                 // Should the compositor not say where it is, it takes the
                 // first bottom dock.
-                let timer = core.timer(LAUNCHER_PLACE_TIMEOUT, |app: &mut Self, core| {
+                let timer = core.timer(PLACE_TIMEOUT, |app: &mut Self, core| {
                     let unplaced = app.launcher.as_ref().is_some_and(|l| l.output().is_none());
                     let first = app.docks.iter().find(|d| d.takes_launcher());
                     if let (true, Some(output)) = (unplaced, first.map(|d| d.output.clone())) {
@@ -1854,7 +2302,9 @@ impl WlDock {
             Click::Launch => self.launch(core, &item.app_id),
             Click::OpenTrash => self.open_trash(core),
             // The popup opens once the folder is listed.
-            Click::OpenFolder => return self.list_folder(item, pressed),
+            Click::OpenFolder => {
+                return self.list_folder(item, output, Some(pressed.serial), None);
+            }
             Click::Nothing => {}
         }
         self.release_keyboard(output);
@@ -1955,9 +2405,17 @@ impl WlDock {
         }
     }
 
-    /// Have the worker list the folder `item` that `pressed` clicked; its
-    /// popup opens when the listing arrives.
-    fn list_folder(&mut self, item: &Item, pressed: Pressed) {
+    /// Have the worker list the folder `item` on the dock on `output`,
+    /// clicked by the press with `serial` (None: from the keyboard, with
+    /// the first entry highlighted, stepped on `steps` more); its popup
+    /// opens when the listing arrives.
+    fn list_folder(
+        &mut self,
+        item: &Item,
+        output: &WlOutput,
+        serial: Option<u32>,
+        steps: Option<usize>,
+    ) {
         let (Some(pin), Some(assets)) = (item.folder(), &self.assets) else {
             return;
         };
@@ -1972,9 +2430,12 @@ impl WlDock {
             },
         );
         self.pending_folder = Some(PendingFolder {
-            pressed,
+            output: output.clone(),
+            key: item.app_id.clone(),
+            serial,
             tag,
             view: settings.view,
+            steps,
         });
     }
 
@@ -1993,7 +2454,7 @@ impl WlDock {
             warn!("{}: {e}", dir.display());
             Vec::new()
         });
-        let output = pending.pressed.output.clone();
+        let output = pending.output.clone();
         // Only one grabbing popup at a time: the others go at once.
         for dock in self.docks.iter_mut() {
             dock.drop_strip(core);
@@ -2001,12 +2462,27 @@ impl WlDock {
                 dock.drop_menu(core);
             }
         }
-        let grab = core.input.seat().map(|seat| (seat, pending.pressed.serial));
-        let key = pending.pressed.app_id.clone();
+        let grab = core.input.seat().zip(pending.serial);
+        let key = pending.key.clone();
         let opened = (self.dock_mut(&output))
             .is_some_and(|d| d.open_folder(core, &key, dir, &entries, pending.view, grab));
-        if !opened {
-            self.release_keyboard(&output);
+        match (opened, pending.steps) {
+            // From the keyboard: the first entry lit, and on.
+            (true, Some(steps)) => {
+                if let Some(dock) = self.dock_mut(&output) {
+                    for _ in 0..=steps {
+                        dock.menu_step(false);
+                    }
+                }
+            }
+            (true, None) => {}
+            (false, Some(_)) => {
+                if let Some(keys) = &mut self.keys {
+                    keys.mode.closed();
+                }
+                self.keys_due(core);
+            }
+            (false, None) => self.release_keyboard(&output),
         }
     }
 
@@ -2221,7 +2697,14 @@ impl WlDock {
         }
     }
 
+    /// Activate the window `id`; during keyboard activation, the mode
+    /// ends first and it is activated once the mode's surface is gone.
     fn activate(&mut self, core: &Core<Self>, id: &str) {
+        if self.keys.is_some() {
+            self.end_keys(core);
+            self.pending_keys.push(KeysRun::Activate(id.to_string()));
+            return;
+        }
         let Some(template) = self.config.integration.activate_command.as_deref() else {
             if !std::mem::replace(&mut self.warned_activate, true) {
                 warn!("set activate-command to focus windows from the dock");
@@ -2686,6 +3169,28 @@ impl Program for WlDock {
         self.rebuild(core, Some(handle));
     }
 
+    fn keyboard_leave(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
+        // Without the keyboard, the mode can't see the release.
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.view.surface() == surface)
+        {
+            self.cancel_keys(core);
+        }
+    }
+
+    fn modifiers(&mut self, core: &mut Core<Self>, modifiers: &Modifiers) {
+        let focus = core.input.keyboard_focus();
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|k| Some(k.view.surface()) == focus)
+        {
+            self.keys_modifiers(core, modifiers);
+        }
+    }
+
     fn focus_changed(&mut self, _: &mut Core<Self>) {
         if self.config.active_indicator {
             self.dirty = true;
@@ -2792,6 +3297,9 @@ impl Program for WlDock {
     }
 
     fn output_removed(&mut self, core: &mut Core<Self>, output: &WlOutput) {
+        if self.keys.as_ref().and_then(|k| k.output.as_ref()) == Some(output) {
+            self.cancel_keys(core);
+        }
         if self.launcher.as_ref().and_then(LauncherView::output) == Some(output) {
             self.cancel_launcher(core);
             self.drop_launcher();
@@ -2801,8 +3309,12 @@ impl Program for WlDock {
 
     /// The compositor closed a dock, e.g. because its output is going
     /// away. It comes back if the outputs or the config change. Closing
-    /// the launcher cancels it.
+    /// the launcher cancels it, and closing the activate surface ends
+    /// keyboard activation.
     fn layer_closed(&mut self, core: &mut Core<Self>, layer: &LayerSurface) {
+        if self.keys.as_ref().is_some_and(|k| k.view.is(layer)) {
+            self.cancel_keys(core);
+        }
         if self.launcher.as_ref().is_some_and(|l| l.is(layer)) {
             self.cancel_launcher(core);
             self.drop_launcher();
@@ -2817,6 +3329,9 @@ impl Program for WlDock {
         configure: LayerSurfaceConfigure,
     ) {
         let (width, height) = configure.new_size;
+        if let Some(keys) = (self.keys.as_mut()).filter(|k| k.view.is(layer)) {
+            keys.view.configure();
+        }
         if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.is(layer)) {
             launcher.configure(width, height);
         }
@@ -2834,9 +3349,16 @@ impl Program for WlDock {
         }
     }
 
-    /// The launcher's surface is on an output: the dock there takes it
-    /// over.
+    /// The launcher's (or the activate) surface is on an output: the dock
+    /// there takes it over (or acts).
     fn surface_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface, output: &WlOutput) {
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.view.surface() == surface)
+        {
+            self.attach_keys(core, output);
+        }
         if self
             .launcher
             .as_ref()
@@ -2876,8 +3398,16 @@ impl Program for WlDock {
     /// keyboard while they are open. Escape cancels a drag (the press gave
     /// the dock the keyboard).
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
-        // The launcher has the keyboard while it is open.
         let focus = core.input.keyboard_focus();
+        // Keyboard activation has the keyboard while it is on.
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|k| Some(k.view.surface()) == focus)
+        {
+            return self.keys_key(core, event, repeat);
+        }
+        // The launcher has the keyboard while it is open.
         if (self.launcher.as_ref()).is_some_and(|l| !l.closing() && Some(l.surface()) == focus) {
             return self.launcher_key(core, event, repeat);
         }
@@ -2947,7 +3477,7 @@ impl Program for WlDock {
         if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_menu_surface(&event.surface)) {
             let output = dock.output.clone();
             match dock.menu_pointer(core, event) {
-                Some(MenuEvent::Pick(app_id, action)) => self.menu_action(core, &app_id, action),
+                Some(MenuEvent::Pick(app_id, action)) => self.menu_pick(core, app_id, action),
                 Some(drag @ MenuEvent::DragOut { .. }) => self.drag_out(core, &output, drag),
                 None => {}
             }

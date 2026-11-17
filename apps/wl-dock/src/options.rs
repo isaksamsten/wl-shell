@@ -20,6 +20,18 @@ pub struct Options {
     #[arg(long, conflicts_with = "config")]
     pub launcher: bool,
 
+    /// Keyboard activation, for a compositor binding Super+N: act on dock
+    /// item N (1-9, and 0 or 10 for the tenth) while the modifier is
+    /// held. Without N, only show the items' numbers. Exits at once.
+    #[arg(
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        value_parser = clap::value_parser!(u8).range(0..=10),
+        conflicts_with_all = ["config", "launcher"],
+    )]
+    pub activate: Option<Option<u8>>,
+
     #[command(subcommand)]
     pub command: Option<Cmd>,
 }
@@ -54,6 +66,13 @@ impl Options {
             }
         })
     }
+
+    /// The item `--activate` asks for, if it was given: Some(None) to
+    /// only show the numbers; 0 is the tenth.
+    pub fn activate(&self) -> Option<Option<u8>> {
+        self.activate
+            .map(|n| n.map(|n| if n == 0 { 10 } else { n }))
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +101,20 @@ mod tests {
         assert!(!parse(&[]).unwrap().launcher);
         assert!(parse(&["--launcher", "--config", "c.toml"]).is_err());
         assert!(parse(&["--launcher", "pins"]).is_err());
+    }
+
+    #[test]
+    fn activate() {
+        let a = |args: &[&str]| parse(args).map(|o| o.activate());
+        assert_eq!(a(&[]).unwrap(), None);
+        assert_eq!(a(&["--activate"]).unwrap(), Some(None));
+        assert_eq!(a(&["--activate", "2"]).unwrap(), Some(Some(2)));
+        assert_eq!(a(&["--activate", "0"]).unwrap(), Some(Some(10)));
+        assert_eq!(a(&["--activate", "10"]).unwrap(), Some(Some(10)));
+        assert!(parse(&["--activate", "11"]).is_err());
+        assert!(parse(&["--activate", "x"]).is_err());
+        assert!(parse(&["--activate", "1", "--launcher"]).is_err());
+        assert!(parse(&["--activate", "pins"]).is_err());
     }
 
     #[test]

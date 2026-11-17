@@ -29,6 +29,12 @@
 #active-indicator = true         # Needs integration.mru-event-stream
 #drag-threshold = 6              # Pixels before an icon starts dragging; 1–100
 
+# --- Keyboard activation (wl-dock --activate N) ---------------------------
+
+#[activate]
+#badges = true                   # Number the items while the modifier is held
+#delay = 150                     # Before the dock shows anything (quick switches don't); 0–2000
+
 # --- Autohide -------------------------------------------------------------
 
 #[autohide]
@@ -147,6 +153,8 @@
 #launcher-completion = "ffffff8c"
 #launcher-match = "81d0ffff"
 #launcher-caret = "ffffffcc"
+#badge-color = "1f1f1fff"        # Item numbers during wl-dock --activate
+#badge-background = "ffffffe6"
 
 # Any appearance key can be overridden for just light or dark mode (example):
 #[appearance.light]

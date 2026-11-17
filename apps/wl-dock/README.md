@@ -89,6 +89,37 @@ entry's actions (New Private Window and the like, unless `desktop-actions =
 false`), its `[app.<id>]` actions, Keep in Dock (or Remove from Dock), and
 while it runs New Window and Close (with `close-command`).
 
+### Keyboard activation
+
+Holding Super, the number keys reach the first ten dock items, as on the
+Windows taskbar. Bind them to `wl-dock --activate N`, for example on niri:
+
+```kdl
+Mod+1 { spawn "wl-dock" "--activate" "1"; }
+Mod+2 { spawn "wl-dock" "--activate" "2"; }
+// …
+Mod+0 { spawn "wl-dock" "--activate" "0"; }
+```
+
+Items are numbered 1–9, then 0, in dock order: the apps, then the folders (the
+Trash has no number). Super+N acts on item N: an app with one window is picked
+(nothing switches until you let go); an app with several opens its strip on its
+previous window, and each further press of N moves to the next one, most
+recently used first (Shift+N goes back); an app that isn't running launches; a
+folder opens its popup with the first entry highlighted, and N again moves
+down. Another number switches to its item. Letting go of the modifier
+activates the picked or highlighted window, or opens the highlighted entry;
+Escape closes without activating, Enter activates at once, and the arrow keys
+move the highlight.
+
+Nothing shows for quick switches: only once the modifier is held for
+`activate.delay` does the dock come out (if hidden), number its icons
+(`activate.badges = false` hides the numbers), magnify the item and open its
+strip. After a quick tap of an app with several windows, its strip opens and
+stays with the keyboard until Enter or Escape. `wl-dock --activate` without a
+number only shows the numbers, for compositors that can bind the modifier
+alone. The command exits as soon as the dock has the request.
+
 ## Configuration
 
 Edit `~/.config/wl-dock/config.toml` (or
@@ -126,6 +157,10 @@ labels = true
 indicator = "dot"               # dot, dots (up to three), none
 active-indicator = true         # Needs mru-event-stream
 drag-threshold = 6              # Pixels before an icon starts dragging; 1–100
+
+[activate]
+badges = true                  # Number the items during --activate
+delay = 150                    # Before anything shows; 0–2000
 
 [autohide]
 enabled = false
@@ -326,6 +361,9 @@ launcher-text = "ffffffff"
 launcher-completion = "ffffff8c" # The rest of the selected name, and the placeholder
 launcher-match = "81d0ffff" # What the query matched
 launcher-caret = "ffffffcc"
+
+badge-color = "1f1f1fff"        # Item numbers during --activate
+badge-background = "ffffffe6"
 ```
 
 Put any theme keys in `[appearance.dark]` or `[appearance.light]` to override

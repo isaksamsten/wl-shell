@@ -55,6 +55,8 @@ pub struct Config {
     pub active_indicator: bool,
     #[serde(deserialize_with = "drag_threshold")]
     pub drag_threshold: u32,
+    /// Keyboard activation (`wl-dock --activate`).
+    pub activate: ActivateConfig,
     pub autohide: AutohideConfig,
     pub windows: WindowsConfig,
     pub launcher: LauncherConfig,
@@ -85,6 +87,7 @@ impl Default for Config {
             indicator: Indicator::default(),
             active_indicator: true,
             drag_threshold: 6,
+            activate: ActivateConfig::default(),
             autohide: AutohideConfig::default(),
             windows: WindowsConfig::default(),
             launcher: LauncherConfig::default(),
@@ -95,6 +98,27 @@ impl Default for Config {
             output: BTreeMap::new(),
             app: BTreeMap::new(),
             folder: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ActivateConfig {
+    /// Number the items while the mode is on.
+    pub badges: bool,
+    /// How long the modifier is held before the dock shows the mode (the
+    /// badges, the strip, the magnification), so quick switching shows
+    /// nothing.
+    #[serde(deserialize_with = "activate_delay")]
+    pub delay: u32,
+}
+
+impl Default for ActivateConfig {
+    fn default() -> Self {
+        Self {
+            badges: true,
+            delay: 150,
         }
     }
 }
@@ -734,6 +758,12 @@ pub struct Theme {
     pub launcher_match: u32,
     #[serde(deserialize_with = "de::color")]
     pub launcher_caret: u32,
+    /// The digit of an item's badge during keyboard activation.
+    #[serde(deserialize_with = "de::color")]
+    pub badge_color: u32,
+    /// The badge's dot.
+    #[serde(deserialize_with = "de::color")]
+    pub badge_background: u32,
 }
 
 impl Default for Theme {
@@ -779,6 +809,8 @@ impl Default for Theme {
             launcher_completion: 0xffffff8c,
             launcher_match: 0x81d0ffff,
             launcher_caret: 0xffffffcc,
+            badge_color: 0x1f1f1fff,
+            badge_background: 0xffffffe6,
         }
     }
 }
@@ -852,6 +884,17 @@ impl Config {
             color: self.theme().title_color,
             background: self.theme().title_background,
         }
+    }
+
+    /// The style of the badges' digits (on their dot, without a pill);
+    /// None if badges are off.
+    pub fn badge_style(&self) -> Option<text::Style> {
+        self.activate.badges.then(|| text::Style {
+            font: self.appearance.font.clone(),
+            size: (self.appearance.font_size as f64 * 0.85).round().max(8.0),
+            color: self.theme().badge_color,
+            background: 0,
+        })
     }
 
     /// The settings of `app_id`, if it has an `[app.<id>]` table.
@@ -990,6 +1033,16 @@ fn autohide_trigger<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 /// Spring response, in milliseconds.
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 10_000)
+}
+
+/// Keyboard activation's delay, 0 to 2000 ms.
+fn activate_delay<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    use serde::de::Error;
+    let v = de::duration(d)?;
+    match v <= 2000 {
+        true => Ok(v),
+        false => Err(D::Error::custom(format!("expected 0 to 2000 ms, got {v}"))),
+    }
 }
 
 /// A menu row's height, 12 to 200.
@@ -1418,6 +1471,35 @@ mod tests {
     }
 
     #[test]
+    fn badges() {
+        let d = Config::default();
+        assert!(d.activate.badges);
+        let s = d.badge_style().unwrap();
+        assert_eq!((s.size, s.color, s.background), (11.0, 0x1f1f1fff, 0));
+        let c = parse(
+            r#"
+            [activate]
+            badges = false
+            delay = 0
+            [appearance]
+            badge-color = "ffffff"
+            badge-background = "e0383b"
+            "#,
+        )
+        .unwrap();
+        assert!(!c.activate.badges && c.badge_style().is_none());
+        assert_eq!((d.activate.delay, c.activate.delay), (150, 0));
+        assert!(parse("[activate]\ndelay = 5000").is_err());
+        assert!(parse("badges = true").is_err());
+        let t = c.theme();
+        assert_eq!(
+            (t.badge_color, t.badge_background),
+            (0xffffffff, 0xe0383bff)
+        );
+        assert!(parse("[appearance]\nbadge-color = \"red\"").is_err());
+    }
+
+    #[test]
     fn file_search() {
         let d = Config::default().launcher.files;
         assert_eq!((d.trigger, d.root.as_str()), (Some('\''), "~"));
@@ -1512,6 +1594,7 @@ mod tests {
     #[test]
     fn sections_are_optional_and_strict() {
         let sections = [
+            "activate",
             "autohide",
             "windows",
             "launcher",

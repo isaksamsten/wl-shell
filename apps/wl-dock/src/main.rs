@@ -1,6 +1,8 @@
 //! wl-dock: a macOS-style dock for Wayland. See PLAN.md for the design.
 
 mod actions;
+mod activate;
+mod activateview;
 mod app;
 mod autohide;
 mod config;
@@ -46,9 +48,12 @@ fn main() -> ExitCode {
     if let Some(cmd) = &opts.command {
         return pins_command(cmd);
     }
+    let missing = "wl-dock isn't running (start it with the compositor)";
     if opts.launcher {
-        let missing = "wl-dock isn't running (start it with the compositor)";
         return wl_shell_daemon::client_to(&DockRequest::Launcher, missing);
+    }
+    if let Some(n) = opts.activate() {
+        return wl_shell_daemon::client_to(&DockRequest::Activate(n), missing);
     }
     match run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
@@ -86,7 +91,7 @@ fn pins_command(cmd: &Cmd) -> ExitCode {
 
 /// The dock is always shown, so unlike wl-switcher it has no client/show
 /// cycle: it runs its own loop until the connection fails, and listens
-/// on its socket for `--launcher`.
+/// on its socket for `--launcher` and `--activate`.
 fn run(opts: &Options) -> Result<(), Error> {
     let dock = WlDock::new(opts.config.clone())?;
     let (mut shell, mut event_loop) = Shell::connect(dock)?;

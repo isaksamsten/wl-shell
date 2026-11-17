@@ -4,8 +4,8 @@
 //! payload escapes `\` as `\\` and newlines as `\n`. The client sends a
 //! request (the program's own lines) terminated by `end` and keeps the
 //! connection open: closing it cancels the show. The daemon answers with any
-//! number of `warn` lines and one final `picked`, `cancelled` or `error`
-//! line, then closes.
+//! number of `warn` lines and one final `picked`, `cancelled`, `done` or
+//! `error` line, then closes.
 
 use std::path::PathBuf;
 
@@ -44,6 +44,8 @@ pub enum Reply {
     /// The show ended with this window picked.
     Picked(String),
     Cancelled,
+    /// The request was taken; there is nothing to wait for.
+    Done,
     Error(String),
 }
 
@@ -109,6 +111,7 @@ impl Reply {
             Reply::Warn(m) => line("warn", Some(m)),
             Reply::Picked(id) => line("picked", Some(id)),
             Reply::Cancelled => line("cancelled", None),
+            Reply::Done => line("done", None),
             Reply::Error(m) => line("error", Some(m)),
         }
     }
@@ -120,6 +123,7 @@ impl Reply {
             ("warn", pl) => Reply::Warn(p(pl)?),
             ("picked", pl) => Reply::Picked(p(pl)?),
             ("cancelled", None) => Reply::Cancelled,
+            ("done", None) => Reply::Done,
             ("error", pl) => Reply::Error(p(pl)?),
             _ => return Err(format!("unknown reply '{text}'")),
         })
@@ -198,6 +202,7 @@ mod tests {
             Reply::Warn("no window with ID '3'".into()),
             Reply::Picked("a\\b".into()),
             Reply::Cancelled,
+            Reply::Done,
             Reply::Error("no windows to show".into()),
         ] {
             let enc = r.encode();
