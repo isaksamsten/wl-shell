@@ -23,9 +23,10 @@ pub struct Config {
     pub notes_dir: String,
     /// Prints the ID of each window that gains focus, one per line.
     pub mru_event_stream: Option<String>,
-    /// `<output> <id>` lines, for `output = "focused"` (not used yet).
+    /// `<output> <id>` lines: which output each window is on, for
+    /// `output = "focused"`.
     pub output_event_stream: Option<String>,
-    /// `focused`, `all`, or an output's name.
+    /// `focused` (the context's output), `all`, or an output's name.
     pub output: String,
     pub edge: Edge,
     pub layer: NoteLayer,

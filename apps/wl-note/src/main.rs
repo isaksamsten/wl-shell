@@ -14,15 +14,17 @@ mod list;
 mod markdown;
 mod options;
 mod papers;
+mod reorder;
 mod title;
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use wl_shell_config::ConfigFile;
 use wl_shell_core::{Error, Shell};
 use wl_shell_log::warn;
-use wl_shell_notes::{Color, Index, Window};
+use wl_shell_notes::{Color, Index, State, Window, state};
 
 use crate::app::WlNote;
 use crate::config::Config;
@@ -50,8 +52,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// The subcommands: `new` and `focus` ask the running wl-note; the
-/// others only read the notes.
+/// The subcommands: `new`, `focus` and `show --focus` ask the running
+/// wl-note; the others only read the notes and change the state files.
 fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
     match cmd {
         Cmd::New {
@@ -97,22 +99,44 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         }
     };
     let dir = config.notes_dir();
-    match cmd {
-        Cmd::New { .. } | Cmd::Focus { .. } => unreachable!("asked above"),
-        Cmd::Path => println!("{}", dir.display()),
-        Cmd::List { app, title, json } => {
-            let (index, errors) = Index::load(&dir);
-            for e in errors {
-                warn!("{e}");
-            }
+    if let Cmd::Path = cmd {
+        println!("{}", dir.display());
+        return ExitCode::SUCCESS;
+    }
+    let (index, errors) = Index::load(&dir);
+    for e in errors {
+        warn!("{e}");
+    }
+    let Some(state_dir) = state::dir() else {
+        warn!("neither XDG_STATE_HOME nor HOME is set: no order or hidden notes");
+        return ExitCode::FAILURE;
+    };
+    let (mut state, errors) = State::load(&state_dir);
+    for e in errors {
+        warn!("{e}");
+    }
+    let result = match cmd {
+        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Path => unreachable!("done above"),
+        Cmd::List {
+            app,
+            title,
+            hidden,
+            all,
+            json,
+        } => {
             let window = (app.is_some() || title.is_some()).then(|| {
                 Window::new(
                     app.clone().unwrap_or_default(),
                     title.clone().unwrap_or_default(),
                 )
             });
-            let notes = list::notes(&index, window.as_ref());
-            for (path, note) in &notes {
+            let which = match (hidden, all) {
+                (true, _) => list::Which::Hidden,
+                (_, true) => list::Which::All,
+                _ => list::Which::Shown,
+            };
+            let notes = list::notes(&index, &state, window.as_ref(), which);
+            for (path, note, _) in &notes {
                 let problems = note.error.iter().chain(&note.warnings);
                 for p in problems {
                     warn!("{}: {p}", path.display());
@@ -122,9 +146,64 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
                 true => print!("{}", list::json(&notes)),
                 false => print!("{}", list::text(&notes)),
             }
+            Ok(())
+        }
+        Cmd::Hide { note } => find_note(&index, note).and_then(|path| {
+            if !state.hidden.push(&path) {
+                println!("{} is hidden already", path.display());
+                return Ok(());
+            }
+            save(state.save_hidden(&state_dir), &state_dir)
+        }),
+        Cmd::Show { focus, note } => find_note(&index, note).and_then(|path| {
+            match state.hidden.remove(&path) {
+                true => save(state.save_hidden(&state_dir), &state_dir)?,
+                false if !*focus => println!("{} isn't hidden", path.display()),
+                false => {}
+            }
+            if *focus {
+                let req = NoteRequest::Focus(Some(path.to_string_lossy().into_owned()));
+                return match wl_shell_daemon::client_to(&req, MISSING) {
+                    code if code == ExitCode::SUCCESS => Ok(()),
+                    _ => Err(String::new()),
+                };
+            }
+            Ok(())
+        }),
+        Cmd::Prune => {
+            let (order, hidden) = state.prune(&index);
+            let mut result = Ok(());
+            if order > 0 {
+                result = result.and(save(state.save_order(&state_dir), &state_dir));
+            }
+            if hidden > 0 {
+                result = result.and(save(state.save_hidden(&state_dir), &state_dir));
+            }
+            println!("dropped {order} lines from the order and {hidden} from the hidden notes");
+            result
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if !e.is_empty() {
+                warn!("{e}");
+            }
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
+}
+
+/// The note `query` names (see find.rs), relative to the notes directory.
+fn find_note(index: &Index, query: &str) -> Result<PathBuf, String> {
+    let notes: Vec<(&Path, Option<&str>)> =
+        (index.iter()).map(|(p, e)| (p, e.note.title())).collect();
+    find::find(index.dir(), &notes, query).map(Path::to_path_buf)
+}
+
+/// A state file written, or the error saying where.
+fn save(result: std::io::Result<()>, dir: &Path) -> Result<(), String> {
+    result.map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// wl-note is always shown: it runs its own loop until the connection

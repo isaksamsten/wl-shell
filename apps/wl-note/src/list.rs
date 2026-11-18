@@ -1,26 +1,50 @@
 //! `wl-note list`: the notes, as text or JSON. Pure, unit tested.
 //!
 //! Text is one note per line: its path (relative to the notes directory),
-//! its title, and where it shows, tab-separated:
+//! its title, and where it shows (`hidden` too, if it is), tab-separated:
 //!
 //! ```text
 //! work/release.md<TAB>Release checklist<TAB>firefox, foot "*wl-shell*"
 //! groceries.md<TAB>Groceries<TAB>everywhere
+//! old.md<TAB>Old<TAB>everywhere, hidden
 //! ```
 
 use std::path::Path;
 
-use wl_shell_notes::{Color, Index, Matcher, Note, Window};
+use wl_shell_notes::{Color, Index, Matcher, Note, State, Window};
+
+/// Which notes to list, as to hiding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Which {
+    /// Those not hidden.
+    Shown,
+    Hidden,
+    All,
+}
+
+/// A note listed: its path, the note, and whether it is hidden.
+pub type Listed<'a> = (&'a Path, &'a Note, bool);
 
 /// The notes to list: all of them, or those shown for `window`, in
-/// column order.
-pub fn notes<'a>(index: &'a Index, window: Option<&Window>) -> Vec<(&'a Path, &'a Note)> {
-    let paths = match window {
-        Some(w) => index.shown(Some(w)),
-        None => index.ordered(),
-    };
-    (paths.into_iter())
-        .filter_map(|p| Some((p, &index.get(p)?.note)))
+/// column order, hidden or not as `which` says.
+pub fn notes<'a>(
+    index: &'a Index,
+    state: &State,
+    window: Option<&Window>,
+    which: Which,
+) -> Vec<Listed<'a>> {
+    (state.arrange(index).into_iter())
+        .filter_map(|p| {
+            let note = &index.get(p)?.note;
+            let hidden = state.is_hidden(p);
+            let wanted = match which {
+                Which::Shown => !hidden,
+                Which::Hidden => hidden,
+                Which::All => true,
+            };
+            let matches = window.is_none_or(|w| note.matches(Some(w)));
+            (wanted && matches).then_some((p, note, hidden))
+        })
         .collect()
 }
 
@@ -32,16 +56,20 @@ pub fn name(path: &Path) -> String {
 }
 
 /// One line per note.
-pub fn text(notes: &[(&Path, &Note)]) -> String {
+pub fn text(notes: &[Listed]) -> String {
     let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     let mut out = String::new();
-    for (path, note) in notes {
+    for (path, note, hidden) in notes {
         let name = name(path);
+        let mut shows = shows(note);
+        if *hidden {
+            shows.push_str(", hidden");
+        }
         out.push_str(&format!(
             "{}\t{}\t{}\n",
             field(&path.to_string_lossy()),
             field(note.title_or(&name)),
-            field(&shows(note)),
+            field(&shows),
         ));
     }
     out
@@ -63,11 +91,11 @@ fn shows(note: &Note) -> String {
 }
 
 /// A JSON array of objects: `path`, `title`, `color` (null: the
-/// default), `global`, `match` (`app` and `title`, null if not given),
-/// `tags`, `error` and `warnings`.
-pub fn json(notes: &[(&Path, &Note)]) -> String {
+/// default), `global`, `hidden`, `match` (`app` and `title`, null if not
+/// given), `tags`, `error` and `warnings`.
+pub fn json(notes: &[Listed]) -> String {
     let mut out = String::from("[");
-    for (i, (path, note)) in notes.iter().enumerate() {
+    for (i, (path, note, hidden)) in notes.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -87,11 +115,12 @@ pub fn json(notes: &[(&Path, &Note)]) -> String {
         };
         let list = |items: Vec<String>| format!("[{}]", items.join(","));
         out.push_str(&format!(
-            "\n  {{\"path\":{},\"title\":{},\"color\":{},\"global\":{},\"match\":{},\"tags\":{},\"error\":{},\"warnings\":{}}}",
+            "\n  {{\"path\":{},\"title\":{},\"color\":{},\"global\":{},\"hidden\":{},\"match\":{},\"tags\":{},\"error\":{},\"warnings\":{}}}",
             string(&path.to_string_lossy()),
             string(note.title_or(&name)),
             color,
             note.global(),
+            hidden,
             list(note.meta.matchers.iter().map(matcher).collect()),
             list(note.meta.tags.iter().map(|t| string(t)).collect()),
             note.error.as_deref().map_or("null".into(), string),
@@ -139,13 +168,13 @@ mod tests {
         );
         let b = note("groceries\twith a tab");
         let notes = [
-            (Path::new("work/release.md"), &a),
-            (Path::new("groceries.md"), &b),
+            (Path::new("work/release.md"), &a, false),
+            (Path::new("groceries.md"), &b, true),
         ];
         assert_eq!(
             text(&notes),
             "work/release.md\tRelease\tfirefox, foot \"*wl-shell*\", \"*Jira*\"\n\
-             groceries.md\tgroceries\teverywhere\n"
+             groceries.md\tgroceries\teverywhere, hidden\n"
         );
     }
 
@@ -155,12 +184,44 @@ mod tests {
             "+++\ntitle = \"Say \\\"hi\\\"\"\ncolor = \"#0a0b0c\"\napps = [\"ff\"]\ntags = [\"t\"]\n+++\n",
         );
         let b = note("+++\nbroken =\n+++\n");
-        let notes = [(Path::new("a.md"), &a), (Path::new("b.md"), &b)];
+        let notes = [
+            (Path::new("a.md"), &a, false),
+            (Path::new("b.md"), &b, true),
+        ];
         let out = json(&notes);
-        assert!(out.starts_with("[\n  {\"path\":\"a.md\",\"title\":\"Say \\\"hi\\\"\",\"color\":\"#0a0b0c\",\"global\":false,\"match\":[{\"app\":\"ff\",\"title\":null}],\"tags\":[\"t\"],\"error\":null,\"warnings\":[]},\n"), "{out}");
-        assert!(out.contains("{\"path\":\"b.md\",\"title\":\"b\",\"color\":null,\"global\":true,\"match\":[],\"tags\":[],\"error\":\"frontmatter, line 2: "), "{out}");
+        assert!(out.starts_with("[\n  {\"path\":\"a.md\",\"title\":\"Say \\\"hi\\\"\",\"color\":\"#0a0b0c\",\"global\":false,\"hidden\":false,\"match\":[{\"app\":\"ff\",\"title\":null}],\"tags\":[\"t\"],\"error\":null,\"warnings\":[]},\n"), "{out}");
+        assert!(out.contains("{\"path\":\"b.md\",\"title\":\"b\",\"color\":null,\"global\":true,\"hidden\":true,\"match\":[],\"tags\":[],\"error\":\"frontmatter, line 2: "), "{out}");
         assert!(out.ends_with("}\n]\n"));
         assert_eq!(json(&[]), "[]\n");
         assert_eq!(string("a\u{1}\n"), "\"a\\u0001\\n\"");
+    }
+
+    #[test]
+    fn choosing() {
+        let dir = std::env::temp_dir().join(format!("wl-note-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in [
+            ("a.md", "a"),
+            ("b.md", "+++\napps = [\"firefox\"]\n+++\nb"),
+            ("c.md", "c"),
+        ] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let (index, _) = Index::load(&dir);
+        let mut state = State::default();
+        state.order.set(["c.md", "b.md", "a.md"].map(Into::into));
+        state.hidden.push(Path::new("a.md"));
+        let paths = |which, window: Option<&Window>| -> Vec<String> {
+            (notes(&index, &state, window, which).iter())
+                .map(|(p, _, _)| p.display().to_string())
+                .collect()
+        };
+        assert_eq!(paths(Which::Shown, None), ["c.md", "b.md"]);
+        assert_eq!(paths(Which::Hidden, None), ["a.md"]);
+        assert_eq!(paths(Which::All, None), ["c.md", "b.md", "a.md"]);
+        let foot = Window::new("foot", "");
+        assert_eq!(paths(Which::All, Some(&foot)), ["c.md", "a.md"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

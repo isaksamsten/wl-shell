@@ -27,7 +27,13 @@
 //!
 //! The file bar's icons are subsurfaces too (thumbnails or type icons,
 //! monochrome in the note's text color until hovered), with the hovered
-//! one's name beside them, and on an open sheet the pin icon at its end.
+//! one's name beside them, and on an open sheet the archive and pin icons
+//! at its end.
+//!
+//! At header level a margin can be dragged along the column to reorder
+//! it (deck.rs, reorder.rs): a press on a margin opens it on release,
+//! unless the pointer moved along the edge first. A hidden note crumples
+//! into the edge: its paper shrinks toward it and fades.
 //!
 //! The keyboard is only taken by an open note: opening asks for it
 //! (`exclusive`), and once it has it, `on-demand` lets a click elsewhere
@@ -110,8 +116,15 @@ const DOCS: usize = 4;
 const LINES: usize = 48;
 /// A wheel click or an arrow key scrolls this far.
 const LINE: f64 = 40.0;
+/// How far the pointer moves along the edge with a margin pressed before
+/// it is dragged rather than clicked.
+const DRAG_START: f64 = 6.0;
+/// What a crumpled note shrinks to.
+const CRUMPLED: f64 = 0.2;
 /// Icons for files whose own aren't known (yet).
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
+/// What the archive icon says it does.
+const ARCHIVE_LABEL: &str = "Archive (hide this note)";
 
 /// The fonts on the main thread, for the open note's title: loaded in the
 /// background, None until then.
@@ -267,6 +280,7 @@ pub struct FileLink {
 }
 
 /// A note to show: its card, and what is on it.
+#[derive(Clone)]
 pub struct Shown {
     pub item: Item,
     pub content: Rc<Content>,
@@ -307,6 +321,11 @@ pub enum Act {
     Unpin(String),
     /// Save this note's title (empty: drop it).
     Title(String, String),
+    /// Hide this note.
+    Hide(String),
+    /// This note was dropped at this slot of the column (its keys, in
+    /// order).
+    Reorder(String, Vec<String>, usize),
 }
 
 /// The column's timers.
@@ -362,6 +381,7 @@ enum BarHit {
     File(usize),
     /// The `+n` for those that don't fit.
     More,
+    Archive,
     Pin,
 }
 
@@ -371,6 +391,7 @@ struct BarLayout {
     icons: Vec<(usize, Rect)>,
     /// How many more, and where the `+n` is.
     more: Option<(usize, Rect)>,
+    archive: Option<Rect>,
     pin: Option<Rect>,
     /// Where names go: from `name_x`, up to `name_end`, centered on
     /// `mid`.
@@ -384,7 +405,23 @@ struct BarSubs {
     icons: Vec<Sub>,
     more: Sub,
     name: Sub,
+    archive: Sub,
     pin: Sub,
+}
+
+/// A press on a margin or a revealed sheet: a click, or the start of a
+/// drag.
+struct Press {
+    key: String,
+    /// Where it was.
+    x: f64,
+    y: f64,
+    /// From the pointer to the card's center, along the edge, once
+    /// dragged.
+    offset: f64,
+    /// On a revealed sheet: a click there does what it does on it.
+    revealed: bool,
+    dragging: bool,
 }
 
 /// A name label: its text, color, width and whether it is struck
@@ -466,11 +503,16 @@ pub struct Column {
     /// The note waiting to be revealed, and its timer.
     reveal: Option<(String, RegistrationToken)>,
     hide: Option<RegistrationToken>,
+    /// A press on a margin, until released.
+    press: Option<Press>,
     keyboard: KeyboardInteractivity,
     frame_pending: bool,
     last_frame: Option<Instant>,
     /// Label and title buffers attached by the last frame.
     attached: Vec<WlBuffer>,
+    /// On its way out, e.g. to another output: its notes slide away, and
+    /// the program drops it once they are gone (`retired`).
+    pub retiring: bool,
 }
 
 impl BarSubs {
@@ -485,15 +527,17 @@ impl BarSubs {
             more: Sub::new(g, parent, no_input, qh),
             name: Sub::new(g, parent, no_input, qh),
             pin: Sub::new(g, parent, no_input, qh),
+            archive: Sub::new(g, parent, no_input, qh),
         }
     }
 
     fn clear(&mut self) {
-        for s in self
-            .icons
-            .iter_mut()
-            .chain([&mut self.more, &mut self.name, &mut self.pin])
-        {
+        for s in self.icons.iter_mut().chain([
+            &mut self.more,
+            &mut self.name,
+            &mut self.archive,
+            &mut self.pin,
+        ]) {
             s.clear();
         }
     }
@@ -520,10 +564,12 @@ impl BarSubs {
         };
         one(&mut self.more, &plan.more);
         one(&mut self.name, &plan.name);
-        match &plan.pin {
-            Some((buffer, rect, a)) => self.pin.present(buffer.as_ref(), *rect, plan.alpha * a),
-            None => self.pin.clear(),
-        }
+        let icon = |sub: &mut Sub, part: &Option<(Option<WlBuffer>, Rect, f64)>| match part {
+            Some((buffer, rect, a)) => sub.present(buffer.as_ref(), *rect, plan.alpha * a),
+            None => sub.clear(),
+        };
+        icon(&mut self.archive, &plan.archive);
+        icon(&mut self.pin, &plan.pin);
         (plan.more.iter().chain(&plan.name))
             .map(|(b, _)| b.clone())
             .collect()
@@ -623,10 +669,12 @@ impl Column {
             pointer: None,
             reveal: None,
             hide: None,
+            press: None,
             keyboard: KeyboardInteractivity::None,
             frame_pending: false,
             last_frame: None,
             attached: Vec::new(),
+            retiring: false,
         };
         column.ask_standard_icons();
         Ok(column)
@@ -647,6 +695,17 @@ impl Column {
     /// The open note, if any.
     pub fn open_key(&self) -> Option<&str> {
         self.deck.open()
+    }
+
+    /// Retiring, and its notes are gone (or were never shown): it can go.
+    pub fn retired(&self) -> bool {
+        self.retiring && (!self.configured || (self.deck.cards().is_empty() && !self.deck.moving()))
+    }
+
+    /// `key` is being hidden: it crumples into the edge as it leaves.
+    pub fn crumple(&mut self, key: &str) {
+        self.deck.crumple(key);
+        self.kick();
     }
 
     /// The notes shown, in order.
@@ -730,8 +789,10 @@ impl Column {
             })
             .collect();
         self.deck.set(notes.into_iter().map(|n| n.item).collect());
+        // The open note went (removed, hidden): the keyboard goes back.
         if self.deck.open().is_none() {
             self.editing = None;
+            self.set_keyboard(KeyboardInteractivity::None);
         }
         // Forget the documents of notes gone; render the others again if
         // they changed.
@@ -887,12 +948,18 @@ impl Column {
         let (x, y) = event.position;
         match &event.kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                self.hover_at(core, x, y);
+                match self.press.is_some() {
+                    true => self.press_moved(core, x, y),
+                    false => self.hover_at(core, x, y),
+                }
                 Vec::new()
             }
             PointerEventKind::Leave { .. } => {
                 self.pointer = None;
                 self.bar_hover = None;
+                if self.press.take().is_some() {
+                    self.deck.drag_cancel();
+                }
                 self.cancel_reveal(core);
                 self.deck.point(On::Outside);
                 self.start_hide(core);
@@ -900,7 +967,10 @@ impl Column {
                 Vec::new()
             }
             PointerEventKind::Press { button, .. } if *button == BTN_LEFT => {
-                self.click(x, y, mods.shift)
+                self.click(core, x, y, mods.shift)
+            }
+            PointerEventKind::Release { button, .. } if *button == BTN_LEFT => {
+                self.release(core, x, y)
             }
             PointerEventKind::Axis { vertical, .. } => {
                 if let Some(key) = self.deck.open()
@@ -990,8 +1060,9 @@ impl Column {
             self.deck.reveal_due(&key);
             return;
         }
-        let timer = core.timer(self.style.reveal_delay, |app: &mut WlNote, core| {
-            app.column_timer(core, Timer::Reveal);
+        let surface = self.surface().clone();
+        let timer = core.timer(self.style.reveal_delay, move |app: &mut WlNote, core| {
+            app.column_timer(core, &surface, Timer::Reveal);
         });
         match timer {
             Ok(token) => self.reveal = Some((key, token)),
@@ -1013,8 +1084,9 @@ impl Column {
             self.deck.hide_due();
             return;
         }
-        let timer = core.timer(self.style.hide_delay, |app: &mut WlNote, core| {
-            app.column_timer(core, Timer::Hide);
+        let surface = self.surface().clone();
+        let timer = core.timer(self.style.hide_delay, move |app: &mut WlNote, core| {
+            app.column_timer(core, &surface, Timer::Hide);
         });
         match timer {
             Ok(token) => self.hide = Some(token),
@@ -1062,7 +1134,53 @@ impl Column {
         }
     }
 
-    fn click(&mut self, x: f64, y: f64, shift: bool) -> Vec<Act> {
+    /// The pointer moved with a margin (or a revealed sheet) pressed: past
+    /// `DRAG_START` along the edge, its margin is dragged.
+    fn press_moved(&mut self, core: &Core<WlNote>, x: f64, y: f64) {
+        self.pointer = Some((x, y));
+        let Some(p) = &mut self.press else {
+            return;
+        };
+        if !p.dragging {
+            if (y - p.y).abs() < DRAG_START {
+                return;
+            }
+            let (key, start) = (p.key.clone(), p.y + p.offset);
+            p.dragging = true;
+            if !self.deck.drag_start(&key, start) {
+                // Not something to drag: neither a drag nor a click.
+                self.press = None;
+                return self.hover_at(core, x, y);
+            }
+            self.cancel_reveal(core);
+            self.bar_hover = None;
+        }
+        if let Some(p) = &self.press {
+            self.deck.drag_to(y + p.offset);
+            self.kick();
+        }
+    }
+
+    /// The button went up: a pressed margin opens (a revealed sheet does
+    /// what a click on it does), a dragged one drops.
+    fn release(&mut self, core: &Core<WlNote>, x: f64, y: f64) -> Vec<Act> {
+        let Some(p) = self.press.take() else {
+            return Vec::new();
+        };
+        let act = match (p.dragging, p.revealed) {
+            (false, false) => Act::Open(p.key),
+            (false, true) => self.revealed_click(p.key, p.x, p.y),
+            (true, _) => match self.deck.drag_end() {
+                Some((key, gap)) => Act::Reorder(key, self.keys().map(String::from).collect(), gap),
+                None => return Vec::new(),
+            },
+        };
+        self.hover_at(core, x, y);
+        self.kick();
+        vec![act]
+    }
+
+    fn click(&mut self, core: &Core<WlNote>, x: f64, y: f64, shift: bool) -> Vec<Act> {
         let on = self.on_at(x, y);
         let open = self.deck.open().map(String::from);
         let on_title = (open.as_deref())
@@ -1075,11 +1193,41 @@ impl Column {
         };
         match on {
             On::Plus => acts.push(Act::New),
-            On::Margin(k) => acts.push(Act::Open(k)),
+            // Opened on release, unless it is dragged.
+            On::Margin(k) => {
+                self.cancel_reveal(core);
+                let card_y = (self.deck.cards().iter())
+                    .find(|c| c.key == k)
+                    .map_or(y, |c| c.y.value);
+                self.press = Some(Press {
+                    key: k,
+                    x,
+                    y,
+                    offset: card_y - y,
+                    revealed: false,
+                    dragging: false,
+                });
+            }
             On::Sheet(k) if open.as_deref() == Some(k.as_str()) => {
                 acts.extend(self.open_click(&k, x, y, shift))
             }
-            On::Sheet(k) => acts.push(self.revealed_click(k, x, y)),
+            // The file bar acts at once; the rest of a revealed sheet on
+            // release, unless it is dragged (folding back to its margin,
+            // under the pointer).
+            On::Sheet(k) => match self.bar_at(x, y) {
+                Some((b, _)) if b == k => acts.push(self.revealed_click(k, x, y)),
+                _ => {
+                    self.cancel_reveal(core);
+                    self.press = Some(Press {
+                        key: k,
+                        x,
+                        y,
+                        offset: 0.0,
+                        revealed: true,
+                        dragging: false,
+                    });
+                }
+            },
             On::Strip | On::Outside => {}
         }
         acts
@@ -1135,6 +1283,7 @@ impl Column {
         match hit {
             BarHit::File(i) => Some(Act::File(note.files.get(i)?.path.clone())),
             BarHit::More => None,
+            BarHit::Archive => Some(Act::Hide(key.to_string())),
             BarHit::Pin => match &note.pin {
                 Pin::Unpinned(_) => Some(Act::Pin(key.to_string(), shift)),
                 Pin::Pinned { .. } => Some(Act::Unpin(key.to_string())),
@@ -1175,6 +1324,9 @@ impl Column {
         }
         if layout.more.is_some_and(|(_, r)| near(&r)) {
             return Some((key, BarHit::More));
+        }
+        if layout.archive.is_some_and(|r| near(&r)) {
+            return Some((key, BarHit::Archive));
         }
         if layout.pin.is_some_and(|r| near(&r)) {
             return Some((key, BarHit::Pin));
@@ -1381,6 +1533,10 @@ impl Column {
         }])
     }
 
+    fn archive_icon(&self) -> NamedIcon {
+        self.named(&["builtin:archive"])
+    }
+
     /// A file's own icon, once its names are known.
     fn file_icon(&self, path: &PathBuf) -> Option<NamedIcon> {
         let names = self.file_icons.get(path)?;
@@ -1393,6 +1549,7 @@ impl Column {
             self.generic_icon(),
             self.pin_icon(false),
             self.pin_icon(true),
+            self.archive_icon(),
         ] {
             self.assets.named_icon(&key);
         }
@@ -1662,8 +1819,9 @@ impl Column {
         let face = self.face(key)?;
         let bar = self.bar_rect(face);
         let mid = bar.y + bar.h / 2.0;
-        let pin_w = if open { ICON + ICON_GAP } else { 0.0 };
-        let (n, more) = bar::fit(note.files.len(), bar.w - pin_w, ICON, ICON_GAP);
+        // The archive and pin icons at the end of an open sheet's.
+        let controls_w = if open { 2.0 * (ICON + ICON_GAP) } else { 0.0 };
+        let (n, more) = bar::fit(note.files.len(), bar.w - controls_w, ICON, ICON_GAP);
         let slot = |i: usize| {
             Rect::new(
                 bar.x + i as f64 * (ICON + ICON_GAP),
@@ -1677,8 +1835,12 @@ impl Column {
             icons: (0..n).map(|i| (i, slot(i))).collect(),
             more: more.map(|count| (count, slot(n))),
             pin: open.then(|| Rect::new(bar.right() - ICON, mid - ICON / 2.0, ICON, ICON)),
+            archive: open.then(|| {
+                let x = bar.right() - 2.0 * ICON - ICON_GAP;
+                Rect::new(x, mid - ICON / 2.0, ICON, ICON)
+            }),
             name_x: bar.x + used as f64 * (ICON + ICON_GAP),
-            name_end: bar.right() - pin_w,
+            name_end: bar.right() - controls_w,
             mid,
         };
         // On a tilted sheet, the icons follow the tilt.
@@ -1824,7 +1986,10 @@ impl Column {
             }
             let role = self.deck.role(&card.key).max(self.deck.role_now(card));
             let want = self.paper(card, role);
-            let ready = self.papers.borrow_mut().get(&want);
+            let ready = match card.crumpling() {
+                true => None,
+                false => self.papers.borrow_mut().get(&want),
+            };
             // Have the next level ready: headers (for the labels to show
             // at once), and the sheet of the note likely to be revealed.
             if role < Role::Header {
@@ -1841,6 +2006,8 @@ impl Column {
             let Some(i) = self.slots.iter().position(|s| s.key == card.key) else {
                 continue;
             };
+            // A crumpling note keeps the paper it had.
+            let crumpling = card.crumpling() && self.slots[i].shown.is_some();
             if let Some(sheet) = ready {
                 self.slots[i].shown = Some((want, sheet));
             }
@@ -1850,14 +2017,18 @@ impl Column {
                 continue;
             };
             let (pw, ph) = (p.w as f64, p.h as f64);
-            let o = lerp(-reach, card.out.value, card.presence.value);
+            // Crumpling, it stays out and shrinks toward the edge instead.
+            let o = match crumpling {
+                true => card.out.value,
+                false => lerp(-reach, card.out.value, card.presence.value),
+            };
             let paper = match edge {
                 Edge::Right => Rect::new(width - o, card.y.value - ph / 2.0, pw, ph),
                 Edge::Left => Rect::new(o - pw, card.y.value - ph / 2.0, pw, ph),
             };
             // Cut to its length while it grows or shrinks.
             let len = card.len.value;
-            let cut = match len < ph - 0.5 {
+            let cut = match len < ph - 0.5 && !crumpling {
                 true => intersect(
                     surface,
                     Rect::new(0.0, card.y.value - len / 2.0, width, len),
@@ -1872,20 +2043,32 @@ impl Column {
                 continue;
             };
             let r = sheet.shape.rect;
-            let image = Rect::new(
+            let mut image = Rect::new(
                 paper.x + r.x as f64,
                 paper.y + r.y as f64,
                 r.w as f64,
                 r.h as f64,
             );
+            let p = card.presence.value.clamp(0.0, 1.0);
+            let alpha = match crumpling {
+                true => {
+                    let edge_x = match edge {
+                        Edge::Right => width,
+                        Edge::Left => 0.0,
+                    };
+                    image = image.scaled(lerp(CRUMPLED, 1.0, p), edge_x, card.y.value);
+                    p * p
+                }
+                false => 1.0,
+            };
             let size = (r.w as f64 * scale, r.h as f64 * scale);
             let placed = cut.and_then(|cut| clip(image, size, None, cut));
             match placed {
-                Some((rect, src)) if card.presence.value > 0.0 => {
+                Some((rect, src)) if card.presence.value > 0.0 && alpha > 0.0 => {
                     slot.sub.show(&sheet.shape.buffer);
                     slot.sub.crop(src);
                     slot.sub.place(IRect::round(rect));
-                    slot.sub.set_alpha(1.0);
+                    slot.sub.set_alpha(alpha);
                     slot.sub.commit();
                 }
                 _ => slot.sub.clear(),
@@ -2109,6 +2292,12 @@ impl Column {
             };
             plan.pin = Some((self.icon_buffer(&icon, tint), rect, a));
         }
+        if let Some(rect) = layout.archive {
+            let lit = hover == Some(BarHit::Archive);
+            let (tint, a) = if lit { (None, 1.0) } else { (Some(ink), 0.75) };
+            let icon = self.archive_icon();
+            plan.archive = Some((self.icon_buffer(&icon, tint), rect, a));
+        }
         // The name of what is hovered.
         let name = match hover {
             Some(BarHit::File(i)) => files.get(i).map(|f| (bar::name(&f.path), !f.exists)),
@@ -2118,13 +2307,16 @@ impl Column {
                     .collect();
                 Some((rest.join(", "), false))
             }
+            Some(BarHit::Archive) => Some((ARCHIVE_LABEL.to_string(), false)),
             Some(BarHit::Pin) => Some((pin_label(&pin), false)),
             None => None,
         };
         if let Some((text, strike)) = name.filter(|(t, _)| !t.is_empty()) {
-            let right_aligned = hover == Some(BarHit::Pin);
-            let end = match (right_aligned, layout.pin) {
-                (true, Some(p)) => p.x - ICON_GAP,
+            // The controls' names end before the first of them.
+            let right_aligned = matches!(hover, Some(BarHit::Pin | BarHit::Archive));
+            let first = layout.archive.or(layout.pin);
+            let end = match (right_aligned, first) {
+                (true, Some(r)) => r.x - ICON_GAP,
                 _ => layout.name_end,
             };
             let width = (end - layout.name_x).max(1.0) as i32;
@@ -2205,6 +2397,7 @@ struct BarPlan {
     alpha: f64,
     icons: Vec<(Option<WlBuffer>, Rect, f64)>,
     more: Option<(WlBuffer, Rect)>,
+    archive: Option<(Option<WlBuffer>, Rect, f64)>,
     pin: Option<(Option<WlBuffer>, Rect, f64)>,
     name: Option<(WlBuffer, Rect)>,
 }
@@ -2212,7 +2405,7 @@ struct BarPlan {
 impl BarSubs {
     /// Bottom first.
     fn subs(&self) -> impl Iterator<Item = &Sub> {
-        self.icons.iter().chain([&self.more, &self.pin, &self.name])
+        (self.icons.iter()).chain([&self.more, &self.archive, &self.pin, &self.name])
     }
 }
 

@@ -1,10 +1,16 @@
-//! The program: the config, the notes and the context, and the column
-//! showing them.
+//! The program: the config, the notes, their arrangement and the context,
+//! and the columns showing them.
 //!
 //! - **Notes.** The notes directory is read into an `Index` and watched
-//!   with inotify, every directory in it. Any event rescans it (only
-//!   changed files are read again), after the loop's dispatch, so a burst
-//!   of events is one rescan. New directories get watched as they appear.
+//!   with inotify, the whole tree (`watch_tree`). Any event rescans it
+//!   (only changed files are read again), after the loop's dispatch, so a
+//!   burst of events is one rescan.
+//! - **The arrangement** (the order and the hidden notes) is kept in the
+//!   state files (`wl_shell_notes::state`), watched too, so editing them
+//!   by hand or with `wl-note hide` shows at once. Renames inside the
+//!   notes directory (a file manager, `git mv`) move their entries, so a
+//!   renamed note keeps its place; an open note follows its file. Nothing
+//!   here rewrites a note to arrange it.
 //! - **Context.** The window the notes follow: the most recently focused
 //!   open window, from the `mru-event-stream`. Focus on anything else
 //!   (wl-note's own surfaces, the dock, a launcher: layer surfaces, which
@@ -13,23 +19,30 @@
 //!   once it held for `settle` (context.rs). When the context's window
 //!   closes, the most recent one left takes over. Without a stream, only
 //!   global notes show.
-//! - **The column** (column.rs) is on one output for now: the one `output`
-//!   names, or the first. Its levels follow the pointer by themselves; it
-//!   asks for the rest (`Act`): opening and closing notes, toggling a
-//!   checkbox, retitling, pinning and unpinning (written to the file,
-//!   which inotify brings back), opening a link or a file
-//!   (`open-command`) or the note (`editor-command`), and making a note.
-//!   An open note stays in the column whatever the context does, until it
-//!   is closed.
+//! - **Outputs.** `output` says where the columns are (column.rs): on the
+//!   output it names (else the first), on every output (`all`), or on the
+//!   context's (`focused`, from the `output-event-stream`; without it, the
+//!   first). Following the focus, the column slides away on the old
+//!   output and in on the new one, but not while a note is open in it:
+//!   the user put it there. One note is open at a time, on any output.
+//! - **The columns** follow the pointer by themselves; they ask for the
+//!   rest (`Act`): opening and closing notes, toggling a checkbox,
+//!   retitling, pinning and unpinning (written to the file, which inotify
+//!   brings back), hiding and reordering (written to the state), opening a
+//!   link or a file (`open-command`) or the note (`editor-command`), and
+//!   making a note. An open note stays in its column whatever the context
+//!   does, where it was, until it is closed.
 //! - **The socket.** `wl-note new` and `wl-note focus` come over it
 //!   (ipc.rs). A new note is attached to the context's app (or global),
-//!   written at once, and opened in the editor if it has no text yet, else
-//!   opened. A note opened by name shows even if it doesn't belong to the
+//!   written at once, put at the end of the order, and opened in the
+//!   editor if it has no text yet, else opened. A note opened by name is
+//!   shown again if hidden, and shows even if it doesn't belong to the
 //!   context, until it is closed.
 //! - **Fonts on the main thread**, for the open note's editable title,
 //!   are loaded on a thread of their own at the start.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -39,13 +52,14 @@ use smithay_client_toolkit::seat::pointer::PointerEvent;
 use smithay_client_toolkit::shell::wlr_layer::{LayerSurface, LayerSurfaceConfigure};
 use wayland_client::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
-use wl_shell_config::Reloader;
+use wl_shell_config::{Reloader, TreeEvent};
 use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
 use wl_shell_core::spawn::{self, Output};
+use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Incoming, Listener, Reply};
 use wl_shell_log::warn;
-use wl_shell_notes::{Index, Note, Window};
+use wl_shell_notes::{Index, Note, State, Window, state};
 use wl_shell_render::text::Text;
 use wl_shell_render::worker::{Assets, Done};
 
@@ -56,7 +70,22 @@ use crate::deck::{self, Item, Look};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
-use crate::{bar, create, find, list};
+use crate::{bar, create, find, list, reorder};
+
+/// Windows whose output is remembered at most: the stream may report
+/// windows the toplevel list never announces, so not all are forgotten.
+const MAX_PLACED: usize = 4096;
+
+/// The window the notes follow.
+#[derive(Clone, Debug, PartialEq)]
+struct Ctx {
+    window: Window,
+    /// Its ext identifier, for the output it is on.
+    id: String,
+}
+
+/// An output a column can go on: it, its name and its scale.
+type Target = (WlOutput, String, i32);
 
 pub struct WlNote {
     /// The config, reloaded when its file changes.
@@ -68,20 +97,34 @@ pub struct WlNote {
     index: Index,
     /// Something in the notes directory changed since the last scan.
     notes_touched: bool,
-    /// The directories watched.
-    watches: Vec<(PathBuf, RegistrationToken)>,
+    /// The notes directory's watch.
+    tree: Option<RegistrationToken>,
+    /// Renames in the notes directory not followed yet, as (from, to).
+    moves: Vec<(PathBuf, PathBuf)>,
+    /// The order and the hidden notes.
+    state: State,
+    /// Where they are kept; None: nowhere (no `$HOME`), so only for now.
+    state_dir: Option<PathBuf>,
+    /// The state files were touched since they were last read.
+    state_touched: bool,
     /// The worker, started with the program.
     assets: Option<Rc<Assets>>,
     papers: Option<Rc<RefCell<Papers>>>,
-    column: Option<Column>,
-    /// The outputs (or the config) changed since the column was placed.
+    /// The columns: those shown, and those retiring.
+    columns: Vec<Column>,
+    /// The outputs, the config or the context's output changed since the
+    /// columns were placed.
     outputs_dirty: bool,
     /// The window the notes follow; None: only global notes.
-    context: Settle<Option<Window>>,
+    context: Settle<Option<Ctx>>,
     /// When a pending context is due, and the timer that checks.
     settle_timer: Option<(Instant, RegistrationToken)>,
     /// Warned that there is no `mru-event-stream`.
     warned_stream: bool,
+    /// The `output-event-stream`, for `output = "focused"`.
+    output_stream: LineStream<Self>,
+    /// Which output each window is on, by ID, as the stream says.
+    window_outputs: HashMap<String, String>,
     /// The notes shown may have changed.
     dirty: bool,
     /// Sheets may have been replaced: destroy the ones no longer shown.
@@ -89,9 +132,10 @@ pub struct WlNote {
     /// The socket `new` and `focus` come over; None if it couldn't be
     /// bound.
     listener: Option<Listener<NoteRequest>>,
-    /// The note open when the notes were last shown: once it closes, the
-    /// notes are shown again (it may not belong to the context).
-    last_open: Option<String>,
+    /// The columns' open notes when the notes were last shown: once one
+    /// closes, the notes are shown again (it may not belong to the
+    /// context), and the columns may move.
+    last_open: Vec<Option<String>>,
     /// Fonts for the main thread, once loaded.
     fonts: Fonts,
 }
@@ -107,24 +151,38 @@ impl WlNote {
             reloader,
             config_touched: false,
             notes_touched: false,
-            watches: Vec::new(),
+            tree: None,
+            moves: Vec::new(),
+            state: State::default(),
+            state_dir: None,
+            state_touched: false,
             assets: None,
             papers: None,
-            column: None,
+            columns: Vec::new(),
             outputs_dirty: true,
             context: Settle::new(None),
             settle_timer: None,
             warned_stream: false,
+            output_stream: LineStream::new(
+                "output-event-stream",
+                Hooks {
+                    locate: |shell: &mut Shell<Self>| &mut shell.program.output_stream,
+                    line: |shell, line| shell.program.output_line(line),
+                    changed: |shell| shell.program.outputs_dirty = true,
+                },
+            ),
+            window_outputs: HashMap::new(),
             dirty: true,
             trim: false,
             listener: None,
-            last_open: None,
+            last_open: Vec::new(),
             fonts: Rc::new(RefCell::new(None)),
         })
     }
 
     /// Connected, with the window list and the outputs received: start the
-    /// worker and the stream, read and watch the notes, and show them.
+    /// worker and the streams, read and watch the notes and their state,
+    /// and show them.
     pub fn started(&mut self, core: &mut Core<Self>) -> Result<(), String> {
         self.reloader
             .refresh(&core.loop_handle, &mut |m| warn!("{m}"));
@@ -132,8 +190,10 @@ impl WlNote {
         self.start_worker(core)?;
         self.load_fonts(core);
         self.watch_config(core);
+        self.open_state(core);
         self.open_notes(core);
         self.use_stream(core);
+        self.use_output_stream(core);
         // The first context shows at once.
         self.context.set(Self::candidate(core, None));
         match Listener::bind(core) {
@@ -176,7 +236,7 @@ impl WlNote {
                 .insert_source(fonts, |event, _, shell: &mut Shell<Self>| {
                     if let channel::Event::Msg(text) = event {
                         *shell.program.fonts.borrow_mut() = Some(text);
-                        if let Some(column) = &mut shell.program.column {
+                        for column in &mut shell.program.columns {
                             column.fonts_ready();
                         }
                     }
@@ -203,22 +263,113 @@ impl WlNote {
         }
     }
 
+    /// Find the state directory (created if missing), and watch its
+    /// files.
+    fn open_state(&mut self, core: &Core<Self>) {
+        let Some(dir) = state::dir() else {
+            return warn!(
+                "neither XDG_STATE_HOME nor HOME is set: the order and hidden notes aren't kept"
+            );
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("{}: {e}", dir.display());
+        }
+        for name in [state::ORDER, state::HIDDEN] {
+            let path = dir.join(name);
+            let watched =
+                wl_shell_config::watch_file(&core.loop_handle, &path, |shell: &mut Shell<Self>| {
+                    shell.program.state_touched = true;
+                });
+            if let Err(e) = watched {
+                warn!("not watching {}: {e}", path.display());
+            }
+        }
+        self.state_dir = Some(dir);
+        self.state_touched = true;
+        self.reload_state();
+    }
+
+    /// Read the state files again, if they were touched. Notes hidden
+    /// from elsewhere (`wl-note hide`) crumple too.
+    fn reload_state(&mut self) {
+        if !std::mem::take(&mut self.state_touched) {
+            return;
+        }
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        let (state, errors) = State::load(dir);
+        for e in errors {
+            warn!("{e}");
+        }
+        if state != self.state {
+            for p in state.hidden.paths() {
+                if self.state.is_hidden(p) {
+                    continue;
+                }
+                let key = p.to_string_lossy();
+                for column in &mut self.columns {
+                    column.crumple(&key);
+                }
+            }
+            self.state = state;
+            self.dirty = true;
+        }
+    }
+
+    /// Write the order and/or the hidden file.
+    fn save_state(&mut self, order: bool, hidden: bool) {
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        if order && let Err(e) = self.state.save_order(dir) {
+            warn!("{}: {e}", dir.join(state::ORDER).display());
+        }
+        if hidden && let Err(e) = self.state.save_hidden(dir) {
+            warn!("{}: {e}", dir.join(state::HIDDEN).display());
+        }
+    }
+
     /// Read the notes directory (created if missing) and watch it.
-    fn open_notes(&mut self, core: &Core<Self>) {
-        for (_, token) in self.watches.drain(..) {
+    fn open_notes(&mut self, core: &mut Core<Self>) {
+        if let Some(token) = self.tree.take() {
             core.loop_handle.remove(token);
         }
+        self.moves.clear();
         let dir = self.config.notes_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!("{}: {e}", dir.display());
+        }
+        let watched = wl_shell_config::watch_tree(
+            &core.loop_handle,
+            &dir,
+            |shell: &mut Shell<Self>, events| shell.program.tree_events(events),
+        );
+        match watched {
+            Ok(token) => self.tree = Some(token),
+            Err(e) => warn!("not watching {}: {e}", dir.display()),
         }
         self.index = Index::new(dir);
         self.notes_touched = true;
         self.rescan(core);
     }
 
-    /// Read the notes directory again, and watch the directories in it.
-    fn rescan(&mut self, core: &Core<Self>) {
+    /// Something changed in the notes directory: rescan, and follow the
+    /// renames of notes and directories (not those to other names, such
+    /// as an editor's backup copy).
+    fn tree_events(&mut self, events: Vec<TreeEvent>) {
+        for e in events {
+            if let TreeEvent::Moved { from, to, dir } = e
+                && (dir || is_note(&to))
+            {
+                self.moves.push((from, to));
+            }
+        }
+        self.notes_touched = true;
+    }
+
+    /// Read the notes directory again, and follow the renames in it.
+    fn rescan(&mut self, core: &mut Core<Self>) {
         if !std::mem::take(&mut self.notes_touched) {
             return;
         }
@@ -236,26 +387,33 @@ impl WlNote {
         if !changes.is_empty() {
             self.dirty = true;
         }
-        let dirs = self.index.dirs().to_vec();
-        self.watches.retain(|(dir, token)| {
-            let keep = dirs.contains(dir);
-            if !keep {
-                core.loop_handle.remove(*token);
+        let moves = std::mem::take(&mut self.moves);
+        let (mut order, mut hidden) = (false, false);
+        for (from, to) in &moves {
+            let (o, h) = self.state.rename(from, to);
+            (order, hidden) = (order || o, hidden || h);
+            // An open note follows its file.
+            for i in 0..self.columns.len() {
+                let Some(open) = self.columns[i].open_key().map(PathBuf::from) else {
+                    continue;
+                };
+                let Ok(rest) = open.strip_prefix(from) else {
+                    continue;
+                };
+                let new = match rest.as_os_str().is_empty() {
+                    true => to.clone(),
+                    false => to.join(rest),
+                };
+                if self.index.get(&open).is_none() && self.index.get(&new).is_some() {
+                    // A title edit of the old name has nowhere to go.
+                    let _ = self.columns[i].open(core, &new.to_string_lossy());
+                    self.dirty = true;
+                }
             }
-            keep
-        });
-        for dir in dirs {
-            if self.watches.iter().any(|(d, _)| *d == dir) {
-                continue;
-            }
-            let watched =
-                wl_shell_config::watch_dir(&core.loop_handle, &dir, |shell: &mut Shell<Self>| {
-                    shell.program.notes_touched = true;
-                });
-            match watched {
-                Ok(token) => self.watches.push((dir, token)),
-                Err(e) => warn!("not watching {}: {e}", dir.display()),
-            }
+        }
+        if order || hidden {
+            self.save_state(order, hidden);
+            self.dirty = true;
         }
     }
 
@@ -269,9 +427,36 @@ impl WlNote {
         core.use_focus_stream(command);
     }
 
+    /// Run the `output-event-stream`, if there is one and the column
+    /// follows the focus.
+    fn use_output_stream(&mut self, core: &Core<Self>) {
+        let command = (self.config.output_event_stream.as_deref())
+            .filter(|_| self.config.output.trim() == "focused");
+        let handle = core.loop_handle.clone();
+        self.output_stream.configure(command, &handle);
+    }
+
+    /// A line of the output stream: `<output> <id>`.
+    fn output_line(&mut self, line: &str) {
+        let Some((output, id)) = parse_output_line(line) else {
+            return;
+        };
+        if self.window_outputs.get(id).is_some_and(|o| o == output) {
+            return;
+        }
+        if self.window_outputs.len() >= MAX_PLACED && !self.window_outputs.contains_key(id) {
+            self.window_outputs.clear();
+        }
+        self.window_outputs
+            .insert(id.to_string(), output.to_string());
+        if self.context.value().as_ref().is_some_and(|c| c.id == id) {
+            self.outputs_dirty = true;
+        }
+    }
+
     /// After every event loop dispatch: follow config and notes changes,
-    /// place the column, and show the notes, once for however many events
-    /// arrived.
+    /// place the columns, and show the notes, once for however many
+    /// events arrived.
     pub fn after_dispatch(&mut self, core: &mut Core<Self>) {
         let touched = std::mem::take(&mut self.config_touched);
         if (touched || self.reloader.scheme_changed())
@@ -279,24 +464,38 @@ impl WlNote {
         {
             self.config_changed(core);
         }
+        // The state first, so renames follow what is on disk.
+        self.reload_state();
         self.rescan(core);
-        if std::mem::take(&mut self.outputs_dirty) {
-            self.sync_column(core);
-        }
         self.serve(core);
-        // A note kept open goes once it is closed.
-        if (self.column.as_ref()).and_then(Column::open_key) != self.last_open.as_deref() {
+        // A note kept open goes once it is closed, and the column may
+        // follow the focus again.
+        if self.open_keys() != self.last_open {
             self.dirty = true;
+            self.outputs_dirty = true;
+        }
+        if std::mem::take(&mut self.outputs_dirty) {
+            self.sync_columns(core);
         }
         if std::mem::take(&mut self.dirty) {
             self.show_notes();
         }
+        // Columns gone from their outputs, once their notes slid away.
+        let before = self.columns.len();
+        self.columns.retain(|c| !c.retired());
+        if self.columns.len() != before {
+            self.trim = true;
+        }
         if std::mem::take(&mut self.trim) {
             if let Some(papers) = &self.papers {
-                let shown = (self.column.as_ref()).map_or(Vec::new(), Column::shown_buffers);
+                let shown: Vec<_> = self
+                    .columns
+                    .iter()
+                    .flat_map(Column::shown_buffers)
+                    .collect();
                 papers.borrow_mut().trim(&shown);
             }
-            if let Some(column) = &mut self.column {
+            for column in &mut self.columns {
                 column.trim();
             }
         }
@@ -315,6 +514,7 @@ impl WlNote {
             self.use_stream(core);
             self.update_context(core, None);
         }
+        self.use_output_stream(core);
         self.outputs_dirty = true;
         self.dirty = true;
         self.trim = true;
@@ -325,7 +525,7 @@ impl WlNote {
     /// The window the notes should follow: the most recently focused one
     /// still open (leaving out `closed`, which is closing). None without
     /// a stream, or before any window was seen focused.
-    fn candidate(core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) -> Option<Window> {
+    fn candidate(core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) -> Option<Ctx> {
         if !core.focus_stream.configured() {
             return None;
         }
@@ -337,7 +537,15 @@ impl WlNote {
             .mru
             .most_recent(open.iter().map(|t| t.identifier.as_str()))?;
         let t = open.iter().find(|t| t.identifier == id)?;
-        Some(Window::new(&t.app_id, &t.title))
+        Some(Ctx {
+            window: Window::new(&t.app_id, &t.title),
+            id: t.identifier.clone(),
+        })
+    }
+
+    /// The context's window.
+    fn window(&self) -> Option<&Window> {
+        self.context.value().as_ref().map(|c| &c.window)
     }
 
     /// The focus, the windows or a title changed: follow, once settled.
@@ -354,6 +562,7 @@ impl WlNote {
             Proposal::Changed => {
                 self.cancel_settle(core);
                 self.dirty = true;
+                self.outputs_dirty = true;
             }
             Proposal::Wait(at) => {
                 if self.settle_timer.as_ref().is_some_and(|(t, _)| *t == at) {
@@ -380,146 +589,224 @@ impl WlNote {
         }
     }
 
-    // -- the column ----------------------------------------------------------
+    // -- the columns ---------------------------------------------------------
 
-    /// The output the column goes on: the one `output` names, else the
-    /// first. Following the focused window comes with the output stream.
-    fn pick_output(&self, core: &Core<Self>) -> Option<(WlOutput, String, i32)> {
-        let wanted = self.config.output.trim();
+    /// The output the context's window is on, if the stream said.
+    fn context_output(&self) -> Option<&str> {
+        if !self.output_stream.running() {
+            return None;
+        }
+        let id = &self.context.value().as_ref()?.id;
+        self.window_outputs.get(id).map(String::as_str)
+    }
+
+    /// The outputs the columns go on (see the module's comment).
+    fn targets(&self, core: &Core<Self>) -> Vec<Target> {
         let named = |o: &WlOutput| {
             let info = core.output_state.info(o)?;
             Some((o.clone(), info.name?, info.scale_factor.max(1)))
         };
-        let outputs: Vec<_> = core
-            .output_state
-            .outputs()
+        let outputs: Vec<Target> = (core.output_state.outputs())
             .filter_map(|o| named(&o))
             .collect();
-        if !matches!(wanted, "focused" | "all")
-            && let Some(o) = outputs.iter().find(|(_, name, _)| name == wanted)
-        {
-            return Some(o.clone());
-        }
-        outputs.into_iter().next()
+        let on = |output: &WlOutput| outputs.iter().find(|t| t.0 == *output);
+        let pick = match self.config.output.trim() {
+            "all" => return outputs,
+            "focused" => {
+                let current = self.columns.iter().find(|c| !c.retiring);
+                let held = current.filter(|c| c.open_key().is_some());
+                (held.and_then(|c| on(&c.output)))
+                    .or_else(|| {
+                        let name = self.context_output()?;
+                        outputs.iter().find(|t| t.1 == name)
+                    })
+                    .or_else(|| current.and_then(|c| on(&c.output)))
+                    .or(outputs.first())
+            }
+            name => outputs.iter().find(|t| t.1 == name).or(outputs.first()),
+        };
+        pick.cloned().into_iter().collect()
     }
 
-    /// Create, restyle, move or drop the column to match the outputs and
-    /// the config.
-    fn sync_column(&mut self, core: &Core<Self>) {
+    /// Create, restyle, move or retire the columns to match the outputs,
+    /// the config and the context.
+    fn sync_columns(&mut self, core: &mut Core<Self>) {
         let (Some(papers), Some(assets)) = (self.papers.clone(), self.assets.clone()) else {
             return; // not started yet
         };
         let style = Style::new(&self.config);
-        let Some((output, name, scale)) = self.pick_output(core) else {
-            self.column = None;
-            return;
-        };
-        if self.column.as_ref().is_some_and(|c| {
-            c.output != output || c.name != name || c.style().needs_new_surface(&style)
-        }) {
-            self.column = None;
-        }
-        match &mut self.column {
-            Some(column) => {
-                column.set_style(style);
-                column.set_scale(scale);
+        let targets = self.targets(core);
+        // A new edge or layer takes new surfaces.
+        self.columns
+            .retain(|c| !c.style().needs_new_surface(&style));
+        let mut acts = Vec::new();
+        for column in &mut self.columns {
+            match targets
+                .iter()
+                .find(|t| t.0 == column.output && t.1 == column.name)
+            {
+                Some((_, _, scale)) => {
+                    if column.retiring {
+                        column.retiring = false;
+                        self.dirty = true;
+                    }
+                    column.set_style(style.clone());
+                    column.set_scale(*scale);
+                }
+                None if !column.retiring => {
+                    // Its notes slide away; it goes once they are gone.
+                    acts.push((column.surface().clone(), column.close()));
+                    column.retiring = true;
+                    column.set_notes(Vec::new());
+                }
+                None => {}
             }
-            None => match Column::new(
+        }
+        for (output, name, scale) in targets {
+            if self
+                .columns
+                .iter()
+                .any(|c| c.output == output && c.name == name)
+            {
+                continue;
+            }
+            let column = Column::new(
                 core,
                 output,
                 name,
                 scale,
-                style,
-                papers,
-                assets,
+                style.clone(),
+                papers.clone(),
+                assets.clone(),
                 self.fonts.clone(),
-            ) {
+            );
+            match column {
                 Ok(column) => {
-                    self.column = Some(column);
+                    self.columns.push(column);
                     self.dirty = true;
                 }
-                Err(e) => warn!("failed to create the column: {e}"),
-            },
+                Err(e) => warn!("failed to create a column: {e}"),
+            }
+        }
+        for (surface, acts) in acts {
+            self.acts(core, &surface, acts);
         }
     }
 
-    /// Show the context's notes, and the open one.
-    fn show_notes(&mut self) {
-        let Some(column) = &mut self.column else {
-            return;
+    /// The column whose surface is `surface`.
+    fn column_at(&self, surface: &WlSurface) -> Option<usize> {
+        self.columns.iter().position(|c| c.surface() == surface)
+    }
+
+    /// The column the CLI's notes open in: the one on the context's
+    /// output, else the first shown.
+    fn main_column(&self) -> Option<usize> {
+        let shown = |c: &Column| !c.retiring;
+        let output = self.context_output();
+        (self.columns.iter())
+            .position(|c| shown(c) && output.is_some_and(|o| c.name == o))
+            .or_else(|| self.columns.iter().position(shown))
+    }
+
+    /// The columns' open notes.
+    fn open_keys(&self) -> Vec<Option<String>> {
+        (self.columns.iter())
+            .filter(|c| !c.retiring)
+            .map(|c| c.open_key().map(String::from))
+            .collect()
+    }
+
+    /// What the column shows of the note `path`.
+    fn shown(&self, path: &Path, window: Option<&Window>) -> Option<Shown> {
+        let entry = self.index.get(path)?;
+        let key = path.to_string_lossy().into_owned();
+        let color = entry.note.meta.color.as_ref();
+        let look = Look {
+            color: self.config.paper_color(color),
+            tilt: deck::tilt(&key, self.config.tilt),
         };
-        let window = self.context.value().as_ref();
-        let mut paths = self.index.shown(window);
-        let open = column.open_key().map(String::from);
-        if let Some(open) = &open
-            && !paths.iter().any(|p| *p == Path::new(open))
-            && self.index.get(Path::new(open)).is_some()
-        {
-            paths.push(Path::new(open));
-        }
-        self.last_open = open.clone();
-        let notes = (paths.into_iter())
-            .filter_map(|path| {
-                let entry = self.index.get(path)?;
-                let key = path.to_string_lossy().into_owned();
-                let color = entry.note.meta.color.as_ref();
-                let look = Look {
-                    color: self.config.paper_color(color),
-                    tilt: deck::tilt(&key, self.config.tilt),
-                };
-                let content = Content::of_note(&entry.note, &list::name(path));
-                let files = (bar::files(&content.links).into_iter())
-                    .map(|path| FileLink {
-                        exists: path.exists(),
-                        path,
-                    })
-                    .collect();
-                Some(Shown {
-                    item: Item { key, look },
-                    content: Rc::new(content),
-                    text: self.config.text_color(color),
-                    files,
-                    pin: pin_state(&entry.note, window),
-                })
+        let content = Content::of_note(&entry.note, &list::name(path));
+        let files = (bar::files(&content.links).into_iter())
+            .map(|path| FileLink {
+                exists: path.exists(),
+                path,
             })
             .collect();
-        column.set_notes(notes);
+        Some(Shown {
+            item: Item { key, look },
+            content: Rc::new(content),
+            text: self.config.text_color(color),
+            files,
+            pin: pin_state(&entry.note, window),
+        })
     }
 
-    /// One of the column's timers fired.
-    pub fn column_timer(&mut self, _: &mut Core<Self>, which: Timer) {
-        if let Some(column) = &mut self.column {
-            column.timer_due(which);
+    /// Show the context's notes in every column, and each one's open
+    /// note where it was.
+    fn show_notes(&mut self) {
+        let window = self.window().cloned();
+        let window = window.as_ref();
+        let paths: Vec<PathBuf> = (self.state.shown(&self.index, window).into_iter())
+            .map(Path::to_path_buf)
+            .collect();
+        let mut lists: Vec<Option<Vec<Shown>>> = Vec::new();
+        for column in &self.columns {
+            if column.retiring {
+                lists.push(None);
+                continue;
+            }
+            let mut mine = paths.clone();
+            if let Some(open) = column.open_key().map(PathBuf::from)
+                && !mine.contains(&open)
+                && self.index.get(&open).is_some()
+                && !self.state.is_hidden(&open)
+            {
+                let key = open.to_string_lossy();
+                let at = column.keys().position(|k| k == key).unwrap_or(mine.len());
+                mine.insert(at.min(mine.len()), open);
+            }
+            let notes = mine.iter().filter_map(|p| self.shown(p, window)).collect();
+            lists.push(Some(notes));
+        }
+        for (column, notes) in self.columns.iter_mut().zip(lists) {
+            if let Some(notes) = notes {
+                column.set_notes(notes);
+            }
+        }
+        self.last_open = self.open_keys();
+    }
+
+    /// One of a column's timers fired.
+    pub fn column_timer(&mut self, _: &mut Core<Self>, surface: &WlSurface, which: Timer) {
+        if let Some(i) = self.column_at(surface) {
+            self.columns[i].timer_due(which);
         }
     }
 
-    // -- what the column asks for ------------------------------------------
+    // -- what the columns ask for ------------------------------------------
 
-    fn acts(&mut self, core: &mut Core<Self>, acts: Vec<Act>) {
+    fn acts(&mut self, core: &mut Core<Self>, from: &WlSurface, acts: Vec<Act>) {
         for act in acts {
-            self.act(core, act);
+            self.act(core, from, act);
         }
     }
 
-    fn act(&mut self, core: &mut Core<Self>, act: Act) {
-        let Some(column) = &mut self.column else {
+    fn act(&mut self, core: &mut Core<Self>, from: &WlSurface, act: Act) {
+        let Some(i) = self.column_at(from) else {
             return;
         };
         match act {
-            Act::Open(key) => {
-                let more = column.open(core, &key);
-                self.acts(core, more);
-            }
+            Act::Open(key) => self.open_in(core, i, &key),
             Act::Close => {
-                let more = column.close();
-                self.acts(core, more);
+                let more = self.columns[i].close();
+                self.acts(core, from, more);
             }
             Act::Task(key, n) => self.toggle_task(&key, n as usize),
             Act::Link(key, n) => self.open_link(core, &key, n as usize),
             Act::File(path) => self.open_path(core, &path.to_string_lossy()),
             Act::Edit(key) => {
-                let more = column.close();
-                self.acts(core, more);
+                let more = self.columns[i].close();
+                self.acts(core, from, more);
                 self.edit(core, &key);
             }
             Act::New => {
@@ -532,18 +819,69 @@ impl WlNote {
                 t => note.set_value("title", t),
             }),
             Act::Pin(key, exact) => {
-                let Some(window) = self.context.value().clone() else {
+                let Some(window) = self.window().cloned() else {
                     return;
                 };
                 self.edit_note(&key, |note| note.pin(&window, exact));
             }
             Act::Unpin(key) => {
-                let Some(window) = self.context.value().clone() else {
+                let Some(window) = self.window().cloned() else {
                     return;
                 };
                 self.edit_note(&key, |note| note.unpin(&window));
             }
+            Act::Hide(key) => self.hide_note(core, &key),
+            Act::Reorder(key, shown, gap) => self.reorder(&key, &shown, gap),
         }
+    }
+
+    /// Open `key` in the column `i`, closing whatever is open in the
+    /// others: one note is open at a time.
+    fn open_in(&mut self, core: &mut Core<Self>, i: usize, key: &str) {
+        for j in 0..self.columns.len() {
+            if j != i && self.columns[j].open_key().is_some() {
+                let more = self.columns[j].close();
+                let surface = self.columns[j].surface().clone();
+                self.acts(core, &surface, more);
+            }
+        }
+        let Some(column) = self.columns.get_mut(i) else {
+            return;
+        };
+        let more = column.open(core, key);
+        let surface = column.surface().clone();
+        self.acts(core, &surface, more);
+    }
+
+    /// Hide `key`: it crumples into the edge (closing first, if open),
+    /// and goes in the hidden file.
+    fn hide_note(&mut self, core: &mut Core<Self>, key: &str) {
+        for i in 0..self.columns.len() {
+            if self.columns[i].open_key() == Some(key) {
+                let more = self.columns[i].close();
+                let surface = self.columns[i].surface().clone();
+                self.acts(core, &surface, more);
+            }
+            self.columns[i].crumple(key);
+        }
+        if self.state.hidden.push(Path::new(key)) {
+            self.save_state(false, true);
+        }
+        self.dirty = true;
+    }
+
+    /// `key` was dropped at slot `gap` of a column showing `shown`: move it
+    /// there in the order, keeping the notes not shown in their places.
+    fn reorder(&mut self, key: &str, shown: &[String], gap: usize) {
+        let full = self.state.full_order(&self.index);
+        let shown: Vec<&Path> = shown.iter().map(Path::new).collect();
+        let new = reorder::land(&full, &shown, Path::new(key), gap);
+        if new != full {
+            self.state.order.set(new);
+            self.save_state(true, false);
+        }
+        // Back to its slot, or to its new one.
+        self.dirty = true;
     }
 
     /// The absolute path of the note `key`.
@@ -647,12 +985,12 @@ impl WlNote {
     }
 
     /// Make a note: attached to the context's app unless `global` (or
-    /// there is no context), written at once, and focused; without text,
-    /// opened in the editor instead.
+    /// there is no context), written at once, put at the end of the
+    /// order, and focused; without text, opened in the editor instead.
     fn new_note(&mut self, core: &mut Core<Self>, new: NewNote) -> Result<(), String> {
         let app = match new.global {
             true => None,
-            false => self.context.value().as_ref().map(|w| w.app_id.clone()),
+            false => self.window().map(|w| w.app_id.clone()),
         };
         let text = create::text(
             app.as_deref(),
@@ -664,9 +1002,11 @@ impl WlNote {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = wl_shell_notes::create_new(&dir, &create::now_stem(), &text)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let key = (path.strip_prefix(&dir).unwrap_or(&path))
-            .to_string_lossy()
-            .into_owned();
+        let rel = path.strip_prefix(&dir).unwrap_or(&path).to_path_buf();
+        let key = rel.to_string_lossy().into_owned();
+        if self.state.order.push(&rel) {
+            self.save_state(true, false);
+        }
         // In the index (and the column) right away.
         self.notes_touched = true;
         self.rescan(core);
@@ -684,14 +1024,13 @@ impl WlNote {
     /// Open `key` with the keyboard, showing it even if it doesn't belong
     /// to the context.
     fn focus_note(&mut self, core: &mut Core<Self>, key: &str) {
-        let Some(column) = &mut self.column else {
+        let Some(i) = self.main_column() else {
             return;
         };
-        let acts = column.open(core, key);
+        self.open_in(core, i, key);
         // Among the notes before its card is made, so it is kept.
         self.show_notes();
         self.dirty = false;
-        self.acts(core, acts);
     }
 
     // -- the socket --------------------------------------------------------
@@ -717,28 +1056,43 @@ impl WlNote {
         }
     }
 
-    /// `wl-note focus [note]`.
+    /// `wl-note focus [note]` (and `show --focus`): a hidden note is shown
+    /// again.
     fn focus_request(&mut self, core: &mut Core<Self>, note: Option<&str>) -> Result<(), String> {
-        let Some(column) = &mut self.column else {
+        let Some(main) = self.main_column() else {
             return Err("no output to show notes on".into());
         };
         let key = match note {
             Some(q) => {
+                // `show --focus` changed the state just now, maybe before
+                // its inotify event arrives.
+                self.state_touched = true;
+                self.reload_state();
+                self.notes_touched = true;
+                self.rescan(core);
                 let notes: Vec<(&Path, Option<&str>)> = self
                     .index
                     .iter()
                     .map(|(p, e)| (p, e.note.title()))
                     .collect();
-                let found = find::find(self.index.dir(), &notes, q)?;
+                let found = find::find(self.index.dir(), &notes, q)?.to_path_buf();
+                if self.state.hidden.remove(&found) {
+                    self.save_state(false, true);
+                }
                 found.to_string_lossy().into_owned()
             }
             // Toggles.
-            None if column.open_key().is_some() => {
-                let acts = column.close();
-                self.acts(core, acts);
+            None if self.columns.iter().any(|c| c.open_key().is_some()) => {
+                for i in 0..self.columns.len() {
+                    if self.columns[i].open_key().is_some() {
+                        let acts = self.columns[i].close();
+                        let surface = self.columns[i].surface().clone();
+                        self.acts(core, &surface, acts);
+                    }
+                }
                 return Ok(());
             }
-            None => match column.keys().next() {
+            None => match self.columns[main].keys().next() {
                 Some(k) => k.to_string(),
                 None => return Err("no notes shown".into()),
             },
@@ -755,34 +1109,52 @@ impl WlNote {
             Done::Paper { paper, rendered } => {
                 if let Some(papers) = &self.papers
                     && (papers.borrow_mut()).insert(&core.g, &core.qh, paper, &rendered)
-                    && let Some(column) = &mut self.column
                 {
-                    column.paper_ready();
+                    for column in &mut self.columns {
+                        column.paper_ready();
+                    }
                 }
             }
             Done::Doc { tag, doc, rendered } => {
-                if let Some(column) = &mut self.column {
+                for column in &mut self.columns {
                     column.doc_ready(tag, &doc, &rendered);
                 }
             }
             Done::FileIcons { path, icons } => {
-                if let Some(column) = &mut self.column {
-                    column.file_icons_ready(path, icons);
+                for column in &mut self.columns {
+                    column.file_icons_ready(path.clone(), icons.clone());
                 }
             }
             Done::Named { key, image } => {
-                if let Some(column) = &mut self.column {
-                    column.icon_ready(key, image);
+                for column in &mut self.columns {
+                    column.icon_ready(key.clone(), image.clone());
                 }
             }
             Done::Pill { request, pill, .. } => {
-                if let Some(column) = &mut self.column {
+                for column in &mut self.columns {
                     column.line_ready(&request, &pill);
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Whether `rel` (in the notes directory) is where a note can be: a
+/// `.md` file outside dot directories, not a dot file.
+fn is_note(rel: &Path) -> bool {
+    rel.extension().is_some_and(|e| e == "md")
+        && !rel
+            .components()
+            .any(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."))
+}
+
+/// A line of the output stream: `<output-name> <id>`. Everything after
+/// the first space is the ID.
+fn parse_output_line(line: &str) -> Option<(&str, &str)> {
+    let (output, id) = line.trim_start().split_once(' ')?;
+    let id = id.trim_end_matches(['\r', '\n']);
+    (!output.is_empty() && !id.is_empty()).then_some((output, id))
 }
 
 /// What the pin icon of `note` does with `window` as the context.
@@ -824,6 +1196,9 @@ impl Program for WlNote {
     }
 
     fn toplevel_closed(&mut self, core: &mut Core<Self>, handle: &ExtForeignToplevelHandleV1) {
+        if let Some(t) = core.toplevel(handle) {
+            self.window_outputs.remove(&t.identifier);
+        }
         self.update_context(core, Some(handle));
     }
 
@@ -840,18 +1215,14 @@ impl Program for WlNote {
     }
 
     fn output_removed(&mut self, _: &mut Core<Self>, output: &WlOutput) {
-        if self.column.as_ref().is_some_and(|c| c.output == *output) {
-            self.column = None;
-        }
+        self.columns.retain(|c| c.output != *output);
         self.outputs_dirty = true;
     }
 
-    /// The compositor closed the column, e.g. because its output is going
+    /// The compositor closed a column, e.g. because its output is going
     /// away. It comes back if the outputs or the config change.
     fn layer_closed(&mut self, _: &mut Core<Self>, layer: &LayerSurface) {
-        if self.column.as_ref().is_some_and(|c| c.is(layer)) {
-            self.column = None;
-        }
+        self.columns.retain(|c| !c.is(layer));
     }
 
     fn layer_configure(
@@ -860,55 +1231,81 @@ impl Program for WlNote {
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
     ) {
-        if let Some(column) = self.column.as_mut().filter(|c| c.is(layer)) {
+        if let Some(column) = self.columns.iter_mut().find(|c| c.is(layer)) {
             let (width, height) = configure.new_size;
             column.configure(width, height);
         }
     }
 
     fn scale_factor_changed(&mut self, _: &mut Core<Self>, surface: &WlSurface, factor: i32) {
-        if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
+        if let Some(column) = self.columns.iter_mut().find(|c| c.surface() == surface) {
             column.set_scale(factor);
         }
     }
 
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {
-        let Some(column) = (self.column.as_mut()).filter(|c| *c.surface() == event.surface) else {
+        let Some(i) = self.column_at(&event.surface) else {
             return;
         };
         let mods = core.input.modifiers;
-        let acts = column.pointer(core, event, &mods);
-        self.acts(core, acts);
+        let acts = self.columns[i].pointer(core, event, &mods);
+        self.acts(core, &event.surface, acts);
     }
 
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, _: bool) {
-        let Some(column) = self.column.as_mut() else {
+        let Some(surface) = core.input.keyboard_focus().cloned() else {
             return;
         };
-        if core.input.keyboard_focus() != Some(column.surface()) {
+        let Some(i) = self.column_at(&surface) else {
             return;
-        }
-        let acts = column.key(event, &core.input.modifiers);
-        self.acts(core, acts);
+        };
+        let acts = self.columns[i].key(event, &core.input.modifiers);
+        self.acts(core, &surface, acts);
     }
 
     fn keyboard_enter(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
-        if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
+        if let Some(column) = self.columns.iter_mut().find(|c| c.surface() == surface) {
             column.keyboard_enter();
         }
     }
 
     fn keyboard_leave(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
-        if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
-            let acts = column.keyboard_leave();
-            self.acts(core, acts);
+        if let Some(i) = self.column_at(surface) {
+            let acts = self.columns[i].keyboard_leave();
+            self.acts(core, surface, acts);
         }
     }
 
     fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
-        if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
+        if let Some(column) = self.columns.iter_mut().find(|c| c.surface() == surface) {
             column.frame_done();
             self.trim = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_lines() {
+        assert_eq!(parse_output_line("DP-1 42"), Some(("DP-1", "42")));
+        assert_eq!(
+            parse_output_line("  HDMI-A-1 a b\n"),
+            Some(("HDMI-A-1", "a b"))
+        );
+        assert_eq!(parse_output_line("DP-1"), None);
+        assert_eq!(parse_output_line(""), None);
+    }
+
+    #[test]
+    fn notes_to_follow() {
+        assert!(is_note(Path::new("a.md")));
+        assert!(is_note(Path::new("work/a.md")));
+        // An editor's backup, or temporary files.
+        assert!(!is_note(Path::new("a.md~")));
+        assert!(!is_note(Path::new(".a.md.swp")));
+        assert!(!is_note(Path::new(".git/a.md")));
     }
 }

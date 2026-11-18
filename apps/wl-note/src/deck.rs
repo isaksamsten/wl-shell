@@ -31,15 +31,16 @@
 //! notes change:
 //!
 //! 1. The notes that stay are left where they are.
-//! 2. The notes that leave slide back behind the edge, staggered.
+//! 2. The notes that leave slide back behind the edge, staggered; a
+//!    hidden one (`crumple`) shrinks and fades into it instead.
 //! 3. Once they are gone, the column closes up: the notes that stay move
 //!    to their new places, and the new ones slide out of the edge at
 //!    theirs, staggered too.
 //!
 //! A note wanted again while it is still leaving comes back from where it
-//! is. The open note keeps its place in the column whatever the context
-//! does. Once everything has arrived, `advance` says nothing moves, so no
-//! more frames are drawn.
+//! is. (The program keeps the open note in its place in the column
+//! whatever the context does.) Once everything has arrived, `advance`
+//! says nothing moves, so no more frames are drawn.
 //!
 //! The pointer (`point`, from what the column finds under it, `On`): at
 //! the edge (in the `band` along all of it) the column goes to header
@@ -50,6 +51,11 @@
 //! between headers turns a revealed sheet back into a header; moving from
 //! a margin onto its own sheet keeps it out, as the sheet is one target
 //! from margin to bottom.
+//!
+//! Dragging a margin at header level (`drag_start`, `drag_to`,
+//! `drag_end`) moves it with the pointer, lifted and on top, while the
+//! others move apart to leave a gap where it would land (reorder.rs).
+//! The drop says where; the program writes the new order and shows it.
 
 use wl_shell_ui::Spring;
 
@@ -193,6 +199,9 @@ pub struct Card {
     delay: f64,
     /// On its way out.
     pub leaving: bool,
+    /// Hidden: it crumples into the edge as it leaves, rather than
+    /// sliding behind it.
+    pub crumple: bool,
 }
 
 impl Card {
@@ -200,6 +209,21 @@ impl Card {
     pub fn present(&self) -> bool {
         !self.leaving && self.presence.value > 0.5
     }
+
+    /// Crumpling into the edge.
+    pub fn crumpling(&self) -> bool {
+        self.leaving && self.crumple
+    }
+}
+
+/// A margin being dragged along the column.
+#[derive(Clone, Debug, PartialEq)]
+struct Drag {
+    key: String,
+    /// Where its center is along the edge.
+    y: f64,
+    /// The slot it would land in.
+    gap: usize,
 }
 
 /// What the pointer is on, as the column finds it.
@@ -238,6 +262,7 @@ pub struct Deck {
     /// A sheet was revealed since the column came out: margins reveal at
     /// once.
     browsing: bool,
+    drag: Option<Drag>,
     /// The `+` button: 0 out of sight, 1 out.
     pub plus: Spring,
 }
@@ -257,6 +282,7 @@ impl Deck {
             revealed: None,
             open: None,
             browsing: false,
+            drag: None,
             plus: Spring::new(0.0, response),
         }
     }
@@ -287,10 +313,16 @@ impl Deck {
         self.revealed.as_deref() == Some(key) || self.open.as_deref() == Some(key)
     }
 
+    /// The note whose margin is being dragged.
+    pub fn dragging(&self) -> Option<&str> {
+        self.drag.as_ref().map(|d| d.key.as_str())
+    }
+
     /// The most `key` is out for.
     pub fn role(&self, key: &str) -> Role {
         match () {
             _ if self.held(key) => Role::Sheet,
+            _ if self.dragging() == Some(key) => Role::Lifted,
             _ if self.level == Level::Marker => Role::Marker,
             _ if self.hover.as_deref() == Some(key) => Role::Lifted,
             _ => Role::Header,
@@ -334,46 +366,70 @@ impl Deck {
     /// Where the cards that stay center along the edge, in the column's
     /// order: on their slots while none is a sheet; else each sheet comes
     /// down from its header's top and what is after it goes below it (see
-    /// the module's comment).
+    /// the module's comment). A dragged margin is where the pointer has
+    /// it, and the others leave its gap free.
     fn places(&self) -> Vec<f64> {
         let m = &self.metrics;
         let (l, h) = (m.header_length, m.sheet_height);
-        let cards: Vec<&Card> = self.cards.iter().filter(|c| !c.leaving).collect();
-        let held: Vec<bool> = cards.iter().map(|c| self.held(&c.key)).collect();
-        if !held.contains(&true) {
-            return cards.iter().map(|c| c.slot).collect();
+        let live: Vec<&Card> = self.cards.iter().filter(|c| !c.leaving).collect();
+        let n = live.len();
+        if n == 0 {
+            return Vec::new();
         }
-        let n = cards.len();
-        // From each card's top to the next one's: a sheet's height after a
-        // sheet, the headers' pitch after a header.
-        let pitch: Vec<f64> = (1..n)
-            .map(|i| (cards[i].slot - cards[i - 1].slot).max(0.0))
-            .collect();
-        let sheets = (0..n - 1).filter(|&i| held[i]).count() as f64 * h;
-        let headers: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
-        // The last card, and the `+` button after it.
-        let tail = (if held[n - 1] { h } else { l }) + PLUS_GAP + m.plus;
-        let avail = (self.length - 2.0 * m.padding).max(0.0);
-        let fixed = sheets + tail;
-        let squeeze = match headers > 0.0 && fixed + headers > avail {
-            true => ((avail - fixed) / headers).clamp(0.0, 1.0),
-            false => 1.0,
-        };
-        let span = fixed + headers * squeeze;
-        let mut top = (cards[0].slot - l / 2.0)
-            .min(self.length - m.padding - span)
-            .max(m.padding);
+        // The order laid out, as indices into `live`, and each position's
+        // slot: the column's, or with a drag, the dragged one in its gap.
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut slot: Vec<f64> = live.iter().map(|c| c.slot).collect();
+        let drag = (self.drag.as_ref())
+            .filter(|_| self.slots.centers.len() == n)
+            .and_then(|d| Some((live.iter().position(|c| c.key == d.key)?, d)));
+        if let Some((i, d)) = drag {
+            order.remove(i);
+            order.insert(d.gap.min(n - 1), i);
+            slot = self.slots.centers.clone();
+        }
+        let cards: Vec<&Card> = order.iter().map(|&i| live[i]).collect();
+        let held: Vec<bool> = cards.iter().map(|c| self.held(&c.key)).collect();
         let mut places = Vec::with_capacity(n);
-        for i in 0..n {
-            places.push(match held[i] {
-                true => self.fit(top + h / 2.0),
-                false => top + l / 2.0,
-            });
-            if i + 1 < n {
-                top += if held[i] { h } else { pitch[i] * squeeze };
+        if !held.contains(&true) {
+            places = slot.clone();
+        } else {
+            // From each card's top to the next one's: a sheet's height
+            // after a sheet, the headers' pitch after a header.
+            let pitch: Vec<f64> = (1..n).map(|i| (slot[i] - slot[i - 1]).max(0.0)).collect();
+            let sheets = (0..n - 1).filter(|&i| held[i]).count() as f64 * h;
+            let headers: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
+            // The last card, and the `+` button after it.
+            let tail = (if held[n - 1] { h } else { l }) + PLUS_GAP + m.plus;
+            let avail = (self.length - 2.0 * m.padding).max(0.0);
+            let fixed = sheets + tail;
+            let squeeze = match headers > 0.0 && fixed + headers > avail {
+                true => ((avail - fixed) / headers).clamp(0.0, 1.0),
+                false => 1.0,
+            };
+            let span = fixed + headers * squeeze;
+            let mut top = (slot[0] - l / 2.0)
+                .min(self.length - m.padding - span)
+                .max(m.padding);
+            for i in 0..n {
+                places.push(match held[i] {
+                    true => self.fit(top + h / 2.0),
+                    false => top + l / 2.0,
+                });
+                if i + 1 < n {
+                    top += if held[i] { h } else { pitch[i] * squeeze };
+                }
             }
         }
-        places
+        // Back in the column's order.
+        let mut out = vec![0.0; n];
+        for (p, &i) in order.iter().enumerate() {
+            out[i] = places[p];
+        }
+        if let Some((i, d)) = drag {
+            out[i] = d.y;
+        }
+        out
     }
 
     /// Point every spring at where the levels want it.
@@ -387,8 +443,11 @@ impl Deck {
             })
             .collect();
         for (c, (out, len, y)) in self.cards.iter_mut().zip(targets) {
-            c.out.retarget(out);
-            c.len.retarget(len);
+            // A crumpling card keeps its size: it shrinks as a whole.
+            if !c.crumpling() {
+                c.out.retarget(out);
+                c.len.retarget(len);
+            }
             if let Some(y) = y {
                 c.y.retarget(y);
             }
@@ -476,6 +535,90 @@ impl Deck {
         }
     }
 
+    /// Hide `key`: as it leaves (once the program stops showing it), it
+    /// crumples into the edge, at the size it is now.
+    pub fn crumple(&mut self, key: &str) {
+        if let Some(c) = self.cards.iter_mut().find(|c| c.key == key) {
+            c.out.snap(c.out.value);
+            c.len.snap(c.len.value);
+            c.crumple = true;
+        }
+        if self.revealed.as_deref() == Some(key) {
+            self.revealed = None;
+        }
+        if self.hover.as_deref() == Some(key) {
+            self.hover = None;
+        }
+    }
+
+    // -- reordering --------------------------------------------------------
+
+    /// Start dragging `key`'s margin, its center at `y`. Only a note at
+    /// header level moves (a revealed one folds back into its header; the
+    /// open one stays), and not while the column changes. Returns whether
+    /// the drag started.
+    pub fn drag_start(&mut self, key: &str, y: f64) -> bool {
+        let live = self.cards.iter().filter(|c| !c.leaving).count();
+        let ok = self.level == Level::Header
+            && !self.closing
+            && self.open.as_deref() != Some(key)
+            && live == self.slots.centers.len()
+            && self.cards.iter().any(|c| c.key == key && c.present());
+        if !ok {
+            return false;
+        }
+        self.drag = Some(Drag {
+            key: key.to_string(),
+            y,
+            gap: 0,
+        });
+        self.hover = Some(key.to_string());
+        // Folded back, and no sheet pops out under the drop at once.
+        self.revealed = None;
+        self.browsing = false;
+        self.drag_to(y);
+        true
+    }
+
+    /// The dragged margin's center is at `y` now (kept within the
+    /// column): the gap follows it.
+    pub fn drag_to(&mut self, y: f64) {
+        let m = &self.metrics;
+        let half = m.header_length / 2.0;
+        let (lo, hi) = (m.padding + half, self.length - m.padding - half);
+        let y = if lo <= hi {
+            y.clamp(lo, hi)
+        } else {
+            self.length / 2.0
+        };
+        let gap = crate::reorder::gap(&self.slots.centers, y);
+        let Some(d) = &mut self.drag else {
+            return;
+        };
+        (d.y, d.gap) = (y, gap);
+        let key = d.key.clone();
+        self.retarget();
+        // It follows the pointer directly.
+        if let Some(c) = self.cards.iter_mut().find(|c| c.key == key) {
+            c.y.snap(y);
+        }
+    }
+
+    /// Drop the dragged margin: the note and the slot it lands in. It
+    /// goes back to its place until the program shows the new order.
+    pub fn drag_end(&mut self) -> Option<(String, usize)> {
+        let d = self.drag.take()?;
+        self.retarget();
+        Some((d.key, d.gap))
+    }
+
+    /// Give up a drag: the margin goes back to its place.
+    pub fn drag_cancel(&mut self) {
+        if self.drag.take().is_some() {
+            self.retarget();
+        }
+    }
+
     // -- the layout --------------------------------------------------------
 
     /// The `+` button's center along the edge: past the last note, or
@@ -537,9 +680,10 @@ impl Deck {
 
     /// The cards bottom first, as they are painted (and hit-tested,
     /// topmost first): the column's order (later on top), then the open
-    /// note, then the revealed one.
+    /// note, then the revealed one, then a dragged margin.
     pub fn paint_order(&self) -> Vec<&Card> {
         let rank = |c: &Card| match () {
+            _ if self.dragging() == Some(c.key.as_str()) => 3,
             _ if self.revealed.as_deref() == Some(c.key.as_str()) => 2,
             _ if self.open.as_deref() == Some(c.key.as_str()) => 1,
             _ => 0,
@@ -594,17 +738,10 @@ impl Deck {
         }
     }
 
-    /// Show `items`, in this order (see the module's comment). The open
-    /// note keeps its place among them; the revealed and hovered ones go
-    /// if they aren't among them.
-    pub fn set(&mut self, mut items: Vec<Item>) {
-        if let Some(open) = &self.open
-            && let Some(i) = items.iter().position(|i| i.key == *open)
-            && let Some(was) = self.wanted.iter().position(|w| w.key == *open)
-        {
-            let item = items.remove(i);
-            items.insert(was.min(items.len()), item);
-        }
+    /// Show `items`, in this order (see the module's comment). The
+    /// revealed, hovered, dragged and open ones go if they aren't among
+    /// them (the program keeps the open note among them, where it was).
+    pub fn set(&mut self, items: Vec<Item>) {
         self.wanted = items;
         let has = |k: &Option<String>| {
             k.as_ref()
@@ -619,6 +756,9 @@ impl Deck {
         if !has(&self.hover) {
             self.hover = None;
         }
+        if (self.drag.as_ref()).is_some_and(|d| !self.wanted.iter().any(|w| w.key == d.key)) {
+            self.drag = None;
+        }
         let mut rank = 0.0;
         for c in &mut self.cards {
             match self.wanted.iter().find(|i| i.key == c.key) {
@@ -626,6 +766,7 @@ impl Deck {
                     c.look = item.look.clone();
                     if c.leaving {
                         c.leaving = false;
+                        c.crumple = false;
                         c.delay = 0.0;
                         c.presence.retarget(1.0);
                     }
@@ -644,6 +785,11 @@ impl Deck {
         self.closing = true;
         self.retarget();
         self.try_close_up();
+        // The column changed under a drag: it ends.
+        let live = self.cards.iter().filter(|c| !c.leaving).count();
+        if self.drag.is_some() && (self.closing || live != self.slots.centers.len()) {
+            self.drag_cancel();
+        }
     }
 
     /// Close up once no card is leaving anymore.
@@ -684,6 +830,7 @@ impl Deck {
                         len: Spring::new(len, r),
                         delay: rank * STAGGER,
                         leaving: false,
+                        crumple: false,
                     };
                     rank += 1.0;
                     if c.delay == 0.0 {
@@ -1064,8 +1211,8 @@ mod tests {
         let order: Vec<&str> = d.paint_order().iter().map(|c| c.key.as_str()).collect();
         assert_eq!(order, ["c", "b", "a"]);
         // The context changes; it doesn't belong to the new one, so the
-        // program keeps it (appended), and it keeps its slot.
-        d.set(items(&["a", "c", "b"]));
+        // program keeps it where it was, and it keeps its slot.
+        d.set(items(&["a", "b", "c"]));
         settle(&mut d);
         assert_eq!(keys(&d), ["a", "b", "c"]);
         assert_eq!(card(&d, "b").slot, slot);
@@ -1078,6 +1225,90 @@ mod tests {
         d.open_note("c");
         d.set(items(&["a"]));
         assert_eq!(d.open(), None);
+    }
+
+    #[test]
+    fn dragging_a_margin_opens_a_gap() {
+        let mut d = deck(&["a", "b", "c", "d"]);
+        // Only at header level.
+        assert!(!d.drag_start("a", 0.0));
+        d.point(On::Strip);
+        settle(&mut d);
+        let slots: Vec<f64> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|k| card(&d, k).y.value)
+            .collect();
+        assert!(d.drag_start("a", slots[0]));
+        assert_eq!(d.dragging(), Some("a"));
+        assert_eq!(d.role("a"), Role::Lifted);
+        // Down between c and d: b and c move up a slot, d stays.
+        d.drag_to(slots[2] + 5.0);
+        settle(&mut d);
+        assert_eq!(card(&d, "a").y.value, slots[2] + 5.0);
+        assert_eq!(card(&d, "b").y.value, slots[0]);
+        assert_eq!(card(&d, "c").y.value, slots[1]);
+        assert_eq!(card(&d, "d").y.value, slots[3]);
+        // On top while dragged.
+        assert_eq!(d.paint_order().last().unwrap().key, "a");
+        // Kept within the column.
+        d.drag_to(-500.0);
+        assert!(card(&d, "a").y.value >= M.padding + M.header_length / 2.0);
+        d.drag_to(slots[2]);
+        assert_eq!(d.drag_end(), Some(("a".into(), 2)));
+        assert_eq!(d.dragging(), None);
+        // The program shows the new order: everyone to their slot.
+        d.set(items(&["b", "c", "a", "d"]));
+        settle(&mut d);
+        let now: Vec<f64> = ["b", "c", "a", "d"]
+            .iter()
+            .map(|k| card(&d, k).y.value)
+            .collect();
+        assert_eq!(now, slots);
+        // Leaving the column, or it changing, ends a drag.
+        assert!(d.drag_start("d", slots[3]));
+        d.set(items(&["b", "c", "a"]));
+        assert_eq!(d.dragging(), None);
+    }
+
+    #[test]
+    fn a_revealed_note_folds_back_to_be_dragged() {
+        let mut d = deck(&["a", "b", "c"]);
+        d.point(margin("b"));
+        d.reveal_due("b");
+        settle(&mut d);
+        assert_eq!(d.role("b"), Role::Sheet);
+        let y = card(&d, "c").y.value;
+        assert!(d.drag_start("b", y));
+        assert_eq!((d.revealed(), d.role("b")), (None, Role::Lifted));
+        settle(&mut d);
+        assert_eq!(d.drag_end().map(|(_, gap)| gap), Some(2));
+        // Not instantly revealed again under the drop.
+        assert_eq!(d.point(margin("b")), Some("b".into()));
+        // The open note doesn't move.
+        d.open_note("a");
+        assert!(!d.drag_start("a", y));
+    }
+
+    #[test]
+    fn hidden_notes_crumple() {
+        let mut d = deck(&["a", "b"]);
+        d.point(On::Strip);
+        settle(&mut d);
+        let out = card(&d, "a").out.value;
+        d.crumple("a");
+        d.set(items(&["b"]));
+        assert!(card(&d, "a").crumpling());
+        d.advance(1.0 / 60.0);
+        // It keeps its size; it goes as a whole.
+        assert_eq!(card(&d, "a").out.target, out);
+        settle(&mut d);
+        assert_eq!(keys(&d), ["b"]);
+        // A note shown again doesn't crumple.
+        let mut d = deck(&["a", "b"]);
+        d.crumple("a");
+        d.set(items(&["b"]));
+        d.set(items(&["a", "b"]));
+        assert!(!card(&d, "a").crumple);
     }
 
     #[test]

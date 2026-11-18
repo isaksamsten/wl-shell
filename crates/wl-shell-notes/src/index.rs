@@ -111,6 +111,11 @@ impl Index {
         self.notes.get(rel)
     }
 
+    /// The index's own path of the note at `rel`, if there is one.
+    pub fn get_key(&self, rel: &Path) -> Option<&Path> {
+        self.notes.get_key_value(rel).map(|(k, _)| k.as_path())
+    }
+
     /// Every note, by path.
     pub fn iter(&self) -> impl Iterator<Item = (&Path, &Entry)> {
         self.notes.iter().map(|(p, e)| (p.as_path(), e))

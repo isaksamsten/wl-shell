@@ -299,6 +299,7 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
     let bundled: Option<&[u8]> = match name {
         "builtin:pin" => Some(include_bytes!("../assets/pin.svg")),
         "builtin:unpin" => Some(include_bytes!("../assets/unpin.svg")),
+        "builtin:archive" => Some(include_bytes!("../assets/archive.svg")),
         _ => None,
     };
     if let Some(data) = bundled {
@@ -1070,7 +1071,8 @@ mod tests {
         for size in [16, 24, 32, 64] {
             let pin = find("builtin:pin", size, "nonexistent-theme").unwrap();
             let unpin = find("builtin:unpin", size, "nonexistent-theme").unwrap();
-            for icon in [&pin, &unpin] {
+            let archive = find("builtin:archive", size, "nonexistent-theme").unwrap();
+            for icon in [&pin, &unpin, &archive] {
                 assert_eq!((icon.width, icon.height), (size, size));
                 assert!(icon.data.chunks_exact(4).any(|p| p[3] > 0));
             }
