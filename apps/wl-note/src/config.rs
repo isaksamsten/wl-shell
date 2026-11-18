@@ -14,8 +14,8 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Deserializer, de::Error as _};
-use wl_shell_config::{ConfigFile, Mode, Scheme, de};
+use serde::{de::Error as _, Deserialize, Deserializer};
+use wl_shell_config::{de, ConfigFile, Mode, Scheme};
 use wl_shell_notes::Color;
 use wl_shell_render::{paper, shadow};
 
@@ -64,7 +64,7 @@ pub struct ColumnConfig {
     pub marker_length: u32,
     #[serde(deserialize_with = "de::px")]
     pub marker_radius: u32,
-    /// Between markers, at least (until they are crowded).
+    /// Gap in pixels between idle markers, reduced when crowded.
     #[serde(deserialize_with = "de::px")]
     pub marker_gap: u32,
     /// Kept free at both ends of the column.

@@ -9,13 +9,12 @@
 //! card's role (`Role`) is the most its note is out for: sheet (revealed
 //! or open) > lifted header (under the pointer) > header > marker.
 //!
-//! Markers and headers share one layout (`slots`): each note has a slot
-//! center along the edge, and its marker and its header are centered on
-//! it, so a marker grows into its header without jumping. Headers
-//! shingle: later ones cover the tails of earlier ones, at a pitch of
-//! `SHINGLE` of their length, tighter when crowded. Markers keep apart:
-//! with more than fit, their gap shrinks first, down to `MIN_GAP`, then
-//! their length, down to `MIN_MARKER`.
+//! Markers and headers have separate centered layouts (`slots`). At
+//! rest, the marker length and gap set the pitch. When hovered, the
+//! cards grow into shingled headers, at a pitch of `SHINGLE` of the
+//! header length. When crowded, headers shingle more tightly; markers
+//! shrink their gap first (to `MIN_GAP` or the configured gap if smaller),
+//! then their length (to `MIN_MARKER` or the configured length if smaller).
 //!
 //! A sheet (revealed or open) takes its whole height in the column
 //! (`places`): it comes down from its header's top, so its title stays
@@ -132,41 +131,40 @@ pub struct Metrics {
     pub plus: f64,
 }
 
-/// The layout of `n` notes along an edge.
+/// The layouts of `n` notes along an edge.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Slots {
-    /// Each note's center along the edge.
-    pub centers: Vec<f64>,
-    /// The markers' length.
-    pub marker: f64,
+struct Slots {
+    markers: Vec<f64>,
+    headers: Vec<f64>,
+    marker_length: f64,
 }
 
-/// Lay out `n` notes along an edge `length` long: headers shingled and
-/// centered, within the padding (tighter if they don't fit), markers on
-/// the same centers (see the module's comment).
-pub fn slots(n: usize, length: f64, m: &Metrics) -> Slots {
-    let mut s = Slots {
-        centers: Vec::new(),
-        marker: m.marker_length,
-    };
-    if n == 0 {
-        return s;
-    }
+/// Center each layout independently within the available edge length.
+fn slots(n: usize, length: f64, m: &Metrics) -> Slots {
+    let mut marker_length = m.marker_length;
+    let mut marker_gap = m.marker_gap;
     let avail = (length - 2.0 * m.padding).max(0.0);
-    let gaps = (n - 1) as f64;
-    let mut pitch = m.header_length * SHINGLE;
-    if n > 1 && gaps * pitch + m.header_length > avail {
-        pitch = ((avail - m.header_length) / gaps).max(1.0);
+    let gaps = n.saturating_sub(1) as f64;
+    if n > 1 {
+        marker_gap =
+            ((avail - n as f64 * marker_length) / gaps).clamp(MIN_GAP.min(marker_gap), marker_gap);
+        marker_length = ((avail - gaps * marker_gap) / n as f64)
+            .clamp(MIN_MARKER.min(marker_length), marker_length);
     }
-    let span = gaps * pitch + m.header_length;
-    let start = (length - span) / 2.0;
-    s.centers = (0..n)
-        .map(|i| start + m.header_length / 2.0 + i as f64 * pitch)
-        .collect();
-    if n > 1 && pitch - m.marker_length < MIN_GAP.min(m.marker_gap) {
-        s.marker = (pitch - MIN_GAP).max(MIN_MARKER).min(m.marker_length);
+
+    let centers = |len: f64, mut pitch: f64| {
+        if n > 1 && gaps * pitch + len > avail {
+            pitch = ((avail - len) / gaps).max(1.0);
+        }
+        (0..n)
+            .map(|i| length / 2.0 + (i as f64 - gaps / 2.0) * pitch)
+            .collect()
+    };
+    Slots {
+        markers: centers(marker_length, marker_length + marker_gap),
+        headers: centers(m.header_length, m.header_length * SHINGLE),
+        marker_length,
     }
-    s
 }
 
 /// A note's tilt, -`max` to `max` degrees, the same every time for the
@@ -187,8 +185,9 @@ pub struct Card {
     pub look: Look,
     /// Its center along the edge.
     pub y: Spring,
-    /// Its slot's center.
-    slot: f64,
+    /// Its slot centers at marker and header levels, respectively.
+    marker_slot: f64,
+    header_slot: f64,
     /// 0 out of sight, 1 in place.
     pub presence: Spring,
     /// How far it is out of the edge when in place.
@@ -305,7 +304,7 @@ impl Deck {
 
     /// The markers' length now.
     pub fn marker_length(&self) -> f64 {
-        self.slots.marker
+        self.slots.marker_length
     }
 
     /// Whether `key` is out as a sheet: revealed or open.
@@ -333,7 +332,7 @@ impl Deck {
     pub fn size(&self, role: Role) -> (f64, f64) {
         let m = &self.metrics;
         match role {
-            Role::Marker => (m.marker_width, self.slots.marker),
+            Role::Marker => (m.marker_width, self.marker_length()),
             Role::Header => (m.header, m.header_length),
             Role::Lifted => (m.header + LIFT, m.header_length),
             Role::Sheet => (m.sheet_width, m.sheet_height),
@@ -370,7 +369,11 @@ impl Deck {
     /// it, and the others leave its gap free.
     fn places(&self) -> Vec<f64> {
         let m = &self.metrics;
-        let (l, h) = (m.header_length, m.sheet_height);
+        let l = match self.level {
+            Level::Marker => self.marker_length(),
+            Level::Header => m.header_length,
+        };
+        let h = m.sheet_height;
         let live: Vec<&Card> = self.cards.iter().filter(|c| !c.leaving).collect();
         let n = live.len();
         if n == 0 {
@@ -379,14 +382,20 @@ impl Deck {
         // The order laid out, as indices into `live`, and each position's
         // slot: the column's, or with a drag, the dragged one in its gap.
         let mut order: Vec<usize> = (0..n).collect();
-        let mut slot: Vec<f64> = live.iter().map(|c| c.slot).collect();
+        let mut slot: Vec<f64> = live
+            .iter()
+            .map(|c| match self.level {
+                Level::Marker => c.marker_slot,
+                Level::Header => c.header_slot,
+            })
+            .collect();
         let drag = (self.drag.as_ref())
-            .filter(|_| self.slots.centers.len() == n)
+            .filter(|_| self.slots.headers.len() == n)
             .and_then(|d| Some((live.iter().position(|c| c.key == d.key)?, d)));
         if let Some((i, d)) = drag {
             order.remove(i);
             order.insert(d.gap.min(n - 1), i);
-            slot = self.slots.centers.clone();
+            slot = self.slots.headers.clone();
         }
         let cards: Vec<&Card> = order.iter().map(|&i| live[i]).collect();
         let held: Vec<bool> = cards.iter().map(|c| self.held(&c.key)).collect();
@@ -395,19 +404,23 @@ impl Deck {
             places = slot.clone();
         } else {
             // From each card's top to the next one's: a sheet's height
-            // after a sheet, the headers' pitch after a header.
+            // after a sheet, the current level's pitch otherwise.
             let pitch: Vec<f64> = (1..n).map(|i| (slot[i] - slot[i - 1]).max(0.0)).collect();
             let sheets = (0..n - 1).filter(|&i| held[i]).count() as f64 * h;
-            let headers: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
-            // The last card, and the `+` button after it.
-            let tail = (if held[n - 1] { h } else { l }) + PLUS_GAP + m.plus;
+            let neighbors: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
+            let plus = if self.level == Level::Header {
+                PLUS_GAP + m.plus
+            } else {
+                0.0
+            };
+            let tail = (if held[n - 1] { h } else { l }) + plus;
             let avail = (self.length - 2.0 * m.padding).max(0.0);
             let fixed = sheets + tail;
-            let squeeze = match headers > 0.0 && fixed + headers > avail {
-                true => ((avail - fixed) / headers).clamp(0.0, 1.0),
+            let squeeze = match neighbors > 0.0 && fixed + neighbors > avail {
+                true => ((avail - fixed) / neighbors).clamp(0.0, 1.0),
                 false => 1.0,
             };
-            let span = fixed + headers * squeeze;
+            let span = fixed + neighbors * squeeze;
             let mut top = (slot[0] - l / 2.0)
                 .min(self.length - m.padding - span)
                 .max(m.padding);
@@ -562,7 +575,7 @@ impl Deck {
         let ok = self.level == Level::Header
             && !self.closing
             && self.open.as_deref() != Some(key)
-            && live == self.slots.centers.len()
+            && live == self.slots.headers.len()
             && self.cards.iter().any(|c| c.key == key && c.present());
         if !ok {
             return false;
@@ -591,7 +604,7 @@ impl Deck {
         } else {
             self.length / 2.0
         };
-        let gap = crate::reorder::gap(&self.slots.centers, y);
+        let gap = crate::reorder::gap(&self.slots.headers, y);
         let Some(d) = &mut self.drag else {
             return;
         };
@@ -636,15 +649,13 @@ impl Deck {
     }
 
     /// What the notes that stay span along the edge where they are going,
-    /// as (top, bottom): their headers, or sheets.
+    /// as (top, bottom), using their target sizes.
     fn extent(&self) -> Option<(f64, f64)> {
-        let m = &self.metrics;
-        (self.cards.iter().filter(|c| !c.leaving))
+        self.cards
+            .iter()
+            .filter(|c| !c.leaving)
             .map(|c| {
-                let half = match self.held(&c.key) {
-                    true => m.sheet_height / 2.0,
-                    false => m.header_length / 2.0,
-                };
+                let half = c.len.target / 2.0;
                 (c.y.target - half, c.y.target + half)
             })
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
@@ -726,7 +737,8 @@ impl Deck {
         self.slots = slots(self.wanted.len(), self.length, &self.metrics);
         for c in self.cards.iter_mut().filter(|c| !c.leaving) {
             if let Some(i) = self.wanted.iter().position(|w| w.key == c.key) {
-                c.slot = self.slots.centers[i];
+                c.marker_slot = self.slots.markers[i];
+                c.header_slot = self.slots.headers[i];
             }
         }
         self.retarget();
@@ -787,7 +799,7 @@ impl Deck {
         self.try_close_up();
         // The column changed under a drag: it ends.
         let live = self.cards.iter().filter(|c| !c.leaving).count();
-        if self.drag.is_some() && (self.closing || live != self.slots.centers.len()) {
+        if self.drag.is_some() && (self.closing || live != self.slots.headers.len()) {
             self.drag_cancel();
         }
     }
@@ -809,11 +821,14 @@ impl Deck {
         let mut rank = 0.0;
         let mut new = Vec::new();
         let wanted = self.wanted.clone();
-        for (item, slot) in wanted.iter().zip(self.slots.centers.clone()) {
+        for (i, item) in wanted.iter().enumerate() {
+            let marker_slot = self.slots.markers[i];
+            let header_slot = self.slots.headers[i];
             match old.iter().position(|c| c.key == item.key) {
                 Some(i) => {
                     let mut c = old.swap_remove(i);
-                    c.slot = slot;
+                    c.marker_slot = marker_slot;
+                    c.header_slot = header_slot;
                     self.cards.push(c);
                 }
                 None => {
@@ -823,8 +838,9 @@ impl Deck {
                     let mut c = Card {
                         key: item.key.clone(),
                         look: item.look.clone(),
-                        y: Spring::new(slot, r),
-                        slot,
+                        y: Spring::new(0.0, r),
+                        marker_slot,
+                        header_slot,
                         presence: Spring::new(0.0, r),
                         out: Spring::new(out, r),
                         len: Spring::new(len, r),
@@ -951,38 +967,65 @@ mod tests {
     }
 
     #[test]
-    fn slots_shingle_headers_and_share_their_centers() {
-        assert!(slots(0, 500.0, &M).centers.is_empty());
-        assert_eq!(slots(1, 500.0, &M).centers, [250.0]);
-        // Shingled at 70% of a header's length, centered.
-        let s = slots(3, 1000.0, &M);
-        assert_eq!(s.centers, [430.0, 500.0, 570.0]);
-        assert_eq!(s.marker, M.marker_length);
-        // Crowded: tighter, within the padding.
+    fn headers_shingle_independently_of_markers() {
+        assert!(slots(0, 500.0, &M).headers.is_empty());
+        assert_eq!(slots(1, 500.0, &M).headers, [250.0]);
+        assert_eq!(slots(3, 1000.0, &M).headers, [430.0, 500.0, 570.0]);
         let s = slots(6, 300.0, &M);
-        let pitch = s.centers[1] - s.centers[0];
+        let pitch = s.headers[1] - s.headers[0];
         assert!((pitch - (276.0 - 100.0) / 5.0).abs() < 1e-9);
-        assert!((s.centers[0] - 50.0 - M.padding).abs() < 1e-9);
-        assert!((s.centers[5] + 50.0 - (300.0 - M.padding)).abs() < 1e-9);
-        // Markers keep apart: the gap shrinks first, then the length.
-        assert!(pitch - s.marker >= 2.0 - 1e-9);
-        let roomy = Metrics {
-            header_length: 60.0,
+        assert!((s.headers[0] - 50.0 - M.padding).abs() < 1e-9);
+        assert!((s.headers[5] + 50.0 - (300.0 - M.padding)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn markers_shrink_their_gaps_then_their_length() {
+        assert!(slots(0, 500.0, &M).markers.is_empty());
+        assert_eq!(slots(1, 500.0, &M).markers, [250.0]);
+        let s = slots(3, 1000.0, &M);
+        assert_eq!(s.markers, [464.0, 500.0, 536.0]);
+        assert_eq!(s.marker_length, M.marker_length);
+        let s = slots(3, 116.0, &M); // Room for 28px markers and 4px gaps.
+        assert_eq!(s.markers, [26.0, 58.0, 90.0]);
+        assert_eq!(s.marker_length, M.marker_length);
+        let s = slots(3, 100.0, &M); // Shrink the markers to keep 2px gaps.
+        assert_eq!(s.markers, [24.0, 50.0, 76.0]);
+        assert_eq!(s.marker_length, 24.0);
+        assert_eq!(slots(40, 200.0, &M).marker_length, MIN_MARKER);
+        let tight = Metrics {
+            marker_gap: 0.0,
+            marker_length: 8.0,
             ..M
         };
-        let s = slots(4, 400.0, &roomy);
-        let pitch = s.centers[1] - s.centers[0];
-        assert_eq!((pitch.round(), s.marker), (42.0, 28.0));
-        let s = slots(7, 200.0, &roomy);
-        let pitch = s.centers[1] - s.centers[0];
-        assert!(pitch < 30.0);
-        assert!(
-            (s.marker - (pitch - 2.0)).abs() < 1e-9,
-            "{pitch} {}",
-            s.marker
+        let s = slots(3, 100.0, &tight);
+        assert_eq!(s.markers, [42.0, 50.0, 58.0]);
+        assert_eq!(s.marker_length, 8.0);
+    }
+
+    #[test]
+    fn spacing_settings_only_affect_their_own_level() {
+        let default = slots(3, 1000.0, &M);
+        let tighter = slots(
+            3,
+            1000.0,
+            &Metrics {
+                marker_gap: 4.0,
+                ..M
+            },
         );
-        let s = slots(40, 200.0, &roomy);
-        assert_eq!(s.marker, 12.0);
+        assert_eq!(tighter.markers, [468.0, 500.0, 532.0]);
+        assert_eq!(tighter.headers, default.headers);
+
+        let shorter = slots(
+            3,
+            1000.0,
+            &Metrics {
+                header_length: 80.0,
+                ..M
+            },
+        );
+        assert_eq!(shorter.markers, default.markers);
+        assert_eq!(shorter.headers, [444.0, 500.0, 556.0]);
     }
 
     #[test]
@@ -1005,7 +1048,7 @@ mod tests {
         assert!(d.moving());
         settle(&mut d);
         assert!(!d.moving());
-        assert_eq!(card(&d, "a").y.value, 465.0);
+        assert_eq!(card(&d, "a").y.value, 482.0);
         assert_eq!(card(&d, "a").out.value, M.marker_width);
         assert_eq!(card(&d, "a").len.value, M.marker_length);
         assert_eq!(card(&d, "b").presence.value, 1.0);
@@ -1019,12 +1062,16 @@ mod tests {
         let mut d = deck(&["a", "b", "c"]);
         assert_eq!(d.level(), Level::Marker);
         assert_eq!(d.plus.value, 0.0);
+        assert_eq!(card(&d, "a").y.value, 464.0);
         // At the edge: headers at once, no reveal yet.
         assert_eq!(d.point(On::Strip), None);
+        assert_eq!(card(&d, "a").y.value, 464.0);
+        assert_eq!(card(&d, "a").y.target, 430.0);
         settle(&mut d);
         assert_eq!(d.level(), Level::Header);
         assert_eq!(card(&d, "a").out.value, M.header);
         assert_eq!(card(&d, "a").len.value, M.header_length);
+        assert_eq!(card(&d, "a").y.value, 430.0);
         assert_eq!(d.plus.value, 1.0);
         // On a margin: it lifts, and is revealed after the delay.
         assert_eq!(d.point(margin("b")), Some("b".into()));
@@ -1047,6 +1094,8 @@ mod tests {
         settle(&mut d);
         assert_eq!(d.revealed(), None);
         assert_eq!(card(&d, "b").out.value, M.marker_width);
+        assert_eq!(card(&d, "a").y.value, 464.0);
+        assert_eq!(card(&d, "a").len.value, M.marker_length);
         assert_eq!(d.plus.value, 0.0);
     }
 
@@ -1173,6 +1222,7 @@ mod tests {
         let mut d = Deck::new(M, 150.0);
         d.resize(400.0);
         d.set(items(&["a", "b", "c", "d"]));
+        d.point(On::Strip);
         settle(&mut d);
         let first = card(&d, "a").y.value;
         d.point(margin("a"));
@@ -1195,7 +1245,7 @@ mod tests {
         d.open_note("b");
         assert_eq!((d.open(), d.revealed()), (Some("b"), None));
         settle(&mut d);
-        let slot = card(&d, "b").slot;
+        let slot = card(&d, "b").header_slot;
         // The pointer leaves: the rest go back to markers, it stays.
         d.point(On::Outside);
         d.hide_due();
@@ -1215,7 +1265,7 @@ mod tests {
         d.set(items(&["a", "b", "c"]));
         settle(&mut d);
         assert_eq!(keys(&d), ["a", "b", "c"]);
-        assert_eq!(card(&d, "b").slot, slot);
+        assert_eq!(card(&d, "b").header_slot, slot);
         assert_eq!(d.open(), Some("b"));
         // Closed, it is a note like the others.
         d.close();
@@ -1343,7 +1393,7 @@ mod tests {
         }
         settle(&mut d);
         assert_eq!(keys(&d), ["b", "d"]);
-        assert_eq!(card(&d, "b").y.value, slots(2, 1000.0, &M).centers[0]);
+        assert_eq!(card(&d, "b").y.value, slots(2, 1000.0, &M).markers[0]);
         assert_eq!(card(&d, "d").presence.value, 1.0);
     }
 
@@ -1390,7 +1440,7 @@ mod tests {
     fn the_plus_follows_the_last_note() {
         let mut d = deck(&["a", "b"]);
         d.point(On::Strip);
-        let b = card(&d, "b").slot;
+        let b = card(&d, "b").header_slot;
         assert_eq!(d.plus_center(), b + 50.0 + PLUS_GAP + 11.0);
         assert_eq!(Deck::new(M, 150.0).plus_center(), M.plus / 2.0);
     }
