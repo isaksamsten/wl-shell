@@ -2505,7 +2505,13 @@ impl WlDock {
         at: (f64, f64),
         down: bool,
     ) {
-        let Some(item) = self.hovered_item(output) else {
+        let item = self
+            .docks
+            .iter()
+            .find(|dock| dock.output == *output)
+            .and_then(|dock| dock.click_item(at.0, at.1))
+            .cloned();
+        let Some(item) = item else {
             self.pressed = None;
             // A click on the dock between icons (or on a hidden dock's
             // trigger band) is a click outside the strip or menu, and
@@ -2539,6 +2545,9 @@ impl WlDock {
         let dock = self.docks.iter().find(|d| d.output == *output);
         let menu_was = dock.and_then(|d| d.menu_app()) == Some(item.app_id.as_str());
         let popup_was = dock.and_then(|d| d.popup_folder()) == Some(item.app_id.as_str());
+        if let Some(dock) = self.dock_mut(output) {
+            dock.transfer_zoom(&item.app_id);
+        }
         self.close_menus(core);
         match button {
             BTN_LEFT if popup_was => self.release_keyboard(output),

@@ -15,9 +15,10 @@
 //! Movement runs on springs, advanced on frame callbacks by the time
 //! measured since the last one: `hover` (magnification growing in and
 //! out), each slot's presence (items appearing and disappearing), and the
-//! label's fade, and launching apps' bounce. The pointer's position along
-//! the dock is used as is (zoom.rs). Once everything has settled, no more
-//! frames are requested.
+//! label's fade, and launching apps' bounce. The zoom focus normally
+//! follows the pointer without lag (zoom.rs), but glides to the clicked
+//! icon when switching away from a popup. Once everything has settled,
+//! no more frames are requested.
 //!
 //! Indicators: a dot (or one per window) under apps with windows on this
 //! dock, brighter for the focused app, and a ring under pinned apps whose
@@ -27,8 +28,8 @@
 //! windows here) starts a static capture of each window, so a click finds
 //! the frames ready. Clicking it opens the strip, a grabbing popup, with
 //! the captures live; clicking the icon again closes it. While it is
-//! open, the magnification holds still. Hovering only ever shows the
-//! app's name.
+//! open, moving the pointer doesn't move the magnification. Clicking
+//! another icon transfers it to that icon.
 //!
 //! The menu (menuview.rs): a right click opens the app's menu, another
 //! grabbing popup, a speech bubble pointing at the icon. While it is open
@@ -580,9 +581,9 @@ pub struct DockView {
     /// The input region last set.
     input: Vec<IRect>,
 
-    /// The pointer along the dock, kept after it leaves while the
-    /// magnification shrinks away.
-    pointer: f64,
+    /// The zoom focus along the dock. It tracks the pointer directly,
+    /// except when gliding to another icon clicked under an open popup.
+    pointer: Spring,
     /// Magnification, 0 to 1.
     hover: Spring,
     /// The app under the pointer.
@@ -605,7 +606,7 @@ pub struct DockView {
     /// Captures of the windows of the hovered app (if it gets a strip) and
     /// of the strip's.
     previews: Vec<Preview>,
-    /// The magnification holds still while the strip is open.
+    /// Pointer motion doesn't move the zoom focus while a popup is open.
     frozen: bool,
     /// The pointer is on the dock.
     pointer_in: bool,
@@ -729,7 +730,7 @@ impl DockView {
             badge_texts: Vec::new(),
             launching: Vec::new(),
             input: Vec::new(),
-            pointer: 0.0,
+            pointer: Spring::new(0.0, response),
             hover: Spring::new(0.0, response),
             hovered: None,
             label_on: false,
@@ -836,7 +837,7 @@ impl DockView {
             let surface = self.layer.wl_surface();
             surface.attach(Some(&self.transparent), 0, 0);
             surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            self.pointer = self.frame().length() / 2.0;
+            self.pointer.snap(self.frame().length() / 2.0);
         }
         self.relayout();
         self.render();
@@ -1171,19 +1172,38 @@ impl DockView {
         if !self.configured || self.drag.is_some() || self.launcher.is_some() {
             return;
         }
-        let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == key) else {
-            return;
-        };
-        // At rest, the layout doesn't depend on the pointer.
-        let rest = self.lay(self.pointer, 0.0, true);
-        let Some(center) = rest.cell(i).map(|c| c.center) else {
+        let Some(center) = self.resting_center(key) else {
             return;
         };
         self.frozen = false;
-        self.pointer = center;
+        self.pointer.snap(center);
         self.hover.retarget(1.0);
         self.set_hovered(core, Some(key.to_string()));
         self.kick();
+    }
+
+    /// A click on a different icon under a popup moves the zoom focus to
+    /// that icon, without changing the hit test that picked it.
+    pub fn transfer_zoom(&mut self, key: &str) {
+        let popup = self.strip_app().or_else(|| self.menu_app());
+        if popup.is_some_and(|app| app != key)
+            && let Some(center) = self.resting_center(key)
+        {
+            self.pointer.retarget(center);
+            self.hover.retarget(1.0);
+            self.kick();
+        }
+    }
+
+    fn resting_center(&self, key: &str) -> Option<f64> {
+        let i = self
+            .slots
+            .iter()
+            .position(|s| !s.leaving && s.item.app_id == key)?;
+        // At rest, the layout doesn't depend on the pointer.
+        self.lay(self.pointer.target, 0.0, true)
+            .cell(i)
+            .map(|c| c.center)
     }
 
     /// The open strip's highlighted window.
@@ -1231,20 +1251,32 @@ impl DockView {
             return self.drag_motion(x, y);
         }
         let (u, _) = self.frame().dock_point(x, y);
-        // Held still while the strip or menu is open: the icons don't move
-        // under the pointer, which may be on its way to another one.
-        let at = if self.frozen { self.pointer } else { u };
-        let laid = self.lay(at, self.hover.value, false);
-        let hovered = (laid.hit(u))
-            .map(|i| &self.slots[i])
-            .filter(|s| !s.leaving && s.item.kind != Kind::Separator)
-            .map(|s| s.item.app_id.clone());
+        // With a popup open, moving the pointer can pick another icon
+        // without moving the zoom focus.
+        let at = if self.frozen { self.pointer.value } else { u };
+        let hovered = self.item_at(u, at).map(|item| item.app_id.clone());
         if !self.frozen {
-            self.pointer = u;
+            self.pointer.snap(u);
         }
         self.hover.retarget(1.0);
         self.set_hovered(core, hovered);
         self.kick();
+    }
+
+    /// The icon at a button event's position. The row can move during a
+    /// zoom transfer even when no motion event updates the hovered item.
+    pub fn click_item(&self, x: f64, y: f64) -> Option<&Item> {
+        if !self.configured || !self.showing() || self.launcher.is_some() {
+            return None;
+        }
+        let (u, _) = self.frame().dock_point(x, y);
+        self.item_at(u, self.pointer.value)
+    }
+
+    fn item_at(&self, u: f64, focus: f64) -> Option<&Item> {
+        let laid = self.lay(focus, self.hover.value.clamp(0.0, 1.0), false);
+        let slot = &self.slots[laid.hit(u)?];
+        (!slot.leaving && slot.item.kind != Kind::Separator).then_some(&slot.item)
     }
 
     /// The pointer left the dock. With the strip or menu open, the
@@ -1406,7 +1438,7 @@ impl DockView {
         let Some(i) = self.slots.iter().position(|s| s.item.app_id == app_id) else {
             return false;
         };
-        let laid = self.lay(self.pointer, self.hover.value, false);
+        let laid = self.lay(self.pointer.value, self.hover.value, false);
         let Some(cell) = laid.cell(i) else {
             return false;
         };
@@ -1482,7 +1514,7 @@ impl DockView {
         let target = drag::target(dragged, &scene, u);
         // Magnified over the dock, at rest off it.
         if on_dock {
-            self.pointer = u;
+            self.pointer.snap(u);
             self.hover.retarget(1.0);
         } else {
             self.hover.retarget(0.0);
@@ -1700,7 +1732,7 @@ impl DockView {
             None => drag::DropTarget::Nothing,
         };
         if on_dock {
-            self.pointer = u;
+            self.pointer.snap(u);
             self.hover.retarget(1.0);
         } else {
             self.hover.retarget(0.0);
@@ -2026,6 +2058,7 @@ impl DockView {
     fn moving(&self) -> bool {
         self.strip.as_ref().is_some_and(StripView::moving)
             || self.menu.as_ref().is_some_and(MenuView::moving)
+            || !self.pointer.settled()
             || !self.hover.settled()
             || !self.shown.settled()
             || !self.label_alpha.settled()
@@ -2046,6 +2079,7 @@ impl DockView {
         let now = Instant::now();
         let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         let mut moving = self.hover.advance(dt);
+        moving |= self.pointer.advance(dt);
         moving |= self.label_alpha.advance(dt);
         moving |= self.shown.advance(dt);
         moving |= row::advance(&mut self.slots, dt);
@@ -2116,7 +2150,7 @@ impl DockView {
         let m = self.style.metrics();
         let scale = self.scale as f64;
         let hover = self.hover.value.clamp(0.0, 1.0);
-        let laid = self.lay(self.pointer, hover, false);
+        let laid = self.lay(self.pointer.value, hover, false);
         let row = &laid.row;
         let present: f64 = (self.slots.iter())
             .map(|s| s.presence.value.clamp(0.0, 1.0))
@@ -2414,10 +2448,10 @@ impl DockView {
     /// What the launcher takes over: where the panel is now, and how long
     /// it is at rest.
     pub fn handover(&self) -> Handover {
-        let laid = self.lay(self.pointer, self.hover.value.clamp(0.0, 1.0), false);
+        let laid = self.lay(self.pointer.value, self.hover.value.clamp(0.0, 1.0), false);
         let slide = autohide::slide(self.shown.value, self.style.reach());
         let (panel, ..) = self.panel_at(&laid.row, slide);
-        let rest = self.lay(self.pointer, 0.0, true);
+        let rest = self.lay(self.pointer.target, 0.0, true);
         let (_, _, rest_length) = self.panel_at(&rest.row, 0.0);
         Handover {
             panel,
@@ -2468,7 +2502,7 @@ impl DockView {
     pub fn landing_rect(&self, app_id: &str) -> Rect {
         let frame = self.frame();
         let m = self.style.metrics();
-        let laid = self.lay(self.pointer, 0.0, true);
+        let laid = self.lay(self.pointer.target, 0.0, true);
         let at = |u: f64| frame.rect(u - m.icon / 2.0, m.icon_v(), m.icon, m.icon);
         if let Some(i) = (self.slots.iter()).position(|s| !s.leaving && s.item.app_id == app_id)
             && let Some(cell) = laid.cell(i)
@@ -2529,7 +2563,7 @@ impl DockView {
         let i = self.slots.iter().position(|s| s.item.app_id == app_id)?;
         let frame = self.frame();
         let m = self.style.metrics();
-        let laid = self.lay(self.pointer, self.hover.target, true);
+        let laid = self.lay(self.pointer.target, self.hover.target, true);
         let cell = laid.cell(i)?;
         let d = cell.size.max(1.0);
         let r = frame.rect(cell.center - d / 2.0, m.icon_v(), d, d);
@@ -2626,6 +2660,7 @@ impl DockView {
         // A grabbing popup has to be the topmost: the old ones go first.
         self.menu = None;
         self.strip = None;
+        self.frozen = false;
         self.set_interactive(true);
         let Some(windows) = (self.slots.iter())
             .find(|s| !s.leaving && s.item.app_id == app_id)
