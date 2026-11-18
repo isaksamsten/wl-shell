@@ -140,6 +140,8 @@ struct Slots {
 }
 
 /// Center each layout independently within the available edge length.
+/// Headers keep clear of the `+` button in the bottom corner: they move up
+/// as little as needed, then shingle more tightly.
 fn slots(n: usize, length: f64, m: &Metrics) -> Slots {
     let mut marker_length = m.marker_length;
     let mut marker_gap = m.marker_gap;
@@ -152,17 +154,24 @@ fn slots(n: usize, length: f64, m: &Metrics) -> Slots {
             .clamp(MIN_MARKER.min(marker_length), marker_length);
     }
 
-    let centers = |len: f64, mut pitch: f64| {
+    let centers = |len: f64, mut pitch: f64, reserve: f64| {
+        let avail = (avail - reserve).max(0.0);
         if n > 1 && gaps * pitch + len > avail {
             pitch = ((avail - len) / gaps).max(1.0);
         }
-        (0..n)
-            .map(|i| length / 2.0 + (i as f64 - gaps / 2.0) * pitch)
-            .collect()
+        let span = gaps * pitch + len;
+        let first = (length / 2.0 - gaps / 2.0 * pitch)
+            .min(length - m.padding - reserve - span + len / 2.0)
+            .max(m.padding + len / 2.0);
+        (0..n).map(|i| first + i as f64 * pitch).collect()
     };
     Slots {
-        markers: centers(marker_length, marker_length + marker_gap),
-        headers: centers(m.header_length, m.header_length * SHINGLE),
+        markers: centers(marker_length, marker_length + marker_gap, 0.0),
+        headers: centers(
+            m.header_length,
+            m.header_length * SHINGLE,
+            PLUS_GAP + m.plus,
+        ),
         marker_length,
     }
 }
@@ -598,7 +607,8 @@ impl Deck {
     pub fn drag_to(&mut self, y: f64) {
         let m = &self.metrics;
         let half = m.header_length / 2.0;
-        let (lo, hi) = (m.padding + half, self.length - m.padding - half);
+        let bottom = self.length - m.padding - PLUS_GAP - m.plus;
+        let (lo, hi) = (m.padding + half, bottom - half);
         let y = if lo <= hi {
             y.clamp(lo, hi)
         } else {
@@ -634,18 +644,12 @@ impl Deck {
 
     // -- the layout --------------------------------------------------------
 
-    /// The `+` button's center along the edge: past the last note, or
-    /// below a sheet reaching farther (centered without notes), within the
-    /// column.
+    /// The `+` button's center along the edge: in the screen's bottom
+    /// corner, `padding` from the end, whatever the notes do, so it is
+    /// always in the same spot. The notes keep clear of it (`places`).
     pub fn plus_center(&self) -> f64 {
         let m = &self.metrics;
-        let center = match self.extent() {
-            Some((_, bottom)) => bottom + PLUS_GAP + m.plus / 2.0,
-            None => self.length / 2.0,
-        };
-        center
-            .min(self.length - m.padding - m.plus / 2.0)
-            .max(m.plus / 2.0)
+        (self.length - m.padding - m.plus / 2.0).max(m.plus / 2.0)
     }
 
     /// What the notes that stay span along the edge where they are going,
@@ -971,11 +975,17 @@ mod tests {
         assert!(slots(0, 500.0, &M).headers.is_empty());
         assert_eq!(slots(1, 500.0, &M).headers, [250.0]);
         assert_eq!(slots(3, 1000.0, &M).headers, [430.0, 500.0, 570.0]);
+        // Crowded: they shingle tighter, clear of the `+` button.
+        let reserve = PLUS_GAP + M.plus;
         let s = slots(6, 300.0, &M);
         let pitch = s.headers[1] - s.headers[0];
-        assert!((pitch - (276.0 - 100.0) / 5.0).abs() < 1e-9);
+        assert!((pitch - (276.0 - reserve - 100.0) / 5.0).abs() < 1e-9);
         assert!((s.headers[0] - 50.0 - M.padding).abs() < 1e-9);
-        assert!((s.headers[5] + 50.0 - (300.0 - M.padding)).abs() < 1e-9);
+        assert!((s.headers[5] + 50.0 - (300.0 - M.padding - reserve)).abs() < 1e-9);
+        // Reaching the button: they move up as little as needed first.
+        let s = slots(3, 310.0, &M);
+        assert_eq!(s.headers[1] - s.headers[0], 70.0);
+        assert!((s.headers[2] + 50.0 - (310.0 - M.padding - reserve)).abs() < 1e-9);
     }
 
     #[test]
@@ -1164,6 +1174,7 @@ mod tests {
         let mut d = deck(&["a", "b", "c", "d"]);
         d.point(On::Strip);
         settle(&mut d);
+        let plus = d.plus_center();
         let before: Vec<(f64, f64)> = ["a", "b"].iter().map(|k| span(&d, k)).collect();
         d.point(margin("b"));
         d.reveal_due("b");
@@ -1176,11 +1187,19 @@ mod tests {
         // after.
         assert_eq!(span(&d, "c").0, span(&d, "b").1);
         assert_eq!(span(&d, "d").0 - span(&d, "c").0, 70.0);
-        // The `+` button too.
+        // The `+` button stays put, in the bottom corner.
+        assert_eq!(d.plus_center(), plus);
+        assert!(plus - M.plus / 2.0 >= span(&d, "d").1);
         d.point(margin("d"));
         settle(&mut d);
         assert_eq!(d.revealed(), Some("d"));
-        assert!(d.plus_center() - M.plus / 2.0 >= span(&d, "d").1);
+        assert_eq!(d.plus_center(), plus);
+        assert!(plus - M.plus / 2.0 >= span(&d, "d").1);
+        // Onto the button: the sheet folds, and the button still stays.
+        d.point(On::Plus);
+        settle(&mut d);
+        assert_eq!(d.revealed(), None);
+        assert_eq!(d.plus_center(), plus);
         // Back to headers: back on their slots.
         d.point(On::Strip);
         settle(&mut d);
@@ -1437,11 +1456,14 @@ mod tests {
     }
 
     #[test]
-    fn the_plus_follows_the_last_note() {
+    fn the_plus_stays_in_the_bottom_corner() {
         let mut d = deck(&["a", "b"]);
+        let corner = 1000.0 - M.padding - M.plus / 2.0;
+        assert_eq!(d.plus_center(), corner);
         d.point(On::Strip);
-        let b = card(&d, "b").header_slot;
-        assert_eq!(d.plus_center(), b + 50.0 + PLUS_GAP + 11.0);
+        assert_eq!(d.plus_center(), corner);
+        d.set(items(&[]));
+        assert_eq!(d.plus_center(), corner);
         assert_eq!(Deck::new(M, 150.0).plus_center(), M.plus / 2.0);
     }
 }

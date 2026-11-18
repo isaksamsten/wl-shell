@@ -2993,7 +2993,8 @@ impl Column {
         }
     }
 
-    /// The `+` button: out from header level on, past the last note.
+    /// The `+` button: out from header level on, in the screen's bottom
+    /// corner, centered on the headers' width.
     fn place_plus(&mut self) {
         let m = self.style.metrics;
         if self
@@ -3017,7 +3018,7 @@ impl Column {
             }
         }
         let p = self.deck.plus.value;
-        let dist = lerp(-m.plus, m.header / 2.0 + LIFT, p);
+        let dist = lerp(-m.plus, m.header / 2.0, p);
         let cx = match self.style.edge {
             Edge::Right => self.width as f64 - dist,
             Edge::Left => dist,
