@@ -22,6 +22,12 @@
 //! keyboard entering one of the program's surfaces), which the compositor
 //! may check is the focus's. The program keeps the data, and writes it
 //! as above, until another client sets the selection.
+//!
+//! Pasting: `Core::selection_mime_types` says what the clipboard offers
+//! (the compositor only tells a client with the keyboard), and
+//! `Core::read_selection` reads it, without blocking, as `dnd_receive`
+//! does; the program's own selection is answered from its data.
+//! `Program::selection_changed` reports a new selection.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -181,6 +187,55 @@ impl<P: Program> Core<P> {
         let pipe = offer.receive(mime.to_string())?;
         // The source only writes once it got the request.
         let _ = self.conn.flush();
+        self.read_pipe(pipe, "drag data", f)
+    }
+
+    /// The mime types on the clipboard: the program's own selection's, or
+    /// the offer's (empty without one).
+    pub fn selection_mime_types(&self) -> Vec<String> {
+        if let Some(own) = &self.dnd.selection {
+            return own.data.iter().map(|(m, _)| m.clone()).collect();
+        }
+        (self.dnd.device.as_ref())
+            .and_then(|d| d.data().selection_offer())
+            .map_or_else(Vec::new, |o| o.with_mime_types(|m| m.to_vec()))
+    }
+
+    /// Read the clipboard as `mime`; `f` gets it once the source wrote it
+    /// all (empty if reading failed). Never blocks.
+    pub fn read_selection(
+        &mut self,
+        mime: &str,
+        f: impl FnOnce(&mut P, &mut Core<P>, Vec<u8>) + 'static,
+    ) -> std::io::Result<()> {
+        if let Some(own) = &self.dnd.selection {
+            let data = (own.data.iter())
+                .find(|(m, _)| m == mime)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default();
+            self.loop_handle.insert_idle(move |shell| {
+                f(&mut shell.program, &mut shell.core, data);
+            });
+            return Ok(());
+        }
+        let offer = (self.dnd.device.as_ref())
+            .and_then(|d| d.data().selection_offer())
+            .ok_or_else(|| std::io::Error::other("nothing on the clipboard"))?;
+        let pipe = offer
+            .receive(mime.to_string())
+            .map_err(std::io::Error::other)?;
+        let _ = self.conn.flush();
+        self.read_pipe(pipe, "the clipboard", f)
+    }
+
+    /// Read `pipe` to its end on the event loop, then call `f` with what
+    /// came (empty if reading failed).
+    fn read_pipe(
+        &mut self,
+        pipe: smithay_client_toolkit::data_device_manager::ReadPipe,
+        what: &'static str,
+        f: impl FnOnce(&mut P, &mut Core<P>, Vec<u8>) + 'static,
+    ) -> std::io::Result<()> {
         let mut data = Vec::new();
         let mut f = Some(f);
         let mut done = move |shell: &mut Shell<P>, data: Vec<u8>| {
@@ -198,7 +253,7 @@ impl<P: Program> Core<P> {
                         PostAction::Remove
                     }
                     Ok(n) if data.len() + n > MAX_DATA => {
-                        warn!("drag data too large");
+                        warn!("{what}: too large");
                         done(shell, Vec::new());
                         PostAction::Remove
                     }
@@ -212,7 +267,7 @@ impl<P: Program> Core<P> {
                         PostAction::Continue
                     }
                     Err(e) => {
-                        warn!("reading drag data: {e}");
+                        warn!("reading {what}: {e}");
                         done(shell, Vec::new());
                         PostAction::Remove
                     }
@@ -330,7 +385,9 @@ impl<P: Program> DataDeviceHandler for Shell<P> {
         self.program.dnd_motion(&mut self.core, (x, y));
     }
 
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        self.program.selection_changed(&mut self.core);
+    }
 
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
         self.core.dnd.dropped = true;

@@ -172,6 +172,10 @@ pub trait Program: Sized + 'static {
     /// `action`, or cancelled (None).
     fn drag_source_done(&mut self, core: &mut Core<Self>, action: Option<DndAction>) {}
 
+    /// The clipboard changed (another client, or the program, set it);
+    /// `core.selection_mime_types` says what it offers.
+    fn selection_changed(&mut self, core: &mut Core<Self>) {}
+
     /// An event for capture `id`: if the program has that capture, call
     /// `f` with it and handle what it returns. The program owns its
     /// captures; events for captures it dropped find nothing.

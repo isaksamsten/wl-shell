@@ -8,6 +8,8 @@ mod config;
 mod context;
 mod create;
 mod deck;
+mod draft;
+mod editor;
 mod find;
 mod ipc;
 mod list;

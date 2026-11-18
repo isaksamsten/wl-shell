@@ -1,6 +1,7 @@
 //! A note's markdown as a document to render (`wl_shell_render::doc`),
-//! with where its checkboxes are in the file and what its links point at.
-//! Pure, unit tested.
+//! with where its checkboxes are in the file and what its links point at;
+//! and as source lines to edit (`wl_shell_render::edit`). Pure, unit
+//! tested.
 //!
 //! Parsed with pulldown-cmark (CommonMark, with task lists and
 //! strikethrough). Headings, paragraphs, lists (bulleted, numbered and
@@ -10,6 +11,12 @@
 //!
 //! Checkboxes are toggled in the file itself (`toggle`), by the byte range
 //! of their `[ ]` or `[x]`, so nothing else in it changes.
+//!
+//! **Source lines** (`source_lines`) are the editor's: the markdown as
+//! typed, styled, its syntax (`**`, `#`, a link's `](…)`, list markers)
+//! hidden except on the active lines (the caret's and the selection's),
+//! where it shows faint. List markers and checkboxes are drawn in a
+//! marker column, with the text hanging beside them.
 
 use std::ops::Range;
 
@@ -18,6 +25,9 @@ use std::path::Path;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use wl_shell_notes::Note;
 use wl_shell_render::doc::{Block, Kind, Marker, Run};
+use wl_shell_render::edit::{Line, LineMarker, Span};
+
+use crate::editor;
 
 /// A note, ready to render.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -112,6 +122,275 @@ pub fn toggle(text: &str, range: Range<usize>) -> Option<String> {
         _ => return None,
     };
     Some(format!("{}{new}{}", &text[..at + 1], &text[at + 2..]))
+}
+
+/// Where a note's editable text starts: after its frontmatter (the first
+/// offset), and after the heading its title comes from, if the body opens
+/// with it (the second), so the title isn't shown twice.
+pub fn editable(note: &Note) -> (usize, usize) {
+    let front = note.text().len() - note.body().len();
+    if (note.meta.title.as_deref()).is_some_and(|t| !t.trim().is_empty()) {
+        return (front, front);
+    }
+    let body = note.body();
+    let mut at = 0;
+    let mut heading = false;
+    for line in body.split_inclusive('\n') {
+        let t = line.trim_end_matches(['\n', '\r']);
+        if t.trim().is_empty() {
+            at += line.len();
+            continue;
+        }
+        if heading || heading_level(t).is_none_or(|(_, text)| text.is_empty()) {
+            break;
+        }
+        heading = true;
+        at += line.len();
+    }
+    match heading {
+        true => (front, front + at),
+        false => (front, front),
+    }
+}
+
+/// An ATX heading's level, and its text.
+fn heading_level(line: &str) -> Option<(u8, &str)> {
+    let t = line.trim_start();
+    if line.len() - t.len() > 3 {
+        return None;
+    }
+    let hashes = t.bytes().take_while(|b| *b == b'#').count();
+    let rest = &t[hashes..];
+    ((1..=6).contains(&hashes) && (rest.is_empty() || rest.starts_with([' ', '\t'])))
+        .then(|| (hashes as u8, rest.trim().trim_end_matches('#').trim_end()))
+}
+
+/// A style over a range of the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Style {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Link(u32),
+}
+
+/// `text` (an editor's, with `\n` line breaks) as styled source lines,
+/// the lines in `active` showing their syntax; and its links'
+/// destinations (`Span::link` indexes them).
+pub fn source_lines(text: &str, active: Range<usize>) -> (Vec<Line>, Vec<String>) {
+    let mut styles: Vec<(Range<usize>, Style)> = Vec::new();
+    let mut marks: Vec<Range<usize>> = Vec::new();
+    let mut blocks: Vec<Range<usize>> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+    // Open links: their range, and where their text starts and ends.
+    let mut open: Vec<(Range<usize>, usize, usize)> = Vec::new();
+    let delims = |r: &Range<usize>, chars: &[u8], most: usize| {
+        let s = &text.as_bytes()[r.clone()];
+        let n = s.iter().take_while(|b| chars.contains(b)).count().min(most);
+        let m = s
+            .iter()
+            .rev()
+            .take_while(|b| chars.contains(b))
+            .count()
+            .min(most);
+        (n == m && 2 * n <= s.len()).then_some(n)
+    };
+    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    for (event, r) in Parser::new_ext(text, options).into_offset_iter() {
+        if !matches!(
+            event,
+            Event::Start(Tag::Link { .. } | Tag::Image { .. })
+                | Event::End(TagEnd::Link | TagEnd::Image)
+        ) && let Some((_, lo, hi)) = open.last_mut()
+        {
+            *lo = (*lo).min(r.start);
+            *hi = (*hi).max(r.end);
+        }
+        let mut style = |style: Style, chars: &[u8], most: usize| {
+            if let Some(n) = delims(&r, chars, most) {
+                marks.push(r.start..r.start + n);
+                marks.push(r.end - n..r.end);
+            }
+            styles.push((r.clone(), style));
+        };
+        match event {
+            Event::Start(Tag::Strong) => style(Style::Bold, b"*_", 2),
+            Event::Start(Tag::Emphasis) => style(Style::Italic, b"*_", 1),
+            Event::Start(Tag::Strikethrough) => style(Style::Strike, b"~", 2),
+            Event::Code(_) => style(Style::Code, b"`", usize::MAX),
+            Event::Start(Tag::CodeBlock(_)) => blocks.push(r),
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                links.push(dest_url.to_string());
+                styles.push((r.clone(), Style::Link(links.len() as u32 - 1)));
+                open.push((r.clone(), r.end, r.start));
+            }
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                if let Some((r, lo, hi)) = open.pop() {
+                    match lo < hi {
+                        true => {
+                            marks.push(r.start..lo);
+                            marks.push(hi..r.end);
+                        }
+                        false => marks.push(r.clone()),
+                    }
+                    // The enclosing link's text includes this one.
+                    if let Some((_, plo, phi)) = open.last_mut() {
+                        *plo = (*plo).min(r.start);
+                        *phi = (*phi).max(r.end);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        let range = start..start + line.len();
+        start = range.end + 1;
+        let code = blocks
+            .iter()
+            .any(|b| range.start >= b.start && range.start < b.end);
+        lines.push(source_line(
+            line,
+            range,
+            active.contains(&i),
+            code,
+            &styles,
+            &marks,
+        ));
+    }
+    (lines, links)
+}
+
+/// One source line: `line`, at `range` of the text.
+fn source_line(
+    line: &str,
+    range: Range<usize>,
+    active: bool,
+    code: bool,
+    styles: &[(Range<usize>, Style)],
+    marks: &[Range<usize>],
+) -> Line {
+    let mut out = Line {
+        text: line.to_string(),
+        active,
+        code,
+        ..Default::default()
+    };
+    let ws = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let cols: usize = line[..ws]
+        .chars()
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum();
+    if code {
+        let fence = ["```", "~~~"]
+            .iter()
+            .any(|f| line.trim_start().starts_with(f));
+        if !line.is_empty() {
+            out.spans.push(Span {
+                faint: fence,
+                code: true,
+                ..Span::plain(0..line.len())
+            });
+        }
+        return out;
+    }
+    out.depth = (cols / 2).min(12) as u8;
+    let mut body = ws;
+    let mut checked = false;
+    if let Some(it) = editor::item(line) {
+        body = it.body;
+        out.marker = match it.task {
+            Some((_, c)) => {
+                checked = c;
+                LineMarker::Task(c)
+            }
+            None => LineMarker::Bullet,
+        };
+        if active || it.number.is_some() {
+            let end = match active {
+                true => it.body,
+                false => it.marker.end,
+            };
+            out.lead.push(Span {
+                faint: it.number.is_none(),
+                ..Span::plain(it.indent..end)
+            });
+        }
+    } else if let Some((level, _)) = heading_level(line) {
+        out.heading = level;
+        let t = &line[ws..];
+        let hashes = t.bytes().take_while(|b| *b == b'#').count();
+        let after = &t[hashes..];
+        let syntax = ws + hashes + (after.len() - after.trim_start().len());
+        if active {
+            out.spans.push(Span {
+                faint: true,
+                ..Span::plain(ws..syntax)
+            });
+        }
+        body = syntax;
+    } else if line[ws..].starts_with('>') {
+        let t = &line[ws..];
+        let n = t.len() - t.trim_start_matches(['>', ' ']).len();
+        out.spans.push(Span {
+            faint: true,
+            ..Span::plain(ws..ws + n)
+        });
+        body = ws + n;
+    }
+    // The text, cut where styles and syntax start and end.
+    let abs = |i: usize| range.start + i;
+    let mut cuts: Vec<usize> = vec![body, line.len()];
+    for r in styles.iter().map(|(r, _)| r).chain(marks) {
+        for p in [r.start, r.end] {
+            if p > abs(body) && p < range.end {
+                cuts.push(p - range.start);
+            }
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let inside = |r: &Range<usize>| r.start <= abs(a) && abs(b) <= r.end;
+        let syntax = marks.iter().any(inside);
+        if syntax && !active {
+            continue;
+        }
+        let mut sp = Span {
+            faint: syntax,
+            dim: checked,
+            strike: checked,
+            ..Span::plain(a..b)
+        };
+        for (r, style) in styles.iter().filter(|(r, _)| inside(r)) {
+            let _ = r;
+            match style {
+                Style::Bold => sp.bold = true,
+                Style::Italic => sp.italic = true,
+                Style::Strike => sp.strike = true,
+                Style::Code => sp.code = true,
+                Style::Link(n) => sp.link = Some(*n),
+            }
+        }
+        match out.spans.last_mut() {
+            Some(last) if last.range.end == a && same(last, &sp) => last.range.end = b,
+            _ => out.spans.push(sp),
+        }
+    }
+    out
+}
+
+/// Whether two spans look the same.
+fn same(a: &Span, b: &Span) -> bool {
+    (a.bold, a.italic, a.code, a.strike, a.dim, a.faint, a.link)
+        == (b.bold, b.italic, b.code, b.strike, b.dim, b.faint, b.link)
 }
 
 /// Remove every occurrence of a local file link (the bar groups them by
@@ -483,5 +762,26 @@ mod tests {
         let c = Content::of_note(&Note::parse("+++\nx =\n+++\n# H\nbody"), "f");
         assert!(texts(&c.blocks[0]).starts_with("⚠ frontmatter"));
         assert_eq!((c.title.as_str(), c.heading), ("H", Some(1)));
+    }
+
+    #[test]
+    fn live_preview_keeps_source_on_the_active_line() {
+        let source = "# Heading\n- [x] **done**\n[a *link*](https://example.org)";
+        let visible = |line: &Line| -> String {
+            line.lead
+                .iter()
+                .chain(&line.spans)
+                .map(|s| &line.text[s.range.clone()])
+                .collect()
+        };
+        let (lines, links) = source_lines(source, 1..2);
+        assert_eq!(visible(&lines[0]), "Heading");
+        assert_eq!(visible(&lines[1]), "- [x] **done**");
+        assert_eq!(visible(&lines[2]), "a link");
+        assert_eq!(links, ["https://example.org"]);
+        let (lines, _) = source_lines(source, 2..3);
+        assert_eq!(visible(&lines[1]), "done");
+        assert_eq!(lines[1].marker, LineMarker::Task(true));
+        assert_eq!(visible(&lines[2]), "[a *link*](https://example.org)");
     }
 }

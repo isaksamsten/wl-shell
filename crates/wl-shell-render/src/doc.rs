@@ -9,9 +9,7 @@
 //! pixels. Lines that would end below `max_height` are left out, and the
 //! result says it was `cut`.
 
-use cosmic_text::{
-    Attrs, Buffer, Color, Family, Metrics, Shaping, Style as Slant, Weight, Wrap,
-};
+use cosmic_text::{Attrs, Buffer, Color, Family, Metrics, Shaping, Style as Slant, Weight, Wrap};
 use resvg::tiny_skia::{
     BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
 };
@@ -20,11 +18,11 @@ use crate::image::Image;
 use crate::text::{Text, blend, family, line_height};
 
 /// Glyph metadata: struck through.
-const STRIKE: usize = 1 << 31;
+pub(crate) const STRIKE: usize = 1 << 31;
 /// Glyph metadata: the link's index plus one (0: none).
-const LINK_MASK: usize = (1 << 30) - 1;
+pub(crate) const LINK_MASK: usize = (1 << 30) - 1;
 /// How much dimmed text keeps of its alpha.
-const DIM: f64 = 0.55;
+pub(crate) const DIM: f64 = 0.55;
 
 /// How a document looks.
 #[derive(Clone, Debug, PartialEq)]
@@ -237,7 +235,11 @@ impl Text {
                 Kind::Heading(_) => (size, lh, true),
                 _ => (size, lh, false),
             };
-            let marker = if b.marker == Marker::None { 0.0 } else { indent };
+            let marker = if b.marker == Marker::None {
+                0.0
+            } else {
+                indent
+            };
             let pad = if b.kind == Kind::Code { code_pad } else { 0.0 };
             let tx = left + marker + pad;
             let avail = (width - tx - pad).max(size);
@@ -306,7 +308,9 @@ impl Text {
                 continue;
             };
             self.glyphs_at(buffer, &mut image, *tx, *ty, base, max_h, &mut cut);
-            decorate(buffer, &mut image, *tx, *ty, base, size, s, max_h, &mut hits);
+            decorate(
+                buffer, &mut image, *tx, *ty, base, size, s, max_h, &mut hits,
+            );
         }
         Rendered {
             image,
@@ -354,7 +358,10 @@ impl Text {
                 }
                 let link = r.link.map_or(0, |l| (l as usize + 1) & LINK_MASK);
                 let strike = if r.strike { STRIKE } else { 0 };
-                (r.text.as_str(), a.color(color(rgba)).metadata(link | strike))
+                (
+                    r.text.as_str(),
+                    a.color(color(rgba)).metadata(link | strike),
+                )
             })
             .collect();
         if spans.is_empty() {
@@ -457,35 +464,7 @@ impl Text {
                     let bs = (size * 0.85).round();
                     let bx = (l.left + (indent - bs) / 2.0 - size * 0.1).round();
                     let by = (center - bs / 2.0).round();
-                    let rr = rounded(bx, by, bs, bs, bs * 0.22);
-                    if checked {
-                        fill(pixmap, rr.as_ref(), fade(st.color, 0.75));
-                        let mut pb = PathBuilder::new();
-                        pb.move_to(bx + 0.24 * bs, by + 0.52 * bs);
-                        pb.line_to(bx + 0.43 * bs, by + 0.71 * bs);
-                        pb.line_to(bx + 0.77 * bs, by + 0.31 * bs);
-                        if let Some(check) = pb.finish() {
-                            let paint = Paint {
-                                anti_alias: true,
-                                blend_mode: BlendMode::Clear,
-                                ..Paint::default()
-                            };
-                            let stroke = Stroke {
-                                width: (bs * 0.15).max(1.5),
-                                line_cap: LineCap::Round,
-                                line_join: LineJoin::Round,
-                                ..Stroke::default()
-                            };
-                            pixmap.stroke_path(&check, &paint, &stroke, Transform::identity(), None);
-                        }
-                    } else if let Some(rr) = &rr {
-                        let stroke = Stroke {
-                            width: (size * 0.08).max(1.2 * s),
-                            ..Stroke::default()
-                        };
-                        let paint = solid(fade(st.color, 0.7));
-                        pixmap.stroke_path(rr, &paint, &stroke, Transform::identity(), None);
-                    }
+                    checkbox(pixmap, bx, by, bs, checked, st.color, size, s);
                     // Generous: the whole marker column of the first line.
                     hits.push(Hit {
                         x: (l.left / s) as f64,
@@ -498,6 +477,49 @@ impl Text {
                 _ => {}
             }
         }
+    }
+}
+
+/// A checkbox `bs` wide at (`bx`, `by`), checked or not, in `rgba`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkbox(
+    pixmap: &mut Pixmap,
+    bx: f32,
+    by: f32,
+    bs: f32,
+    checked: bool,
+    rgba: u32,
+    size: f32,
+    s: f32,
+) {
+    let rr = rounded(bx, by, bs, bs, bs * 0.22);
+    if checked {
+        fill(pixmap, rr.as_ref(), fade(rgba, 0.75));
+        let mut pb = PathBuilder::new();
+        pb.move_to(bx + 0.24 * bs, by + 0.52 * bs);
+        pb.line_to(bx + 0.43 * bs, by + 0.71 * bs);
+        pb.line_to(bx + 0.77 * bs, by + 0.31 * bs);
+        if let Some(check) = pb.finish() {
+            let paint = Paint {
+                anti_alias: true,
+                blend_mode: BlendMode::Clear,
+                ..Paint::default()
+            };
+            let stroke = Stroke {
+                width: (bs * 0.15).max(1.5),
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(&check, &paint, &stroke, Transform::identity(), None);
+        }
+    } else if let Some(rr) = &rr {
+        let stroke = Stroke {
+            width: (size * 0.08).max(1.2 * s),
+            ..Stroke::default()
+        };
+        let paint = solid(fade(rgba, 0.7));
+        pixmap.stroke_path(rr, &paint, &stroke, Transform::identity(), None);
     }
 }
 
@@ -553,17 +575,17 @@ fn decorate(
 }
 
 /// `rgba` with its alpha times `f`.
-fn fade(rgba: u32, f: f64) -> u32 {
+pub(crate) fn fade(rgba: u32, f: f64) -> u32 {
     let a = ((rgba & 0xff) as f64 * f).round().clamp(0.0, 255.0) as u32;
     (rgba & !0xff) | a
 }
 
-fn color(rgba: u32) -> Color {
+pub(crate) fn color(rgba: u32) -> Color {
     let [r, g, b, a] = rgba.to_be_bytes();
     Color::rgba(r, g, b, a)
 }
 
-fn solid(rgba: u32) -> Paint<'static> {
+pub(crate) fn solid(rgba: u32) -> Paint<'static> {
     let [r, g, b, a] = rgba.to_be_bytes();
     let mut p = Paint::default();
     p.set_color_rgba8(r, g, b, a);
@@ -571,7 +593,7 @@ fn solid(rgba: u32) -> Paint<'static> {
     p
 }
 
-fn fill(pixmap: &mut Pixmap, path: Option<&Path>, rgba: u32) {
+pub(crate) fn fill(pixmap: &mut Pixmap, path: Option<&Path>, rgba: u32) {
     if let Some(path) = path {
         pixmap.fill_path(
             path,
@@ -584,7 +606,7 @@ fn fill(pixmap: &mut Pixmap, path: Option<&Path>, rgba: u32) {
 }
 
 /// A rounded rect's outline.
-fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+pub(crate) fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
     let mut pb = PathBuilder::new();
     pb.move_to(x + r, y);
@@ -601,7 +623,7 @@ fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
 }
 
 /// Blend a rect of `c` over `img` (physical pixels, rounded out).
-fn fill_rect(img: &mut Image, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
+pub(crate) fn fill_rect(img: &mut Image, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
     let (w, h) = (img.width as i32, img.height as i32);
     let alpha = c.a() as f64 / 255.0;
     let src = [c.b(), c.g(), c.r()].map(|v| v as f64 * alpha);
@@ -614,7 +636,7 @@ fn fill_rect(img: &mut Image, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
 }
 
 /// A pixmap (premultiplied RGBA) as an image (premultiplied BGRA).
-fn bgra(pixmap: &Pixmap) -> Image {
+pub(crate) fn bgra(pixmap: &Pixmap) -> Image {
     let mut data = Vec::with_capacity(pixmap.data().len());
     for px in pixmap.data().as_chunks::<4>().0 {
         data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
@@ -683,7 +705,11 @@ mod tests {
         assert_eq!(r.image.width, 400);
         assert_eq!(r.image.height as i32, r.height * 2);
         assert!(!r.cut);
-        let tasks: Vec<_> = r.hits.iter().filter(|h| matches!(h.target, Target::Task(_))).collect();
+        let tasks: Vec<_> = r
+            .hits
+            .iter()
+            .filter(|h| matches!(h.target, Target::Task(_)))
+            .collect();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].target, Target::Task(0));
         assert!(tasks[1].y > tasks[0].y);
@@ -691,9 +717,12 @@ mod tests {
         let short = text.doc(&doc(blocks, (tasks[1].y as i32) + 2));
         assert!(short.cut);
         assert_eq!(
-            short.hits.iter().filter(|h| matches!(h.target, Target::Task(_))).count(),
+            short
+                .hits
+                .iter()
+                .filter(|h| matches!(h.target, Target::Task(_)))
+                .count(),
             1
         );
     }
 }
-

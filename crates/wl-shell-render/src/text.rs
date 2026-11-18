@@ -344,10 +344,10 @@ impl Text {
         let edges = caret_edges(&buffer);
         let text_w = edges.last().map_or(0.0, |e| e.1) / s;
         let width = f.width.max(1);
-        let caret_x = f.caret.map(|c| caret_x(&edges, c) / s);
+        let caret_pos = f.caret.map(|c| caret_x(&edges, c) / s);
         let room = width as f32 - 2.0;
         let mut scroll = (f.scroll as f32).clamp(0.0, (text_w - room).max(0.0));
-        if let Some(x) = caret_x {
+        if let Some(x) = caret_pos {
             scroll = scroll.min(x).max(x - room);
         }
         let height = line_height(f.style.size);
@@ -358,8 +358,19 @@ impl Text {
             data: vec![0; (bw * bh * 4) as usize],
         };
         let x = (-scroll * s).round() as i32;
+        if let Some((range, rgba)) = &f.selection {
+            let [r, g, b, a] = rgba.to_be_bytes();
+            crate::doc::fill_rect(
+                &mut image,
+                caret_x(&edges, range.start) + x as f32,
+                0.0,
+                caret_x(&edges, range.end) + x as f32,
+                bh as f32,
+                Color::rgba(r, g, b, a),
+            );
+        }
         self.draw(&buffer, &mut image, x, 0, f.style.color);
-        if let Some(cx) = caret_x {
+        if let Some(cx) = caret_pos {
             let px = ((cx - scroll) * s).round() as i32;
             let [r, g, b, a] = f.style.color.to_be_bytes();
             let alpha = a as f64 / 255.0;
@@ -400,6 +411,7 @@ pub struct Field {
     pub text: String,
     /// A byte index of `text`; None: no caret.
     pub caret: Option<usize>,
+    pub selection: Option<(std::ops::Range<usize>, u32)>,
     /// The background is left out.
     pub style: Style,
     pub bold: bool,
@@ -707,6 +719,7 @@ mod tests {
         let mut f = Field {
             text: "A long title that does not fit in the field".into(),
             caret: Some(0),
+            selection: None,
             style,
             bold: true,
             width: 60,

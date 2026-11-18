@@ -12,6 +12,7 @@ pub struct Title {
     pub text: String,
     /// A byte index of `text`, on a char boundary.
     pub caret: usize,
+    anchor: usize,
     /// As it was.
     original: String,
 }
@@ -22,6 +23,7 @@ impl Title {
         Self {
             text: text.to_string(),
             caret: text.len(),
+            anchor: text.len(),
             original: text.to_string(),
         }
     }
@@ -35,6 +37,7 @@ impl Title {
     pub fn set_caret(&mut self, at: usize) {
         self.caret = at.min(self.text.len());
         self.snap();
+        self.anchor = self.caret;
     }
 
     fn snap(&mut self) {
@@ -43,12 +46,47 @@ impl Title {
         }
     }
 
+    pub fn selection(&self) -> Option<std::ops::Range<usize>> {
+        (self.anchor != self.caret)
+            .then(|| self.anchor.min(self.caret)..self.anchor.max(self.caret))
+    }
+
+    pub fn selected(&self) -> Option<&str> {
+        self.selection().map(|r| &self.text[r])
+    }
+
+    pub fn select_all(&mut self) {
+        self.anchor = 0;
+        self.caret = self.text.len();
+    }
+
+    pub fn cut(&mut self) -> Option<String> {
+        let range = self.selection()?;
+        let text = self.text[range.clone()].to_owned();
+        self.text.replace_range(range.clone(), "");
+        self.set_caret(range.start);
+        Some(text)
+    }
+
+    pub fn extend_from(&mut self, anchor: usize) {
+        self.anchor = anchor;
+    }
+
+    pub fn anchor(&self) -> usize {
+        self.anchor
+    }
+
     /// Type `s` at the caret; line breaks and other control characters
     /// are left out.
     pub fn insert(&mut self, s: &str) {
         let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        if s.is_empty() {
+            return;
+        }
+        self.cut();
         self.text.insert_str(self.caret, &s);
         self.caret += s.len();
+        self.anchor = self.caret;
     }
 
     /// Where the char before `at` starts.
@@ -91,6 +129,7 @@ impl Title {
             true => self.word_back(),
             false => self.prev(self.caret),
         };
+        self.anchor = self.caret;
     }
 
     pub fn right(&mut self, word: bool) {
@@ -98,28 +137,38 @@ impl Title {
             true => self.word_forward(),
             false => self.next(self.caret),
         };
+        self.anchor = self.caret;
     }
 
     pub fn home(&mut self) {
         self.caret = 0;
+        self.anchor = self.caret;
     }
 
     pub fn end(&mut self) {
         self.caret = self.text.len();
+        self.anchor = self.caret;
     }
 
     /// Remove the char (or word) before the caret.
     pub fn backspace(&mut self, word: bool) {
+        if self.cut().is_some() {
+            return;
+        }
         let from = match word {
             true => self.word_back(),
             false => self.prev(self.caret),
         };
         self.text.replace_range(from..self.caret, "");
         self.caret = from;
+        self.anchor = self.caret;
     }
 
     /// Remove the char (or word) after the caret.
     pub fn delete(&mut self, word: bool) {
+        if self.cut().is_some() {
+            return;
+        }
         let to = match word {
             true => self.word_forward(),
             false => self.next(self.caret),

@@ -5,6 +5,7 @@
 
 pub mod bubble;
 pub mod doc;
+pub mod edit;
 pub mod files;
 pub mod icons;
 pub mod image;

@@ -21,9 +21,8 @@
 //!   quarter, a dashed crease; lifted under the pointer.
 //! - **Sheet, revealed:** the whole sheet, tilted, with its title and
 //!   text drawn on (cut with a fade), and its file bar.
-//! - **Sheet, open:** straight, without text: the title (a field drawn on
-//!   the main thread, editable), the text (a document from the worker,
-//!   scrolled) and the bar's icons are subsurfaces above it.
+//! - **Sheet, open:** straight, with the editable title and body drawn
+//!   on the main thread, and the bar's icons above the paper.
 //!
 //! The file bar's icons are subsurfaces too (thumbnails or type icons,
 //! monochrome in the note's text color until hovered), with the hovered
@@ -71,7 +70,8 @@ use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
 use wl_shell_notes::{Color, PRESETS};
 use wl_shell_render::Image;
-use wl_shell_render::doc::{self, Doc, DocStyle, Hit, Target};
+use wl_shell_render::doc::{self, Doc, DocStyle, Target};
+use wl_shell_render::edit::{EditLayout, EditStyle, Pos};
 use wl_shell_render::icons::NamedIcon;
 use wl_shell_render::paper::{self, Paper};
 use wl_shell_render::shadow::IconShadow;
@@ -85,7 +85,8 @@ use crate::app::WlNote;
 use crate::bar;
 use crate::config::{Config, Edge, NoteLayer};
 use crate::deck::{Card, Deck, Item, LIFT, Metrics, On, Role};
-use crate::markdown::Content;
+use crate::draft::Draft;
+use crate::markdown::{self, Content};
 use crate::papers::{Papers, Sheet};
 use crate::title::Title;
 
@@ -111,10 +112,6 @@ const ICON: f64 = 16.0;
 const ICON_GAP: f64 = 8.0;
 const TRASH_RED: u32 = 0xcb3535ff;
 const PALETTE_TIME: Duration = Duration::from_millis(150);
-/// The most of an open note's text that is rendered, logical pixels.
-const DOC_MAX: i32 = 3000;
-/// Documents kept rendered (the open one, and the last revealed).
-const DOCS: usize = 4;
 /// Name labels kept.
 const LINES: usize = 48;
 /// A wheel click or an arrow key scrolls this far.
@@ -317,6 +314,13 @@ pub enum Act {
     Task(String, u32),
     /// Open this note's n-th link.
     Link(String, u32),
+    OpenLink(String, String),
+    Save,
+    QueueSave,
+    Reload,
+    KeepMine,
+    Copy(String),
+    Paste(u64),
     /// Open this note in the editor.
     Edit(String),
     /// Make a new note.
@@ -361,21 +365,10 @@ struct Slot {
     hit: Option<Rect>,
 }
 
-/// An open (or about to be) note's text, rendered.
-struct DocEntry {
-    key: String,
-    /// What was asked of the worker last, and its tag.
-    want: Doc,
-    tag: u64,
-    shown: Option<RenderedDoc>,
-}
-
-struct RenderedDoc {
-    buffer: WlBuffer,
-    /// Logical size.
-    w: f64,
-    h: f64,
-    hits: Vec<Hit>,
+/// A body viewport already drawn; animation only repositions it.
+struct BodyShown {
+    image: Sized,
+    scroll: f64,
 }
 
 /// A buffer and its logical size.
@@ -498,8 +491,19 @@ pub struct Column {
     title_shown: Option<TitleShown>,
     /// The title being edited.
     editing: Option<Title>,
-    docs: Vec<DocEntry>,
-    next_tag: u64,
+    pub draft: Option<Draft>,
+    layout: EditLayout,
+    links: Vec<String>,
+    body_shown: Option<BodyShown>,
+    notice: Sub,
+    notice_shown: Option<(String, Sized)>,
+    body_dirty: bool,
+    follow_caret: bool,
+    focused: bool,
+    selecting: bool,
+    last_click: Option<(Instant, f64, f64, u8)>,
+    goal_x: Option<f64>,
+    paste_serial: u64,
     /// Replaced buffers, destroyed by `trim` once not shown.
     stale: Vec<WlBuffer>,
     /// How far the open note's text is scrolled.
@@ -656,7 +660,7 @@ impl Column {
         layer.commit();
         let parent = layer.wl_surface().clone();
         let sub = || Sub::new(&g, &parent, &no_input, &qh);
-        let (plus, text, title) = (sub(), sub(), sub());
+        let (plus, text, title, notice) = (sub(), sub(), sub(), sub());
         let open_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let reveal_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let deck = Deck::new(style.metrics, style.response);
@@ -690,8 +694,19 @@ impl Column {
             text_shown: None,
             title_shown: None,
             editing: None,
-            docs: Vec::new(),
-            next_tag: 0,
+            draft: None,
+            layout: EditLayout::default(),
+            links: Vec::new(),
+            body_shown: None,
+            notice,
+            notice_shown: None,
+            body_dirty: true,
+            follow_caret: false,
+            focused: false,
+            selecting: false,
+            last_click: None,
+            goal_x: None,
+            paste_serial: 0,
             stale: Vec::new(),
             scroll: 0.0,
             file_icons: HashMap::new(),
@@ -765,7 +780,6 @@ impl Column {
         self.deck.set_metrics(style.metrics, style.response);
         self.style = style;
         self.forget_drawn();
-        self.refresh_docs();
         self.kick();
     }
 
@@ -792,7 +806,6 @@ impl Column {
         self.scale = scale;
         self.forget_drawn();
         self.ask_standard_icons();
-        self.refresh_docs();
         self.kick();
     }
 
@@ -803,6 +816,13 @@ impl Column {
         self.reveal_bar.clear();
         self.plus.clear();
         self.title.clear();
+        self.text.clear();
+        self.notice.clear();
+        self.stale
+            .extend(self.body_shown.take().map(|b| b.image.buffer));
+        self.stale
+            .extend(self.notice_shown.take().map(|(_, s)| s.buffer));
+        self.body_dirty = true;
         self.stale.extend(self.icon_buffers.drain().map(|(_, b)| b));
         self.stale.extend(self.dots.drain().map(|(_, b)| b));
         self.stale.extend(
@@ -836,18 +856,13 @@ impl Column {
         // The open note went (removed, hidden): the keyboard goes back.
         if self.deck.open().is_none() {
             self.editing = None;
+            self.draft = None;
+            self.focused = false;
+            self.selecting = false;
+            self.paste_serial = self.paste_serial.wrapping_add(1);
             self.palette_since = None;
             self.trash.clear();
             self.set_keyboard(KeyboardInteractivity::None);
-        }
-        // Forget the documents of notes gone; render the others again if
-        // they changed.
-        let gone: Vec<usize> = (0..self.docs.len())
-            .filter(|i| !self.notes.contains_key(&self.docs[*i].key))
-            .collect();
-        for i in gone.into_iter().rev() {
-            let e = self.docs.remove(i);
-            self.stale.extend(e.shown.map(|s| s.buffer));
         }
         let paths: Vec<PathBuf> = (self.notes.values())
             .flat_map(|n| n.files.iter().map(|f| f.path.clone()))
@@ -855,7 +870,7 @@ impl Column {
         for path in paths {
             self.ask_file_icons(&path);
         }
-        self.refresh_docs();
+        self.body_dirty = true;
         self.kick();
     }
 
@@ -891,7 +906,7 @@ impl Column {
     // -- what the notes do -------------------------------------------------
 
     /// Open `key`: its sheet comes out and stays, and it asks for the
-    /// keyboard. Returns a title edit of another note to save.
+    /// keyboard. The program has already saved any previous draft.
     pub fn open(&mut self, core: &Core<WlNote>, key: &str) -> Vec<Act> {
         let again = self.deck.open() == Some(key);
         let acts = match again {
@@ -905,7 +920,12 @@ impl Column {
             self.trash.clear();
             self.reset_file_views();
             self.scroll = 0.0;
-            self.ensure_doc(key);
+            self.layout = EditLayout::default();
+            self.body_dirty = true;
+            self.last_click = None;
+            self.selecting = false;
+            self.goal_x = None;
+            self.paste_serial = self.paste_serial.wrapping_add(1);
         }
         self.set_keyboard(KeyboardInteractivity::Exclusive);
         self.kick();
@@ -916,6 +936,11 @@ impl Column {
     /// edit to save.
     pub fn close(&mut self) -> Vec<Act> {
         let acts = self.commit_title();
+        self.draft = None;
+        self.body_dirty = true;
+        self.selecting = false;
+        self.focused = false;
+        self.paste_serial = self.paste_serial.wrapping_add(1);
         self.deck.close();
         self.palette_since = None;
         self.trash.clear();
@@ -931,6 +956,8 @@ impl Column {
             return Vec::new();
         };
         self.kick();
+        self.body_dirty = true;
+        self.paste_serial = self.paste_serial.wrapping_add(1);
         match (self.deck.open(), title.changed()) {
             (Some(key), true) => vec![Act::Title(key.to_string(), title.text.trim().to_string())],
             _ => Vec::new(),
@@ -949,6 +976,8 @@ impl Column {
                 .get(key)
                 .map_or(String::new(), |n| n.content.title.clone());
             self.editing = Some(Title::new(&text));
+            self.body_dirty = true;
+            self.paste_serial = self.paste_serial.wrapping_add(1);
         }
         if let (Some(x), Some(face)) = (x, self.face(key)) {
             let area = self.title_rect(face);
@@ -967,6 +996,9 @@ impl Column {
     /// The open note's keyboard focus came: keep it until a click
     /// elsewhere takes it.
     pub fn keyboard_enter(&mut self) {
+        self.focused = true;
+        self.body_dirty = true;
+        self.kick();
         if self.keyboard == KeyboardInteractivity::Exclusive {
             self.set_keyboard(KeyboardInteractivity::OnDemand);
         }
@@ -975,6 +1007,11 @@ impl Column {
     /// The keyboard went elsewhere, e.g. to a window clicked: the note
     /// stays open, a title edit is kept.
     pub fn keyboard_leave(&mut self) -> Vec<Act> {
+        self.focused = false;
+        self.selecting = false;
+        self.body_dirty = true;
+        self.paste_serial = self.paste_serial.wrapping_add(1);
+        self.kick();
         self.commit_title()
     }
 
@@ -1000,6 +1037,10 @@ impl Column {
         let (x, y) = event.position;
         match &event.kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                if self.selecting {
+                    self.drag_selection(x, y);
+                    return Vec::new();
+                }
                 match self.press.is_some() {
                     true => self.press_moved(core, x, y),
                     false => self.hover_at(core, x, y),
@@ -1008,6 +1049,7 @@ impl Column {
             }
             PointerEventKind::Leave { .. } => {
                 self.pointer = None;
+                self.selecting = false;
                 self.bar_hover = None;
                 self.trash.clear();
                 self.all_files = [None, None];
@@ -1024,6 +1066,7 @@ impl Column {
                 self.click(core, x, y, mods.shift)
             }
             PointerEventKind::Release { button, .. } if *button == BTN_LEFT => {
+                self.selecting = false;
                 self.release(core, x, y)
             }
             PointerEventKind::Axis { vertical, .. } => {
@@ -1051,10 +1094,54 @@ impl Column {
         let Some(key) = self.deck.open().map(String::from) else {
             return Vec::new();
         };
+        self.paste_serial = self.paste_serial.wrapping_add(1);
+        let sym = event.keysym;
+        if mods.ctrl && !mods.alt {
+            match sym {
+                Keysym::v | Keysym::V => return vec![Act::Paste(self.paste_serial)],
+                Keysym::c | Keysym::C | Keysym::x | Keysym::X => {
+                    let cut = matches!(sym, Keysym::x | Keysym::X);
+                    let (text, changed) = if let Some(title) = &mut self.editing {
+                        (
+                            if cut {
+                                title.cut()
+                            } else {
+                                title.selected().map(str::to_owned)
+                            },
+                            false,
+                        )
+                    } else if let Some(d) = &mut self.draft {
+                        let text = if cut {
+                            d.editor.cut()
+                        } else {
+                            d.editor.selected().map(str::to_owned)
+                        };
+                        let changed = cut && text.is_some();
+                        (text, changed)
+                    } else {
+                        (None, false)
+                    };
+                    self.follow_caret = changed;
+                    self.draft_changed();
+                    let mut acts: Vec<_> = text.into_iter().map(Act::Copy).collect();
+                    if changed {
+                        acts.push(Act::QueueSave);
+                    }
+                    return acts;
+                }
+                _ => {}
+            }
+        }
         if let Some(t) = &mut self.editing {
+            let anchor = t.anchor();
             match event.keysym {
                 Keysym::Return | Keysym::KP_Enter | Keysym::Tab => return self.commit_title(),
-                Keysym::Escape => self.editing = None,
+                Keysym::Escape => {
+                    self.editing = None;
+                    self.draft_changed();
+                    return Vec::new();
+                }
+                Keysym::a | Keysym::A if mods.ctrl => t.select_all(),
                 Keysym::BackSpace => t.backspace(mods.ctrl),
                 Keysym::Delete | Keysym::KP_Delete => t.delete(mods.ctrl),
                 Keysym::Left | Keysym::KP_Left => t.left(mods.ctrl),
@@ -1068,11 +1155,24 @@ impl Column {
                 }
                 _ => {}
             }
+            if mods.shift
+                && matches!(
+                    event.keysym,
+                    Keysym::Left
+                        | Keysym::KP_Left
+                        | Keysym::Right
+                        | Keysym::KP_Right
+                        | Keysym::Home
+                        | Keysym::KP_Home
+                        | Keysym::End
+                        | Keysym::KP_End
+                )
+            {
+                t.extend_from(anchor);
+            }
             self.kick();
             return Vec::new();
         }
-        let page =
-            (self.style.metrics.sheet_height - self.style.text_top() - self.style.file_bar) * 0.9;
         match event.keysym {
             Keysym::Escape if self.palette_since.take().is_some() => self.kick(),
             Keysym::Escape if self.showing_files(&key) => {
@@ -1083,15 +1183,96 @@ impl Column {
             Keysym::Return | Keysym::KP_Enter if mods.ctrl => return vec![Act::Close],
             Keysym::e | Keysym::E if mods.ctrl => return vec![Act::Edit(key)],
             Keysym::F2 => self.edit_title(None),
-            Keysym::Up => self.scroll_by(-LINE),
-            Keysym::Down => self.scroll_by(LINE),
-            Keysym::Page_Up => self.scroll_by(-page),
-            Keysym::Page_Down | Keysym::space => self.scroll_by(page),
-            Keysym::Home => self.scroll_by(-f64::INFINITY),
-            Keysym::End => self.scroll_by(f64::INFINITY),
-            _ => {}
+            Keysym::s | Keysym::S if mods.ctrl => return vec![Act::Save],
+            _ => return self.body_key(event, mods),
         }
         Vec::new()
+    }
+
+    fn body_key(&mut self, event: &KeyEvent, mods: &Modifiers) -> Vec<Act> {
+        if self.deck.open().is_some_and(|k| self.showing_files(k)) || mods.alt {
+            return Vec::new();
+        }
+        let page = self.body_height() as f64 * 0.9;
+        let Some(d) = &mut self.draft else {
+            return Vec::new();
+        };
+        let e = &mut d.editor;
+        let version = e.version();
+        let (ctrl, shift) = (mods.ctrl, mods.shift);
+        let goal = self.goal_x.take();
+        match event.keysym {
+            Keysym::Left | Keysym::KP_Left => e.left(ctrl, shift),
+            Keysym::Right | Keysym::KP_Right => e.right(ctrl, shift),
+            Keysym::Home | Keysym::KP_Home if ctrl => e.doc_start(shift),
+            Keysym::End | Keysym::KP_End if ctrl => e.doc_end(shift),
+            Keysym::Home | Keysym::KP_Home => e.home(shift),
+            Keysym::End | Keysym::KP_End => e.end(shift),
+            Keysym::Up
+            | Keysym::KP_Up
+            | Keysym::Down
+            | Keysym::KP_Down
+            | Keysym::Page_Up
+            | Keysym::Page_Down => {
+                let pos = e.line_col(e.caret());
+                let up = matches!(event.keysym, Keysym::Up | Keysym::KP_Up | Keysym::Page_Up);
+                let dir = if up { -1 } else { 1 };
+                let dy = matches!(event.keysym, Keysym::Page_Up | Keysym::Page_Down)
+                    .then_some(page * f64::from(dir));
+                let x = goal
+                    .or_else(|| self.layout.caret(pos).map(|c| c.x))
+                    .unwrap_or(0.0);
+                let (line, col) = self.layout.vertical(pos, x, dir, dy);
+                e.set_caret(e.offset(line, col), shift);
+                self.goal_x = Some(x);
+            }
+            Keysym::BackSpace => e.backspace(ctrl),
+            Keysym::Delete | Keysym::KP_Delete => e.delete(ctrl),
+            Keysym::Return | Keysym::KP_Enter => e.enter(),
+            Keysym::Tab | Keysym::ISO_Left_Tab => {
+                e.indent(shift || event.keysym == Keysym::ISO_Left_Tab)
+            }
+            Keysym::a | Keysym::A if ctrl => e.select_all(),
+            Keysym::z | Keysym::Z if ctrl && !shift => {
+                e.undo();
+            }
+            Keysym::z | Keysym::Z | Keysym::y | Keysym::Y if ctrl => {
+                e.redo();
+            }
+            _ if !ctrl => {
+                let Some(s) = &event.utf8 else {
+                    return Vec::new();
+                };
+                e.insert(s);
+            }
+            _ => return Vec::new(),
+        }
+        let changed = e.version() != version;
+        self.follow_caret = true;
+        self.draft_changed();
+        if changed {
+            vec![Act::QueueSave]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn paste(&mut self, serial: u64, text: &str) -> bool {
+        if serial != self.paste_serial || self.deck.open().is_none() || text.is_empty() {
+            return false;
+        }
+        if let Some(title) = &mut self.editing {
+            title.insert(text);
+            self.kick();
+            return false;
+        }
+        let Some(d) = &mut self.draft else {
+            return false;
+        };
+        d.editor.paste(text);
+        self.follow_caret = true;
+        self.draft_changed();
+        true
     }
 
     /// One of the column's timers fired.
@@ -1100,10 +1281,6 @@ impl Column {
             Timer::Reveal => {
                 if let Some((key, _)) = self.reveal.take() {
                     self.deck.reveal_due(&key);
-                    if self.deck.revealed() == Some(key.as_str()) {
-                        // Likely to be opened next.
-                        self.ensure_doc(&key);
-                    }
                 }
             }
             Timer::Hide => {
@@ -1191,9 +1368,6 @@ impl Column {
         );
         if before != after {
             changed = true;
-            if let Some(k) = &after.1 {
-                self.ensure_doc(&k.clone());
-            }
         }
         if changed {
             self.kick();
@@ -1247,6 +1421,7 @@ impl Column {
     }
 
     fn click(&mut self, core: &Core<WlNote>, x: f64, y: f64, shift: bool) -> Vec<Act> {
+        self.paste_serial = self.paste_serial.wrapping_add(1);
         let on = self.on_at(x, y);
         let left_files = self.leave_file_views(&on);
         if self.update_bar_hover(x, y) || left_files {
@@ -1291,7 +1466,7 @@ impl Column {
                 });
             }
             On::Sheet(k) if open.as_deref() == Some(k.as_str()) => {
-                acts.extend(self.open_click(&k, x, y));
+                acts.extend(self.open_click(&k, x, y, shift));
             }
             On::Sheet(k) if self.showing_files(&k) => {}
             On::Sheet(k) => {
@@ -1311,7 +1486,7 @@ impl Column {
     }
 
     /// What a click at (`x`, `y`) on the open note `key` does.
-    fn open_click(&mut self, key: &str, x: f64, y: f64) -> Option<Act> {
+    fn open_click(&mut self, key: &str, x: f64, y: f64, shift: bool) -> Option<Act> {
         let face = self.face(key)?;
         if self.margin_rect(face).contains(x, y) {
             return Some(Act::Close);
@@ -1320,14 +1495,74 @@ impl Column {
             self.edit_title(Some(x));
             return None;
         }
-        let area = self.text_rect(face);
+        let banner = self.notice_rect(face);
+        if banner.contains(x, y) && self.draft.as_ref()?.conflict.is_some() {
+            let (reload, keep) = self.notice_buttons(banner);
+            return if reload.contains(x, y) {
+                Some(Act::Reload)
+            } else if keep.contains(x, y) {
+                Some(Act::KeepMine)
+            } else {
+                None
+            };
+        }
+        let area = self.editor_rect(face);
         if self.showing_files(key) || !area.contains(x, y) {
             return None;
         }
-        let d = self.docs.iter().find(|d| d.key == key)?.shown.as_ref()?;
-        match doc::hit(&d.hits, x - area.x, y - area.y + self.scroll)? {
-            Target::Task(n) => Some(Act::Task(key.to_string(), n)),
-            Target::Link(n) => Some(Act::Link(key.to_string(), n)),
+        let (dx, dy) = (x - area.x, y - area.y + self.scroll);
+        let now = Instant::now();
+        let count = self
+            .last_click
+            .filter(|(t, px, py, n)| {
+                *n < 3
+                    && now.duration_since(*t) < Duration::from_millis(400)
+                    && (x - px).hypot(y - py) < 5.0
+            })
+            .map_or(1, |(_, _, _, n)| n + 1);
+        self.last_click = Some((now, x, y, count));
+        let draft = self.draft.as_mut()?;
+        if !shift && count == 1 {
+            match doc::hit(self.layout.hits(), dx, dy) {
+                Some(Target::Task(n)) if draft.editor.toggle_task(n as usize) => {
+                    self.draft_changed();
+                    return Some(Act::QueueSave);
+                }
+                Some(Target::Link(n)) => {
+                    return self
+                        .links
+                        .get(n as usize)
+                        .map(|url| Act::OpenLink(key.to_owned(), url.clone()));
+                }
+                _ => {}
+            }
+        }
+        let (line, col) = self.layout.index_at(dx, dy);
+        let e = &mut draft.editor;
+        let at = e.offset(line, col);
+        match (shift, count) {
+            (false, 2) => e.select_word(at),
+            (false, 3) => e.select_line(at),
+            _ => e.set_caret(at, shift),
+        }
+        self.selecting = true;
+        self.goal_x = None;
+        self.follow_caret = true;
+        self.draft_changed();
+        None
+    }
+
+    fn drag_selection(&mut self, x: f64, y: f64) {
+        let Some(face) = self.deck.open().and_then(|k| self.face(k)) else {
+            return;
+        };
+        let area = self.editor_rect(face);
+        let (line, col): Pos = self.layout.index_at(x - area.x, y - area.y + self.scroll);
+        if let Some(d) = &mut self.draft {
+            let at = d.editor.offset(line, col);
+            d.editor.set_caret(at, true);
+            self.follow_caret = true;
+            self.draft_changed();
         }
     }
 
@@ -1572,102 +1807,132 @@ impl Column {
         }
     }
 
-    /// How far the open note's text scrolls.
-    fn max_scroll(&self) -> f64 {
-        let Some(key) = self.deck.open() else {
-            return 0.0;
-        };
-        let h = (self.docs.iter().find(|d| d.key == key))
-            .and_then(|d| d.shown.as_ref())
-            .map_or(0.0, |d| d.h);
-        let m = &self.style.metrics;
-        (h - (m.sheet_height - self.style.text_top() - self.style.file_bar)).max(0.0)
+    fn notice_height(&self) -> f64 {
+        if self.notice_text().is_some() {
+            self.style.title_h() * if self.has_conflict() { 2.0 } else { 1.0 }
+        } else {
+            0.0
+        }
     }
 
-    // -- documents ---------------------------------------------------------
+    fn has_conflict(&self) -> bool {
+        self.draft.as_ref().is_some_and(|d| d.conflict.is_some())
+    }
 
-    /// What an open `key` renders: its body (the title is a field).
-    fn want_doc(&self, key: &str) -> Option<Doc> {
-        let n = self.notes.get(key)?;
-        Some(Doc {
-            blocks: n.content.body(),
-            style: self.style.doc_style(n.text),
-            width: self.style.content_w() as i32,
-            max_height: DOC_MAX,
-            scale: self.scale,
+    fn notice_text(&self) -> Option<&str> {
+        let draft = self.draft.as_ref()?;
+        if draft.conflict.is_some() {
+            Some("Changed on disk")
+        } else {
+            draft.error.as_deref().or(draft.base().error.as_deref())
+        }
+    }
+
+    fn body_height(&self) -> i32 {
+        (self.style.metrics.sheet_height
+            - self.style.text_top()
+            - self.style.file_bar
+            - self.notice_height())
+        .floor()
+        .max(1.0) as i32
+    }
+
+    fn max_scroll(&self) -> f64 {
+        (self.layout.height() - self.body_height() as f64).max(0.0)
+    }
+
+    pub fn draft_changed(&mut self) {
+        self.body_dirty = true;
+        self.kick();
+    }
+
+    fn edit_style(&self) -> Option<EditStyle> {
+        let note = self.notes.get(self.deck.open()?)?;
+        Some(EditStyle {
+            font: self.style.font.clone(),
+            heading_font: Some(UI_FONT.into()),
+            size: self.style.font_size,
+            color: note.text,
+            link: self.style.link,
+            selection: (self.style.link & !0xff) | 0x48,
         })
     }
 
-    /// Have the open rendering of `key` drawn, unless it is already.
-    fn ensure_doc(&mut self, key: &str) {
-        let Some(want) = self.want_doc(key) else {
-            return;
+    fn layout_body(&mut self, style: &EditStyle) {
+        let Some(draft) = &self.draft else { return };
+        let mut fonts = self.fonts.borrow_mut();
+        let Some(fonts) = fonts.as_mut() else { return };
+        let editor = &draft.editor;
+        let active = if self.focused && self.editing.is_none() {
+            editor.active_lines()
+        } else {
+            0..0
         };
-        let i = match self.docs.iter().position(|d| d.key == key) {
-            Some(i) if self.docs[i].want == want => i,
-            found => {
-                self.next_tag += 1;
-                let tag = self.next_tag;
-                self.assets.doc(tag, want.clone());
-                match found {
-                    Some(i) => {
-                        (self.docs[i].want, self.docs[i].tag) = (want, tag);
-                        i
-                    }
-                    None => {
-                        self.docs.push(DocEntry {
-                            key: key.to_string(),
-                            want,
-                            tag,
-                            shown: None,
-                        });
-                        self.docs.len() - 1
-                    }
-                }
-            }
-        };
-        // Most recently wanted first; the oldest go.
-        let entry = self.docs.remove(i);
-        self.docs.insert(0, entry);
-        while self.docs.len() > DOCS {
-            if let Some(e) = self.docs.pop() {
-                self.stale.extend(e.shown.map(|s| s.buffer));
-            }
-        }
+        let (lines, links) = markdown::source_lines(editor.text(), active);
+        self.links = links;
+        fonts.edit_layout(
+            &mut self.layout,
+            lines,
+            style,
+            self.style.content_w() as i32,
+            self.scale,
+        );
     }
 
-    /// The notes or the scale changed: the open note (and the revealed
-    /// one) may need drawing again.
-    fn refresh_docs(&mut self) {
-        let keys: Vec<String> = (self.deck.open().into_iter())
-            .chain(self.deck.revealed())
-            .map(String::from)
-            .collect();
-        for k in keys {
-            self.ensure_doc(&k);
-        }
-    }
-
-    /// A rendered document from the worker.
-    pub fn doc_ready(&mut self, tag: u64, doc: &Doc, rendered: &doc::Rendered) {
-        let Some(e) = (self.docs.iter_mut()).find(|e| e.tag == tag && e.want == *doc) else {
+    fn draw_body(&mut self) {
+        let Some(style) = self.edit_style() else {
             return;
         };
-        let buffer = match shm_buffer(&self.g, &rendered.image, &self.qh) {
-            Ok(buffer) => buffer,
-            Err(e) => return warn!("text buffer: {e}"),
+        if self.body_dirty {
+            self.layout_body(&style);
+        }
+        let Some(draft) = &self.draft else { return };
+        let height = self.body_height();
+        let editor = &draft.editor;
+        let caret =
+            (self.focused && self.editing.is_none()).then(|| editor.line_col(editor.caret()));
+        if self.follow_caret
+            && let Some(c) = caret.and_then(|p| self.layout.caret(p))
+        {
+            self.scroll = self.scroll.min(c.y).max(c.y + c.h - height as f64);
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        if !self.body_dirty
+            && self
+                .body_shown
+                .as_ref()
+                .is_some_and(|b| b.scroll == self.scroll)
+        {
+            return;
+        }
+        let selection = caret
+            .and_then(|_| editor.selection())
+            .map(|r| (editor.line_col(r.start), editor.line_col(r.end)));
+        let drawn = {
+            let mut fonts = self.fonts.borrow_mut();
+            let Some(fonts) = fonts.as_mut() else { return };
+            fonts.edit_draw(&self.layout, &style, self.scroll, height, selection, caret)
         };
-        let new = RenderedDoc {
+        let buffer = match shm_buffer(&self.g, &drawn, &self.qh) {
+            Ok(b) => b,
+            Err(e) => return warn!("editor buffer: {e}"),
+        };
+        let s = self.scale as f64;
+        let image = Sized {
             buffer,
-            w: rendered.width as f64,
-            h: rendered.height as f64,
-            hits: rendered.hits.clone(),
+            w: drawn.width as f64 / s,
+            h: drawn.height as f64 / s,
         };
-        if let Some(old) = e.shown.replace(new) {
-            self.stale.push(old.buffer);
-        }
-        self.scroll = self.scroll.min(self.max_scroll());
-        self.kick();
+        self.stale.extend(
+            self.body_shown
+                .replace(BodyShown {
+                    image,
+                    scroll: self.scroll,
+                })
+                .map(|b| b.image.buffer),
+        );
+        self.body_dirty = false;
+        self.follow_caret = false;
     }
 
     // -- the title -----------------------------------------------------------
@@ -1694,6 +1959,11 @@ impl Column {
         Some(Field {
             text,
             caret,
+            selection: self
+                .editing
+                .as_ref()
+                .and_then(Title::selection)
+                .map(|r| (r, (self.style.link & !0xff) | 0x48)),
             style: self.style.title(note.text),
             bold: true,
             width: area.w.round().max(1.0) as i32,
@@ -2072,6 +2342,100 @@ impl Column {
         let top = self.style.text_top();
         let h = (face.h - top - self.style.file_bar).max(0.0);
         Rect::new(body.x + PAD_X, face.y + top, self.style.content_w(), h)
+    }
+
+    fn notice_rect(&self, face: Rect) -> Rect {
+        let area = self.text_rect(face);
+        Rect::new(area.x, area.y, area.w, self.notice_height().min(area.h))
+    }
+
+    fn editor_rect(&self, face: Rect) -> Rect {
+        let area = self.text_rect(face);
+        let h = self.notice_rect(face).h;
+        Rect::new(area.x, area.y + h, area.w, area.h - h)
+    }
+
+    fn notice_buttons(&self, area: Rect) -> (Rect, Rect) {
+        let y = area.y + self.style.title_h();
+        let h = (area.bottom() - y).max(0.0);
+        let w = (area.w / 2.0).floor();
+        (Rect::new(area.x, y, w, h), Rect::new(area.x + w, y, w, h))
+    }
+
+    fn place_notice(&mut self, face: Rect, surface: Rect, alpha: f64) {
+        let area = self.notice_rect(face);
+        let Some(message) = self.notice_text() else {
+            self.notice.clear();
+            return;
+        };
+        let conflict = self.has_conflict();
+        let label = if conflict {
+            format!("{message}\nReload\nKeep mine")
+        } else {
+            message.to_owned()
+        };
+        if self.notice_shown.as_ref().is_none_or(|(s, _)| *s != label) {
+            let drawn = {
+                let mut fonts = self.fonts.borrow_mut();
+                let Some(fonts) = fonts.as_mut() else { return };
+                let mut field = Field {
+                    text: message.to_owned(),
+                    caret: None,
+                    selection: None,
+                    style: self.style.small(TRASH_RED),
+                    bold: true,
+                    width: area.w.floor().max(1.0) as i32,
+                    scroll: 0.0,
+                    scale: self.scale,
+                };
+                let mut image = fonts.field(&field).image;
+                if conflict {
+                    let s = self.scale as usize;
+                    let row = self.style.title_h() as usize * s;
+                    let width = image.width as usize;
+                    let height = row * 2;
+                    image.height = height as u32;
+                    image.data.resize(width * height * 4, 0);
+                    field.width /= 2;
+                    for (i, name) in ["Reload", "Keep mine"].into_iter().enumerate() {
+                        field.text = name.into();
+                        let button = fonts.field(&field).image;
+                        let w = button.width as usize;
+                        for (j, pixels) in button.data.chunks_exact(w * 4).take(row).enumerate() {
+                            let start = ((row + j) * width + i * w) * 4;
+                            image.data[start..start + w * 4].copy_from_slice(pixels);
+                        }
+                    }
+                }
+                image
+            };
+            if let Ok(buffer) = shm_buffer(&self.g, &drawn, &self.qh) {
+                let sized = Sized {
+                    buffer,
+                    w: drawn.width as f64 / self.scale as f64,
+                    h: drawn.height as f64 / self.scale as f64,
+                };
+                self.stale.extend(
+                    self.notice_shown
+                        .replace((label, sized))
+                        .map(|(_, s)| s.buffer),
+                );
+            }
+        }
+        if let Some((_, image)) = &self.notice_shown
+            && let Some(buffer) = place_image(
+                &mut self.notice,
+                image,
+                area,
+                surface,
+                self.scale as f64,
+                alpha,
+            )
+        {
+            self.attached.push(buffer);
+        } else {
+            self.notice.clear();
+        }
     }
 
     fn bar_rect(&self, face: Rect) -> Rect {
@@ -2492,34 +2856,23 @@ impl Column {
             .as_deref()
             .and_then(|k| self.face(k))
             .filter(|_| alpha > 0.0);
-        // The text, scrolled.
-        let mut shown_text = None;
-        let doc = key
-            .as_deref()
-            .zip(face)
-            .filter(|(k, _)| !self.showing_files(k))
-            .and_then(|(k, f)| Some((self.docs.iter().find(|d| d.key == k)?.shown.as_ref()?, f)));
-        match doc {
-            Some((d, f)) => {
-                let area = self.text_rect(f);
-                let image = Rect::new(area.x, area.y - self.scroll, d.w, d.h);
-                match intersect(area, surface)
-                    .and_then(|a| clip(image, (d.w * s, d.h * s), None, a))
-                {
-                    Some((rect, src)) => {
-                        self.text.show(&d.buffer);
-                        self.text.crop(src);
-                        self.text.place(IRect::round(rect));
-                        self.text.set_alpha(alpha);
-                        self.text.commit();
-                        shown_text = Some(d.buffer.clone());
-                    }
-                    None => self.text.clear(),
+        self.text_shown = None;
+        if let Some(f) = face {
+            self.place_notice(f, surface, alpha);
+            if key.as_deref().is_some_and(|k| !self.showing_files(k)) {
+                self.draw_body();
+                if let Some(b) = &self.body_shown {
+                    let area = self.editor_rect(f);
+                    self.text_shown =
+                        place_image(&mut self.text, &b.image, area, surface, s, alpha);
                 }
             }
-            None => self.text.clear(),
+        } else {
+            self.notice.clear();
         }
-        self.text_shown = shown_text;
+        if self.text_shown.is_none() {
+            self.text.clear();
+        }
         // The title.
         if face.is_some() {
             self.draw_title();
@@ -2771,7 +3124,7 @@ impl Column {
                 order.push(&slot.sub);
             }
             if self.deck.open() == Some(card.key.as_str()) {
-                order.extend([&self.text, &self.title]);
+                order.extend([&self.text, &self.title, &self.notice]);
                 order.extend(self.open_bar.subs());
             }
             if self.deck.revealed() == Some(card.key.as_str()) {
@@ -2824,6 +3177,29 @@ impl BarSubs {
             &self.name,
         ])
     }
+}
+
+fn place_image(
+    sub: &mut Sub,
+    image: &Sized,
+    area: Rect,
+    surface: Rect,
+    scale: f64,
+    alpha: f64,
+) -> Option<WlBuffer> {
+    let rect = Rect::new(area.x, area.y, image.w, image.h);
+    let (rect, src) = clip(
+        rect,
+        (image.w * scale, image.h * scale),
+        None,
+        intersect(area, surface)?,
+    )?;
+    sub.show(&image.buffer);
+    sub.crop(src);
+    sub.place(IRect::round(rect));
+    sub.set_alpha(alpha);
+    sub.commit();
+    Some(image.buffer.clone())
 }
 
 fn grid_icon(cell: Rect) -> Rect {
@@ -2907,9 +3283,6 @@ fn axis(a: &AxisScroll) -> f64 {
 impl Drop for Column {
     fn drop(&mut self) {
         self.slots.clear();
-        for e in self.docs.drain(..) {
-            self.stale.extend(e.shown.map(|s| s.buffer));
-        }
         self.forget_drawn();
         for b in self.stale.drain(..) {
             b.destroy();
