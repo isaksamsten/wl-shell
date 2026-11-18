@@ -141,6 +141,7 @@ use crate::activateview::ActivateView;
 use crate::config::{Config, FolderView, LauncherEnter, Previews, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
+use crate::engines::{self, Engine};
 use crate::filesearch::{self, FileSearch, Found};
 use crate::folder;
 use crate::history::{self, History};
@@ -156,6 +157,7 @@ use crate::search::Search;
 use crate::strip::{self, Key};
 use crate::trash;
 use crate::view::{DockView, MenuEvent, Offer, Style};
+use crate::websuggest;
 
 /// How long the launcher (or the activate surface) waits for the
 /// compositor to say which output it is on before it takes the first
@@ -428,6 +430,7 @@ pub struct WlDock {
     /// A file the launcher opened (with `open-command`), and the path
     /// its client is told; run once it gave up the keyboard.
     pending_path: Option<(PathBuf, String)>,
+    pending_url: Option<(String, String)>,
     /// A file the launcher opens with an app.
     pending_with: Option<PendingWith>,
     /// A folder the launcher opens a terminal in, and the path its
@@ -436,6 +439,10 @@ pub struct WlDock {
     /// An app's action the launcher runs.
     pending_app: Option<PendingApp>,
     files: Option<Files>,
+    web_worker: Option<websuggest::Worker>,
+    web_session: Option<websuggest::Session>,
+    web_generation: u64,
+    mime_apps: wl_shell_render::mimeapps::MimeApps,
     /// Files' types for the launcher's actions, for its session.
     file_types: HashMap<PathBuf, FileType>,
     /// Tab on this file waits for its type.
@@ -508,10 +515,15 @@ impl WlDock {
             launcher_client: None,
             pending_open: None,
             pending_path: None,
+            pending_url: None,
             pending_with: None,
             pending_terminal: None,
             pending_app: None,
             files: None,
+            web_worker: None,
+            web_session: None,
+            web_generation: 0,
+            mime_apps: Default::default(),
             file_types: HashMap::new(),
             pending_tab: None,
             apps: Arc::default(),
@@ -537,6 +549,8 @@ impl WlDock {
             .refresh(&core.loop_handle, &mut |m| warn!("{m}"));
         self.config = self.reloader.config().clone();
         self.start_worker(core)?;
+        self.start_web_worker(core);
+        self.load_browser_preferences();
         self.watch_config(core);
         self.watch_pins(core);
         self.watch_trash(core);
@@ -1178,6 +1192,7 @@ impl WlDock {
         match self.launcher.as_ref().map(|l| l.query().scope()) {
             Some(Scope::Apps) => self.rank_apps(),
             Some(Scope::Files) => self.rank_files(core),
+            Some(Scope::Bang | Scope::Web) => self.rank_web(),
             Some(Scope::Actions) => self.rank_choices(),
             None => {}
         }
@@ -1401,41 +1416,283 @@ impl WlDock {
         });
     }
 
+    fn start_web_worker(&mut self, core: &Core<Self>) {
+        let (send, source) = channel::channel();
+        if let Err(e) =
+            core.loop_handle
+                .insert_source(source, |event, _, shell: &mut Shell<Self>| {
+                    if let channel::Event::Msg(answer) = event {
+                        let app = &mut shell.program;
+                        if app.web_session.as_mut().is_some_and(|s| s.accept(answer)) {
+                            app.show_web(true);
+                        }
+                    }
+                })
+        {
+            return warn!("cannot receive web suggestions: {}", e.error);
+        }
+        match websuggest::Worker::start(move |answer| {
+            let _ = send.send(answer);
+        }) {
+            Ok(worker) => self.web_worker = Some(worker),
+            Err(e) => warn!("cannot start web suggestions: {e}"),
+        }
+    }
+
+    fn load_browser_preferences(&mut self) {
+        let desktops = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let desktops: Vec<_> = desktops
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        self.mime_apps = wl_shell_render::mimeapps::MimeApps::load(&desktops);
+    }
+
+    fn browser(&self) -> Option<&IndexedApp> {
+        let i = self
+            .mime_apps
+            .default_app(&["x-scheme-handler/https".into()], &self.apps)?;
+        self.apps.get(i)
+    }
+
+    fn engine_match(
+        &self,
+        engine: &Engine,
+        id: String,
+        name: String,
+        matched: Vec<std::ops::Range<usize>>,
+    ) -> Match {
+        let mut named = Vec::new();
+        if let Some(icon) = engine
+            .icon
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+        {
+            named.push(icon);
+        }
+        if let Some(icon) = self.browser().and_then(|a| a.entry.icon.clone()) {
+            named.push(icon);
+        }
+        named.push("web-browser".into());
+        Match {
+            id,
+            name,
+            icon: None,
+            app: None,
+            named,
+            matched,
+            file: None,
+            window: None,
+        }
+    }
+
+    fn rank_web(&mut self) {
+        let Some(l) = &self.launcher else { return };
+        let web = &self.config.launcher.web;
+        let engine = l
+            .query()
+            .engine()
+            .and_then(|key| web.engine(key))
+            .filter(|_| web.suggest);
+        if let Some(worker) = &self.web_worker {
+            let session = self.web_session.get_or_insert_with(|| {
+                self.web_generation += 1;
+                websuggest::Session::new(self.web_generation)
+            });
+            session.query(worker, engine, l.query().text());
+        }
+        self.show_web(false);
+    }
+
+    /// Suggestions stream onto the existing ring; an edit instead puts
+    /// the typed query back in front.
+    fn show_web(&mut self, streamed: bool) {
+        let Some(l) = self.launcher.as_ref().filter(|l| !l.closing()) else {
+            return;
+        };
+        let web = &self.config.launcher.web;
+        let slots = (self.config.launcher.matches as usize).max(1);
+        let query = l.query();
+        let engine = query.engine().and_then(|key| web.engine(key));
+        let matches = match query.scope() {
+            Scope::Bang => web
+                .ranked(&mut self.search, query.text())
+                .into_iter()
+                .take(slots)
+                .map(|e| (e, self.search.highlight(&e.name, query.text())))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(e, matched)| {
+                    self.engine_match(e, e.keyword.clone(), e.name.clone(), matched)
+                })
+                .collect(),
+            Scope::Web => {
+                if let Some(e) = engine {
+                    let text = query.text();
+                    let mut matches = vec![Match {
+                        id: engines::TYPED.into(),
+                        name: text.into(),
+                        icon: None,
+                        app: None,
+                        named: crate::launcherview::SEARCH_ICONS
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        matched: Vec::new(),
+                        file: None,
+                        window: None,
+                    }];
+                    if let Some(session) = &self.web_session {
+                        matches.extend(session.values().iter().take(slots - 1).map(|s| {
+                            let matched = s
+                                .starts_with(text.trim())
+                                .then_some(0..text.trim().len())
+                                .into_iter()
+                                .collect();
+                            self.engine_match(e, format!("suggestion:{s}"), s.clone(), matched)
+                        }));
+                    }
+                    matches
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => return,
+        };
+        let l = self.launcher.as_mut().unwrap();
+        if streamed {
+            l.stream_matches(matches);
+        } else {
+            l.set_matches(matches);
+        }
+    }
+
+    fn edit_launcher(&mut self, core: &Core<Self>, edit: launcher::Key, pasted: bool) {
+        let Some(l) = &mut self.launcher else { return };
+        let scope = l.query().scope();
+        let config = &self.config.launcher;
+        let bang = config
+            .web
+            .bang_trigger
+            .filter(|_| !config.web.engines.is_empty());
+        let changed = match &edit {
+            launcher::Key::Text(text) if l.query_mut().start_bang(text, bang) => {
+                if pasted && let Some((keyword, text)) = config.web.paste_bang(l.query().text()) {
+                    let (keyword, text) = (keyword.to_owned(), text.to_owned());
+                    l.query_mut().edit(&launcher::Key::Clear, None);
+                    l.query_mut()
+                        .edit(&launcher::Key::Text(keyword.clone()), None);
+                    self.show_web(false);
+                    if let Some(l) = &mut self.launcher {
+                        l.enter_web(keyword, &text);
+                    }
+                }
+                true
+            }
+            _ => l.query_mut().edit(&edit, config.files.trigger),
+        };
+        if !changed {
+            return;
+        }
+        if let Some(l) = &mut self.launcher
+            && scope != l.query().scope()
+            && l.query().scope() == Scope::Files
+        {
+            l.set_matches(Vec::new());
+        }
+        if self
+            .launcher
+            .as_ref()
+            .is_some_and(|l| !matches!(l.query().scope(), Scope::Web | Scope::Bang))
+            && let (Some(session), Some(worker)) = (&mut self.web_session, &self.web_worker)
+        {
+            session.query(worker, None, "");
+        }
+        self.rank_launcher(core);
+    }
+
+    fn clear_web(&mut self) {
+        if self.web_session.take().is_some()
+            && let Some(worker) = &self.web_worker
+        {
+            worker.clear();
+        }
+    }
+
+    fn paste_launcher(&mut self, core: &mut Core<Self>) {
+        let Some(l) = &self.launcher else { return };
+        let surface = l.surface().clone();
+        let offered = core.selection_mime_types();
+        let Some(mime) = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"]
+            .into_iter()
+            .find(|mime| offered.iter().any(|s| s == mime))
+        else {
+            return;
+        };
+        let _ = core.read_selection(mime, move |app, core, bytes| {
+            if !app
+                .launcher
+                .as_ref()
+                .is_some_and(|l| l.surface() == &surface && !l.closing())
+            {
+                return;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return;
+            };
+            let text: String = text
+                .chars()
+                .filter_map(|c| {
+                    if c.is_whitespace() {
+                        Some(if c.is_control() { ' ' } else { c })
+                    } else if c.is_control() {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                })
+                .take(4096)
+                .collect();
+            if !text.is_empty() {
+                app.edit_launcher(core, launcher::Key::Text(text), true);
+            }
+        });
+    }
+
     /// A key on the launcher.
     fn launcher_key(&mut self, core: &mut Core<Self>, event: &KeyEvent, repeat: bool) {
         let mods = core.input.modifiers;
+        if mods.ctrl
+            && !mods.alt
+            && !mods.logo
+            && event.keysym == smithay_client_toolkit::seat::keyboard::Keysym::v
+        {
+            if !repeat {
+                self.paste_launcher(core);
+            }
+            return;
+        }
         let Some(key) = launcher::Key::from(event.keysym, event.utf8.as_deref(), &mods) else {
             return;
         };
         if repeat && !key.repeats() {
             return;
         }
-        let trigger = self.config.launcher.files.trigger;
         let Some(l) = &mut self.launcher else { return };
         match launcher::act(key, l.depth(), l.query()) {
             Act::Close => self.cancel_launcher(core),
-            Act::Clear => {
-                l.query_mut().edit(&launcher::Key::Clear, trigger);
-                self.rank_launcher(core);
-            }
+            Act::Clear => self.edit_launcher(core, launcher::Key::Clear, false),
             Act::Roll(by) => l.roll(by),
-            Act::Open { .. } if l.depth() > 0 => self.launcher_run(core, None),
+            Act::Open { .. } if l.level().is_some() => self.launcher_run(core, None),
             Act::Open { other } => self.launcher_pick(core, None, other),
             Act::Into => self.launcher_into(core, None),
             Act::Out => {
                 let to = l.depth().saturating_sub(1);
                 self.launcher_back(to);
             }
-            Act::Edit(edit) => {
-                let scope = l.query().scope();
-                if l.query_mut().edit(&edit, trigger) {
-                    // Apps and files never share the drum.
-                    if l.query().scope() != scope {
-                        l.set_matches(Vec::new());
-                    }
-                    self.rank_launcher(core);
-                }
-            }
+            Act::Edit(edit) => self.edit_launcher(core, edit, false),
         }
     }
 
@@ -1453,6 +1710,11 @@ impl WlDock {
                 files.search.tick();
             }
             self.show_files();
+        } else if left && l.query().scope() == Scope::Bang {
+            if let (Some(session), Some(worker)) = (&mut self.web_session, &self.web_worker) {
+                session.query(worker, None, "");
+            }
+            self.show_web(true);
         }
     }
 
@@ -1466,6 +1728,36 @@ impl WlDock {
         let Some(m) = index.or(l.selected()).and_then(|i| l.match_at(i)) else {
             return;
         };
+        if l.query().scope() == Scope::Web {
+            let query = if m.id == engines::TYPED {
+                l.query().text()
+            } else {
+                &m.name
+            };
+            let web = &self.config.launcher.web;
+            let Some(e) = l.query().engine().and_then(|key| web.engine(key)) else {
+                return;
+            };
+            let url = engines::url(&e.url, query);
+            if engines::http_url(&url).is_none() {
+                return;
+            }
+            let command = spawn::fill(&web.command, &[("url", &spawn::quote(&url))]);
+            let browser = self
+                .browser()
+                .map(|a| self.dock_app_id(core, a))
+                .filter(|id| {
+                    self.docks
+                        .iter()
+                        .any(|dock| Some(&dock.output) == l.output() && dock.item(id).is_some())
+                });
+            self.close_launcher(core, browser);
+            self.pending_url = Some((command, url));
+            return;
+        }
+        if l.query().scope() == Scope::Bang {
+            return;
+        }
         if let Some(f) = &m.file {
             let path = match other {
                 true => f.path.parent().unwrap_or(&f.path).to_path_buf(),
@@ -1502,6 +1794,32 @@ impl WlDock {
         let Some(l) = &mut self.launcher else { return };
         if let Some(i) = index {
             l.select(i);
+        }
+        match l.query().scope() {
+            Scope::Bang => {
+                if let Some(keyword) = l
+                    .selected()
+                    .and_then(|i| l.match_at(i))
+                    .map(|m| m.id.clone())
+                {
+                    l.enter_web(keyword, "");
+                }
+                self.rank_web();
+                return;
+            }
+            Scope::Web => {
+                if let Some(text) = l
+                    .selected()
+                    .and_then(|i| l.match_at(i))
+                    .filter(|m| m.id != engines::TYPED)
+                    .map(|m| m.name.clone())
+                {
+                    l.query_mut().complete_web(text);
+                    self.rank_web();
+                }
+                return;
+            }
+            _ => {}
         }
         let Some(i) = l.selected() else {
             return;
@@ -1795,6 +2113,7 @@ impl WlDock {
     fn close_launcher(&mut self, core: &Core<Self>, opened: Option<String>) {
         let _ = core;
         self.files = None;
+        self.clear_web();
         self.file_types.clear();
         self.pending_tab = None;
         let Some(launcher) = &mut self.launcher else {
@@ -1818,6 +2137,7 @@ impl WlDock {
     /// Drop the launcher at once; its dock gets its panel back.
     fn drop_launcher(&mut self) {
         self.files = None;
+        self.clear_web();
         self.file_types.clear();
         self.pending_tab = None;
         let Some(launcher) = self.launcher.take() else {
@@ -1837,6 +2157,7 @@ impl WlDock {
     fn launcher_after(&mut self, core: &mut Core<Self>) {
         let pending = self.pending_open.is_some()
             || self.pending_path.is_some()
+            || self.pending_url.is_some()
             || self.pending_with.is_some()
             || self.pending_terminal.is_some()
             || self.pending_app.is_some();
@@ -1891,6 +2212,18 @@ impl WlDock {
             }
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(picked));
+            }
+        }
+        if let Some((command, url)) = self.pending_url.take() {
+            if let Err(e) = spawn::shell(
+                &core.loop_handle,
+                &command,
+                Output::Prefixed("web-command".into()),
+            ) {
+                warn!("web-command: {e}");
+            }
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(url));
             }
         }
         if let Some((path, picked)) = self.pending_path.take() {
@@ -1956,6 +2289,15 @@ impl WlDock {
     /// with the old one and restyle the docks.
     fn config_changed(&mut self, core: &mut Core<Self>) {
         self.config = self.reloader.config().clone();
+        self.load_browser_preferences();
+        self.clear_web();
+        if self
+            .launcher
+            .as_ref()
+            .is_some_and(|l| !l.closing() && matches!(l.query().scope(), Scope::Bang | Scope::Web))
+        {
+            self.rank_web();
+        }
         let mut cache = self.cache.borrow_mut();
         cache.clear_icons();
         cache.clear_shapes();
@@ -3144,6 +3486,8 @@ impl WlDock {
                 self.apps = apps;
                 if (self.launcher.as_ref()).is_some_and(|l| l.query().scope() == Scope::Apps) {
                     self.rank_apps();
+                } else {
+                    self.show_web(true);
                 }
             }
             Done::Paper { .. } | Done::Doc { .. } => {}
@@ -3461,7 +3805,12 @@ impl Program for WlDock {
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {
         if let Some(launcher) = (self.launcher.as_mut()).filter(|l| *l.surface() == event.surface) {
             match launcher.pointer(event) {
-                LauncherInput::Open(i) if launcher.depth() > 0 => self.launcher_run(core, Some(i)),
+                LauncherInput::Open(i) if launcher.level().is_some() => {
+                    self.launcher_run(core, Some(i))
+                }
+                LauncherInput::Open(i) if launcher.query().scope() == Scope::Bang => {
+                    self.launcher_into(core, Some(i));
+                }
                 LauncherInput::Open(i) => self.launcher_pick(core, Some(i), false),
                 LauncherInput::Back(depth) => self.launcher_back(depth),
                 LauncherInput::Close => self.cancel_launcher(core),

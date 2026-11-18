@@ -93,6 +93,8 @@ pub enum Scope {
     #[default]
     Apps,
     Files,
+    Bang,
+    Web,
     /// A level's choices (a subject's actions, or an action's choices).
     Actions,
 }
@@ -103,6 +105,7 @@ pub enum Scope {
 pub struct Query {
     text: String,
     scope: Scope,
+    engine: Option<String>,
 }
 
 impl Query {
@@ -111,6 +114,7 @@ impl Query {
         Self {
             text: String::new(),
             scope: Scope::Actions,
+            engine: None,
         }
     }
 
@@ -126,11 +130,37 @@ impl Query {
         self.text.is_empty()
     }
 
+    pub fn engine(&self) -> Option<&str> {
+        self.engine.as_deref()
+    }
+
+    /// A trigger at the start of the app query is parsed out of band.
+    pub fn start_bang(&mut self, text: &str, trigger: Option<char>) -> bool {
+        if self.scope != Scope::Apps || !self.is_empty() {
+            return false;
+        }
+        let Some(rest) = trigger.and_then(|c| text.strip_prefix(c)) else {
+            return false;
+        };
+        self.scope = Scope::Bang;
+        self.text.push_str(rest);
+        true
+    }
+
+    pub fn commit_engine(&mut self, keyword: String, text: &str) {
+        self.text = text.to_owned();
+        self.engine = Some(keyword);
+        self.scope = Scope::Web;
+    }
+
+    pub fn complete_web(&mut self, text: String) {
+        self.text = text;
+    }
+
     /// Apply an editing key; `trigger` typed first in an empty app query
     /// switches to files. Returns whether the text or the scope changed.
     pub fn edit(&mut self, key: &Key, trigger: Option<char>) -> bool {
         let before = (self.text.len(), self.scope);
-        let files = self.scope == Scope::Files;
         match key {
             Key::Text(t) => {
                 let rest = (trigger.filter(|c| !c.is_whitespace()))
@@ -144,12 +174,13 @@ impl Query {
                     None => self.text.push_str(t),
                 }
             }
-            Key::Backspace | Key::DeleteWord | Key::Back if files && self.text.is_empty() => {
-                self.scope = Scope::Apps;
+            Key::Back if matches!(self.scope, Scope::Files | Scope::Bang) => {
+                *self = Self::default();
             }
-            Key::Back if files => {
-                self.scope = Scope::Apps;
-                self.text.clear();
+            Key::Backspace | Key::DeleteWord
+                if matches!(self.scope, Scope::Files | Scope::Bang) && self.is_empty() =>
+            {
+                *self = Self::default();
             }
             Key::Backspace => {
                 self.text.pop();
@@ -157,7 +188,11 @@ impl Query {
             Key::DeleteWord => {
                 let kept = self.text.trim_end().len();
                 self.text.truncate(kept);
-                let start = self.text.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                let start = self
+                    .text
+                    .char_indices()
+                    .rfind(|(_, c)| c.is_whitespace())
+                    .map_or(0, |(i, c)| i + c.len_utf8());
                 self.text.truncate(start);
             }
             Key::Clear => self.text.clear(),
@@ -258,8 +293,13 @@ impl<T, S> Nav<T, S> {
     }
 
     /// Enter `level`, leaving from `from`; its query starts empty.
+    #[cfg(test)]
     pub fn enter(&mut self, from: Selection<S>, level: T) {
-        let query = std::mem::replace(&mut self.query, Query::actions());
+        self.enter_with(from, level, Query::actions());
+    }
+
+    pub fn enter_with(&mut self, from: Selection<S>, level: T, next: Query) {
+        let query = std::mem::replace(&mut self.query, next);
         self.levels.push((query, from, level));
     }
 

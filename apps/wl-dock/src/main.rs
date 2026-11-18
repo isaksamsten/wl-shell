@@ -9,6 +9,7 @@ mod config;
 mod dock;
 mod drag;
 mod drum;
+mod engines;
 mod filesearch;
 mod folder;
 mod history;
@@ -28,6 +29,7 @@ mod strip;
 mod stripview;
 mod trash;
 mod view;
+mod websuggest;
 mod zoom;
 
 use std::process::ExitCode;

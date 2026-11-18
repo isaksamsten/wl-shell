@@ -19,7 +19,10 @@ ignore.workspace = true
 nucleo.workspace = true
 nucleo-matcher.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 smithay-client-toolkit.workspace = true
+ureq.workspace = true
+url.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 

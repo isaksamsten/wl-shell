@@ -78,6 +78,46 @@
 #gitignore = true                # Honor .gitignore, .ignore and git excludes
 #max = 1000000                   # Entries searched at most; 1–100000000
 
+# Web search is opt-in: uncomment the engines you want. Type ! to filter
+# engines, then Tab to search with one. Ctrl+V can paste a whole bang.
+#[launcher.web]
+#bang-trigger = "!"              # One character; "" disables the trigger
+#command = "xdg-open {url}"
+#suggest = true                  # Send typed web queries to the selected engine
+
+#[launcher.web.engine.g]
+#name = "Google"
+#url = "https://www.google.com/search?q={query}"
+#suggest = "https://suggestqueries.google.com/complete/search?client=firefox&q={query}"
+# icon = "~/.local/share/icons/google.svg" # Local path or theme icon name
+
+#[launcher.web.engine.d]
+#name = "DuckDuckGo"
+#url = "https://duckduckgo.com/?q={query}"
+#suggest = "https://duckduckgo.com/ac/?type=list&q={query}"
+
+#[launcher.web.engine.w]
+#name = "Wikipedia"
+#url = "https://en.wikipedia.org/wiki/Special:Search?search={query}"
+#suggest = "https://en.wikipedia.org/w/api.php?action=opensearch&search={query}"
+
+#[launcher.web.engine.y]
+#name = "YouTube"
+#url = "https://www.youtube.com/results?search_query={query}"
+#suggest = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={query}"
+
+#[launcher.web.engine.a]
+#name = "Amazon"
+#url = "https://www.amazon.com/s?k={query}"
+
+#[launcher.web.engine.gh]
+#name = "GitHub"
+#url = "https://github.com/search?q={query}"
+
+#[launcher.web.engine.m]
+#name = "Google Maps"
+#url = "https://www.google.com/maps/search/?api=1&query={query}"
+
 # --- Compositor integration -----------------------------------------------
 # Commands run through `sh -c`. The commands below are niri examples; replace
 # them with your compositor's equivalents. Without close-command, the menu has

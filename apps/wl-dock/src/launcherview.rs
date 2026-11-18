@@ -129,7 +129,7 @@ const SLIDE_MAX: f64 = 120.0;
 /// The crumbs before the deepest, of its alpha.
 const CRUMB_DIM: f64 = 0.5;
 /// The front's icon with an empty query.
-const SEARCH_ICON: &str = "system-search";
+pub const SEARCH_ICONS: &[&str] = &["system-search", "edit-find", "search"];
 /// Stand-ins for a file's icon, and a folder's.
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
 /// A character's width, of the font size, at most (to fit paths).
@@ -534,9 +534,9 @@ impl Texts {
         let caret_x = x0 + dx + query_w - scroll;
         (self.query).present_clipped(x0 + dx - scroll, ty, clip, alpha);
         (self.inline).present_clipped(caret_x, ty, clip, alpha);
-        // At the bar's end, unless it would run into the query.
+        // At the bar's end, unless it would run into the query or its completion.
         let after_x = x1 - self.after.width() + dx;
-        match after_x >= caret_x + 1.5 * style.padding {
+        match after_x >= caret_x + self.inline.width() + 1.5 * style.padding {
             true => self.after.present_clipped(after_x, ty, clip, alpha),
             false => self.after.sub.clear(),
         }
@@ -791,7 +791,7 @@ pub struct LauncherView {
     attached: Option<Attached>,
 
     /// The query of the search or the level entered, and the levels.
-    nav: Nav<Level, Vec<Match>>,
+    nav: Nav<Option<Level>, Vec<Match>>,
     /// The subject of the actions and the crumbs, while shown (or
     /// dropping back), by depth.
     pinned: Vec<Pinned>,
@@ -1138,8 +1138,9 @@ impl LauncherView {
     fn search_key(&self, scope: Scope) -> Option<NamedIcon> {
         let a = self.attached.as_ref()?;
         let names: &[&str] = match scope {
-            Scope::Apps | Scope::Actions => &[SEARCH_ICON, "edit-find", "search"],
+            Scope::Apps | Scope::Actions | Scope::Web => SEARCH_ICONS,
             Scope::Files => &files::FOLDER_ICONS,
+            Scope::Bang => &["web-browser"],
         };
         let names = names.iter().map(|s| s.to_string()).collect();
         Self::named(a, self.scale, false, names)
@@ -1210,7 +1211,7 @@ impl LauncherView {
 
     /// The level entered, unless searching.
     pub fn level(&self) -> Option<&Level> {
-        self.nav.level()
+        self.nav.level()?.as_ref()
     }
 
     /// The subject of the actions, while entered.
@@ -1225,6 +1226,16 @@ impl LauncherView {
     /// flies out of the front into the pill: from the search it is the
     /// subject, else a crumb.
     pub fn enter(&mut self, level: Level) {
+        self.enter_level(Some(level), Query::actions());
+    }
+
+    pub fn enter_web(&mut self, keyword: String, text: &str) {
+        let mut query = Query::default();
+        query.commit_engine(keyword, text);
+        self.enter_level(None, query);
+    }
+
+    fn enter_level(&mut self, level: Option<Level>, query: Query) {
         let depth = self.nav.depth();
         let selected = self.selected().and_then(|i| self.ring.get(i));
         let from = Selection {
@@ -1253,7 +1264,7 @@ impl LauncherView {
             });
         }
         self.pill_in.retarget(1.0);
-        self.nav.enter(from, level);
+        self.nav.enter_with(from, level, query);
         self.slide_texts(1.0);
         // The choices come in fresh: nothing cross-fades into them.
         self.ring.clear();
@@ -1455,9 +1466,10 @@ impl LauncherView {
             style: style.line_style(color),
         };
         let line = |text: String, color: u32| spanned(text, Vec::new(), color);
+        let scope = self.nav.query().scope();
         // The names on the drum, with what the query matched brighter.
         let labels: Vec<PillRequest> = (self.ring.iter())
-            .map(|r| label_request(&r.m, style, max, scale))
+            .map(|r| label_request(&r.m, style, max, scale, scope == Scope::Web))
             .collect();
         let selected = self.selected().and_then(|i| self.ring.get(i)).map(|r| &r.m);
         let q = self.nav.query().text();
@@ -1467,7 +1479,6 @@ impl LauncherView {
         let pill_name = (self.pinned.first())
             .filter(|p| p.depth == 0)
             .map(|p| name_request(&p.m, style, max / 2, scale));
-        let scope = self.nav.query().scope();
         let (path, inline, after) = match scope {
             Scope::Files => {
                 let file = selected.and_then(|m| Some((m, m.file.as_ref()?)));
@@ -1510,7 +1521,7 @@ impl LauncherView {
                 // name (the default's at first); else the placeholder.
                 let placeholder = match scope {
                     Scope::Actions => (name.filter(|n| !n.is_empty()))
-                        .or_else(|| self.nav.level().map(|l| l.placeholder.as_str()))
+                        .or_else(|| self.level().map(|l| l.placeholder.as_str()))
                         .unwrap_or(""),
                     _ => PLACEHOLDER,
                 };
@@ -1524,6 +1535,42 @@ impl LauncherView {
                 let inline = inline.map(|t| line(t, style.completion));
                 let after = after.map(|t| line(t, style.completion));
                 (None, inline, after)
+            }
+            Scope::Bang => {
+                let name = selected.map(|m| m.name.as_str());
+                let engine_label = || {
+                    selected.map(|m| {
+                        let spans = m
+                            .matched
+                            .iter()
+                            .map(|r| (r.clone(), style.matched))
+                            .collect();
+                        spanned(m.name.clone(), spans, style.completion)
+                    })
+                };
+                match completion(q, name) {
+                    Completion::Inline(rest) if !rest.is_empty() => {
+                        (None, Some(line(rest, style.completion)), None)
+                    }
+                    Completion::After(_) => (None, None, engine_label()),
+                    Completion::None if q.is_empty() => (None, None, engine_label()),
+                    _ => (None, None, None),
+                }
+            }
+            Scope::Web => {
+                let name = selected
+                    .filter(|m| m.id != crate::engines::TYPED)
+                    .map(|m| m.name.as_str());
+                let (inline, after) = match completion(q, name) {
+                    Completion::Inline(rest) if !rest.is_empty() => (Some(rest), None),
+                    Completion::After(text) => (None, Some(text)),
+                    _ => (None, None),
+                };
+                (
+                    None,
+                    inline.map(|t| line(t, style.completion)),
+                    after.map(|t| line(t, style.completion)),
+                )
             }
         };
         // The query and what continues it scroll in the bar instead of
@@ -2190,11 +2237,11 @@ fn path_request(f: &FileMatch, style: &LauncherStyle, max: i32, scale: i32) -> P
 
 /// A match's pill on the drum: its name, with what the query matched
 /// brighter, and for a file its parent directory's name, dimmer.
-fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
+fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32, web: bool) -> PillRequest {
     let mut spans: Vec<(Range<usize>, u32)> = m
         .matched
         .iter()
-        .map(|r| (r.clone(), style.matched))
+        .map(|r| (r.clone(), if web { style.text } else { style.matched }))
         .collect();
     let mut text = m.name.clone();
     if let Some(f) = m.file.as_ref().filter(|f| !f.parent.is_empty()) {
@@ -2214,7 +2261,14 @@ fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> Pill
         spans,
         max_width: max,
         scale,
-        style: style.label_style(),
+        style: if web && m.id != crate::engines::TYPED {
+            text::Style {
+                color: style.completion,
+                ..style.label_style()
+            }
+        } else {
+            style.label_style()
+        },
     }
 }
 

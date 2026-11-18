@@ -206,6 +206,7 @@ pub struct LauncherConfig {
     pub far_scale: f64,
     pub enter: LauncherEnter,
     pub history: bool,
+    pub web: crate::engines::Web,
     /// File search (`[launcher.files]`).
     pub files: LauncherFiles,
 }
@@ -220,6 +221,7 @@ impl Default for LauncherConfig {
             far_scale: 0.5,
             enter: LauncherEnter::default(),
             history: true,
+            web: crate::engines::Web::default(),
             files: LauncherFiles::default(),
         }
     }
@@ -1089,7 +1091,7 @@ fn launcher_far_scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> 
 
 /// The file search's trigger: one character, not a space; `""` turns file
 /// search off.
-fn files_trigger<'de, D: Deserializer<'de>>(d: D) -> Result<Option<char>, D::Error> {
+pub(crate) fn files_trigger<'de, D: Deserializer<'de>>(d: D) -> Result<Option<char>, D::Error> {
     use serde::de::Error;
     let s = String::deserialize(d)?;
     let mut chars = s.chars();
