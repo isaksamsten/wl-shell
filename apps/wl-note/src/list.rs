@@ -26,14 +26,15 @@ pub enum Which {
 pub type Listed<'a> = (&'a Path, &'a Note, bool);
 
 /// The notes to list: all of them, or those shown for `window`, in
-/// column order, hidden or not as `which` says.
+/// column order (for a window, the global ones first), hidden or not as
+/// `which` says.
 pub fn notes<'a>(
     index: &'a Index,
     state: &State,
     window: Option<&Window>,
     which: Which,
 ) -> Vec<Listed<'a>> {
-    (state.arrange(index).into_iter())
+    let mut out: Vec<Listed> = (state.arrange(index).into_iter())
         .filter_map(|p| {
             let note = &index.get(p)?.note;
             let hidden = state.is_hidden(p);
@@ -45,7 +46,12 @@ pub fn notes<'a>(
             let matches = window.is_none_or(|w| note.matches(Some(w)));
             (wanted && matches).then_some((p, note, hidden))
         })
-        .collect()
+        .collect();
+    if window.is_some() {
+        // Stable: each group keeps its order.
+        out.sort_by_key(|(_, note, _)| !note.global());
+    }
+    out
 }
 
 /// The file's name without `.md`, as titles fall back to.
@@ -222,6 +228,9 @@ mod tests {
         assert_eq!(paths(Which::All, None), ["c.md", "b.md", "a.md"]);
         let foot = Window::new("foot", "");
         assert_eq!(paths(Which::All, Some(&foot)), ["c.md", "a.md"]);
+        // For a window, as the column shows them: the global ones first.
+        let firefox = Window::new("firefox", "");
+        assert_eq!(paths(Which::All, Some(&firefox)), ["c.md", "a.md", "b.md"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

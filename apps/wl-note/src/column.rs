@@ -86,7 +86,7 @@ use wl_shell_ui::{IRect, Rect, Sub, cache, lerp};
 use crate::app::WlNote;
 use crate::bar;
 use crate::config::{Config, Edge, NoteLayer};
-use crate::deck::{Card, Deck, Item, LIFT, Metrics, On, Role};
+use crate::deck::{Card, Deck, Group, Item, LIFT, Metrics, On, Role};
 use crate::draft::Draft;
 use crate::files;
 use crate::markdown::{self, Content};
@@ -99,6 +99,8 @@ const PAD_Y: f64 = 10.0;
 /// How far papers reach behind the edge past how far they are out, so
 /// a tilt or a lift never shows their end.
 const BEHIND: f64 = 10.0;
+/// How much larger than its markers a group's backdrop is, on each side.
+const BACKDROP_PAD: f64 = 3.0;
 /// Corner radii of tabs and sheets.
 const TAB_RADIUS: f64 = 7.0;
 const SHEET_RADIUS: f64 = 8.0;
@@ -155,6 +157,8 @@ pub struct Style {
     /// The `+` button's color and its plus's.
     pub plus_color: u32,
     pub plus_glyph: u32,
+    /// Behind each group's markers (alpha 0: none).
+    pub backdrop: u32,
     palette: [u32; PRESETS.len()],
 }
 
@@ -176,6 +180,8 @@ impl Style {
                 sheet_width: config.sheet.width as f64,
                 sheet_height: config.sheet.height as f64,
                 plus: 22.0,
+                group_gap: config.column.group_gap as f64,
+                backdrop_headers: config.column.group_backdrop_headers,
             },
             marker_radius: config.column.marker_radius as f64,
             reserve_band: config.column.reserve_edge_band,
@@ -190,6 +196,7 @@ impl Style {
             link: theme.link_color,
             plus_color: (white & !0xff) | 0xe6,
             plus_glyph: (ink & !0xff) | 0xb0,
+            backdrop: theme.group_backdrop,
             palette: PRESETS.map(|name| config.paper_color(Some(&Color::Preset(name)))),
         }
     }
@@ -341,8 +348,8 @@ pub enum Act {
     Color(String, Color),
     Trash(String),
     RemoveFile(String, PathBuf),
-    /// This note was dropped at this slot of the column (its keys, in
-    /// order).
+    /// This note was dropped at this slot of these notes (the group it
+    /// lands in, in order).
     Reorder(String, Vec<String>, usize),
 }
 
@@ -498,6 +505,11 @@ pub struct Column {
     notes: HashMap<String, NoteView>,
     slots: Vec<Slot>,
     plus: Sub,
+    /// Each group's backdrop, by `Group`: its top, middle and bottom.
+    backdrops: [[Sub; 3]; 2],
+    /// The backdrops' buffer: a rounded rect cut in three, and what it
+    /// was drawn for (scale, color, width, radius).
+    backdrop_shown: Option<((i32, u32, i32, i32), WlBuffer)>,
     /// The `+` button's buffer, and the scale it was drawn at.
     plus_shown: Option<(i32, WlBuffer, paper::Rendered)>,
     /// Where the `+` button is, while it takes the pointer.
@@ -685,6 +697,7 @@ impl Column {
         let parent = layer.wl_surface().clone();
         let sub = || Sub::new(&g, &parent, &no_input, &qh);
         let (plus, text, title, notice) = (sub(), sub(), sub(), sub());
+        let backdrops = [[sub(), sub(), sub()], [sub(), sub(), sub()]];
         let open_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let reveal_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let deck = Deck::new(style.metrics, style.response);
@@ -709,6 +722,8 @@ impl Column {
             notes: HashMap::new(),
             slots: Vec::new(),
             plus,
+            backdrops,
+            backdrop_shown: None,
             plus_shown: None,
             plus_rect: None,
             text,
@@ -842,6 +857,11 @@ impl Column {
         self.open_bar.clear();
         self.reveal_bar.clear();
         self.plus.clear();
+        for sub in self.backdrops.iter_mut().flatten() {
+            sub.clear();
+        }
+        self.stale
+            .extend(self.backdrop_shown.take().map(|(_, b)| b));
         self.title.clear();
         self.text.clear();
         self.notice.clear();
@@ -1583,22 +1603,39 @@ impl Column {
     }
 
     /// The button went up: a pressed margin opens (a revealed sheet does
-    /// what a click on it does), a dragged one drops.
+    /// what a click on it does), a dragged one drops: into its place in
+    /// the order, pinned to the context's app or unpinned if it went to
+    /// the other group.
     fn release(&mut self, core: &Core<WlNote>, x: f64, y: f64) -> Vec<Act> {
         let Some(p) = self.press.take() else {
             return Vec::new();
         };
-        let act = match (p.dragging, p.revealed) {
-            (false, false) => Some(Act::Open(p.key)),
-            (false, true) => self.revealed_click(p.key, p.x, p.y),
-            (true, _) => self
-                .deck
-                .drag_end()
-                .map(|(key, gap)| Act::Reorder(key, self.keys().map(String::from).collect(), gap)),
+        let acts = match (p.dragging, p.revealed) {
+            (false, false) => vec![Act::Open(p.key)],
+            (false, true) => self.revealed_click(p.key, p.x, p.y).into_iter().collect(),
+            (true, _) => match self.deck.drag_end() {
+                Some(l) => {
+                    // The slot is among the notes of the group it lands
+                    // in, which the order is changed among.
+                    let keys = (self.deck.cards().iter())
+                        .filter(|c| !c.leaving && c.group == l.group)
+                        .map(|c| c.key.clone())
+                        .collect();
+                    let mut acts = vec![Act::Reorder(l.key.clone(), keys, l.gap)];
+                    if l.moved {
+                        acts.push(match l.group {
+                            Group::Window => Act::Pin(l.key, false),
+                            Group::Global => Act::Unpin(l.key),
+                        });
+                    }
+                    acts
+                }
+                None => Vec::new(),
+            },
         };
         self.hover_at(core, x, y);
         self.kick();
-        act.into_iter().collect()
+        acts
     }
 
     fn click(
@@ -2910,10 +2947,7 @@ impl Column {
                     let above = (-r.y as f64).max(0.0);
                     let below = (r.y as f64 + r.h as f64 - ph).max(0.0);
                     let top = card.y.value - len / 2.0 - above;
-                    intersect(
-                        surface,
-                        Rect::new(0.0, top, width, len + above + below),
-                    )
+                    intersect(surface, Rect::new(0.0, top, width, len + above + below))
                 }
                 false => Some(surface),
             };
@@ -2958,6 +2992,7 @@ impl Column {
         }
 
         self.place_plus();
+        self.place_backdrops();
         if self.press.is_none()
             && let Some((x, y)) = self.pointer
         {
@@ -2993,6 +3028,74 @@ impl Column {
         }
     }
 
+    /// The groups' backdrops: a rounded rect, cut in three so the middle
+    /// stretches, `BACKDROP_PAD` larger than the markers along the edge
+    /// and out of it, and reaching behind it like them.
+    fn place_backdrops(&mut self) {
+        let m = self.style.metrics;
+        let color = self.style.backdrop;
+        let r = (self.style.marker_radius + BACKDROP_PAD).round().max(1.0) as i32;
+        let out = m.marker_width + BACKDROP_PAD;
+        let w = (out + BEHIND).round() as i32;
+        let key = (self.scale, color, w, r);
+        let visible = color & 0xff != 0;
+        if visible && self.backdrop_shown.as_ref().is_none_or(|(k, _)| *k != key) {
+            let image = paper::rounded(w, 2 * r + 1, r as f64, color, self.scale);
+            match shm_buffer(&self.g, &image, &self.qh) {
+                Ok(buffer) => {
+                    let old = self.backdrop_shown.replace((key, buffer));
+                    self.stale.extend(old.map(|(_, b)| b));
+                }
+                Err(e) => warn!("backdrop buffer: {e}"),
+            }
+        }
+        let surface = self.surface_rect();
+        let s = self.scale as f64;
+        let (wf, rf) = (w as f64, r as f64);
+        let x = match self.style.edge {
+            Edge::Right => self.width as f64 - out,
+            Edge::Left => out - wf,
+        };
+        let backdrops = *self.deck.backdrops();
+        for (subs, b) in self.backdrops.iter_mut().zip(backdrops) {
+            let alpha = b.alpha.value.clamp(0.0, 1.0);
+            let shown = self
+                .backdrop_shown
+                .as_ref()
+                .filter(|_| visible && alpha > 0.0);
+            let Some((_, buffer)) = shown else {
+                for sub in subs.iter_mut() {
+                    sub.clear();
+                }
+                continue;
+            };
+            let (top, bottom) = (b.top.value - BACKDROP_PAD, b.bottom.value + BACKDROP_PAD);
+            let len = (bottom - top).max(0.0);
+            let cap = rf.min(len / 2.0);
+            let (bw, rp) = (wf * s, rf * s);
+            let parts = [
+                (Rect::new(x, top, wf, cap), [0.0, 0.0, bw, rp]),
+                (
+                    Rect::new(x, top + cap, wf, len - 2.0 * cap),
+                    [0.0, rp, bw, s],
+                ),
+                (Rect::new(x, bottom - cap, wf, cap), [0.0, rp + s, bw, rp]),
+            ];
+            for (sub, (rect, src)) in subs.iter_mut().zip(parts) {
+                match clip(rect, (bw, rp * 2.0 + s), Some(src), surface) {
+                    Some((rect, src)) => {
+                        sub.show(buffer);
+                        sub.crop(src);
+                        sub.place(IRect::round(rect));
+                        sub.set_alpha(alpha);
+                        sub.commit();
+                    }
+                    None => sub.clear(),
+                }
+            }
+            self.attached.push(buffer.clone());
+        }
+    }
     /// The `+` button: out from header level on, in the screen's bottom
     /// corner, centered on the headers' width.
     fn place_plus(&mut self) {
@@ -3350,7 +3453,8 @@ impl Column {
     /// notes in their paint order, each held one with its parts on top
     /// of it.
     fn restack(&mut self) {
-        let mut order: Vec<&Sub> = vec![&self.plus];
+        let mut order: Vec<&Sub> = self.backdrops.iter().flatten().collect();
+        order.push(&self.plus);
         for card in self.deck.paint_order() {
             if let Some(slot) = self.slots.iter().find(|s| s.key == card.key) {
                 order.push(&slot.sub);

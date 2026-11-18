@@ -9,12 +9,20 @@
 //! card's role (`Role`) is the most its note is out for: sheet (revealed
 //! or open) > lifted header (under the pointer) > header > marker.
 //!
-//! Markers and headers have separate centered layouts (`slots`). At
-//! rest, the marker length and gap set the pitch. When hovered, the
-//! cards grow into shingled headers, at a pitch of `SHINGLE` of the
-//! header length. When crowded, headers shingle more tightly; markers
-//! shrink their gap first (to `MIN_GAP` or the configured gap if smaller),
-//! then their length (to `MIN_MARKER` or the configured length if smaller).
+//! Markers and headers have separate layouts (`slots`). At rest, the
+//! marker length and gap set the pitch. When hovered, the cards grow into
+//! shingled headers, at a pitch of `SHINGLE` of the header length. When
+//! crowded, headers shingle more tightly; markers shrink their gap first
+//! (to `MIN_GAP` or the configured gap if smaller), then their length (to
+//! `MIN_MARKER` or the configured length if smaller).
+//!
+//! The column is in two groups (`Group`): the global notes, then the
+//! window's, `group-gap` apart (at header level, as much more as their
+//! pitch is to the markers'), centered on the edge together; a group
+//! without notes takes no room. Crowding counts both together. Each group
+//! has a backdrop (`Backdrop`) behind its markers, on springs along its
+//! extent, fading in with its first note and out with its last, and out
+//! at header level.
 //!
 //! A sheet (revealed or open) takes its whole height in the column
 //! (`places`): it comes down from its header's top, so its title stays
@@ -53,8 +61,12 @@
 //!
 //! Dragging a margin at header level (`drag_start`, `drag_to`,
 //! `drag_end`) moves it with the pointer, lifted and on top, while the
-//! others move apart to leave a gap where it would land (reorder.rs).
-//! The drop says where; the program writes the new order and shows it.
+//! others move apart to leave a gap where it would land (reorder.rs). The
+//! gap opens in the note's own group, or in the other one if it can go
+//! there (`Item::cross`: the program pins or unpins it then). The drop
+//! says where; the program writes the new order and shows it.
+
+use std::ops::Range;
 
 use wl_shell_ui::Spring;
 
@@ -74,6 +86,33 @@ const MIN_MARKER: f64 = 12.0;
 /// Between the last header and the `+` button.
 const PLUS_GAP: f64 = 10.0;
 
+/// The column's two groups, in their order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    /// Shown everywhere.
+    #[default]
+    Global,
+    /// Shown for the context's window.
+    Window,
+}
+
+impl Group {
+    pub fn other(self) -> Self {
+        match self {
+            Group::Global => Group::Window,
+            Group::Window => Group::Global,
+        }
+    }
+
+    /// Its positions in a column whose second group starts at `split`, of
+    /// `n` notes.
+    fn range(self, split: usize, n: usize) -> Range<usize> {
+        match self {
+            Group::Global => 0..split.min(n),
+            Group::Window => split.min(n)..n,
+        }
+    }
+}
 /// How far out the column is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Level {
@@ -109,6 +148,9 @@ pub struct Look {
 pub struct Item {
     pub key: String,
     pub look: Look,
+    pub group: Group,
+    /// It can be dragged into the other group (pinned or unpinned).
+    pub cross: bool,
 }
 
 /// The sizes the column is laid out with, logical pixels.
@@ -129,50 +171,81 @@ pub struct Metrics {
     pub sheet_height: f64,
     /// The `+` button's size.
     pub plus: f64,
+    /// Between the groups at marker level (scaled at header level).
+    pub group_gap: f64,
+    /// The groups' backdrops stay at header level.
+    pub backdrop_headers: bool,
 }
 
-/// The layouts of `n` notes along an edge.
+/// The layouts of the notes along an edge.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Slots {
     markers: Vec<f64>,
     headers: Vec<f64>,
     marker_length: f64,
+    /// Where the second group starts.
+    split: usize,
+    /// The extra room between the groups, at markers and at headers.
+    between: [f64; 2],
 }
 
-/// Center each layout independently within the available edge length.
-/// Headers keep clear of the `+` button in the bottom corner: they move up
-/// as little as needed, then shingle more tightly.
-fn slots(n: usize, length: f64, m: &Metrics) -> Slots {
+/// Lay out `groups` notes (the first group's, then the second's), apart:
+/// each level independently, centered as a whole (see the module's
+/// comment). Headers keep clear of the `+` button in the bottom corner:
+/// they move up as little as needed, then shingle more tightly.
+fn slots(groups: [usize; 2], length: f64, m: &Metrics) -> Slots {
+    let n = groups[0] + groups[1];
+    let split = groups[0];
+    let both = groups.iter().all(|&g| g > 0);
+    let group_gap = if both { m.group_gap } else { 0.0 };
+    // At headers, the gap is as much more as their pitch is.
+    let per_pitch = group_gap / (m.marker_length + m.marker_gap).max(1.0);
     let mut marker_length = m.marker_length;
     let mut marker_gap = m.marker_gap;
     let avail = (length - 2.0 * m.padding).max(0.0);
     let gaps = n.saturating_sub(1) as f64;
     if n > 1 {
+        let room = (avail - group_gap).max(0.0);
         marker_gap =
-            ((avail - n as f64 * marker_length) / gaps).clamp(MIN_GAP.min(marker_gap), marker_gap);
-        marker_length = ((avail - gaps * marker_gap) / n as f64)
+            ((room - n as f64 * marker_length) / gaps).clamp(MIN_GAP.min(marker_gap), marker_gap);
+        marker_length = ((room - gaps * marker_gap) / n as f64)
             .clamp(MIN_MARKER.min(marker_length), marker_length);
     }
-
-    let centers = |len: f64, mut pitch: f64, reserve: f64| {
+    // A layout of cards `len` long at `pitch`, `fixed` plus `rel` pitches
+    // between the groups; the room between them.
+    let centers = |len: f64, mut pitch: f64, fixed: f64, rel: f64, reserve: f64| {
         let avail = (avail - reserve).max(0.0);
-        if n > 1 && gaps * pitch + len > avail {
-            pitch = ((avail - len) / gaps).max(1.0);
+        let span = |pitch: f64| gaps * pitch + fixed + rel * pitch + len;
+        if n > 1 && span(pitch) > avail {
+            pitch = ((avail - len - fixed) / (gaps + rel)).max(1.0);
         }
-        let span = gaps * pitch + len;
-        let first = (length / 2.0 - gaps / 2.0 * pitch)
-            .min(length - m.padding - reserve - span + len / 2.0)
+        let between = fixed + rel * pitch;
+        let first = (length / 2.0 - (span(pitch) - len) / 2.0)
+            .min(length - m.padding - reserve - span(pitch) + len / 2.0)
             .max(m.padding + len / 2.0);
-        (0..n).map(|i| first + i as f64 * pitch).collect()
+        let at = |i: usize| first + i as f64 * pitch + if i >= split { between } else { 0.0 };
+        ((0..n).map(at).collect::<Vec<f64>>(), between)
     };
-    Slots {
-        markers: centers(marker_length, marker_length + marker_gap, 0.0),
-        headers: centers(
-            m.header_length,
-            m.header_length * SHINGLE,
-            PLUS_GAP + m.plus,
-        ),
+    let (markers, marker_between) = centers(
         marker_length,
+        marker_length + marker_gap,
+        group_gap,
+        0.0,
+        0.0,
+    );
+    let (headers, header_between) = centers(
+        m.header_length,
+        m.header_length * SHINGLE,
+        0.0,
+        per_pitch,
+        PLUS_GAP + m.plus,
+    );
+    Slots {
+        markers,
+        headers,
+        marker_length,
+        split,
+        between: [marker_between, header_between],
     }
 }
 
@@ -197,6 +270,10 @@ pub struct Card {
     /// Its slot centers at marker and header levels, respectively.
     marker_slot: f64,
     header_slot: f64,
+    /// The group its slots are in.
+    pub group: Group,
+    /// It can be dragged into the other group.
+    cross: bool,
     /// 0 out of sight, 1 in place.
     pub presence: Spring,
     /// How far it is out of the edge when in place.
@@ -224,14 +301,59 @@ impl Card {
     }
 }
 
+/// The springs of a group's backdrop: its extent along the edge (its
+/// cards', without padding) and how much it shows.
+#[derive(Clone, Copy, Debug)]
+pub struct Backdrop {
+    pub top: Spring,
+    pub bottom: Spring,
+    /// 0 out of sight, 1 shown.
+    pub alpha: Spring,
+}
+
+impl Backdrop {
+    fn new(response: f64) -> Self {
+        Self {
+            top: Spring::new(0.0, response),
+            bottom: Spring::new(0.0, response),
+            alpha: Spring::new(0.0, response),
+        }
+    }
+
+    fn springs(&mut self) -> [&mut Spring; 3] {
+        [&mut self.top, &mut self.bottom, &mut self.alpha]
+    }
+
+    fn settled(&self) -> bool {
+        self.top.settled() && self.bottom.settled() && self.alpha.settled()
+    }
+}
+
 /// A margin being dragged along the column.
 #[derive(Clone, Debug, PartialEq)]
 struct Drag {
     key: String,
     /// Where its center is along the edge.
     y: f64,
-    /// The slot it would land in.
+    /// The group it was in, and the one it would land in.
+    from: Group,
+    group: Group,
+    /// The slot it would land in, of the column as it would be then.
     gap: usize,
+    /// That column's layout.
+    slots: Slots,
+}
+
+/// Where a dragged margin was dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landing {
+    pub key: String,
+    /// The group it lands in.
+    pub group: Group,
+    /// The slot it lands in, among that group's notes (it included).
+    pub gap: usize,
+    /// It came from the other group.
+    pub moved: bool,
 }
 
 /// What the pointer is on, as the column finds it.
@@ -273,6 +395,8 @@ pub struct Deck {
     drag: Option<Drag>,
     /// The `+` button: 0 out of sight, 1 out.
     pub plus: Spring,
+    /// The groups' backdrops, by `Group`.
+    backdrops: [Backdrop; 2],
 }
 
 impl Deck {
@@ -292,6 +416,7 @@ impl Deck {
             browsing: false,
             drag: None,
             plus: Spring::new(0.0, response),
+            backdrops: [Backdrop::new(response); 2],
         }
     }
 
@@ -324,6 +449,30 @@ impl Deck {
     /// The note whose margin is being dragged.
     pub fn dragging(&self) -> Option<&str> {
         self.drag.as_ref().map(|d| d.key.as_str())
+    }
+
+    /// The groups' backdrops, by `Group` (`Global` first).
+    pub fn backdrops(&self) -> &[Backdrop; 2] {
+        &self.backdrops
+    }
+
+    /// The group `card` is laid out in: a dragged one's is where it would
+    /// land.
+    fn group_of(&self, card: &Card) -> Group {
+        match &self.drag {
+            Some(d) if d.key == card.key => d.group,
+            _ => card.group,
+        }
+    }
+
+    /// How many notes each group has, of those to show.
+    fn counts(&self) -> [usize; 2] {
+        let global = self
+            .wanted
+            .iter()
+            .filter(|w| w.group == Group::Global)
+            .count();
+        [global, self.wanted.len() - global]
     }
 
     /// The most `key` is out for.
@@ -390,6 +539,10 @@ impl Deck {
         }
         // The order laid out, as indices into `live`, and each position's
         // slot: the column's, or with a drag, the dragged one in its gap.
+        let level = match self.level {
+            Level::Marker => 0,
+            Level::Header => 1,
+        };
         let mut order: Vec<usize> = (0..n).collect();
         let mut slot: Vec<f64> = live
             .iter()
@@ -398,24 +551,32 @@ impl Deck {
                 Level::Header => c.header_slot,
             })
             .collect();
+        let mut between = self.slots.between[level];
         let drag = (self.drag.as_ref())
-            .filter(|_| self.slots.headers.len() == n)
+            .filter(|d| self.slots.headers.len() == n && d.slots.headers.len() == n)
             .and_then(|d| Some((live.iter().position(|c| c.key == d.key)?, d)));
         if let Some((i, d)) = drag {
             order.remove(i);
             order.insert(d.gap.min(n - 1), i);
-            slot = self.slots.headers.clone();
+            slot = d.slots.headers.clone();
+            between = d.slots.between[1];
         }
         let cards: Vec<&Card> = order.iter().map(|&i| live[i]).collect();
         let held: Vec<bool> = cards.iter().map(|c| self.held(&c.key)).collect();
+        // Whether the second group starts after each position.
+        let parts: Vec<bool> = (cards.windows(2))
+            .map(|w| self.group_of(w[0]) != self.group_of(w[1]))
+            .collect();
         let mut places = Vec::with_capacity(n);
         if !held.contains(&true) {
             places = slot.clone();
         } else {
             // From each card's top to the next one's: a sheet's height
-            // after a sheet, the current level's pitch otherwise.
+            // (and the groups' gap) after a sheet, the current level's
+            // pitch otherwise.
+            let after_sheet = |i: usize| h + if parts[i] { between } else { 0.0 };
             let pitch: Vec<f64> = (1..n).map(|i| (slot[i] - slot[i - 1]).max(0.0)).collect();
-            let sheets = (0..n - 1).filter(|&i| held[i]).count() as f64 * h;
+            let sheets: f64 = (0..n - 1).filter(|&i| held[i]).map(after_sheet).sum();
             let neighbors: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
             let plus = if self.level == Level::Header {
                 PLUS_GAP + m.plus
@@ -439,7 +600,11 @@ impl Deck {
                     false => top + l / 2.0,
                 });
                 if i + 1 < n {
-                    top += if held[i] { h } else { pitch[i] * squeeze };
+                    top += if held[i] {
+                        after_sheet(i)
+                    } else {
+                        pitch[i] * squeeze
+                    };
                 }
             }
         }
@@ -478,6 +643,39 @@ impl Deck {
             Level::Header => 1.0,
             Level::Marker => 0.0,
         });
+        self.retarget_backdrops();
+    }
+
+    /// Point the backdrops at their groups' extents. One shows while its
+    /// group has cards (or is between some leaving and others coming),
+    /// at marker level; one coming out of sight starts at its extent.
+    fn retarget_backdrops(&mut self) {
+        let level = self.level == Level::Marker || self.metrics.backdrop_headers;
+        for g in [Group::Global, Group::Window] {
+            let extent = (self.cards.iter())
+                .filter(|c| !c.leaving && self.group_of(c) == g)
+                .map(|c| {
+                    let half = c.len.target / 2.0;
+                    (c.y.target - half, c.y.target + half)
+                })
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+            let coming = self.wanted.iter().any(|w| w.group == g);
+            let b = &mut self.backdrops[g as usize];
+            let shown = extent.is_some() || (coming && b.alpha.target > 0.0);
+            if let Some((top, bottom)) = extent {
+                match b.alpha.value <= 0.01 && b.alpha.target == 0.0 {
+                    true => {
+                        b.top.snap(top);
+                        b.bottom.snap(bottom);
+                    }
+                    false => {
+                        b.top.retarget(top);
+                        b.bottom.retarget(bottom);
+                    }
+                }
+            }
+            b.alpha.retarget(if shown && level { 1.0 } else { 0.0 });
+        }
     }
 
     // -- the pointer -------------------------------------------------------
@@ -589,10 +787,16 @@ impl Deck {
         if !ok {
             return false;
         }
+        let Some(from) = self.cards.iter().find(|c| c.key == key).map(|c| c.group) else {
+            return false;
+        };
         self.drag = Some(Drag {
             key: key.to_string(),
             y,
+            from,
+            group: from,
             gap: 0,
+            slots: self.slots.clone(),
         });
         self.hover = Some(key.to_string());
         // Folded back, and no sheet pops out under the drop at once.
@@ -602,24 +806,64 @@ impl Deck {
         true
     }
 
-    /// The dragged margin's center is at `y` now (kept within the
-    /// column): the gap follows it.
+    /// The dragged margin's center is at `y` now (kept within the column,
+    /// and along its group unless it can go to the other one): the gap
+    /// follows it, to the nearest slot it can land in.
     pub fn drag_to(&mut self, y: f64) {
-        let m = &self.metrics;
+        let Some(d) = &self.drag else {
+            return;
+        };
+        let (key, from) = (d.key.clone(), d.from);
+        let cross = self.cards.iter().any(|c| c.key == key && c.cross);
+        let m = self.metrics;
         let half = m.header_length / 2.0;
         let bottom = self.length - m.padding - PLUS_GAP - m.plus;
         let (lo, hi) = (m.padding + half, bottom - half);
-        let y = if lo <= hi {
+        let mut y = if lo <= hi {
             y.clamp(lo, hi)
         } else {
             self.length / 2.0
         };
-        let gap = crate::reorder::gap(&self.slots.headers, y);
+        let n = self.slots.headers.len();
+        let own = from.range(self.slots.split, n);
+        if !cross && !own.is_empty() {
+            let reach = half * SHINGLE;
+            let (lo, hi) = (
+                lo.max(self.slots.headers[own.start] - reach),
+                hi.min(self.slots.headers[own.end - 1] + reach),
+            );
+            if lo <= hi {
+                y = y.clamp(lo, hi);
+            }
+        }
+        // The nearest slot of its own group, or of the other one in the
+        // column as it would be with it there.
+        let nearest = |s: &Slots, g: Group| {
+            let r = g.range(s.split, s.headers.len());
+            let i = r.start + crate::reorder::gap(&s.headers[r.clone()], y);
+            (!r.is_empty()).then(|| ((s.headers[i] - y).abs(), i))
+        };
+        let mut best = nearest(&self.slots, from).map(|(dist, i)| (dist, i, from, None));
+        if cross {
+            let to = from.other();
+            let mut counts = [self.slots.split, n - self.slots.split];
+            counts[from as usize] -= 1;
+            counts[to as usize] += 1;
+            let s = slots(counts, self.length, &m);
+            if let Some((dist, i)) = nearest(&s, to)
+                && best.as_ref().is_none_or(|b| dist < b.0)
+            {
+                best = Some((dist, i, to, Some(s)));
+            }
+        }
+        let Some((_, gap, group, s)) = best else {
+            return;
+        };
+        let s = s.unwrap_or_else(|| self.slots.clone());
         let Some(d) = &mut self.drag else {
             return;
         };
-        (d.y, d.gap) = (y, gap);
-        let key = d.key.clone();
+        (d.y, d.gap, d.group, d.slots) = (y, gap, group, s);
         self.retarget();
         // It follows the pointer directly.
         if let Some(c) = self.cards.iter_mut().find(|c| c.key == key) {
@@ -627,12 +871,19 @@ impl Deck {
         }
     }
 
-    /// Drop the dragged margin: the note and the slot it lands in. It
-    /// goes back to its place until the program shows the new order.
-    pub fn drag_end(&mut self) -> Option<(String, usize)> {
+    /// Drop the dragged margin: the note, the slot it lands in, and the
+    /// group if it changes. It goes back to its place until the program
+    /// shows the new order.
+    pub fn drag_end(&mut self) -> Option<Landing> {
         let d = self.drag.take()?;
         self.retarget();
-        Some((d.key, d.gap))
+        let start = d.group.range(d.slots.split, d.slots.headers.len()).start;
+        Some(Landing {
+            key: d.key,
+            group: d.group,
+            gap: d.gap - start,
+            moved: d.group != d.from,
+        })
     }
 
     /// Give up a drag: the margin goes back to its place.
@@ -733,16 +984,22 @@ impl Deck {
             }
         }
         self.plus = respring(self.plus, response);
+        for b in &mut self.backdrops {
+            for s in b.springs() {
+                *s = respring(*s, response);
+            }
+        }
         self.relayout(false);
     }
 
     /// Move the cards that stay to their places among `wanted`.
     fn relayout(&mut self, snap: bool) {
-        self.slots = slots(self.wanted.len(), self.length, &self.metrics);
+        self.slots = slots(self.counts(), self.length, &self.metrics);
         for c in self.cards.iter_mut().filter(|c| !c.leaving) {
             if let Some(i) = self.wanted.iter().position(|w| w.key == c.key) {
                 c.marker_slot = self.slots.markers[i];
                 c.header_slot = self.slots.headers[i];
+                c.group = self.wanted[i].group;
             }
         }
         self.retarget();
@@ -751,13 +1008,20 @@ impl Deck {
                 c.y.snap(c.y.target);
                 c.len.snap(c.len.target);
             }
+            for b in &mut self.backdrops {
+                b.top.snap(b.top.target);
+                b.bottom.snap(b.bottom.target);
+            }
         }
     }
 
-    /// Show `items`, in this order (see the module's comment). The
-    /// revealed, hovered, dragged and open ones go if they aren't among
-    /// them (the program keeps the open note among them, where it was).
-    pub fn set(&mut self, items: Vec<Item>) {
+    /// Show `items`, each group's in this order, the global ones first
+    /// (see the module's comment). The revealed, hovered, dragged and open
+    /// ones go if they aren't among them (the program keeps the open note
+    /// among them, where it was).
+    pub fn set(&mut self, mut items: Vec<Item>) {
+        // Stable: each group keeps its order.
+        items.sort_by_key(|i| i.group);
         self.wanted = items;
         let has = |k: &Option<String>| {
             k.as_ref()
@@ -780,6 +1044,7 @@ impl Deck {
             match self.wanted.iter().find(|i| i.key == c.key) {
                 Some(item) => {
                     c.look = item.look.clone();
+                    c.cross = item.cross;
                     if c.leaving {
                         c.leaving = false;
                         c.crumple = false;
@@ -821,7 +1086,7 @@ impl Deck {
     fn close_up(&mut self) {
         self.closing = false;
         let mut old: Vec<Card> = self.cards.drain(..).filter(|c| !c.leaving).collect();
-        self.slots = slots(self.wanted.len(), self.length, &self.metrics);
+        self.slots = slots(self.counts(), self.length, &self.metrics);
         let mut rank = 0.0;
         let mut new = Vec::new();
         let wanted = self.wanted.clone();
@@ -833,6 +1098,8 @@ impl Deck {
                     let mut c = old.swap_remove(i);
                     c.marker_slot = marker_slot;
                     c.header_slot = header_slot;
+                    c.group = item.group;
+                    c.cross = item.cross;
                     self.cards.push(c);
                 }
                 None => {
@@ -845,6 +1112,8 @@ impl Deck {
                         y: Spring::new(0.0, r),
                         marker_slot,
                         header_slot,
+                        group: item.group,
+                        cross: item.cross,
                         presence: Spring::new(0.0, r),
                         out: Spring::new(out, r),
                         len: Spring::new(len, r),
@@ -884,6 +1153,11 @@ impl Deck {
             c.len.advance(dt);
         }
         self.plus.advance(dt);
+        for b in &mut self.backdrops {
+            for s in b.springs() {
+                s.advance(dt);
+            }
+        }
         self.try_close_up();
         self.moving()
     }
@@ -897,7 +1171,10 @@ impl Deck {
                 && c.out.settled()
                 && c.len.settled()
         };
-        self.closing || !self.plus.settled() || !self.cards.iter().all(still)
+        self.closing
+            || !self.plus.settled()
+            || !self.backdrops.iter().all(Backdrop::settled)
+            || !self.cards.iter().all(still)
     }
 }
 
@@ -924,6 +1201,8 @@ mod tests {
         sheet_width: 300.0,
         sheet_height: 220.0,
         plus: 22.0,
+        group_gap: 8.0,
+        backdrop_headers: false,
     };
 
     fn item(key: &str) -> Item {
@@ -933,6 +1212,16 @@ mod tests {
                 color: 0xffff00ff,
                 tilt: 0.0,
             },
+            group: Group::Global,
+            cross: false,
+        }
+    }
+
+    /// A note for the window.
+    fn win(key: &str) -> Item {
+        Item {
+            group: Group::Window,
+            ..item(key)
         }
     }
 
@@ -972,51 +1261,51 @@ mod tests {
 
     #[test]
     fn headers_shingle_independently_of_markers() {
-        assert!(slots(0, 500.0, &M).headers.is_empty());
-        assert_eq!(slots(1, 500.0, &M).headers, [250.0]);
-        assert_eq!(slots(3, 1000.0, &M).headers, [430.0, 500.0, 570.0]);
+        assert!(slots([0, 0], 500.0, &M).headers.is_empty());
+        assert_eq!(slots([1, 0], 500.0, &M).headers, [250.0]);
+        assert_eq!(slots([3, 0], 1000.0, &M).headers, [430.0, 500.0, 570.0]);
         // Crowded: they shingle tighter, clear of the `+` button.
         let reserve = PLUS_GAP + M.plus;
-        let s = slots(6, 300.0, &M);
+        let s = slots([6, 0], 300.0, &M);
         let pitch = s.headers[1] - s.headers[0];
         assert!((pitch - (276.0 - reserve - 100.0) / 5.0).abs() < 1e-9);
         assert!((s.headers[0] - 50.0 - M.padding).abs() < 1e-9);
         assert!((s.headers[5] + 50.0 - (300.0 - M.padding - reserve)).abs() < 1e-9);
         // Reaching the button: they move up as little as needed first.
-        let s = slots(3, 310.0, &M);
+        let s = slots([3, 0], 310.0, &M);
         assert_eq!(s.headers[1] - s.headers[0], 70.0);
         assert!((s.headers[2] + 50.0 - (310.0 - M.padding - reserve)).abs() < 1e-9);
     }
 
     #[test]
     fn markers_shrink_their_gaps_then_their_length() {
-        assert!(slots(0, 500.0, &M).markers.is_empty());
-        assert_eq!(slots(1, 500.0, &M).markers, [250.0]);
-        let s = slots(3, 1000.0, &M);
+        assert!(slots([0, 0], 500.0, &M).markers.is_empty());
+        assert_eq!(slots([1, 0], 500.0, &M).markers, [250.0]);
+        let s = slots([3, 0], 1000.0, &M);
         assert_eq!(s.markers, [464.0, 500.0, 536.0]);
         assert_eq!(s.marker_length, M.marker_length);
-        let s = slots(3, 116.0, &M); // Room for 28px markers and 4px gaps.
+        let s = slots([3, 0], 116.0, &M); // Room for 28px markers and 4px gaps.
         assert_eq!(s.markers, [26.0, 58.0, 90.0]);
         assert_eq!(s.marker_length, M.marker_length);
-        let s = slots(3, 100.0, &M); // Shrink the markers to keep 2px gaps.
+        let s = slots([3, 0], 100.0, &M); // Shrink the markers to keep 2px gaps.
         assert_eq!(s.markers, [24.0, 50.0, 76.0]);
         assert_eq!(s.marker_length, 24.0);
-        assert_eq!(slots(40, 200.0, &M).marker_length, MIN_MARKER);
+        assert_eq!(slots([40, 0], 200.0, &M).marker_length, MIN_MARKER);
         let tight = Metrics {
             marker_gap: 0.0,
             marker_length: 8.0,
             ..M
         };
-        let s = slots(3, 100.0, &tight);
+        let s = slots([3, 0], 100.0, &tight);
         assert_eq!(s.markers, [42.0, 50.0, 58.0]);
         assert_eq!(s.marker_length, 8.0);
     }
 
     #[test]
     fn spacing_settings_only_affect_their_own_level() {
-        let default = slots(3, 1000.0, &M);
+        let default = slots([3, 0], 1000.0, &M);
         let tighter = slots(
-            3,
+            [3, 0],
             1000.0,
             &Metrics {
                 marker_gap: 4.0,
@@ -1027,7 +1316,7 @@ mod tests {
         assert_eq!(tighter.headers, default.headers);
 
         let shorter = slots(
-            3,
+            [3, 0],
             1000.0,
             &Metrics {
                 header_length: 80.0,
@@ -1323,7 +1612,13 @@ mod tests {
         d.drag_to(-500.0);
         assert!(card(&d, "a").y.value >= M.padding + M.header_length / 2.0);
         d.drag_to(slots[2]);
-        assert_eq!(d.drag_end(), Some(("a".into(), 2)));
+        let landing = Landing {
+            key: "a".into(),
+            group: Group::Global,
+            gap: 2,
+            moved: false,
+        };
+        assert_eq!(d.drag_end(), Some(landing));
         assert_eq!(d.dragging(), None);
         // The program shows the new order: everyone to their slot.
         d.set(items(&["b", "c", "a", "d"]));
@@ -1350,7 +1645,7 @@ mod tests {
         assert!(d.drag_start("b", y));
         assert_eq!((d.revealed(), d.role("b")), (None, Role::Lifted));
         settle(&mut d);
-        assert_eq!(d.drag_end().map(|(_, gap)| gap), Some(2));
+        assert_eq!(d.drag_end().map(|l| l.gap), Some(2));
         // Not instantly revealed again under the drop.
         assert_eq!(d.point(margin("b")), Some("b".into()));
         // The open note doesn't move.
@@ -1412,7 +1707,7 @@ mod tests {
         }
         settle(&mut d);
         assert_eq!(keys(&d), ["b", "d"]);
-        assert_eq!(card(&d, "b").y.value, slots(2, 1000.0, &M).markers[0]);
+        assert_eq!(card(&d, "b").y.value, slots([2, 0], 1000.0, &M).markers[0]);
         assert_eq!(card(&d, "d").presence.value, 1.0);
     }
 
@@ -1465,5 +1760,233 @@ mod tests {
         d.set(items(&[]));
         assert_eq!(d.plus_center(), corner);
         assert_eq!(Deck::new(M, 150.0).plus_center(), M.plus / 2.0);
+    }
+
+    // -- groups ------------------------------------------------------------
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// Two global notes (g1, g2) and two for the window (w1, w2), each
+    /// `cross` as given.
+    fn grouped(cross: bool) -> Vec<Item> {
+        let mut v = vec![item("g1"), item("g2"), win("w1"), win("w2")];
+        for i in &mut v {
+            i.cross = cross;
+        }
+        v
+    }
+
+    fn grouped_deck(cross: bool) -> Deck {
+        let mut d = Deck::new(M, 150.0);
+        d.resize(1000.0);
+        d.set(grouped(cross));
+        settle(&mut d);
+        d
+    }
+
+    #[test]
+    fn groups_are_apart_and_centered_together() {
+        let s = slots([2, 2], 1000.0, &M);
+        assert_eq!(s.split, 2);
+        // 28px markers 8px apart, 8px more between the groups, and the
+        // whole centered.
+        assert_eq!(s.markers, [442.0, 478.0, 522.0, 558.0]);
+        assert_eq!(s.markers[0] + s.markers[3], 1000.0);
+        // At headers, as much more as their pitch is to the markers'.
+        let between = 70.0 * 8.0 / 36.0;
+        assert!(close(s.between[1], between));
+        assert!(close(s.headers[0], 395.0 - between / 2.0));
+        assert!(close(s.headers[1], 465.0 - between / 2.0));
+        assert!(close(s.headers[2], 535.0 + between / 2.0));
+        assert!(close(s.headers[3], 605.0 + between / 2.0));
+    }
+
+    #[test]
+    fn an_empty_group_takes_no_room() {
+        for n in [1, 3] {
+            let alone = slots([n, 0], 1000.0, &M);
+            let window = slots([0, n], 1000.0, &M);
+            assert_eq!(
+                (&alone.markers, &alone.headers),
+                (&window.markers, &window.headers)
+            );
+            assert_eq!(alone.between, [0.0, 0.0]);
+        }
+        assert!(slots([0, 0], 1000.0, &M).markers.is_empty());
+    }
+
+    #[test]
+    fn crowding_counts_both_groups() {
+        let s = slots([3, 3], 200.0, &M);
+        let half = s.marker_length / 2.0;
+        assert!(s.marker_length < M.marker_length);
+        assert!(s.markers[0] - half >= M.padding - 1e-9);
+        assert!(s.markers[5] + half <= 200.0 - M.padding + 1e-9);
+        // The groups stay apart.
+        let pitch = s.markers[1] - s.markers[0];
+        assert!(close(s.markers[3] - s.markers[2], pitch + M.group_gap));
+        // Headers shingle tighter, the gap with them.
+        let s = slots([3, 3], 400.0, &M);
+        let pitch = s.headers[1] - s.headers[0];
+        assert!(pitch < 70.0);
+        assert!(close(
+            s.headers[3] - s.headers[2],
+            pitch * (1.0 + 8.0 / 36.0)
+        ));
+        assert!(s.headers[0] - 50.0 >= M.padding - 1e-9);
+        assert!(s.headers[5] + 50.0 <= 400.0 - M.padding - PLUS_GAP - M.plus + 1e-9);
+    }
+
+    #[test]
+    fn the_column_stays_centered_through_context_switches() {
+        let mut d = grouped_deck(false);
+        for window in [
+            vec![win("w3")],
+            vec![],
+            vec![win("w1"), win("w2"), win("w3")],
+        ] {
+            let mut v = vec![item("g1"), item("g2")];
+            v.extend(window);
+            d.set(v);
+            settle(&mut d);
+            let (first, last) = (&d.cards()[0], d.cards().last().unwrap());
+            assert!(close(first.y.value + last.y.value, 1000.0));
+        }
+        // Given in any order, the global ones come first.
+        d.set(vec![win("w1"), item("g1"), win("w2"), item("g2")]);
+        settle(&mut d);
+        assert_eq!(keys(&d), ["g1", "g2", "w1", "w2"]);
+    }
+
+    #[test]
+    fn backdrops_follow_their_groups() {
+        let mut d = grouped_deck(false);
+        let [g, w] = *d.backdrops();
+        assert_eq!(
+            (g.top.value, g.bottom.value, g.alpha.value),
+            (428.0, 492.0, 1.0)
+        );
+        assert_eq!(
+            (w.top.value, w.bottom.value, w.alpha.value),
+            (508.0, 572.0, 1.0)
+        );
+        // At header level they fade out.
+        d.point(On::Strip);
+        settle(&mut d);
+        assert!(d.backdrops().iter().all(|b| b.alpha.value == 0.0));
+        d.hide_due();
+        settle(&mut d);
+        assert!(d.backdrops().iter().all(|b| b.alpha.value == 1.0));
+        // Notes coming stretch it.
+        d.set(vec![
+            item("g1"),
+            item("g2"),
+            win("w1"),
+            win("w2"),
+            win("w3"),
+        ]);
+        settle(&mut d);
+        assert_eq!(d.backdrops()[1].bottom.value, 590.0);
+        // Swapping all of a group's notes keeps it.
+        d.set(vec![item("g1"), item("g2"), win("w4")]);
+        for _ in 0..60 {
+            d.advance(1.0 / 60.0);
+            assert_eq!(d.backdrops()[1].alpha.target, 1.0);
+        }
+        settle(&mut d);
+        // Its last note gone, it fades out.
+        d.set(vec![item("g1"), item("g2")]);
+        settle(&mut d);
+        assert_eq!(d.backdrops()[1].alpha.value, 0.0);
+        assert_eq!(d.backdrops()[0].alpha.value, 1.0);
+        // Coming back, it fades in where its notes are.
+        d.set(vec![item("g1"), item("g2"), win("w1")]);
+        let w = d.backdrops()[1];
+        assert_eq!((w.top.value, w.bottom.value), (526.0, 554.0));
+        // Kept at header level if asked.
+        let mut d = Deck::new(
+            Metrics {
+                backdrop_headers: true,
+                ..M
+            },
+            150.0,
+        );
+        d.resize(1000.0);
+        d.set(grouped(false));
+        d.point(On::Strip);
+        settle(&mut d);
+        assert!(d.backdrops().iter().all(|b| b.alpha.value == 1.0));
+    }
+
+    #[test]
+    fn pinning_moves_a_note_to_the_other_group() {
+        let mut d = grouped_deck(false);
+        d.set(vec![item("g1"), win("g2"), win("w1"), win("w2")]);
+        settle(&mut d);
+        assert_eq!(card(&d, "g2").group, Group::Window);
+        let s = slots([1, 3], 1000.0, &M);
+        assert_eq!(card(&d, "g2").y.value, s.markers[1]);
+        assert_eq!(card(&d, "g1").y.value, s.markers[0]);
+    }
+
+    #[test]
+    fn dragging_stays_in_its_group_unless_it_can_cross() {
+        let mut d = grouped_deck(false);
+        d.point(On::Strip);
+        settle(&mut d);
+        let w2 = card(&d, "w2").y.value;
+        assert!(d.drag_start("g1", card(&d, "g1").y.value));
+        d.drag_to(w2);
+        // Kept along its group: at its end.
+        assert!(card(&d, "g1").y.value <= card(&d, "g2").y.value + 35.0 + 1e-9);
+        let l = d.drag_end().unwrap();
+        assert_eq!((l.group, l.gap, l.moved), (Group::Global, 1, false));
+        assert!(d.drag_start("w2", w2));
+        d.drag_to(0.0);
+        assert_eq!(
+            d.drag_end().map(|l| (l.group, l.gap, l.moved)),
+            Some((Group::Window, 0, false))
+        );
+    }
+
+    #[test]
+    fn dragging_into_the_other_group() {
+        let mut d = grouped_deck(true);
+        d.point(On::Strip);
+        settle(&mut d);
+        let (g2, w2) = (card(&d, "g2").y.value, card(&d, "w2").y.value);
+        assert!(d.drag_start("g1", card(&d, "g1").y.value));
+        // Past w2: the column as it would be with g1 last.
+        d.drag_to(w2 + 30.0);
+        settle(&mut d);
+        let s = slots([1, 3], 1000.0, &M);
+        assert_eq!(card(&d, "g2").y.value, s.headers[0]);
+        assert_eq!(card(&d, "w1").y.value, s.headers[1]);
+        assert_eq!(card(&d, "w2").y.value, s.headers[2]);
+        // Back over its own group: it stays there.
+        d.drag_to(g2);
+        assert_eq!(
+            d.drag_end().map(|l| (l.group, l.gap, l.moved)),
+            Some((Group::Global, 1, false))
+        );
+        assert!(d.drag_start("g1", card(&d, "g1").y.value));
+        d.drag_to(w2 + 30.0);
+        let landing = Landing {
+            key: "g1".into(),
+            group: Group::Window,
+            gap: 2,
+            moved: true,
+        };
+        assert_eq!(d.drag_end(), Some(landing));
+        // And up from the window's group into the global one.
+        settle(&mut d);
+        assert!(d.drag_start("w1", card(&d, "w1").y.value));
+        d.drag_to(0.0);
+        assert_eq!(
+            d.drag_end().map(|l| (l.group, l.gap, l.moved)),
+            Some((Group::Global, 0, true))
+        );
     }
 }

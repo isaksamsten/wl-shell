@@ -14,8 +14,8 @@
 
 use std::path::PathBuf;
 
-use serde::{de::Error as _, Deserialize, Deserializer};
-use wl_shell_config::{de, ConfigFile, Mode, Scheme};
+use serde::{Deserialize, Deserializer, de::Error as _};
+use wl_shell_config::{ConfigFile, Mode, Scheme, de};
 use wl_shell_notes::Color;
 use wl_shell_render::{paper, shadow};
 
@@ -82,6 +82,12 @@ pub struct ColumnConfig {
     /// A header's length along the edge.
     #[serde(deserialize_with = "header_length")]
     pub header_length: u32,
+    /// Between the global notes and the window's, at marker level (more
+    /// at header level, with their pitch).
+    #[serde(deserialize_with = "group_gap")]
+    pub group_gap: u32,
+    /// Keep the groups' backdrops at header level too.
+    pub group_backdrop_headers: bool,
     #[serde(deserialize_with = "de::duration")]
     pub reveal_delay: u32,
     #[serde(deserialize_with = "de::duration")]
@@ -103,6 +109,8 @@ impl Default for ColumnConfig {
             reserve_edge_band: false,
             header: 28,
             header_length: 96,
+            group_gap: 8,
+            group_backdrop_headers: false,
             reveal_delay: 120,
             hide_delay: 400,
             response: 150,
@@ -282,6 +290,9 @@ pub struct Theme {
     /// `[away from the edge, down]`.
     #[serde(deserialize_with = "de::offset")]
     pub shadow_offset: [i32; 2],
+    /// Behind each group of markers; alpha 0 hides them.
+    #[serde(deserialize_with = "de::color")]
+    pub group_backdrop: u32,
 }
 
 impl Default for Theme {
@@ -309,6 +320,7 @@ impl Default for Theme {
             shadow_color: 0x00000059,
             shadow_softness: 8,
             shadow_offset: [2, 3],
+            group_backdrop: 0x00000026,
         }
     }
 }
@@ -436,6 +448,10 @@ fn header<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
 
 fn header_length<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 24, 1000)
+}
+
+fn group_gap<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 0, 200)
 }
 
 fn sheet_width<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {

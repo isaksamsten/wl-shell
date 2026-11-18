@@ -577,6 +577,37 @@ pub fn button(
     }
 }
 
+/// A rounded rectangle `w`x`h` logical pixels in `color` (0xRRGGBBAA),
+/// with corners of radius `r`, at `scale`: say, a group's backdrop.
+pub fn rounded(w: i32, h: i32, r: f64, color: u32, scale: i32) -> Image {
+    let s = scale.max(1);
+    let (bw, bh) = ((w.max(1) * s) as u32, (h.max(1) * s) as u32);
+    let mut image = Image {
+        width: bw,
+        height: bh,
+        data: vec![0; (bw * bh * 4) as usize],
+    };
+    let Some(mut pixmap) = Pixmap::new(bw, bh) else {
+        return image;
+    };
+    let r = (r as f32 * s as f32).min(bw.min(bh) as f32 / 2.0);
+    if let Some(path) = outline(bw as f32, bh as f32, r, 0.0) {
+        pixmap.fill_path(
+            &path,
+            &solid(color),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    let mut data = Vec::with_capacity(image.data.len());
+    for px in pixmap.data().as_chunks::<4>().0 {
+        data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    image.data = data;
+    image
+}
+
 /// `rgba` with its alpha times `f`.
 fn faint(rgba: u32, f: f64) -> u32 {
     let a = ((rgba & 0xff) as f64 * f).round().clamp(0.0, 255.0) as u32;

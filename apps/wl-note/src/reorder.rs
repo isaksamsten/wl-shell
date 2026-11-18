@@ -1,11 +1,13 @@
 //! Reordering the column by dragging a margin along it. Pure, unit tested.
 //!
 //! While a margin is dragged, a gap opens in the column where it would
-//! land (`gap`): the slot nearest the pointer, among as many slots as
-//! there are notes shown. The other notes move apart to leave that slot
-//! free. A drop moves the note in the whole order (`land`), just before
-//! the next note shown, or right after the previous one at the end of the
-//! column, so the notes this context doesn't show keep their places.
+//! land (`gap`): the slot nearest the pointer, among the slots of the
+//! group it lands in (deck.rs picks the group). The other notes move
+//! apart to leave that slot free. A drop moves the note in the whole
+//! order (`land`) among the notes of that group: just before the next
+//! one shown, or right after the previous one at the group's end, so the
+//! notes this context doesn't show, and the other group's, keep their
+//! places. A note from the other group isn't among them yet.
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +20,8 @@ pub fn gap(slots: &[f64], y: f64) -> usize {
 }
 
 /// The whole order `full` after `key` was dropped at slot `gap` of the
-/// column `shown` (in order, `key` included).
+/// group `shown` (in order; `key` included unless it comes from the other
+/// group).
 pub fn land(full: &[PathBuf], shown: &[&Path], key: &Path, gap: usize) -> Vec<PathBuf> {
     let others: Vec<&Path> = shown.iter().copied().filter(|p| *p != key).collect();
     // Where it was (or alone): nothing moves.
@@ -103,6 +106,29 @@ mod tests {
         assert_eq!(
             land(&full, &refs(&shown), Path::new("n"), 0),
             paths(&["n", "a", "b"])
+        );
+    }
+
+    #[test]
+    fn dropping_within_a_group_or_into_it() {
+        // The window's w1 comes first in the order, the global g1 and g2
+        // after it; the column shows g1, g2, w1.
+        let full = paths(&["w1", "g1", "g2", "w2"]);
+        let globals = paths(&["g1", "g2"]);
+        // g1 to the end of its group: after g2, not before w1.
+        assert_eq!(
+            land(&full, &refs(&globals), Path::new("g1"), 1),
+            paths(&["w1", "g2", "g1", "w2"])
+        );
+        // w1 into the global group, between them.
+        assert_eq!(
+            land(&full, &refs(&globals), Path::new("w1"), 1),
+            paths(&["g1", "w1", "g2", "w2"])
+        );
+        // Or at its end: after g2.
+        assert_eq!(
+            land(&full, &refs(&globals), Path::new("w1"), 2),
+            paths(&["g1", "g2", "w1", "w2"])
         );
     }
 }

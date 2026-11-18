@@ -68,7 +68,7 @@ use wl_shell_render::worker::{Assets, Done};
 use crate::column::{Act, Column, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
 use crate::config::Config;
 use crate::context::{Proposal, Settle};
-use crate::deck::{self, Item, Look};
+use crate::deck::{self, Group, Item, Look};
 use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
@@ -796,12 +796,28 @@ impl WlNote {
                 path,
             })
             .collect();
+        let pin = pin_state(note, window);
+        let group = match note.global() {
+            true => Group::Global,
+            false => Group::Window,
+        };
+        // Dragged into the other group, it is pinned to the window, or
+        // unpinned and global.
+        let cross = matches!(
+            (group, &pin),
+            (Group::Global, Pin::Unpinned(_)) | (Group::Window, Pin::Pinned { global_after: true })
+        );
         Some(Shown {
-            item: Item { key, look },
+            item: Item {
+                key,
+                look,
+                group,
+                cross,
+            },
             content: Rc::new(content),
             text: self.config.text_color(color),
             files,
-            pin: pin_state(note, window),
+            pin,
             color: color.copied().unwrap_or(self.config.sheet.default_color),
         })
     }
@@ -1098,8 +1114,9 @@ impl WlNote {
         }
     }
 
-    /// `key` was dropped at slot `gap` of a column showing `shown`: move it
-    /// there in the order, keeping the notes not shown in their places.
+    /// `key` was dropped at slot `gap` of a group showing `shown`: move it
+    /// there in the order, keeping the notes not shown, and the other
+    /// group's, in their places.
     fn reorder(&mut self, key: &str, shown: &[String], gap: usize) {
         let full = self.state.full_order(&self.index);
         let shown: Vec<&Path> = shown.iter().map(Path::new).collect();
