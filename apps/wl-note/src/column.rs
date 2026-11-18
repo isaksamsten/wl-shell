@@ -2775,10 +2775,16 @@ impl Column {
 
     // -- papers --------------------------------------------------------------
 
-    /// A note's margin: its title turned, and the crease.
-    fn margin(&self, key: &str) -> Option<paper::Margin> {
+    /// A note's margin: its title turned, and the crease. A sheet's
+    /// title may take the whole margin, so as the sheet comes down from
+    /// its header the title comes down with it.
+    fn margin(&self, key: &str, role: Role) -> Option<paper::Margin> {
         let note = self.notes.get(key)?;
         let m = &self.style.metrics;
+        let room = match role {
+            Role::Sheet => m.sheet_height,
+            _ => m.header_length * 0.7,
+        };
         let ink = (note.text & !0xff) | 0xc8;
         Some(paper::Margin {
             width: m.header as i32,
@@ -2789,7 +2795,7 @@ impl Column {
                 style: self.style.small(ink),
                 spacing: LABEL_SPACING,
                 top: LABEL_PAD as i32,
-                len: (m.header_length * 0.7 - 2.0 * LABEL_PAD).max(8.0) as i32,
+                len: (room - 2.0 * LABEL_PAD).max(8.0) as i32,
             }),
         })
     }
@@ -2819,7 +2825,7 @@ impl Column {
                 h: m.header_length.round() as i32,
                 sliver: false,
                 radius: TAB_RADIUS,
-                margin: self.margin(&card.key),
+                margin: self.margin(&card.key, role),
                 shadow: match role {
                     Role::Lifted => self.style.lifted,
                     _ => self.style.shadow,
@@ -2863,7 +2869,7 @@ impl Column {
                     tilt: if open { 0.0 } else { card.look.tilt },
                     sliver: false,
                     radius: SHEET_RADIUS,
-                    margin: self.margin(&card.key),
+                    margin: self.margin(&card.key, Role::Sheet),
                     bar: bar as i32,
                     shadow: self.style.lifted,
                     content,
