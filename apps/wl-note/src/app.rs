@@ -50,7 +50,9 @@ use std::time::{Duration, Instant};
 use smithay_client_toolkit::seat::keyboard::KeyEvent;
 use smithay_client_toolkit::seat::pointer::PointerEvent;
 use smithay_client_toolkit::shell::wlr_layer::{LayerSurface, LayerSurfaceConfigure};
-use wayland_client::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
+use wayland_client::protocol::{
+    wl_data_device_manager::DndAction, wl_output::WlOutput, wl_surface::WlSurface,
+};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::{Reloader, TreeEvent};
 use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
@@ -63,7 +65,7 @@ use wl_shell_notes::{Index, Note, State, Window, state};
 use wl_shell_render::text::Text;
 use wl_shell_render::worker::{Assets, Done};
 
-use crate::column::{Act, Column, FileLink, Fonts, Pin, Shown, Style, Timer};
+use crate::column::{Act, Column, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
 use crate::config::Config;
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Item, Look};
@@ -71,7 +73,7 @@ use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
-use crate::{bar, create, find, list, reorder};
+use crate::{bar, create, files, find, list, reorder};
 
 /// Windows whose output is remembered at most: the stream may report
 /// windows the toplevel list never announces, so not all are forgotten.
@@ -88,6 +90,18 @@ struct Ctx {
 
 /// An output a column can go on: it, its name and its scale.
 type Target = (WlOutput, String, i32);
+
+struct FileOffer {
+    surface: WlSurface,
+    at: (f64, f64),
+}
+
+struct FileDrop {
+    surface: WlSurface,
+    dir: PathBuf,
+    target: FileTarget,
+    app: Option<String>,
+}
 
 pub struct WlNote {
     /// The config, reloaded when its file changes.
@@ -116,6 +130,8 @@ pub struct WlNote {
     papers: Option<Rc<RefCell<Papers>>>,
     /// The columns: those shown, and those retiring.
     columns: Vec<Column>,
+    file_offer: Option<FileOffer>,
+    file_drop_serial: u64,
     save_timer: Option<RegistrationToken>,
     /// Drafts whose surfaces were forcibly removed, keyed by absolute path.
     detached_drafts: HashMap<PathBuf, Draft>,
@@ -167,6 +183,8 @@ impl WlNote {
             assets: None,
             papers: None,
             columns: Vec::new(),
+            file_offer: None,
+            file_drop_serial: 0,
             save_timer: None,
             detached_drafts: HashMap::new(),
             outputs_dirty: true,
@@ -500,6 +518,10 @@ impl WlNote {
             self.dirty = true;
             self.outputs_dirty = true;
         }
+        // A seat can disappear without delivering a source cancellation.
+        if !core.dnd.dragging() {
+            self.release_file_drag(core);
+        }
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_columns(core);
         }
@@ -641,7 +663,8 @@ impl WlNote {
             "all" => return outputs,
             "focused" => {
                 let current = self.columns.iter().find(|c| !c.retiring);
-                let held = current.filter(|c| c.open_key().is_some());
+                let held =
+                    current.filter(|c| c.open_key().is_some() || c.dragged_file_note().is_some());
                 (held.and_then(|c| on(&c.output)))
                     .or_else(|| {
                         let name = self.context_output()?;
@@ -682,6 +705,9 @@ impl WlNote {
                 None if !column.retiring => {
                     // Its notes slide away; it goes once they are gone.
                     if column.draft.as_ref().is_some_and(Draft::dirty) {
+                        continue;
+                    }
+                    if column.dragged_file_note().is_some() {
                         continue;
                     }
                     acts.push((column.surface().clone(), column.close()));
@@ -791,14 +817,21 @@ impl WlNote {
                 continue;
             }
             let mut mine = paths.clone();
-            if let Some(open) = column.open_key().map(PathBuf::from)
-                && !mine.contains(&open)
-                && ((self.index.get(&open).is_some() && !self.state.is_hidden(&open))
-                    || column.draft.as_ref().is_some_and(Draft::dirty))
+            for key in [column.open_key(), column.dragged_file_note()]
+                .into_iter()
+                .flatten()
             {
-                let key = open.to_string_lossy();
-                let at = column.keys().position(|k| k == key).unwrap_or(mine.len());
-                mine.insert(at.min(mine.len()), open);
+                let path = PathBuf::from(key);
+                if !mine.contains(&path)
+                    && ((self.index.get(&path).is_some() && !self.state.is_hidden(&path))
+                        || column
+                            .draft
+                            .as_ref()
+                            .is_some_and(|d| d.key == key && d.dirty()))
+                {
+                    let at = column.keys().position(|k| k == key).unwrap_or(mine.len());
+                    mine.insert(at.min(mine.len()), path);
+                }
             }
             let notes = mine
                 .iter()
@@ -1301,9 +1334,15 @@ impl WlNote {
             new.title.as_deref(),
             new.text.as_deref(),
         )?;
+        let key = self.write_new_note(core, &text)?;
+        self.focus_note(core, &key);
+        Ok(())
+    }
+
+    fn write_new_note(&mut self, core: &mut Core<Self>, text: &str) -> Result<String, String> {
         let dir = self.index.dir().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = wl_shell_notes::create_new(&dir, &create::now_stem(), &text)
+        let path = wl_shell_notes::create_new(&dir, &create::now_stem(), text)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let rel = path.strip_prefix(&dir).unwrap_or(&path).to_path_buf();
         let key = rel.to_string_lossy().into_owned();
@@ -1313,8 +1352,7 @@ impl WlNote {
         // In the index (and the column) right away.
         self.notes_touched = true;
         self.rescan(core);
-        self.focus_note(core, &key);
-        Ok(())
+        Ok(key)
     }
 
     /// Open `key` with the keyboard, showing it even if it doesn't belong
@@ -1327,6 +1365,139 @@ impl WlNote {
         // Among the notes before its card is made, so it is kept.
         self.show_notes();
         self.dirty = false;
+    }
+
+    // -- file drops --------------------------------------------------------
+
+    fn release_file_drag(&mut self, core: &Core<Self>) {
+        for column in &mut self.columns {
+            if column.dragged_file_note().is_some() {
+                column.file_drag_done(core);
+                self.dirty = true;
+                self.outputs_dirty = true;
+            }
+        }
+    }
+
+    fn track_file_offer(&mut self, core: &Core<Self>, at: (f64, f64)) {
+        let Some(offer) = &mut self.file_offer else {
+            return;
+        };
+        offer.at = at;
+        if let Some(c) = self
+            .columns
+            .iter_mut()
+            .find(|c| c.surface() == &offer.surface && !c.retiring)
+        {
+            c.file_hover(core, at.0, at.1);
+        }
+    }
+
+    fn leave_file_offer(&mut self, core: &Core<Self>) {
+        let Some(offer) = self.file_offer.take() else {
+            return;
+        };
+        if let Some(i) = self.column_at(&offer.surface)
+            && self.columns[i].dragged_file_note().is_none()
+        {
+            self.columns[i].pointer_left(core);
+        }
+    }
+
+    fn receive_files(&mut self, core: &mut Core<Self>, drop: FileDrop, data: Vec<u8>) {
+        let Some(paths) = std::str::from_utf8(&data)
+            .ok()
+            .and_then(wl_shell_render::files::parse_uri_list)
+        else {
+            return warn!("drop did not contain a local file list");
+        };
+        let result = self.apply_drop(core, drop, paths);
+        if let Err(e) = result {
+            warn!("attaching files: {e}");
+        }
+    }
+
+    fn drop_note(&self, key: &str) -> Result<Note, String> {
+        let path = self.path(key);
+        if let Some(d) = self
+            .columns
+            .iter()
+            .filter_map(|c| c.draft.as_ref())
+            .find(|d| d.key == key)
+            .or_else(|| self.detached_drafts.get(&path))
+        {
+            return Ok(Note::parse(d.source()));
+        }
+        read_note(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .map(Note::parse)
+            .ok_or_else(|| format!("{} is no longer there", path.display()))
+    }
+
+    fn apply_drop(
+        &mut self,
+        core: &mut Core<Self>,
+        drop: FileDrop,
+        mut paths: Vec<PathBuf>,
+    ) -> Result<(), String> {
+        if self.index.dir() != drop.dir {
+            return Err("notes directory changed during drop".into());
+        }
+        match drop.target {
+            FileTarget::New => {
+                let body = files::append("", &paths, "\n");
+                let text = create::text(drop.app.as_deref(), None, None, Some(&body))?;
+                let key = self.write_new_note(core, &text)?;
+                if let Some(i) = self
+                    .column_at(&drop.surface)
+                    .filter(|&i| !self.columns[i].retiring)
+                    .or_else(|| self.main_column())
+                {
+                    self.open_in(core, i, &key);
+                    self.show_notes();
+                }
+            }
+            FileTarget::Note { key, editor } => {
+                let path = self.path(&key);
+                let note = self.drop_note(&key)?;
+                files::keep_unlinked(&mut paths, note.body());
+                if paths.is_empty() {
+                    return Ok(());
+                }
+                if let Some(i) = self
+                    .columns
+                    .iter()
+                    .position(|c| c.draft.as_ref().is_some_and(|d| d.key == key))
+                {
+                    let editor = (self.columns[i].surface() == &drop.surface)
+                        .then_some(editor)
+                        .flatten();
+                    self.columns[i].attach_files(&key, editor, &paths);
+                    self.save_draft(i, false);
+                } else if self.detached_drafts.contains_key(&path) {
+                    return Err(
+                        "reopen the note to resolve its unsaved draft before attaching files"
+                            .into(),
+                    );
+                } else {
+                    let newline = if note.text().contains("\r\n") {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    };
+                    let added = files::append(note.body(), &paths, newline);
+                    let mut text = note.text().to_owned();
+                    if note.body().is_empty() && !text.is_empty() && !text.ends_with('\n') {
+                        text.push_str(newline);
+                    }
+                    text.push_str(&added);
+                    wl_shell_notes::write_atomic(&path, &text)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    self.notes_touched = true;
+                }
+            }
+        }
+        Ok(())
     }
 
     // -- the socket --------------------------------------------------------
@@ -1483,6 +1654,73 @@ fn expand(path: &str) -> String {
 
 impl Program for WlNote {
     const DATA_DEVICE: bool = true;
+
+    fn dnd_enter(
+        &mut self,
+        core: &mut Core<Self>,
+        surface: &WlSurface,
+        at: (f64, f64),
+        mimes: &[String],
+    ) {
+        self.leave_file_offer(core);
+        self.file_drop_serial = self.file_drop_serial.wrapping_add(1);
+        let accepted = !core.dnd.dragging()
+            && mimes.iter().any(|m| m == files::URI_LIST)
+            && self
+                .column_at(surface)
+                .is_some_and(|i| !self.columns[i].retiring);
+        let (mime, action) = if accepted {
+            self.file_offer = Some(FileOffer {
+                surface: surface.clone(),
+                at,
+            });
+            self.track_file_offer(core, at);
+            (Some(files::URI_LIST), DndAction::Copy)
+        } else {
+            (None, DndAction::empty())
+        };
+        core.dnd.accept(mime, action, action);
+    }
+
+    fn dnd_motion(&mut self, core: &mut Core<Self>, at: (f64, f64)) {
+        self.track_file_offer(core, at);
+    }
+
+    fn dnd_leave(&mut self, core: &mut Core<Self>) {
+        self.leave_file_offer(core);
+    }
+
+    fn dnd_drop(&mut self, core: &mut Core<Self>) {
+        let drop = self.file_offer.as_ref().and_then(|o| {
+            let target = self.columns[self.column_at(&o.surface)?].file_target(o.at.0, o.at.1)?;
+            Some(FileDrop {
+                surface: o.surface.clone(),
+                dir: self.index.dir().to_path_buf(),
+                target,
+                app: self.window().map(|w| w.app_id.clone()),
+            })
+        });
+        self.leave_file_offer(core);
+        if let Some(drop) = drop
+            && core.dnd.action() == DndAction::Copy
+        {
+            let serial = self.file_drop_serial;
+            match core.dnd_receive(files::URI_LIST, move |app, core, data| {
+                if app.file_drop_serial == serial {
+                    core.dnd.finish();
+                }
+                app.receive_files(core, drop, data);
+            }) {
+                Ok(()) => return,
+                Err(e) => warn!("reading dropped files: {e}"),
+            }
+        }
+        core.dnd.finish();
+    }
+
+    fn drag_source_done(&mut self, core: &mut Core<Self>, _: Option<DndAction>) {
+        self.release_file_drag(core);
+    }
 
     fn toplevel_new(&mut self, core: &mut Core<Self>, _: &ExtForeignToplevelHandleV1) {
         // The focused window may only be announced now.

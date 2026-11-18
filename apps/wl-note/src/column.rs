@@ -59,11 +59,13 @@ use smithay_client_toolkit::{
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
     },
 };
+use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::{
     QueueHandle,
     protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_surface::WlSurface},
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wl_shell_core::dnd::DragIcon;
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::reexports::calloop::RegistrationToken;
 use wl_shell_core::{Core, Shell};
@@ -86,6 +88,7 @@ use crate::bar;
 use crate::config::{Config, Edge, NoteLayer};
 use crate::deck::{Card, Deck, Item, LIFT, Metrics, On, Role};
 use crate::draft::Draft;
+use crate::files;
 use crate::markdown::{self, Content};
 use crate::papers::{Papers, Sheet};
 use crate::title::Title;
@@ -438,6 +441,24 @@ struct Press {
     dragging: bool,
 }
 
+struct FilePress {
+    key: String,
+    path: PathBuf,
+    at: (f64, f64),
+    serial: u32,
+    ctrl: bool,
+}
+
+/// A drop is resolved against the sheet at button release, not when the
+/// data (or a copy) arrives. Only reuse the offset in the same text.
+pub enum FileTarget {
+    New,
+    Note {
+        key: String,
+        editor: Option<(usize, String)>,
+    },
+}
+
 /// A name label: its text, color, width and whether it is struck
 /// through.
 #[derive(Clone, Debug, PartialEq)]
@@ -519,6 +540,9 @@ pub struct Column {
     lines: Vec<(LineKey, Option<Sized>)>,
     /// What the bars hover.
     bar_hover: Option<(String, BarHit)>,
+    selected_files: Option<(String, HashSet<PathBuf>)>,
+    file_press: Option<FilePress>,
+    dragged_file_note: Option<String>,
     trash: bar::Trash,
     palette_since: Option<Instant>,
     dots: HashMap<(u32, u32, bool), WlBuffer>,
@@ -715,6 +739,9 @@ impl Column {
             icon_buffers: HashMap::new(),
             lines: Vec::new(),
             bar_hover: None,
+            selected_files: None,
+            file_press: None,
+            dragged_file_note: None,
             trash: bar::Trash::default(),
             palette_since: None,
             dots: HashMap::new(),
@@ -1030,13 +1057,20 @@ impl Column {
 
     pub fn pointer(
         &mut self,
-        core: &Core<WlNote>,
+        core: &mut Core<WlNote>,
         event: &PointerEvent,
         mods: &Modifiers,
     ) -> Vec<Act> {
         let (x, y) = event.position;
         match &event.kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                if self.dragged_file_note.is_some() {
+                    return Vec::new();
+                }
+                if self.file_press.is_some() {
+                    self.file_press_moved(core, x, y);
+                    return Vec::new();
+                }
                 if self.selecting {
                     self.drag_selection(x, y);
                     return Vec::new();
@@ -1048,25 +1082,20 @@ impl Column {
                 Vec::new()
             }
             PointerEventKind::Leave { .. } => {
-                self.pointer = None;
-                self.selecting = false;
-                self.bar_hover = None;
-                self.trash.clear();
-                self.all_files = [None, None];
-                if self.press.take().is_some() {
-                    self.deck.drag_cancel();
+                self.file_press = None;
+                if self.dragged_file_note.is_none() {
+                    self.pointer_left(core);
                 }
-                self.cancel_reveal(core);
-                self.deck.point(On::Outside);
-                self.start_hide(core);
-                self.kick();
                 Vec::new()
             }
-            PointerEventKind::Press { button, .. } if *button == BTN_LEFT => {
-                self.click(core, x, y, mods.shift)
+            PointerEventKind::Press { button, serial, .. } if *button == BTN_LEFT => {
+                self.click(core, x, y, mods, *serial)
             }
             PointerEventKind::Release { button, .. } if *button == BTN_LEFT => {
                 self.selecting = false;
+                if let Some(p) = self.file_press.take() {
+                    return self.file_release(core, p, x, y).into_iter().collect();
+                }
                 self.release(core, x, y)
             }
             PointerEventKind::Axis { vertical, .. } => {
@@ -1285,7 +1314,7 @@ impl Column {
             }
             Timer::Hide => {
                 self.hide = None;
-                if self.pointer.is_none() {
+                if self.pointer.is_none() && self.dragged_file_note.is_none() {
                     self.deck.hide_due();
                 }
             }
@@ -1342,6 +1371,158 @@ impl Column {
         if let Some(token) = self.hide.take() {
             core.loop_handle.remove(token);
         }
+    }
+
+    pub fn pointer_left(&mut self, core: &Core<WlNote>) {
+        self.pointer = None;
+        self.selecting = false;
+        self.bar_hover = None;
+        self.trash.clear();
+        self.all_files = [None, None];
+        if self.press.take().is_some() {
+            self.deck.drag_cancel();
+        }
+        self.cancel_reveal(core);
+        self.deck.point(On::Outside);
+        self.start_hide(core);
+        self.kick();
+    }
+
+    pub fn dragged_file_note(&self) -> Option<&str> {
+        self.dragged_file_note.as_deref()
+    }
+
+    pub fn file_drag_done(&mut self, core: &Core<WlNote>) {
+        self.dragged_file_note = None;
+        if core.input.pointer_on(self.surface()) {
+            let (x, y) = core.input.pointer_pos;
+            self.hover_at(core, x, y);
+        } else {
+            self.pointer_left(core);
+        }
+    }
+
+    pub fn file_hover(&mut self, core: &Core<WlNote>, x: f64, y: f64) {
+        if self.dragged_file_note.is_none() {
+            self.hover_at(core, x, y);
+        }
+    }
+
+    pub fn file_target(&self, x: f64, y: f64) -> Option<FileTarget> {
+        if self.retiring {
+            return None;
+        }
+        let key = match self.on_at(x, y) {
+            On::Sheet(key) | On::Margin(key) => key,
+            On::Plus | On::Strip => return Some(FileTarget::New),
+            On::Outside => return None,
+        };
+        let editor = (|| {
+            let draft = self.draft.as_ref().filter(|d| d.key == key)?;
+            let area = self.editor_rect(self.face(&key)?);
+            if self.showing_files(&key) || !area.contains(x, y) {
+                return None;
+            }
+            let (line, col) = self.layout.index_at(x - area.x, y - area.y + self.scroll);
+            Some((
+                draft.editor.offset(line, col),
+                draft.editor.text().to_owned(),
+            ))
+        })();
+        Some(FileTarget::Note { key, editor })
+    }
+
+    pub fn attach_files(
+        &mut self,
+        key: &str,
+        editor: Option<(usize, String)>,
+        paths: &[PathBuf],
+    ) -> bool {
+        let Some(draft) = self.draft.as_mut().filter(|d| d.key == key) else {
+            return false;
+        };
+        let body = draft.editor.text();
+        let (at, text) = match editor {
+            Some((at, expected)) if expected == body => (at, files::insert(body, at, paths)),
+            _ => (body.len(), files::append(body, paths, "\n")),
+        };
+        draft.editor.set_caret(at, false);
+        draft.editor.paste(&text);
+        self.paste_serial = self.paste_serial.wrapping_add(1);
+        self.follow_caret = true;
+        self.draft_changed();
+        true
+    }
+
+    fn file_press_moved(&mut self, core: &mut Core<WlNote>, x: f64, y: f64) {
+        let Some(p) = &self.file_press else { return };
+        if (x - p.at.0).hypot(y - p.at.1) < DRAG_START {
+            return;
+        }
+        let p = self.file_press.take().unwrap();
+        let Some(note) = self.notes.get(&p.key).filter(|_| self.deck.held(&p.key)) else {
+            return;
+        };
+        let paths: Vec<_> = match &self.selected_files {
+            Some((key, set)) if *key == p.key && set.contains(&p.path) => note
+                .files
+                .iter()
+                .filter(|f| set.contains(&f.path) && f.path.exists())
+                .map(|f| f.path.clone())
+                .collect(),
+            _ if p.path.exists() => vec![p.path.clone()],
+            _ => return,
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let buffer = self.file_buffer(&p.path, None);
+        let icon = buffer.as_ref().map(|buffer| DragIcon {
+            buffer,
+            scale: self.scale,
+            hotspot: (ICON as i32 / 2, ICON as i32 / 2),
+        });
+        match core.start_drag(
+            self.surface(),
+            p.serial,
+            files::offer(&paths),
+            DndAction::Copy,
+            icon,
+        ) {
+            Ok(()) => {
+                self.cancel_hide(core);
+                self.dragged_file_note = Some(p.key);
+            }
+            Err(e) => warn!("cannot drag {}: {e}", p.path.display()),
+        }
+    }
+
+    fn file_release(&mut self, core: &Core<WlNote>, p: FilePress, x: f64, y: f64) -> Option<Act> {
+        let hit = self.bar_at(x, y);
+        self.hover_at(core, x, y);
+        let (key, BarHit::File(i)) = hit? else {
+            return None;
+        };
+        if key != p.key || self.notes.get(&key)?.files.get(i)?.path != p.path {
+            return None;
+        }
+        let act = if p.ctrl {
+            if p.path.exists() {
+                if !self.selected_files.as_ref().is_some_and(|(k, _)| *k == key) {
+                    self.selected_files = Some((key, HashSet::new()));
+                }
+                let (_, set) = self.selected_files.as_mut().unwrap();
+                if !set.remove(&p.path) {
+                    set.insert(p.path);
+                }
+            }
+            None
+        } else {
+            self.selected_files = None;
+            Some(Act::File(p.path))
+        };
+        self.kick();
+        act
     }
 
     /// The pointer is at (`x`, `y`): follow it with the levels, and the
@@ -1420,7 +1601,14 @@ impl Column {
         act.into_iter().collect()
     }
 
-    fn click(&mut self, core: &Core<WlNote>, x: f64, y: f64, shift: bool) -> Vec<Act> {
+    fn click(
+        &mut self,
+        core: &Core<WlNote>,
+        x: f64,
+        y: f64,
+        mods: &Modifiers,
+        serial: u32,
+    ) -> Vec<Act> {
         self.paste_serial = self.paste_serial.wrapping_add(1);
         let on = self.on_at(x, y);
         let left_files = self.leave_file_views(&on);
@@ -1428,6 +1616,11 @@ impl Column {
             self.kick();
         }
         let hit = self.bar_hover.clone();
+        if !matches!(hit, Some((_, BarHit::File(_) | BarHit::More)))
+            && self.selected_files.take().is_some()
+        {
+            self.kick();
+        }
         if self.palette_since.is_some()
             && !matches!(hit, Some((_, BarHit::Color | BarHit::Swatch(_))))
         {
@@ -1445,7 +1638,25 @@ impl Column {
             false => self.commit_title(),
         };
         if let Some((key, hit)) = hit {
-            acts.extend(self.bar_click(core, &key, hit, shift));
+            if let BarHit::File(i) = hit {
+                if let Some(path) = self
+                    .notes
+                    .get(&key)
+                    .and_then(|n| n.files.get(i))
+                    .map(|f| f.path.clone())
+                {
+                    self.cancel_reveal(core);
+                    self.file_press = Some(FilePress {
+                        key,
+                        path,
+                        at: (x, y),
+                        serial,
+                        ctrl: mods.ctrl,
+                    });
+                }
+            } else {
+                acts.extend(self.bar_click(core, &key, hit, mods.shift));
+            }
             return acts;
         }
         match on {
@@ -1466,7 +1677,7 @@ impl Column {
                 });
             }
             On::Sheet(k) if open.as_deref() == Some(k.as_str()) => {
-                acts.extend(self.open_click(&k, x, y, shift));
+                acts.extend(self.open_click(&k, x, y, mods.shift));
             }
             On::Sheet(k) if self.showing_files(&k) => {}
             On::Sheet(k) => {
@@ -1591,7 +1802,7 @@ impl Column {
     ) -> Option<Act> {
         let note = self.notes.get(key)?;
         match hit {
-            BarHit::File(i) => Some(Act::File(note.files.get(i)?.path.clone())),
+            BarHit::File(_) => None,
             BarHit::RemoveFile(i) => {
                 Some(Act::RemoveFile(key.into(), note.files.get(i)?.path.clone()))
             }
@@ -2949,9 +3160,20 @@ impl Column {
         );
         for (i, rect, cell) in entries {
             let f = &files[i];
+            let selected = self
+                .selected_files
+                .as_ref()
+                .is_some_and(|(k, set)| k == key && set.contains(&f.path));
             let lit = matches!(hover, Some(BarHit::File(j) | BarHit::RemoveFile(j)) if i == j);
             let exists = if lit { f.path.exists() } else { f.exists };
-            let buffer = self.file_buffer(&f.path, (!lit).then_some(ink));
+            if selected {
+                plan.icons.push((
+                    self.dot(self.style.link, ink, false),
+                    rect.outset(3.0),
+                    0.55,
+                ));
+            }
+            let buffer = self.file_buffer(&f.path, (!(lit || selected)).then_some(ink));
             plan.icons
                 .push((buffer, rect, if exists { 1.0 } else { 0.4 }));
             if !exists && lit {

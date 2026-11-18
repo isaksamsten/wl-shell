@@ -10,6 +10,7 @@ mod create;
 mod deck;
 mod draft;
 mod editor;
+mod files;
 mod find;
 mod ipc;
 mod list;

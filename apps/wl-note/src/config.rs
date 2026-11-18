@@ -97,7 +97,6 @@ pub struct Config {
     pub open_command: String,
     /// `{paths}`.
     pub trash_command: String,
-    pub attach_mode: AttachMode,
     /// For new notes and notes without `color`.
     #[serde(deserialize_with = "color_name")]
     pub default_color: Color,
@@ -143,7 +142,6 @@ impl Default for Config {
             editor_command: "xdg-open {path}".into(),
             open_command: "xdg-open {path}".into(),
             trash_command: "gio trash -- {paths}".into(),
-            attach_mode: AttachMode::default(),
             default_color: Color::Preset("yellow"),
             font: "sans-serif".into(),
             font_size: 13,
@@ -176,17 +174,6 @@ pub enum NoteLayer {
     #[default]
     Top,
     Overlay,
-}
-
-/// What dropping files on a note does.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum AttachMode {
-    /// Link the files where they are.
-    #[default]
-    Link,
-    /// Copy them next to the note, and link the copies.
-    Copy,
 }
 
 /// Colors: the keys of `[appearance]`, and of its `dark` and `light`
