@@ -16,10 +16,10 @@
 //! (to `MIN_GAP` or the configured gap if smaller), then their length (to
 //! `MIN_MARKER` or the configured length if smaller).
 //!
-//! The column is in two groups (`Group`): the global notes, then the
-//! window's, `group-gap` apart (at header level, as much more as their
-//! pitch is to the markers'), centered on the edge together; a group
-//! without notes takes no room. Crowding counts both together. Each group
+//! The column shows global, app, then window scratch notes, `group-gap`
+//! apart (at header level, scaled by their pitch). The groups are
+//! centered together; empty groups take no room. Crowding counts all
+//! groups together. Each group
 //! has a backdrop (`Backdrop`) behind its markers, on springs along its
 //! extent, fading in with its first note and out with its last, and out
 //! at header level.
@@ -92,24 +92,20 @@ pub enum Group {
     /// Shown everywhere.
     #[default]
     Global,
-    /// Shown for the context's window.
+    /// Shown for the context's app or matching its title.
     Window,
+    /// Scratch notes for this particular toplevel.
+    Scratch,
 }
 
 impl Group {
-    pub fn other(self) -> Self {
-        match self {
-            Group::Global => Group::Window,
-            Group::Window => Group::Global,
-        }
-    }
+    pub const ALL: [Self; 3] = [Self::Global, Self::Window, Self::Scratch];
 
-    /// Its positions in a column whose second group starts at `split`, of
-    /// `n` notes.
-    fn range(self, split: usize, n: usize) -> Range<usize> {
+    fn destinations(self) -> &'static [Self] {
         match self {
-            Group::Global => 0..split.min(n),
-            Group::Window => split.min(n)..n,
+            Self::Global => &[Self::Window],
+            Self::Window => &[Self::Global],
+            Self::Scratch => &[Self::Global, Self::Window],
         }
     }
 }
@@ -183,21 +179,26 @@ struct Slots {
     markers: Vec<f64>,
     headers: Vec<f64>,
     marker_length: f64,
-    /// Where the second group starts.
-    split: usize,
+    ranges: Vec<Range<usize>>,
     /// The extra room between the groups, at markers and at headers.
     between: [f64; 2],
 }
 
-/// Lay out `groups` notes (the first group's, then the second's), apart:
+impl Slots {
+    fn range(&self, group: Group) -> Range<usize> {
+        self.ranges.get(group as usize).cloned().unwrap_or(0..0)
+    }
+}
+
+/// Lay out `groups` notes in group order, with gaps between nonempty groups:
 /// each level independently, centered as a whole (see the module's
 /// comment). Headers keep clear of the `+` button in the bottom corner:
 /// they move up as little as needed, then shingle more tightly.
-fn slots(groups: [usize; 2], length: f64, m: &Metrics) -> Slots {
-    let n = groups[0] + groups[1];
-    let split = groups[0];
-    let both = groups.iter().all(|&g| g > 0);
-    let group_gap = if both { m.group_gap } else { 0.0 };
+fn slots(groups: impl AsRef<[usize]>, length: f64, m: &Metrics) -> Slots {
+    let groups = groups.as_ref();
+    let n = groups.iter().sum::<usize>();
+    let breaks = groups.iter().filter(|&&g| g > 0).count().saturating_sub(1) as f64;
+    let group_gap = if breaks > 0.0 { m.group_gap } else { 0.0 };
     // At headers, the gap is as much more as their pitch is.
     let per_pitch = group_gap / (m.marker_length + m.marker_gap).max(1.0);
     let mut marker_length = m.marker_length;
@@ -205,7 +206,7 @@ fn slots(groups: [usize; 2], length: f64, m: &Metrics) -> Slots {
     let avail = (length - 2.0 * m.padding).max(0.0);
     let gaps = n.saturating_sub(1) as f64;
     if n > 1 {
-        let room = (avail - group_gap).max(0.0);
+        let room = (avail - breaks * group_gap).max(0.0);
         marker_gap =
             ((room - n as f64 * marker_length) / gaps).clamp(MIN_GAP.min(marker_gap), marker_gap);
         marker_length = ((room - gaps * marker_gap) / n as f64)
@@ -215,16 +216,25 @@ fn slots(groups: [usize; 2], length: f64, m: &Metrics) -> Slots {
     // between the groups; the room between them.
     let centers = |len: f64, mut pitch: f64, fixed: f64, rel: f64, reserve: f64| {
         let avail = (avail - reserve).max(0.0);
-        let span = |pitch: f64| gaps * pitch + fixed + rel * pitch + len;
+        let span = |pitch: f64| gaps * pitch + breaks * (fixed + rel * pitch) + len;
         if n > 1 && span(pitch) > avail {
-            pitch = ((avail - len - fixed) / (gaps + rel)).max(1.0);
+            pitch = ((avail - len - breaks * fixed) / (gaps + breaks * rel)).max(1.0);
         }
         let between = fixed + rel * pitch;
         let first = (length / 2.0 - (span(pitch) - len) / 2.0)
             .min(length - m.padding - reserve - span(pitch) + len / 2.0)
             .max(m.padding + len / 2.0);
-        let at = |i: usize| first + i as f64 * pitch + if i >= split { between } else { 0.0 };
-        ((0..n).map(at).collect::<Vec<f64>>(), between)
+        let at = groups
+            .iter()
+            .filter(|&&g| g > 0)
+            .enumerate()
+            .flat_map(|(group, &count)| (0..count).map(move |_| group as f64 * between));
+        (
+            at.enumerate()
+                .map(|(i, extra)| first + i as f64 * pitch + extra)
+                .collect(),
+            between,
+        )
     };
     let (markers, marker_between) = centers(
         marker_length,
@@ -244,7 +254,14 @@ fn slots(groups: [usize; 2], length: f64, m: &Metrics) -> Slots {
         markers,
         headers,
         marker_length,
-        split,
+        ranges: groups
+            .iter()
+            .scan(0, |start, count| {
+                let range = *start..*start + count;
+                *start = range.end;
+                Some(range)
+            })
+            .collect(),
         between: [marker_between, header_between],
     }
 }
@@ -396,7 +413,7 @@ pub struct Deck {
     /// The `+` button: 0 out of sight, 1 out.
     pub plus: Spring,
     /// The groups' backdrops, by `Group`.
-    backdrops: [Backdrop; 2],
+    backdrops: [Backdrop; Group::ALL.len()],
 }
 
 impl Deck {
@@ -416,7 +433,7 @@ impl Deck {
             browsing: false,
             drag: None,
             plus: Spring::new(0.0, response),
-            backdrops: [Backdrop::new(response); 2],
+            backdrops: [Backdrop::new(response); Group::ALL.len()],
         }
     }
 
@@ -452,8 +469,38 @@ impl Deck {
     }
 
     /// The groups' backdrops, by `Group` (`Global` first).
-    pub fn backdrops(&self) -> &[Backdrop; 2] {
+    pub fn backdrops(&self) -> &[Backdrop; Group::ALL.len()] {
         &self.backdrops
+    }
+
+    /// Whether a drop on the edge strip is within the scratch group's extent.
+    pub fn over_scratch(&self, y: f64) -> bool {
+        let mut extents = self
+            .cards
+            .iter()
+            .filter(|c| !c.leaving && c.group == Group::Scratch)
+            .map(|c| (c.y.value - c.len.value / 2.0, c.y.value + c.len.value / 2.0));
+        extents.next().is_some_and(|first| {
+            let (top, bottom) = extents.fold(first, |a, b| (a.0.min(b.0), a.1.max(b.1)));
+            (top..=bottom).contains(&y)
+        })
+    }
+
+    /// Preserve a card's springs when keeping its scratch file under a new key.
+    pub fn rename(&mut self, from: &str, to: &str) {
+        for key in self
+            .cards
+            .iter_mut()
+            .map(|c| &mut c.key)
+            .chain(self.wanted.iter_mut().map(|w| &mut w.key))
+            .chain(self.open.iter_mut())
+            .chain(self.revealed.iter_mut())
+            .chain(self.hover.iter_mut())
+        {
+            if key == from {
+                to.clone_into(key);
+            }
+        }
     }
 
     /// The group `card` is laid out in: a dragged one's is where it would
@@ -466,13 +513,12 @@ impl Deck {
     }
 
     /// How many notes each group has, of those to show.
-    fn counts(&self) -> [usize; 2] {
-        let global = self
-            .wanted
-            .iter()
-            .filter(|w| w.group == Group::Global)
-            .count();
-        [global, self.wanted.len() - global]
+    fn counts(&self) -> [usize; Group::ALL.len()] {
+        let mut counts = [0; Group::ALL.len()];
+        for w in &self.wanted {
+            counts[w.group as usize] += 1;
+        }
+        counts
     }
 
     /// The most `key` is out for.
@@ -651,7 +697,7 @@ impl Deck {
     /// at marker level; one coming out of sight starts at its extent.
     fn retarget_backdrops(&mut self) {
         let level = self.level == Level::Marker || self.metrics.backdrop_headers;
-        for g in [Group::Global, Group::Window] {
+        for g in Group::ALL {
             let extent = (self.cards.iter())
                 .filter(|c| !c.leaving && self.group_of(c) == g)
                 .map(|c| {
@@ -790,6 +836,9 @@ impl Deck {
         let Some(from) = self.cards.iter().find(|c| c.key == key).map(|c| c.group) else {
             return false;
         };
+        if from == Group::Scratch && !self.cards.iter().any(|c| c.key == key && c.cross) {
+            return false;
+        }
         self.drag = Some(Drag {
             key: key.to_string(),
             y,
@@ -824,8 +873,7 @@ impl Deck {
         } else {
             self.length / 2.0
         };
-        let n = self.slots.headers.len();
-        let own = from.range(self.slots.split, n);
+        let own = self.slots.range(from);
         if !cross && !own.is_empty() {
             let reach = half * SHINGLE;
             let (lo, hi) = (
@@ -839,14 +887,62 @@ impl Deck {
         // The nearest slot of its own group, or of the other one in the
         // column as it would be with it there.
         let nearest = |s: &Slots, g: Group| {
-            let r = g.range(s.split, s.headers.len());
+            let r = s.range(g);
             let i = r.start + crate::reorder::gap(&s.headers[r.clone()], y);
             (!r.is_empty()).then(|| ((s.headers[i] - y).abs(), i))
         };
-        let mut best = nearest(&self.slots, from).map(|(dist, i)| (dist, i, from, None));
-        if cross {
-            let to = from.other();
-            let mut counts = [self.slots.split, n - self.slots.split];
+        let same = if from == Group::Scratch {
+            let i = self
+                .wanted
+                .iter()
+                .position(|w| w.key == key)
+                .unwrap_or(own.start);
+            // No reordering within the scratch group.
+            Some((f64::INFINITY, i))
+        } else {
+            nearest(&self.slots, from)
+        };
+        let mut best = same.map(|(dist, i)| (dist, i, from, None));
+        // Scratch keeps its original slot unless dragged into the app or
+        // global region. Split the space above scratch at the midpoint
+        // between the two groups (or reserve room for an empty group).
+        let scratch_target = if from == Group::Scratch {
+            let above_scratch = |g: Group| {
+                let r = self.slots.range(g);
+                let next = self.slots.headers[r.end];
+                if r.is_empty() {
+                    next - half * SHINGLE
+                } else {
+                    (self.slots.headers[r.end - 1] + next) / 2.0
+                }
+            };
+            let app_end = above_scratch(Group::Window);
+            let global_end = if self.slots.range(Group::Window).is_empty() {
+                let global = self.slots.range(Group::Global);
+                if global.is_empty() {
+                    app_end - half * SHINGLE
+                } else {
+                    (self.slots.headers[global.end - 1] + app_end) / 2.0
+                }
+            } else {
+                above_scratch(Group::Global)
+            };
+            if y <= global_end {
+                Some(Group::Global)
+            } else if y <= app_end {
+                Some(Group::Window)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        for &to in from
+            .destinations()
+            .iter()
+            .filter(|&&to| cross && (from != Group::Scratch || scratch_target == Some(to)))
+        {
+            let mut counts = self.counts();
             counts[from as usize] -= 1;
             counts[to as usize] += 1;
             let s = slots(counts, self.length, &m);
@@ -877,7 +973,7 @@ impl Deck {
     pub fn drag_end(&mut self) -> Option<Landing> {
         let d = self.drag.take()?;
         self.retarget();
-        let start = d.group.range(d.slots.split, d.slots.headers.len()).start;
+        let start = d.slots.range(d.group).start;
         Some(Landing {
             key: d.key,
             group: d.group,
@@ -1789,7 +1885,7 @@ mod tests {
     #[test]
     fn groups_are_apart_and_centered_together() {
         let s = slots([2, 2], 1000.0, &M);
-        assert_eq!(s.split, 2);
+        assert_eq!(s.range(Group::Window), 2..4);
         // 28px markers 8px apart, 8px more between the groups, and the
         // whole centered.
         assert_eq!(s.markers, [442.0, 478.0, 522.0, 558.0]);
@@ -1815,6 +1911,57 @@ mod tests {
             assert_eq!(alone.between, [0.0, 0.0]);
         }
         assert!(slots([0, 0], 1000.0, &M).markers.is_empty());
+    }
+
+    #[test]
+    fn arbitrary_group_counts_skip_empty_groups() {
+        let s = slots([1, 0, 1, 1, 0, 1], 1000.0, &M);
+        assert_eq!(s.markers, [434.0, 478.0, 522.0, 566.0]);
+        assert_eq!(s.ranges, [0..1, 1..1, 1..2, 2..3, 3..3, 3..4]);
+        assert!(
+            s.headers
+                .windows(2)
+                .all(|pair| close(pair[1] - pair[0], 70.0 * (1.0 + 8.0 / 36.0)))
+        );
+    }
+
+    #[test]
+    fn scratch_can_land_in_app_or_global_and_reuses_its_card() {
+        let mut d = grouped_deck(false);
+        let scratch = |key| Item {
+            group: Group::Scratch,
+            cross: true,
+            ..item(key)
+        };
+        let mut g = item("g1");
+        g.cross = true;
+        d.set(vec![g.clone(), win("app"), scratch("s1"), scratch("s2")]);
+        settle(&mut d);
+        assert_eq!(keys(&d), ["g1", "app", "s1", "s2"]);
+        assert_eq!(d.backdrops()[2].alpha.value, 1.0);
+        d.point(On::Strip);
+        settle(&mut d);
+        let y = |d: &Deck, key| card(d, key).y.value;
+        assert!(d.drag_start("s2", y(&d, "s2")));
+        d.drag_to(y(&d, "s1"));
+        let stay = d.drag_end().unwrap();
+        assert_eq!((stay.group, stay.gap), (Group::Scratch, 1));
+        assert!(d.drag_start("s2", y(&d, "s2")));
+        d.drag_to(y(&d, "app"));
+        let app = d.drag_end().unwrap();
+        assert_eq!((app.group, app.moved), (Group::Window, true));
+        assert!(d.drag_start("s2", y(&d, "s2")));
+        d.drag_to(y(&d, "g1"));
+        assert_eq!(d.drag_end().unwrap().group, Group::Global);
+        assert!(d.drag_start("g1", y(&d, "g1")));
+        d.drag_to(y(&d, "s2"));
+        assert_ne!(d.drag_end().unwrap().group, Group::Scratch);
+        let before = y(&d, "s2");
+        d.rename("s2", "kept");
+        d.set(vec![g, item("kept"), win("app"), scratch("s1")]);
+        assert_eq!(y(&d, "kept"), before);
+        settle(&mut d);
+        assert_eq!(keys(&d), ["g1", "kept", "app", "s1"]);
     }
 
     #[test]
@@ -1863,7 +2010,8 @@ mod tests {
     #[test]
     fn backdrops_follow_their_groups() {
         let mut d = grouped_deck(false);
-        let [g, w] = *d.backdrops();
+        let [g, w, scratch] = *d.backdrops();
+        assert_eq!(scratch.alpha.value, 0.0);
         assert_eq!(
             (g.top.value, g.bottom.value, g.alpha.value),
             (428.0, 492.0, 1.0)
@@ -1878,7 +2026,7 @@ mod tests {
         assert!(d.backdrops().iter().all(|b| b.alpha.value == 0.0));
         d.hide_due();
         settle(&mut d);
-        assert!(d.backdrops().iter().all(|b| b.alpha.value == 1.0));
+        assert!(d.backdrops()[..2].iter().all(|b| b.alpha.value == 1.0));
         // Notes coming stretch it.
         d.set(vec![
             item("g1"),
@@ -1917,7 +2065,7 @@ mod tests {
         d.set(grouped(false));
         d.point(On::Strip);
         settle(&mut d);
-        assert!(d.backdrops().iter().all(|b| b.alpha.value == 1.0));
+        assert!(d.backdrops()[..2].iter().all(|b| b.alpha.value == 1.0));
     }
 
     #[test]

@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 
 /// Sticky notes along a screen edge, belonging to apps: the notes shown
 /// follow the focused window. Start it with the compositor. `new`,
-/// `focus` and `show --focus` ask the running wl-note; the others only
-/// read and change the files, so they work without it.
+/// `keep`, `focus` and `show --focus` ask the running wl-note; the other
+/// commands work directly with the files.
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Options {
@@ -39,6 +39,9 @@ pub enum Cmd {
         /// As a JSON array
         #[arg(long)]
         json: bool,
+        /// List only window scratch notes
+        #[arg(long, conflicts_with_all = ["app", "title", "hidden", "all"])]
+        scratch: bool,
     },
     /// Print the notes directory
     Path,
@@ -48,6 +51,9 @@ pub enum Cmd {
         /// Shown everywhere, not only for the focused app
         #[arg(long)]
         global: bool,
+        /// Scratch note for the focused window, not its app
+        #[arg(long, conflicts_with = "global")]
+        window: bool,
         /// A preset (yellow, orange, pink, purple, blue, green, gray,
         /// white) or #rrggbb
         #[arg(long, value_name = "COLOR")]
@@ -57,6 +63,11 @@ pub enum Cmd {
         /// The note's text; - reads it from stdin
         #[arg(long, value_name = "TEXT")]
         text: Option<String>,
+    },
+    /// Keep a scratch note as an app note (asks the running wl-note)
+    Keep {
+        #[arg(value_name = "NOTE")]
+        note: String,
     },
     /// Focus a note (a path, file name or title), showing it again if it
     /// is hidden; without one, the first note shown, or tuck the focused
@@ -127,6 +138,7 @@ mod tests {
                 title: None,
                 hidden: false,
                 all: false,
+                scratch: false,
                 json: false
             })
         );
@@ -138,6 +150,7 @@ mod tests {
                 title: Some("x y".into()),
                 hidden: false,
                 all: true,
+                scratch: false,
                 json: true
             })
         );
@@ -153,6 +166,7 @@ mod tests {
             o.command,
             Some(Cmd::New {
                 global: true,
+                window: false,
                 color: Some("pink".into()),
                 title: None,
                 text: Some("-".into()),
@@ -168,6 +182,30 @@ mod tests {
             })
         );
         assert!(parse(&["focus", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn scratch_commands() {
+        assert!(matches!(
+            parse(&["new", "--window"]).unwrap().command,
+            Some(Cmd::New { window: true, .. })
+        ));
+        assert!(parse(&["new", "--global", "--window"]).is_err());
+        assert!(matches!(
+            parse(&["list", "--scratch", "--json"]).unwrap().command,
+            Some(Cmd::List {
+                scratch: true,
+                json: true,
+                ..
+            })
+        ));
+        assert!(parse(&["list", "--scratch", "--app", "foot"]).is_err());
+        assert_eq!(
+            parse(&["keep", "terminal/scratch.md"]).unwrap().command,
+            Some(Cmd::Keep {
+                note: "terminal/scratch.md".into()
+            })
+        );
     }
 
     #[test]

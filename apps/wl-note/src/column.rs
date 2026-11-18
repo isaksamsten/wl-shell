@@ -282,6 +282,8 @@ pub enum Pin {
     Unpinned(String),
     /// Pinned; unpinning leaves it global.
     Pinned { global_after: bool },
+    /// Promote a scratch note to an ordinary note.
+    Keep,
 }
 
 /// A file on a note.
@@ -311,6 +313,7 @@ struct NoteView {
     pin: Pin,
     color: Color,
     paper: u32,
+    scratch: bool,
 }
 
 /// What a pointer event or a key asks of the program.
@@ -334,7 +337,11 @@ pub enum Act {
     /// Open this note in the editor.
     Edit(String),
     /// Make a new note.
-    New,
+    New(bool),
+    /// Keep as an app note (optionally matching its title).
+    Keep(String, bool),
+    /// Keep at this gap in the app or global group.
+    KeepAt(String, Group, Vec<String>, usize),
     /// Open this file.
     File(PathBuf),
     /// Pin this note to the context's app (or, with true, its window).
@@ -460,6 +467,7 @@ struct FilePress {
 /// data (or a copy) arrives. Only reuse the offset in the same text.
 pub enum FileTarget {
     New,
+    NewScratch,
     Note {
         key: String,
         editor: Option<(usize, String)>,
@@ -506,7 +514,7 @@ pub struct Column {
     slots: Vec<Slot>,
     plus: Sub,
     /// Each group's backdrop, by `Group`: its top, middle and bottom.
-    backdrops: [[Sub; 3]; 2],
+    backdrops: [[Sub; 3]; Group::ALL.len()],
     /// The backdrops' buffer: a rounded rect cut in three, and what it
     /// was drawn for (scale, color, width, radius).
     backdrop_shown: Option<((i32, u32, i32, i32), WlBuffer)>,
@@ -697,7 +705,7 @@ impl Column {
         let parent = layer.wl_surface().clone();
         let sub = || Sub::new(&g, &parent, &no_input, &qh);
         let (plus, text, title, notice) = (sub(), sub(), sub(), sub());
-        let backdrops = [[sub(), sub(), sub()], [sub(), sub(), sub()]];
+        let backdrops = std::array::from_fn(|_| std::array::from_fn(|_| sub()));
         let open_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let reveal_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let deck = Deck::new(style.metrics, style.response);
@@ -894,6 +902,7 @@ impl Column {
                     pin: n.pin.clone(),
                     color: n.color,
                     paper: n.item.look.color,
+                    scratch: n.item.group == Group::Scratch,
                 };
                 (n.item.key.clone(), view)
             })
@@ -919,6 +928,20 @@ impl Column {
         }
         self.body_dirty = true;
         self.kick();
+    }
+
+    pub fn rename_note(&mut self, from: &str, to: &str) {
+        self.deck.rename(from, to);
+        if let Some(view) = self.notes.remove(from) {
+            self.notes.insert(to.to_owned(), view);
+        }
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.key == from) {
+            to.clone_into(&mut slot.key);
+        }
+        if let Some(d) = self.draft.as_mut().filter(|d| d.key == from) {
+            to.clone_into(&mut d.key);
+        }
+        self.body_dirty = true;
     }
 
     /// A sheet arrived: show it.
@@ -1433,7 +1456,19 @@ impl Column {
             return None;
         }
         let key = match self.on_at(x, y) {
+            On::Margin(key) if self.notes.get(&key).is_some_and(|n| n.scratch) => {
+                return Some(FileTarget::NewScratch);
+            }
+            On::Sheet(key)
+                if self.notes.get(&key).is_some_and(|n| n.scratch)
+                    && self
+                        .face(&key)
+                        .is_some_and(|face| self.margin_rect(face).contains(x, y)) =>
+            {
+                return Some(FileTarget::NewScratch);
+            }
             On::Sheet(key) | On::Margin(key) => key,
+            On::Strip if self.deck.over_scratch(y) => return Some(FileTarget::NewScratch),
             On::Plus | On::Strip => return Some(FileTarget::New),
             On::Outside => return None,
         };
@@ -1614,6 +1649,7 @@ impl Column {
             (false, false) => vec![Act::Open(p.key)],
             (false, true) => self.revealed_click(p.key, p.x, p.y).into_iter().collect(),
             (true, _) => match self.deck.drag_end() {
+                Some(l) if l.group == Group::Scratch => Vec::new(),
                 Some(l) => {
                     // The slot is among the notes of the group it lands
                     // in, which the order is changed among.
@@ -1621,14 +1657,19 @@ impl Column {
                         .filter(|c| !c.leaving && c.group == l.group)
                         .map(|c| c.key.clone())
                         .collect();
-                    let mut acts = vec![Act::Reorder(l.key.clone(), keys, l.gap)];
-                    if l.moved {
-                        acts.push(match l.group {
-                            Group::Window => Act::Pin(l.key, false),
-                            Group::Global => Act::Unpin(l.key),
-                        });
+                    if self.notes.get(&l.key).is_some_and(|n| n.scratch) {
+                        vec![Act::KeepAt(l.key, l.group, keys, l.gap)]
+                    } else {
+                        let mut acts = vec![Act::Reorder(l.key.clone(), keys, l.gap)];
+                        if l.moved {
+                            acts.push(match l.group {
+                                Group::Window => Act::Pin(l.key, false),
+                                Group::Global => Act::Unpin(l.key),
+                                Group::Scratch => unreachable!(),
+                            });
+                        }
+                        acts
                     }
-                    acts
                 }
                 None => Vec::new(),
             },
@@ -1697,7 +1738,7 @@ impl Column {
             return acts;
         }
         match on {
-            On::Plus => acts.push(Act::New),
+            On::Plus => acts.push(Act::New(mods.shift)),
             // Opened on release, unless it is dragged.
             On::Margin(k) => {
                 self.cancel_reveal(core);
@@ -1881,6 +1922,7 @@ impl Column {
             BarHit::Pin => match &note.pin {
                 Pin::Unpinned(_) => Some(Act::Pin(key.to_string(), shift)),
                 Pin::Pinned { .. } => Some(Act::Unpin(key.to_string())),
+                Pin::Keep => Some(Act::Keep(key.to_string(), shift)),
                 Pin::None | Pin::Locked => None,
             },
         }
@@ -2714,7 +2756,7 @@ impl Column {
         let rect = |x| Rect::new(x, mid - size / 2.0, size, size);
         let slot = |i: usize| rect(bar.x + i as f64 * pitch);
         let control = |i: usize| open.then(|| rect(bar.right() - size - i as f64 * pitch));
-        let color = control(3);
+        let color = control(if note.scratch { 2 } else { 3 });
         let file_end = color.map_or(bar.right(), |r| r.x - (pitch - size));
         let (n, more) = bar::fit(note.files.len(), file_end - bar.x, size, pitch - size);
         let grid = self.showing_files(key);
@@ -2742,8 +2784,8 @@ impl Column {
                 more.map(|count| (count, slot(n)))
             },
             pin: control(0),
-            archive: control(1),
-            trash: control(2),
+            archive: if note.scratch { None } else { control(1) },
+            trash: control(if note.scratch { 1 } else { 2 }),
             color,
             swatches,
             hit_pad: (pitch - size) / 2.0,
@@ -3359,6 +3401,7 @@ impl Column {
                 Pin::Pinned { .. } => (self.pin_icon(lit), None, 1.0),
                 Pin::Unpinned(_) if lit => (self.pin_icon(false), None, 1.0),
                 Pin::Unpinned(_) => (self.pin_icon(false), Some(ink), 0.75),
+                Pin::Keep => (self.pin_icon(false), (!lit).then_some(ink), 1.0),
                 Pin::None | Pin::Locked => (self.pin_icon(false), Some(ink), 0.3),
             };
             plan.pin = Some((self.icon_buffer(&icon, tint), rect, a));
@@ -3559,6 +3602,7 @@ fn pin_label(pin: &Pin) -> String {
     match pin {
         Pin::None => "No window to pin to".into(),
         Pin::Locked => "The frontmatter doesn't parse".into(),
+        Pin::Keep => "Keep as app note (⇧: match window title)".into(),
         Pin::Unpinned(app) => format!("Pin to {app} (⇧: this window)"),
         Pin::Pinned { global_after: true } => "Unpin (show everywhere)".into(),
         Pin::Pinned {

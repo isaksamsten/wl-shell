@@ -141,7 +141,7 @@ pub fn json(notes: &[Listed]) -> String {
 }
 
 /// A JSON string.
-fn string(s: &str) -> String {
+pub(crate) fn string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

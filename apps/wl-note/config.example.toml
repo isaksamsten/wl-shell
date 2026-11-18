@@ -16,7 +16,7 @@ edge-band = 2                      # 0: only markers bring out headers
 reserve-edge-band = false
 header = 28                        # Pixels out from the edge
 header-length = 96                 # Pixels along the edge when hovered
-group-gap = 8                      # Pixels between global and window notes
+group-gap = 8                      # Pixels between nonempty note groups
 group-backdrop-headers = false     # Keep the group backdrops when hovered
 reveal-delay = 120                 # Milliseconds
 hide-delay = 400
@@ -38,6 +38,10 @@ command = "xdg-open {path}"         # External editor (Ctrl+E)
 [files]
 open-command = "xdg-open {path}"
 trash-command = "gio trash -- {paths}"
+
+[scratch]
+color = "white"                    # Shift+click + or run wl-note new --window
+on-close = "trash"                 # trash, delete, or keep as an app note
 
 [integration]
 settle = 120                       # Milliseconds before notes follow focus

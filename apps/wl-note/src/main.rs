@@ -18,6 +18,7 @@ mod markdown;
 mod options;
 mod papers;
 mod reorder;
+mod scratch;
 mod title;
 
 use std::io::Read;
@@ -55,12 +56,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// The subcommands: `new`, `focus` and `show --focus` ask the running
-/// wl-note; the others only read the notes and change the state files.
+/// `new`, `keep`, `focus` and `show --focus` ask the running wl-note.
+/// Other commands only read or change files.
 fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
     match cmd {
         Cmd::New {
             global,
+            window,
             color,
             title,
             text,
@@ -82,6 +84,7 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
             };
             let req = NoteRequest::New(NewNote {
                 global: *global,
+                window: *window,
                 color: color.clone(),
                 title: title.clone(),
                 text,
@@ -91,6 +94,29 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         Cmd::Focus { note } => {
             let req = NoteRequest::Focus(note.clone());
             return wl_shell_daemon::client_to(&req, MISSING);
+        }
+        Cmd::Keep { note } => {
+            return wl_shell_daemon::client_to(&NoteRequest::Keep(note.clone()), MISSING);
+        }
+        Cmd::List {
+            scratch: true,
+            json,
+            ..
+        } => {
+            if let Some(dir) = state::dir()
+                .map(|dir| dir.join("scratch"))
+                .filter(|dir| dir.exists())
+            {
+                let (index, errors) = Index::load(dir);
+                for e in errors {
+                    warn!("{e}");
+                }
+                let windows = wl_shell_core::list::toplevels().unwrap_or_default();
+                print!("{}", scratch::listing(&index, *json, &windows));
+            } else if *json {
+                println!("[]");
+            }
+            return ExitCode::SUCCESS;
         }
         _ => {}
     }
@@ -119,13 +145,16 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         warn!("{e}");
     }
     let result = match cmd {
-        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Path => unreachable!("done above"),
+        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Keep { .. } | Cmd::Path => {
+            unreachable!("done above")
+        }
         Cmd::List {
             app,
             title,
             hidden,
             all,
             json,
+            ..
         } => {
             let window = (app.is_some() || title.is_some()).then(|| {
                 Window::new(

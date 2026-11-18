@@ -32,6 +32,7 @@ pub struct Config {
     pub sheet: SheetConfig,
     pub editor: EditorConfig,
     pub files: FilesConfig,
+    pub scratch: ScratchConfig,
     pub integration: IntegrationConfig,
     pub appearance: wl_shell_config::Appearance<Theme>,
 }
@@ -47,10 +48,37 @@ impl Default for Config {
             sheet: SheetConfig::default(),
             editor: EditorConfig::default(),
             files: FilesConfig::default(),
+            scratch: ScratchConfig::default(),
             integration: IntegrationConfig::default(),
             appearance: wl_shell_config::Appearance::default(),
         }
     }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ScratchConfig {
+    #[serde(deserialize_with = "color_name")]
+    pub color: Color,
+    pub on_close: OnClose,
+}
+
+impl Default for ScratchConfig {
+    fn default() -> Self {
+        Self {
+            color: Color::Preset("white"),
+            on_close: OnClose::Trash,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnClose {
+    #[default]
+    Trash,
+    Delete,
+    Keep,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -497,6 +525,19 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.edge, Edge::Right);
         assert_eq!(c.sheet.default_color, Color::Preset("yellow"));
+    }
+
+    #[test]
+    fn scratch_settings() {
+        let defaults = parse("").unwrap().scratch;
+        assert_eq!(defaults.color, Color::Preset("white"));
+        assert_eq!(defaults.on_close, OnClose::Trash);
+        let settings = parse("[scratch]\ncolor = 'blue'\non-close = 'keep'")
+            .unwrap()
+            .scratch;
+        assert_eq!(settings.color, Color::Preset("blue"));
+        assert_eq!(settings.on_close, OnClose::Keep);
+        assert!(parse("[scratch]\non-close = 'invalid'").is_err());
     }
 
     #[test]

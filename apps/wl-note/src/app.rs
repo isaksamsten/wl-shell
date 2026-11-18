@@ -61,19 +61,19 @@ use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Incoming, Listener, Reply};
 use wl_shell_log::warn;
-use wl_shell_notes::{Index, Note, State, Window, state};
+use wl_shell_notes::{Index, Note, State, Window, index::Entry, state};
 use wl_shell_render::text::Text;
 use wl_shell_render::worker::{Assets, Done};
 
 use crate::column::{Act, Column, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
-use crate::config::Config;
+use crate::config::{Config, OnClose};
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Group, Item, Look};
 use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
-use crate::{bar, create, files, find, list, reorder};
+use crate::{bar, create, files, find, list, reorder, scratch};
 
 /// Windows whose output is remembered at most: the stream may report
 /// windows the toplevel list never announces, so not all are forgotten.
@@ -101,6 +101,7 @@ struct FileDrop {
     dir: PathBuf,
     target: FileTarget,
     app: Option<String>,
+    window: Option<Ctx>,
 }
 
 pub struct WlNote {
@@ -111,6 +112,12 @@ pub struct WlNote {
     /// The config file was touched since it was last read.
     config_touched: bool,
     index: Index,
+    scratch: Option<Index>,
+    scratch_touched: bool,
+    /// Closed window directories and their last live metadata, if seen.
+    scratch_closed: HashMap<String, Option<Window>>,
+    /// The settled context may still refer to a just-closed window.
+    scratch_dead_context: Option<String>,
     /// Something in the notes directory changed since the last scan.
     notes_touched: bool,
     /// The notes directory's watch.
@@ -170,6 +177,10 @@ impl WlNote {
         let config = reloader.config().clone();
         Ok(Self {
             index: Index::new(config.notes_dir()),
+            scratch: None,
+            scratch_touched: false,
+            scratch_closed: HashMap::new(),
+            scratch_dead_context: None,
             config,
             reloader,
             config_touched: false,
@@ -220,6 +231,7 @@ impl WlNote {
         self.watch_config(core);
         self.open_state(core);
         self.open_notes(core);
+        self.open_scratch(core);
         self.use_stream(core);
         self.use_output_stream(core);
         // The first context shows at once.
@@ -382,6 +394,139 @@ impl WlNote {
         self.rescan(core);
     }
 
+    fn open_scratch(&mut self, core: &Core<Self>) {
+        let Some(root) = self.state_dir.as_ref().map(|p| p.join("scratch")) else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            return warn!("{}: {e}", root.display());
+        }
+        match wl_shell_config::watch_tree(&core.loop_handle, &root, |shell: &mut Shell<Self>, _| {
+            shell.program.scratch_touched = true;
+        }) {
+            Ok(_) => {}
+            Err(e) => warn!("not watching {}: {e}", root.display()),
+        }
+        // Shell::connect completed the initial toplevel roundtrips before started().
+        let live = core
+            .toplevels()
+            .into_iter()
+            .filter(|(_, t)| !t.identifier.is_empty())
+            .map(|(_, t)| scratch::directory(&t.identifier))
+            .collect();
+        match scratch::orphans(&root, &live) {
+            Ok(gone) => self
+                .scratch_closed
+                .extend(gone.into_iter().map(|dir| (dir, None))),
+            Err(e) => warn!("{}: {e}", root.display()),
+        }
+        self.scratch = Some(Index::new(root));
+        self.scratch_touched = true;
+    }
+
+    fn scan_scratch(&mut self) {
+        if !std::mem::take(&mut self.scratch_touched) {
+            return;
+        }
+        let Some(index) = &mut self.scratch else {
+            return;
+        };
+        let changes = index.scan();
+        for e in &changes.errors {
+            warn!("{e}");
+        }
+        if !changes.is_empty() {
+            self.dirty = true;
+            self.observe_drafts();
+        }
+    }
+
+    fn scratch_rel<'a>(&self, key: &'a Path) -> Option<&'a Path> {
+        let rel = key.strip_prefix(self.scratch.as_ref()?.dir()).ok()?;
+        scratch::owner(rel)?;
+        Some(rel)
+    }
+
+    fn entry(&self, key: &Path) -> Option<&Entry> {
+        if let Some(rel) = self.scratch_rel(key) {
+            self.scratch.as_ref()?.get(rel)
+        } else {
+            self.index.get(key)
+        }
+    }
+
+    fn scratch_context(&self) -> Option<&Ctx> {
+        self.context
+            .value()
+            .as_ref()
+            .filter(|c| !c.id.is_empty() && self.scratch_dead_context.as_ref() != Some(&c.id))
+    }
+
+    fn touch_note(&mut self, path: &Path) {
+        if self.scratch_rel(path).is_some() {
+            self.scratch_touched = true;
+        } else {
+            self.notes_touched = true;
+        }
+    }
+
+    /// Process a closed window once, except for sheets and drafts still in use.
+    fn retire_scratch(&mut self, core: &mut Core<Self>) {
+        let Some(index) = &self.scratch else {
+            return;
+        };
+        let root = index.dir().to_path_buf();
+        let closed: Vec<_> = self.scratch_closed.keys().cloned().collect();
+        for dir in closed {
+            let paths: Vec<_> = scratch::notes(self.scratch.as_ref().unwrap(), &dir)
+                .map(|p| root.join(p))
+                .collect();
+            let mut deferred = false;
+            for path in paths {
+                let key = path.to_string_lossy();
+                if self
+                    .columns
+                    .iter()
+                    .any(|c| c.open_key() == Some(&key) || c.dragged_file_note() == Some(&key))
+                    || self.detached_drafts.contains_key(&path)
+                {
+                    deferred = true;
+                    continue;
+                }
+                if self.trash_pending.contains(&path) {
+                    continue;
+                }
+                let result = match read_note(&path) {
+                    Ok(None) => continue,
+                    Ok(Some(text)) => {
+                        let note = Note::parse(text);
+                        match scratch::disposition(self.config.scratch.on_close, &note) {
+                            OnClose::Delete => {
+                                std::fs::remove_file(&path).map_err(|e| e.to_string())
+                            }
+                            OnClose::Trash => {
+                                self.trash_note(core, &key);
+                                Ok(())
+                            }
+                            OnClose::Keep => {
+                                self.keep_scratch(core, &key, false, false).map(|_| ())
+                            }
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = result {
+                    warn!("{}: {e}", path.display());
+                }
+                self.scratch_touched = true;
+            }
+            if !deferred {
+                self.scratch_closed.remove(&dir);
+                scratch::remove_empty(&root.join(&dir));
+            }
+        }
+    }
+
     /// Something changed in the notes directory: rescan, and follow the
     /// renames of notes and directories (not those to other names, such
     /// as an editor's backup copy).
@@ -515,6 +660,7 @@ impl WlNote {
         // The state first, so renames follow what is on disk.
         self.reload_state();
         self.rescan(core);
+        self.scan_scratch();
         self.serve(core);
         // A note kept open goes once it is closed, and the column may
         // follow the focus again.
@@ -526,6 +672,8 @@ impl WlNote {
         if !core.dnd.dragging() {
             self.release_file_drag(core);
         }
+        self.retire_scratch(core);
+        self.scan_scratch();
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_columns(core);
         }
@@ -614,6 +762,7 @@ impl WlNote {
             Proposal::Same => self.cancel_settle(core),
             Proposal::Changed => {
                 self.cancel_settle(core);
+                self.scratch_dead_context = None;
                 self.dirty = true;
                 self.outputs_dirty = true;
             }
@@ -782,9 +931,14 @@ impl WlNote {
         window: Option<&Window>,
         fallback: Option<&Note>,
     ) -> Option<Shown> {
-        let note = self.index.get(path).map(|e| &e.note).or(fallback)?;
+        let note = self.entry(path).map(|e| &e.note).or(fallback)?;
         let key = path.to_string_lossy().into_owned();
-        let color = note.meta.color.as_ref();
+        let scratch = self.scratch_rel(path).is_some();
+        let color = note
+            .meta
+            .color
+            .as_ref()
+            .or_else(|| scratch.then_some(&self.config.scratch.color));
         let look = Look {
             color: self.config.paper_color(color),
             tilt: deck::tilt(&key, self.config.sheet.tilt),
@@ -796,17 +950,27 @@ impl WlNote {
                 path,
             })
             .collect();
-        let pin = pin_state(note, window);
-        let group = match note.global() {
-            true => Group::Global,
-            false => Group::Window,
+        let (group, pin, cross) = if scratch {
+            let valid = note.error.is_none();
+            (
+                Group::Scratch,
+                if valid { Pin::Keep } else { Pin::Locked },
+                valid,
+            )
+        } else {
+            let pin = pin_state(note, window);
+            let group = if note.global() {
+                Group::Global
+            } else {
+                Group::Window
+            };
+            let cross = matches!(
+                (group, &pin),
+                (Group::Global, Pin::Unpinned(_))
+                    | (Group::Window, Pin::Pinned { global_after: true })
+            );
+            (group, pin, cross)
         };
-        // Dragged into the other group, it is pinned to the window, or
-        // unpinned and global.
-        let cross = matches!(
-            (group, &pin),
-            (Group::Global, Pin::Unpinned(_)) | (Group::Window, Pin::Pinned { global_after: true })
-        );
         Some(Shown {
             item: Item {
                 key,
@@ -827,9 +991,14 @@ impl WlNote {
     fn show_notes(&mut self) {
         let window = self.window().cloned();
         let window = window.as_ref();
-        let paths: Vec<PathBuf> = (self.state.shown(&self.index, window).into_iter())
+        let mut paths: Vec<PathBuf> = (self.state.shown(&self.index, window).into_iter())
             .map(Path::to_path_buf)
             .collect();
+        if let (Some(index), Some(c)) = (&self.scratch, self.scratch_context()) {
+            paths.extend(
+                scratch::notes(index, &scratch::directory(&c.id)).map(|p| index.dir().join(p)),
+            );
+        }
         let mut lists: Vec<Option<Vec<Shown>>> = Vec::new();
         for column in &self.columns {
             if column.retiring {
@@ -843,7 +1012,7 @@ impl WlNote {
             {
                 let path = PathBuf::from(key);
                 if !mine.contains(&path)
-                    && ((self.index.get(&path).is_some() && !self.state.is_hidden(&path))
+                    && ((self.entry(&path).is_some() && !self.state.is_hidden(&path))
                         || column
                             .draft
                             .as_ref()
@@ -948,9 +1117,26 @@ impl WlNote {
                 self.save_draft(i, false);
                 self.edit(core, &key);
             }
-            Act::New => {
-                if let Err(e) = self.new_note(core, NewNote::default()) {
+            Act::New(window) => {
+                if let Err(e) = self.new_note(
+                    core,
+                    NewNote {
+                        window,
+                        ..NewNote::default()
+                    },
+                ) {
                     warn!("{e}");
+                }
+            }
+            Act::Keep(key, exact) => {
+                if let Err(e) = self.keep_scratch(core, &key, exact, false) {
+                    warn!("{e}");
+                }
+            }
+            Act::KeepAt(key, group, shown, gap) => {
+                match self.keep_scratch(core, &key, false, group == Group::Global) {
+                    Ok(key) => self.reorder(&key, &shown, gap),
+                    Err(e) => warn!("{e}"),
                 }
             }
             Act::Title(key, title) => self.edit_note(&key, |note| match title.trim() {
@@ -1052,7 +1238,7 @@ impl WlNote {
         {
             return;
         }
-        if self.index.get(Path::new(key)).is_none() {
+        if self.entry(Path::new(key)).is_none() {
             return;
         }
         let path = self.path(key);
@@ -1076,7 +1262,12 @@ impl WlNote {
                         warn!("files.trash-command: {}: {e}", tracked.display());
                     }
                     let app = &mut shell.program;
-                    app.notes_touched = true;
+                    app.touch_note(&tracked);
+                    if app.scratch_rel(&tracked).is_some()
+                        && let Some(dir) = tracked.parent()
+                    {
+                        scratch::remove_empty(dir);
+                    }
                     app.rescan(&mut shell.core);
                     app.trash_pending.remove(&tracked);
                 }
@@ -1184,7 +1375,7 @@ impl WlNote {
         match result {
             Ok(SaveBody::Unchanged) => true,
             Ok(SaveBody::Written) => {
-                self.notes_touched = true;
+                self.touch_note(&path);
                 true
             }
             Ok(SaveBody::Conflict) => false,
@@ -1212,7 +1403,7 @@ impl WlNote {
                 return;
             }
         }
-        self.notes_touched = true;
+        self.touch_note(&path);
         self.dirty = true;
         self.columns[i].draft_changed();
     }
@@ -1259,7 +1450,7 @@ impl WlNote {
         }
         match wl_shell_notes::write_atomic(&path, note.text()) {
             Ok(()) => {
-                self.notes_touched = true;
+                self.touch_note(&path);
                 self.observe_drafts();
             }
             Err(e) => warn!("{}: {e}", path.display()),
@@ -1269,7 +1460,7 @@ impl WlNote {
     /// Check or uncheck the n-th checkbox of `key`, in its file.
     fn toggle_task(&mut self, key: &str, n: usize) {
         let rel = Path::new(key);
-        let Some(entry) = self.index.get(rel) else {
+        let Some(entry) = self.entry(rel) else {
             return;
         };
         let content = Content::of_note(&entry.note, &list::name(rel));
@@ -1301,7 +1492,7 @@ impl WlNote {
 
     /// Open the n-th link of `key` with `files.open-command`.
     fn open_link(&self, core: &Core<Self>, key: &str, n: usize) {
-        let Some(entry) = self.index.get(Path::new(key)) else {
+        let Some(entry) = self.entry(Path::new(key)) else {
             return;
         };
         let content = Content::of_note(&entry.note, "");
@@ -1345,6 +1536,18 @@ impl WlNote {
     /// there is no context), written at once, put at the end of the
     /// order, and opened in the built-in editor.
     fn new_note(&mut self, core: &mut Core<Self>, new: NewNote) -> Result<(), String> {
+        if new.window {
+            if new.global {
+                return Err("--window conflicts with --global".into());
+            }
+            let ctx = self
+                .scratch_context()
+                .cloned()
+                .ok_or("no window for a scratch note")?;
+            let key = self.write_scratch(&ctx, &new)?;
+            self.focus_note(core, &key);
+            return Ok(());
+        }
         let app = match new.global {
             true => None,
             false => self.window().map(|w| w.app_id.clone()),
@@ -1358,6 +1561,84 @@ impl WlNote {
         let key = self.write_new_note(core, &text)?;
         self.focus_note(core, &key);
         Ok(())
+    }
+
+    fn write_scratch(&mut self, ctx: &Ctx, new: &NewNote) -> Result<String, String> {
+        let index = self
+            .scratch
+            .as_ref()
+            .ok_or("scratch storage is unavailable")?;
+        let color = bar::color_name(self.config.scratch.color);
+        let text = create::text(
+            None,
+            Some(new.color.as_deref().unwrap_or(&color)),
+            new.title.as_deref(),
+            new.text.as_deref(),
+        )?;
+        let path = scratch::create(index.dir(), &ctx.id, &text)?;
+        self.scratch_touched = true;
+        self.scan_scratch();
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    fn keep_scratch(
+        &mut self,
+        core: &mut Core<Self>,
+        key: &str,
+        exact: bool,
+        global: bool,
+    ) -> Result<String, String> {
+        let path = Path::new(key);
+        let rel = self.scratch_rel(path).ok_or("not a scratch note")?;
+        let owner = scratch::owner(rel).unwrap();
+        if self.detached_drafts.contains_key(path) {
+            return Err("reopen the note to resolve its unsaved draft before keeping it".into());
+        }
+        if self.trash_pending.contains(path) {
+            return Err("the note is being trashed".into());
+        }
+        if let Some(i) = self.columns.iter().position(|c| c.open_key() == Some(key))
+            && !self.save_draft(i, false)
+        {
+            return Err("resolve the note's unsaved changes before keeping it".into());
+        }
+        let window = if global {
+            None
+        } else {
+            let window = core
+                .toplevels()
+                .into_iter()
+                .find(|(_, t)| scratch::directory(&t.identifier) == owner)
+                .map(|(_, t)| Window::new(t.app_id, t.title))
+                .or_else(|| self.scratch_closed.get(owner).and_then(Clone::clone))
+                .filter(|w| !w.app_id.is_empty());
+            if window.is_none() {
+                warn!(
+                    "{}: window app unavailable; keeping as a global note",
+                    path.display()
+                );
+            }
+            window
+        };
+        let dest = self.index.dir();
+        let new = scratch::keep(path, dest, window.as_ref().map(|w| (w, exact)))?;
+        let rel = new.strip_prefix(dest).unwrap();
+        let new_key = rel.to_string_lossy().into_owned();
+        if self.state.order.push(rel) {
+            self.save_state(true, false);
+        }
+        for c in &mut self.columns {
+            c.rename_note(key, &new_key);
+        }
+        if let Some(dir) = path.parent() {
+            scratch::remove_empty(dir);
+        }
+        self.scratch_touched = true;
+        self.notes_touched = true;
+        self.rescan(core);
+        self.scan_scratch();
+        self.dirty = true;
+        Ok(new_key)
     }
 
     fn write_new_note(&mut self, core: &mut Core<Self>, text: &str) -> Result<String, String> {
@@ -1465,10 +1746,24 @@ impl WlNote {
             return Err("notes directory changed during drop".into());
         }
         match drop.target {
-            FileTarget::New => {
+            FileTarget::New | FileTarget::NewScratch => {
                 let body = files::append("", &paths, "\n");
-                let text = create::text(drop.app.as_deref(), None, None, Some(&body))?;
-                let key = self.write_new_note(core, &text)?;
+                let key = if matches!(drop.target, FileTarget::NewScratch) {
+                    let ctx = drop.window.ok_or("no window for a scratch note")?;
+                    if !core.toplevels().iter().any(|(_, t)| t.identifier == ctx.id) {
+                        return Err("the scratch window closed during the drop".into());
+                    }
+                    self.write_scratch(
+                        &ctx,
+                        &NewNote {
+                            text: Some(body),
+                            ..NewNote::default()
+                        },
+                    )?
+                } else {
+                    let text = create::text(drop.app.as_deref(), None, None, Some(&body))?;
+                    self.write_new_note(core, &text)?
+                };
                 if let Some(i) = self
                     .column_at(&drop.surface)
                     .filter(|&i| !self.columns[i].retiring)
@@ -1514,7 +1809,7 @@ impl WlNote {
                     text.push_str(&added);
                     wl_shell_notes::write_atomic(&path, &text)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
-                    self.notes_touched = true;
+                    self.touch_note(&path);
                 }
             }
         }
@@ -1536,6 +1831,21 @@ impl WlNote {
                 NoteRequest::Nothing => Err("nothing asked".into()),
                 NoteRequest::New(new) => self.new_note(core, new),
                 NoteRequest::Focus(note) => self.focus_request(core, note.as_deref()),
+                NoteRequest::Keep(query) => (|| {
+                    self.scan_scratch();
+                    let index = self
+                        .scratch
+                        .as_ref()
+                        .ok_or("scratch storage is unavailable")?;
+                    let notes: Vec<_> = index
+                        .iter()
+                        .filter(|(p, _)| scratch::owner(p).is_some())
+                        .map(|(p, e)| (p, e.note.title()))
+                        .collect();
+                    let path = index.dir().join(find::find(index.dir(), &notes, &query)?);
+                    self.keep_scratch(core, &path.to_string_lossy(), false, false)
+                        .map(|_| ())
+                })(),
             };
             client.answer(match result {
                 Ok(()) => Reply::Done,
@@ -1719,6 +2029,7 @@ impl Program for WlNote {
                 dir: self.index.dir().to_path_buf(),
                 target,
                 app: self.window().map(|w| w.app_id.clone()),
+                window: self.scratch_context().cloned(),
             })
         });
         self.leave_file_offer(core);
@@ -1755,6 +2066,22 @@ impl Program for WlNote {
     fn toplevel_closed(&mut self, core: &mut Core<Self>, handle: &ExtForeignToplevelHandleV1) {
         if let Some(t) = core.toplevel(handle) {
             self.window_outputs.remove(&t.identifier);
+            if !t.identifier.is_empty() {
+                if self
+                    .context
+                    .value()
+                    .as_ref()
+                    .is_some_and(|c| c.id == t.identifier)
+                {
+                    self.scratch_dead_context = Some(t.identifier.clone());
+                }
+                self.scratch_closed.insert(
+                    scratch::directory(&t.identifier),
+                    Some(Window::new(t.app_id, t.title)),
+                );
+                self.scratch_touched = true;
+                self.dirty = true;
+            }
         }
         self.update_context(core, Some(handle));
     }
