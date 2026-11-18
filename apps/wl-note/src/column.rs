@@ -2884,12 +2884,13 @@ impl Column {
             if let Some(sheet) = ready {
                 self.slots[i].shown = Some((want, sheet));
             }
-            let Some((p, _)) = &self.slots[i].shown else {
+            let Some((p, sheet)) = &self.slots[i].shown else {
                 self.slots[i].sub.clear();
                 self.slots[i].hit = None;
                 continue;
             };
             let (pw, ph) = (p.w as f64, p.h as f64);
+            let r = sheet.shape.rect;
             // Crumpling, it stays out and shrinks toward the edge instead.
             let o = match crumpling {
                 true => card.out.value,
@@ -2899,13 +2900,21 @@ impl Column {
                 Edge::Right => Rect::new(width - o, card.y.value - ph / 2.0, pw, ph),
                 Edge::Left => Rect::new(o - pw, card.y.value - ph / 2.0, pw, ph),
             };
-            // Cut to its length while it grows or shrinks.
+            // Cut to its length while it grows or shrinks. The cut keeps
+            // the shadow's reach past the paper's ends, so the shadow
+            // grows along with the paper instead of showing once it
+            // settles.
             let len = card.len.value;
             let cut = match len < ph - 0.5 && !crumpling {
-                true => intersect(
-                    surface,
-                    Rect::new(0.0, card.y.value - len / 2.0, width, len),
-                ),
+                true => {
+                    let above = (-r.y as f64).max(0.0);
+                    let below = (r.y as f64 + r.h as f64 - ph).max(0.0);
+                    let top = card.y.value - len / 2.0 - above;
+                    intersect(
+                        surface,
+                        Rect::new(0.0, top, width, len + above + below),
+                    )
+                }
                 false => Some(surface),
             };
             let hit = self.hit_rect(card, ph).filter(|_| card.present());
