@@ -29,7 +29,7 @@
 //!   rest (`Act`): opening and closing notes, toggling a checkbox,
 //!   retitling, pinning and unpinning (written to the file, which inotify
 //!   brings back), hiding and reordering (written to the state), opening a
-//!   link or a file (`open-command`) or the note (`editor-command`), and
+//!   link or a file (`files.open-command`) or the note (`editor.command`), and
 //!   making a note. An open note stays in its column whatever the context
 //!   does, where it was, until it is closed.
 //! - **The socket.** `wl-note new` and `wl-note focus` come over it
@@ -463,9 +463,9 @@ impl WlNote {
 
     /// Run the `mru-event-stream`, if there is one.
     fn use_stream(&mut self, core: &mut Core<Self>) {
-        let command = self.config.mru_event_stream.as_deref();
+        let command = self.config.integration.mru_event_stream.as_deref();
         if command.is_none_or(|c| c.trim().is_empty()) && !self.warned_stream {
-            warn!("no mru-event-stream: only global notes are shown");
+            warn!("no integration.mru-event-stream: only global notes are shown");
             self.warned_stream = true;
         }
         core.use_focus_stream(command);
@@ -474,7 +474,11 @@ impl WlNote {
     /// Run the `output-event-stream`, if there is one and the column
     /// follows the focus.
     fn use_output_stream(&mut self, core: &Core<Self>) {
-        let command = (self.config.output_event_stream.as_deref())
+        let command = self
+            .config
+            .integration
+            .output_event_stream
+            .as_deref()
             .filter(|_| self.config.output.trim() == "focused");
         let handle = core.loop_handle.clone();
         self.output_stream.configure(command, &handle);
@@ -558,7 +562,7 @@ impl WlNote {
             self.remove_columns(core, |_| true);
             self.open_notes(core);
         }
-        if old.mru_event_stream != self.config.mru_event_stream {
+        if old.integration.mru_event_stream != self.config.integration.mru_event_stream {
             self.warned_stream = false;
             self.use_stream(core);
             self.update_context(core, None);
@@ -600,7 +604,7 @@ impl WlNote {
     /// The focus, the windows or a title changed: follow, once settled.
     fn update_context(&mut self, core: &Core<Self>, closed: Option<&ExtForeignToplevelHandleV1>) {
         let candidate = Self::candidate(core, closed);
-        let settle = Duration::from_millis(self.config.settle as u64);
+        let settle = Duration::from_millis(self.config.integration.settle as u64);
         let p = self.context.propose(candidate, Instant::now(), settle);
         self.context_settled(core, p);
     }
@@ -783,7 +787,7 @@ impl WlNote {
         let color = note.meta.color.as_ref();
         let look = Look {
             color: self.config.paper_color(color),
-            tilt: deck::tilt(&key, self.config.tilt),
+            tilt: deck::tilt(&key, self.config.sheet.tilt),
         };
         let content = Content::of_note(note, &list::name(path));
         let files = (bar::files(&content.links).into_iter())
@@ -798,7 +802,7 @@ impl WlNote {
             text: self.config.text_color(color),
             files,
             pin: pin_state(note, window),
-            color: color.copied().unwrap_or(self.config.default_color),
+            color: color.copied().unwrap_or(self.config.sheet.default_color),
         })
     }
 
@@ -1039,9 +1043,9 @@ impl WlNote {
         if self.trash_pending.contains(&path) {
             return;
         }
-        let template = &self.config.trash_command;
+        let template = &self.config.files.trash_command;
         if !spawn::uses(template, "paths") {
-            return warn!("trash-command: expected {{paths}}");
+            return warn!("files.trash-command: expected {{paths}}");
         }
         // Pass the path as a standalone shell argument, including when
         // its filename is not UTF-8.
@@ -1053,7 +1057,7 @@ impl WlNote {
             .insert_source(results, move |event, _, shell| {
                 if let channel::Event::Msg(result) = event {
                     if let Err(e) = result {
-                        warn!("trash-command: {}: {e}", tracked.display());
+                        warn!("files.trash-command: {}: {e}", tracked.display());
                     }
                     let app = &mut shell.program;
                     app.notes_touched = true;
@@ -1063,7 +1067,7 @@ impl WlNote {
             });
         let token = match registered {
             Ok(token) => token,
-            Err(e) => return warn!("trash-command: {e}"),
+            Err(e) => return warn!("files.trash-command: {e}"),
         };
         let target = path.clone();
         let started = std::thread::Builder::new()
@@ -1089,7 +1093,7 @@ impl WlNote {
             }
             Err(e) => {
                 core.loop_handle.remove(token);
-                warn!("trash-command: {e}");
+                warn!("files.trash-command: {e}");
             }
         }
     }
@@ -1130,7 +1134,7 @@ impl WlNote {
         if let Some(token) = self.save_timer.take() {
             core.loop_handle.remove(token);
         }
-        let delay = Duration::from_millis(self.config.save_delay.into());
+        let delay = Duration::from_millis(self.config.editor.save_delay.into());
         if delay.is_zero() {
             self.save_open_drafts();
         } else {
@@ -1266,19 +1270,19 @@ impl WlNote {
         });
     }
 
-    /// Open `target` (a path or URL) with `open-command`.
+    /// Open `target` (a path or URL) with `files.open-command`.
     fn open_path(&self, core: &Core<Self>, target: &str) {
         let command = spawn::fill(
-            &self.config.open_command,
+            &self.config.files.open_command,
             &[("path", &spawn::quote(target))],
         );
-        let output = Output::Prefixed("open-command".into());
+        let output = Output::Prefixed("files.open-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
-            warn!("open-command: {e}");
+            warn!("files.open-command: {e}");
         }
     }
 
-    /// Open the n-th link of `key` with `open-command`.
+    /// Open the n-th link of `key` with `files.open-command`.
     fn open_link(&self, core: &Core<Self>, key: &str, n: usize) {
         let Some(entry) = self.index.get(Path::new(key)) else {
             return;
@@ -1307,16 +1311,16 @@ impl WlNote {
         self.open_path(core, &target);
     }
 
-    /// Open the note `key` with `editor-command`.
+    /// Open the note `key` with `editor.command`.
     fn edit(&self, core: &Core<Self>, key: &str) {
         let path = self.path(key).to_string_lossy().into_owned();
         let command = spawn::fill(
-            &self.config.editor_command,
+            &self.config.editor.command,
             &[("path", &spawn::quote(&path))],
         );
-        let output = Output::Prefixed("editor-command".into());
+        let output = Output::Prefixed("editor.command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
-            warn!("editor-command: {e}");
+            warn!("editor.command: {e}");
         }
     }
 

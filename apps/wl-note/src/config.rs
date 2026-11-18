@@ -4,6 +4,9 @@
 //! `~/.config/wl-note/config.toml`) unless `--config` names a file. A
 //! missing default file means the defaults; every key is optional.
 //!
+//! General settings live at the root; column, sheet, editor, files and
+//! compositor integration settings have their own tables.
+//!
 //! Colors live in `[appearance]`; `[appearance.dark]` and
 //! `[appearance.light]` override its keys in the desktop's dark or light
 //! mode (or the one `mode` forces). Paper stays paper in dark mode: only
@@ -21,15 +24,38 @@ use wl_shell_render::{paper, shadow};
 pub struct Config {
     /// Where the notes are; `~/` expands.
     pub notes_dir: String,
-    /// Prints the ID of each window that gains focus, one per line.
-    pub mru_event_stream: Option<String>,
-    /// `<output> <id>` lines: which output each window is on, for
-    /// `output = "focused"`.
-    pub output_event_stream: Option<String>,
     /// `focused` (the context's output), `all`, or an output's name.
     pub output: String,
     pub edge: Edge,
     pub layer: NoteLayer,
+    pub column: ColumnConfig,
+    pub sheet: SheetConfig,
+    pub editor: EditorConfig,
+    pub files: FilesConfig,
+    pub integration: IntegrationConfig,
+    pub appearance: wl_shell_config::Appearance<Theme>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            notes_dir: "~/Notes/wl-note".into(),
+            output: "focused".into(),
+            edge: Edge::default(),
+            layer: NoteLayer::default(),
+            column: ColumnConfig::default(),
+            sheet: SheetConfig::default(),
+            editor: EditorConfig::default(),
+            files: FilesConfig::default(),
+            integration: IntegrationConfig::default(),
+            appearance: wl_shell_config::Appearance::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ColumnConfig {
     /// How far a note's marker comes out of the edge.
     #[serde(deserialize_with = "marker_width")]
     pub marker_width: u32,
@@ -56,65 +82,18 @@ pub struct Config {
     /// A header's length along the edge.
     #[serde(deserialize_with = "header_length")]
     pub header_length: u32,
-    #[serde(deserialize_with = "sheet_width")]
-    pub sheet_width: u32,
-    #[serde(deserialize_with = "sheet_height")]
-    pub sheet_height: u32,
-    /// The bar of file icons along a sheet's bottom.
-    #[serde(deserialize_with = "file_bar")]
-    pub file_bar: u32,
-    /// Replaced keys: never set, an error naming the new one.
-    #[serde(deserialize_with = "replaced::tuck")]
-    tuck: (),
-    #[serde(deserialize_with = "replaced::tab_gap")]
-    tab_gap: (),
-    #[serde(deserialize_with = "replaced::tab_height")]
-    tab_height: (),
-    #[serde(deserialize_with = "replaced::peek")]
-    peek: (),
-    #[serde(deserialize_with = "replaced::focus_width")]
-    focus_width: (),
-    #[serde(deserialize_with = "replaced::focus_height")]
-    focus_height: (),
     #[serde(deserialize_with = "de::duration")]
     pub reveal_delay: u32,
     #[serde(deserialize_with = "de::duration")]
     pub hide_delay: u32,
-    /// How long a window has focus before the notes follow it.
-    #[serde(deserialize_with = "de::duration")]
-    pub settle: u32,
     /// Spring response, ms.
     #[serde(deserialize_with = "response")]
     pub response: u32,
-    /// The most a note is tilted, degrees.
-    #[serde(deserialize_with = "tilt")]
-    pub tilt: f64,
-    #[serde(deserialize_with = "de::duration")]
-    pub save_delay: u32,
-    /// `{path}`.
-    pub editor_command: String,
-    /// Opens links and files: `{path}`.
-    pub open_command: String,
-    /// `{paths}`.
-    pub trash_command: String,
-    /// For new notes and notes without `color`.
-    #[serde(deserialize_with = "color_name")]
-    pub default_color: Color,
-    pub font: String,
-    #[serde(deserialize_with = "de::font_size")]
-    pub font_size: u32,
-    pub appearance: wl_shell_config::Appearance<Theme>,
 }
 
-impl Default for Config {
+impl Default for ColumnConfig {
     fn default() -> Self {
         Self {
-            notes_dir: "~/Notes/wl-note".into(),
-            mru_event_stream: None,
-            output_event_stream: None,
-            output: "focused".into(),
-            edge: Edge::default(),
-            layer: NoteLayer::default(),
             marker_width: 6,
             marker_length: 28,
             marker_radius: 3,
@@ -124,28 +103,103 @@ impl Default for Config {
             reserve_edge_band: false,
             header: 28,
             header_length: 96,
-            sheet_width: 300,
-            sheet_height: 220,
-            file_bar: 24,
-            tuck: (),
-            tab_gap: (),
-            tab_height: (),
-            peek: (),
-            focus_width: (),
-            focus_height: (),
             reveal_delay: 120,
             hide_delay: 400,
-            settle: 120,
             response: 150,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SheetConfig {
+    #[serde(deserialize_with = "sheet_width")]
+    pub width: u32,
+    #[serde(deserialize_with = "sheet_height")]
+    pub height: u32,
+    /// The bar of file icons along a sheet's bottom.
+    #[serde(deserialize_with = "file_bar")]
+    pub file_bar: u32,
+    /// The most a note is tilted, degrees.
+    #[serde(deserialize_with = "tilt")]
+    pub tilt: f64,
+    /// For new notes and notes without `color`.
+    #[serde(deserialize_with = "color_name")]
+    pub default_color: Color,
+    pub font: String,
+    #[serde(deserialize_with = "de::font_size")]
+    pub font_size: u32,
+}
+
+impl Default for SheetConfig {
+    fn default() -> Self {
+        Self {
+            width: 300,
+            height: 220,
+            file_bar: 24,
             tilt: 1.5,
-            save_delay: 500,
-            editor_command: "xdg-open {path}".into(),
-            open_command: "xdg-open {path}".into(),
-            trash_command: "gio trash -- {paths}".into(),
             default_color: Color::Preset("yellow"),
             font: "sans-serif".into(),
             font_size: 13,
-            appearance: wl_shell_config::Appearance::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct EditorConfig {
+    #[serde(deserialize_with = "de::duration")]
+    pub save_delay: u32,
+    /// Opens a note in an external editor: `{path}`.
+    pub command: String,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            save_delay: 500,
+            command: "xdg-open {path}".into(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FilesConfig {
+    /// Opens links and files: `{path}`.
+    pub open_command: String,
+    /// Moves notes to the Trash: `{paths}`.
+    pub trash_command: String,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            open_command: "xdg-open {path}".into(),
+            trash_command: "gio trash -- {paths}".into(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct IntegrationConfig {
+    /// Prints the ID of each window that gains focus, one per line.
+    pub mru_event_stream: Option<String>,
+    /// `<output> <id>` lines: which output each window is on, for
+    /// `output = "focused"`.
+    pub output_event_stream: Option<String>,
+    /// How long a window has focus before the notes follow it.
+    #[serde(deserialize_with = "de::duration")]
+    pub settle: u32,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self {
+            mru_event_stream: None,
+            output_event_stream: None,
+            settle: 120,
         }
     }
 }
@@ -292,7 +346,7 @@ impl Config {
     /// 0xRRGGBBAA, dimmed in dark mode.
     pub fn paper_color(&self, color: Option<&Color>) -> u32 {
         let theme = self.theme();
-        let rgba = match color.unwrap_or(&self.default_color) {
+        let rgba = match color.unwrap_or(&self.sheet.default_color) {
             Color::Preset(name) => theme.preset(name).0,
             Color::Rgb(rgb) => rgb << 8 | 0xff,
         };
@@ -305,7 +359,7 @@ impl Config {
     /// The text on a note in `color` (None: the default color): the
     /// preset's, or dark or light for a color of its own.
     pub fn text_color(&self, color: Option<&Color>) -> u32 {
-        match color.unwrap_or(&self.default_color) {
+        match color.unwrap_or(&self.sheet.default_color) {
             Color::Preset(name) => self.theme().preset(name).1,
             Color::Rgb(rgb) => {
                 let [_, r, g, b] = rgb.to_be_bytes();
@@ -396,39 +450,6 @@ fn file_bar<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 16, 100)
 }
 
-/// Keys the redesign replaced: each is an error naming what to use.
-mod replaced {
-    use serde::{Deserializer, de::Error as _};
-
-    fn gone<'de, D: Deserializer<'de>>(old: &str, new: &str) -> Result<(), D::Error> {
-        Err(D::Error::custom(format!("`{old}` is gone: use {new}")))
-    }
-
-    pub fn tuck<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("tuck", "`marker-width`")
-    }
-
-    pub fn tab_gap<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("tab-gap", "`marker-gap` (headers overlap now)")
-    }
-
-    pub fn tab_height<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("tab-height", "`header-length`")
-    }
-
-    pub fn peek<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("peek", "`header`")
-    }
-
-    pub fn focus_width<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("focus-width", "`sheet-width`")
-    }
-
-    pub fn focus_height<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-        gone::<D>("focus-height", "`sheet-height` (in pixels)")
-    }
-}
-
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 1, 10_000)
 }
@@ -459,20 +480,61 @@ mod tests {
         let c = parse("").unwrap();
         assert_eq!(c, Config::default());
         assert_eq!(c.edge, Edge::Right);
-        assert_eq!(c.default_color, Color::Preset("yellow"));
+        assert_eq!(c.sheet.default_color, Color::Preset("yellow"));
     }
 
     #[test]
-    fn keys() {
+    fn tables() {
         let c = parse(
-            "notes-dir = \"/n\"\nedge = \"left\"\nmarker-width = 12\nsettle = 0\ndefault-color = \"#102030\"\n\
-             mru-event-stream = \"x\"\nsheet-height = 300\n[appearance]\npaper-pink = \"#ff0000\"\n[appearance.dark]\ndark-dim = 1.0\n",
+            r##"
+notes-dir = "/n"
+edge = "left"
+
+[column]
+marker-width = 12
+
+[sheet]
+height = 300
+default-color = "#102030"
+
+[editor]
+save-delay = 0
+command = "foot nvim {path}"
+
+[files]
+open-command = "open {path}"
+
+[integration]
+mru-event-stream = "focus-stream"
+output-event-stream = "output-stream"
+settle = 0
+
+[appearance]
+paper-pink = "#ff0000"
+
+[appearance.dark]
+dark-dim = 1.0
+"##,
         )
         .unwrap();
         assert_eq!(c.notes_dir(), PathBuf::from("/n"));
-        assert_eq!((c.edge, c.marker_width, c.settle), (Edge::Left, 12, 0));
-        assert_eq!(c.sheet_height, 300);
-        assert_eq!(c.default_color, Color::Rgb(0x102030));
+        assert_eq!(c.edge, Edge::Left);
+        assert_eq!(c.column.marker_width, 12);
+        assert_eq!(c.column.hide_delay, 400);
+        assert_eq!(c.sheet.height, 300);
+        assert_eq!(c.sheet.default_color, Color::Rgb(0x102030));
+        assert_eq!(c.editor.save_delay, 0);
+        assert_eq!(c.editor.command, "foot nvim {path}");
+        assert_eq!(c.files.open_command, "open {path}");
+        assert_eq!(
+            c.integration.mru_event_stream.as_deref(),
+            Some("focus-stream")
+        );
+        assert_eq!(
+            c.integration.output_event_stream.as_deref(),
+            Some("output-stream")
+        );
+        assert_eq!(c.integration.settle, 0);
         assert_eq!(c.appearance.dark.paper_pink, 0xff0000ff);
         assert_eq!(c.appearance.dark.dark_dim, 1.0);
         assert_eq!(c.appearance.light.dark_dim, 0.9);
@@ -482,11 +544,13 @@ mod tests {
     fn invalid() {
         for bad in [
             "edge = \"top\"",
-            "marker-width = 0",
-            "header = 1000",
-            "default-color = \"teal\"",
+            "marker-width = 12", // Moved keys aren't accepted at the root.
+            "[column]\nmarker-width = 0",
+            "[column]\nheader = 1000",
+            "[sheet]\ndefault-color = \"teal\"",
             "unknown = 1",
-            "tilt = 20.0",
+            "[sheet]\ntilt = 20.0",
+            "[files]\nunknown = 1",
             "[appearance]\nunknown = 1",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
@@ -494,18 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn replaced_keys_name_their_replacement() {
-        for (old, new) in [
-            ("tuck = 10", "marker-width"),
-            ("tab-gap = 4", "marker-gap"),
-            ("tab-height = 64", "header-length"),
-            ("peek = 180", "`header`"),
-            ("focus-width = 420", "sheet-width"),
-            ("focus-height = 0.7", "sheet-height"),
-        ] {
-            let e = parse(old).unwrap_err();
-            assert!(e.contains(new), "{old}: {e}");
-        }
+    fn example_config() {
+        assert_eq!(
+            parse(include_str!("../config.example.toml")).unwrap(),
+            Config::default(),
+        );
     }
 
     #[test]

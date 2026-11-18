@@ -1,0 +1,75 @@
+# Copy to $XDG_CONFIG_HOME/wl-note/config.toml (usually ~/.config/wl-note/config.toml).
+# Every key is optional. The values below are the defaults unless marked as examples.
+
+notes-dir = "~/Notes/wl-note"
+output = "focused"                 # focused, all, or an output name
+edge = "right"                     # left or right
+layer = "top"                      # top or overlay
+
+[column]
+marker-width = 6                   # Pixels out from the edge
+marker-length = 28                 # Pixels along the edge
+marker-radius = 3
+marker-gap = 8
+marker-padding = 12                # Space at each end of the column
+edge-band = 2                      # 0: only markers bring out headers
+reserve-edge-band = false
+header = 28                        # Pixels out from the edge
+header-length = 96                 # Pixels along the edge
+reveal-delay = 120                 # Milliseconds
+hide-delay = 400
+response = 150                     # Spring response in milliseconds
+
+[sheet]
+width = 300                        # Pixels, including the margin
+height = 220
+file-bar = 24                      # Height in pixels
+tilt = 1.5                         # Maximum degrees; 0 for straight notes
+font = "sans-serif"
+font-size = 13
+default-color = "yellow"            # Preset name or hex color
+
+[editor]
+save-delay = 500                   # Milliseconds after the last edit
+command = "xdg-open {path}"         # External editor (Ctrl+E)
+
+[files]
+open-command = "xdg-open {path}"
+trash-command = "gio trash -- {paths}"
+
+[integration]
+settle = 120                       # Milliseconds before notes follow focus
+# mru-event-stream = "~/.config/wl-dock/focus-stream.sh"     # Example: window ID per line
+# output-event-stream = "~/.config/wl-dock/output-stream.sh" # Example: <output> <id> per line
+
+[appearance]
+mode = "auto"                      # auto, light, or dark
+paper-yellow = "#fff2a8"
+paper-yellow-text = "#3d3420"
+paper-orange = "#ffd6a5"
+paper-orange-text = "#4a3218"
+paper-pink = "#ffcfe0"
+paper-pink-text = "#4a2433"
+paper-purple = "#e4d4f7"
+paper-purple-text = "#34264a"
+paper-blue = "#cfe5ff"
+paper-blue-text = "#1f3349"
+paper-green = "#d5f0c4"
+paper-green-text = "#263d1f"
+paper-gray = "#e4e4e0"
+paper-gray-text = "#333333"
+paper-white = "#fafaf7"
+paper-white-text = "#2b2b2b"
+dark-dim = 0.9
+link-color = "#1a5fb4"
+chip-background = "#0000000f"
+shadow-color = "#00000059"          # Alpha 0 disables shadows
+shadow-softness = 8
+shadow-offset = [2, 3]             # [away from the edge, down]
+
+# Override appearance keys for a particular color scheme:
+# [appearance.dark]
+# shadow-color = "#00000080"
+# [appearance.light]
+# shadow-color = "#00000040"
+
