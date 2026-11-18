@@ -273,6 +273,22 @@ impl Config {
         }
     }
 
+    /// The text on a note in `color` (None: the default color): the
+    /// preset's, or dark or light for a color of its own.
+    pub fn text_color(&self, color: Option<&Color>) -> u32 {
+        match color.unwrap_or(&self.default_color) {
+            Color::Preset(name) => self.theme().preset(name).1,
+            Color::Rgb(rgb) => {
+                let [_, r, g, b] = rgb.to_be_bytes();
+                let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+                match luma > 140.0 {
+                    true => 0x2b2b2bff,
+                    false => 0xf2f2f2ff,
+                }
+            }
+        }
+    }
+
     /// The notes' shadow; None if disabled.
     pub fn shadow(&self) -> Option<shadow::IconShadow> {
         let t = self.theme();
@@ -280,6 +296,19 @@ impl Config {
             color: t.shadow_color,
             softness: t.shadow_softness,
             offset: (t.shadow_offset[0], t.shadow_offset[1]),
+        })
+    }
+
+    /// The shadow of a lifted or focused note: larger, softer and a
+    /// little stronger.
+    pub fn lifted_shadow(&self) -> Option<shadow::IconShadow> {
+        self.shadow().map(|s| {
+            let a = ((s.color & 0xff) as f64 * 1.3).round().min(255.0) as u32;
+            shadow::IconShadow {
+                color: (s.color & !0xff) | a,
+                softness: (s.softness * 2).max(4),
+                offset: (s.offset.0 * 2, s.offset.1 * 2 + 2),
+            }
         })
     }
 }
@@ -399,3 +428,4 @@ mod tests {
         assert_eq!(c.paper_color(Some(&Color::Rgb(0x804020))), 0x804020ff);
     }
 }
+

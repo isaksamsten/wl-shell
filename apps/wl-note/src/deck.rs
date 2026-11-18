@@ -1,9 +1,12 @@
-//! The notes in a column, and how they move when the context changes.
-//! Pure, unit tested.
+//! The notes in a column, how they move when the context changes, and
+//! how far out they are. Pure, unit tested.
 //!
-//! Each note is a card with two springs: `y`, its top along the edge, and
-//! `presence`, from 0 (behind the edge, out of sight) to 1 (tucked, its
-//! sliver showing). When the notes change:
+//! Each note is a card with springs: `y`, its top along the edge;
+//! `presence`, from 0 (behind the edge, out of sight) to 1 (in place);
+//! `out`, how far it sticks out from the edge when in place (`tuck`
+//! tucked, `peek` peeking, a little more when lifted under the pointer);
+//! and `focus`, from 0 (in the column) to 1 (focused: grown and fully on
+//! screen). When the notes change:
 //!
 //! 1. The notes that stay are left where they are.
 //! 2. The notes that leave slide back behind the edge, staggered.
@@ -12,8 +15,10 @@
 //!    theirs, staggered too.
 //!
 //! A note wanted again while it is still leaving comes back from where it
-//! is. Once everything has arrived, `advance` says nothing moves, so no
-//! more frames are drawn.
+//! is. The column's [`Mode`] (tucked, peeking, or a note focused) and the
+//! note under the pointer set where `out` and `focus` head. A `+` sliver
+//! after the last note comes out while peeking. Once everything has
+//! arrived, `advance` says nothing moves, so no more frames are drawn.
 
 use wl_shell_ui::Spring;
 
@@ -23,6 +28,20 @@ pub const STAGGER: f64 = 0.04;
 const MARGIN: f64 = 8.0;
 /// Cards overlap like a deck when they don't fit, at least this far apart.
 const MIN_STEP: f64 = 6.0;
+/// How much farther than `peek` the note under the pointer comes out.
+pub const LIFT: f64 = 14.0;
+
+/// What the column is doing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Only the slivers show.
+    #[default]
+    Tucked,
+    /// The notes are out far enough to read their titles.
+    Peeking,
+    /// This note is forward, grown; the others are tucked.
+    Focused(String),
+}
 
 /// How a note looks: what its paper is rendered from.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +66,12 @@ pub struct Metrics {
     pub tab: f64,
     /// Between slivers.
     pub gap: f64,
+    /// How much of a tucked note shows.
+    pub tuck: f64,
+    /// How much of a peeking note shows.
+    pub peek: f64,
+    /// The `+` sliver's length along the edge.
+    pub plus: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -55,8 +80,12 @@ pub struct Card {
     pub look: Look,
     /// Its top along the edge.
     pub y: Spring,
-    /// 0 out of sight, 1 tucked.
+    /// 0 out of sight, 1 in place.
     pub presence: Spring,
+    /// How far it sticks out when in place.
+    pub out: Spring,
+    /// 0 in the column, 1 focused.
+    pub focus: Spring,
     /// Seconds before `presence` starts toward its target.
     delay: f64,
     /// On its way out.
@@ -109,6 +138,11 @@ pub struct Deck {
     response: f64,
     /// Leaving cards are on their way out; the column closes up after.
     closing: bool,
+    mode: Mode,
+    /// The note under the pointer, lifted while peeking.
+    hover: Option<String>,
+    /// The `+` sliver: 0 out of sight, 1 peeking.
+    pub plus: Spring,
 }
 
 impl Deck {
@@ -120,7 +154,81 @@ impl Deck {
             metrics,
             response,
             closing: false,
+            mode: Mode::Tucked,
+            hover: None,
+            plus: Spring::new(0.0, response),
         }
+    }
+
+    pub fn mode(&self) -> &Mode {
+        &self.mode
+    }
+
+    pub fn hover(&self) -> Option<&str> {
+        self.hover.as_deref()
+    }
+
+    /// Tuck, peek or focus a note: the cards head there.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if mode != self.mode {
+            self.mode = mode;
+            self.retarget();
+        }
+    }
+
+    /// The note under the pointer (lifted while peeking).
+    pub fn set_hover(&mut self, hover: Option<String>) {
+        if hover != self.hover {
+            self.hover = hover;
+            self.retarget();
+        }
+    }
+
+    /// Where `out` heads for the card of `key`.
+    fn out_target(&self, key: &str) -> f64 {
+        let m = &self.metrics;
+        match &self.mode {
+            Mode::Tucked => m.tuck,
+            Mode::Peeking if self.hover.as_deref() == Some(key) => m.peek + LIFT,
+            Mode::Peeking => m.peek,
+            Mode::Focused(k) if k == key => m.peek,
+            Mode::Focused(_) => m.tuck,
+        }
+    }
+
+    /// Where `focus` heads for the card of `key`.
+    fn focus_target(&self, key: &str) -> f64 {
+        match &self.mode {
+            Mode::Focused(k) if k == key => 1.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Point every spring at where the mode wants it.
+    fn retarget(&mut self) {
+        let targets: Vec<(f64, f64)> = (self.cards.iter())
+            .map(|c| (self.out_target(&c.key), self.focus_target(&c.key)))
+            .collect();
+        for (c, (out, focus)) in self.cards.iter_mut().zip(targets) {
+            c.out.retarget(out);
+            c.focus.retarget(if c.leaving { 0.0 } else { focus });
+        }
+        self.plus.retarget(match self.mode {
+            Mode::Peeking => 1.0,
+            _ => 0.0,
+        });
+    }
+
+    /// The `+` sliver's top: right after the last note (centered without
+    /// notes), within the column.
+    pub fn plus_top(&self) -> f64 {
+        let m = &self.metrics;
+        let last = self.cards.iter().rev().find(|c| !c.leaving);
+        let top = match last {
+            Some(c) => c.y.value + m.tab + m.gap,
+            None => (self.length - m.plus) / 2.0,
+        };
+        top.min(self.length - MARGIN - m.plus).max(0.0)
     }
 
     /// The cards, leaving ones included.
@@ -149,8 +257,12 @@ impl Deck {
         for c in &mut self.cards {
             c.y = respring(c.y, response);
             c.presence = respring(c.presence, response);
+            c.out = respring(c.out, response);
+            c.focus = respring(c.focus, response);
         }
+        self.plus = respring(self.plus, response);
         self.relayout(false);
+        self.retarget();
     }
 
     /// Move the cards that stay to their places among `wanted`.
@@ -192,6 +304,7 @@ impl Deck {
             }
         }
         self.closing = true;
+        self.retarget();
         self.try_close_up();
     }
 
@@ -218,11 +331,15 @@ impl Deck {
                     self.cards.push(c);
                 }
                 None => {
+                    let mut focus = Spring::new(0.0, self.response);
+                    focus.retarget(self.focus_target(&item.key));
                     let mut c = Card {
                         key: item.key.clone(),
                         look: item.look.clone(),
                         y: Spring::new(top, self.response),
                         presence: Spring::new(0.0, self.response),
+                        out: Spring::new(self.out_target(&item.key), self.response),
+                        focus,
                         delay: rank * STAGGER,
                         leaving: false,
                     };
@@ -248,15 +365,24 @@ impl Deck {
             }
             c.y.advance(dt);
             c.presence.advance(dt);
+            c.out.advance(dt);
+            c.focus.advance(dt);
         }
+        self.plus.advance(dt);
         self.try_close_up();
         self.moving()
     }
 
     /// Whether anything moves (or waits to).
     pub fn moving(&self) -> bool {
-        self.closing
-            || (self.cards.iter()).any(|c| c.delay > 0.0 || !c.y.settled() || !c.presence.settled())
+        let still = |c: &Card| {
+            c.delay <= 0.0
+                && c.y.settled()
+                && c.presence.settled()
+                && c.out.settled()
+                && c.focus.settled()
+        };
+        self.closing || !self.plus.settled() || !self.cards.iter().all(still)
     }
 }
 
@@ -275,6 +401,9 @@ mod tests {
     const M: Metrics = Metrics {
         tab: 60.0,
         gap: 4.0,
+        tuck: 10.0,
+        peek: 180.0,
+        plus: 30.0,
     };
 
     fn item(key: &str) -> Item {
@@ -420,5 +549,47 @@ mod tests {
         assert_eq!(card(&d, "a").y.target, 120.0);
         settle(&mut d);
         assert_eq!(card(&d, "a").y.value, 120.0);
+    }
+
+    #[test]
+    fn peeking_lifting_and_focusing() {
+        let mut d = Deck::new(M, 150.0);
+        d.resize(500.0);
+        d.set(items(&["a", "b"]));
+        settle(&mut d);
+        assert_eq!(card(&d, "a").out.value, M.tuck);
+        assert_eq!(d.plus.value, 0.0);
+        d.set_mode(Mode::Peeking);
+        d.set_hover(Some("b".into()));
+        settle(&mut d);
+        assert_eq!(card(&d, "a").out.value, M.peek);
+        assert_eq!(card(&d, "b").out.value, M.peek + LIFT);
+        assert_eq!(d.plus.value, 1.0);
+        assert_eq!(d.plus_top(), card(&d, "b").y.value + M.tab + M.gap);
+        d.set_mode(Mode::Focused("a".into()));
+        settle(&mut d);
+        assert_eq!(card(&d, "a").focus.value, 1.0);
+        assert_eq!(card(&d, "b").out.value, M.tuck);
+        assert_eq!(card(&d, "b").focus.value, 0.0);
+        assert_eq!(d.plus.value, 0.0);
+        d.set_mode(Mode::Tucked);
+        settle(&mut d);
+        assert_eq!(card(&d, "a").focus.value, 0.0);
+        assert_eq!(card(&d, "a").out.value, M.tuck);
+    }
+
+    #[test]
+    fn new_notes_come_in_focused() {
+        let mut d = Deck::new(M, 150.0);
+        d.resize(500.0);
+        d.set(items(&["a"]));
+        settle(&mut d);
+        // `wl-note new`: focused before its card exists.
+        d.set_mode(Mode::Focused("n".into()));
+        d.set(items(&["a", "n"]));
+        assert_eq!(card(&d, "n").focus.target, 1.0);
+        settle(&mut d);
+        assert_eq!(card(&d, "n").focus.value, 1.0);
+        assert_eq!(card(&d, "n").presence.value, 1.0);
     }
 }

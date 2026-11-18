@@ -71,6 +71,12 @@ impl Sub {
         self.subsurface.place_below(sibling);
     }
 
+    /// Stack it right above `sibling` (a sibling or the parent), from the
+    /// parent's next commit on.
+    pub fn place_above(&self, sibling: &WlSurface) {
+        self.subsurface.place_above(sibling);
+    }
+
     /// Attach `buffer` unless it is attached already; true if it wasn't.
     pub fn show(&mut self, buffer: &WlBuffer) -> bool {
         if self.attached.as_ref() == Some(buffer) {

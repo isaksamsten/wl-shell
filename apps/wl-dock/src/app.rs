@@ -3146,7 +3146,7 @@ impl WlDock {
                     self.rank_apps();
                 }
             }
-            Done::Paper { .. } => {}
+            Done::Paper { .. } | Done::Doc { .. } => {}
         }
     }
 }

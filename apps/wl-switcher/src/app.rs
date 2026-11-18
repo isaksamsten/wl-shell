@@ -144,7 +144,8 @@ impl WlSwitcher {
             | Done::FileIcons { .. }
             | Done::FileType { .. }
             | Done::Apps(_)
-            | Done::Paper { .. } => {}
+            | Done::Paper { .. }
+            | Done::Doc { .. } => {}
         }
     }
 

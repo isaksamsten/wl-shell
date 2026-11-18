@@ -2,6 +2,9 @@
 //! color, tilt and scale, and it is kept as an shm buffer here. The most
 //! recently used few dozen are kept.
 //!
+//! A sheet with content (a preview) comes with where the content's
+//! checkboxes and links are.
+//!
 //! Replaced buffers are only destroyed by `trim`, and only once nothing
 //! shows them anymore.
 
@@ -11,6 +14,7 @@ use wayland_client::{QueueHandle, protocol::wl_buffer::WlBuffer};
 use wl_shell_core::globals::Globals;
 use wl_shell_core::{Program, Shell};
 use wl_shell_log::warn;
+use wl_shell_render::doc::Hit;
 use wl_shell_render::paper::{Paper, Rendered};
 use wl_shell_render::worker::Assets;
 use wl_shell_ui::Shape;
@@ -19,10 +23,18 @@ use wl_shell_ui::cache::shm_buffer;
 /// Sheets kept: a few per note shown.
 const KEEP: usize = 64;
 
+/// A sheet, ready to show.
+#[derive(Clone, Debug)]
+pub struct Sheet {
+    pub shape: Shape,
+    /// Its content's checkboxes and links, in sheet coordinates.
+    pub hits: Rc<Vec<Hit>>,
+}
+
 pub struct Papers {
     assets: Rc<Assets>,
     /// Most recently used first.
-    ready: Vec<(Paper, Shape)>,
+    ready: Vec<(Paper, Sheet)>,
     /// Asked of the worker.
     pending: Vec<Paper>,
     /// Buffers no longer kept, destroyed by `trim`.
@@ -41,12 +53,12 @@ impl Papers {
 
     /// The sheet for `paper`, or None if it is still being drawn (it is
     /// asked for).
-    pub fn get(&mut self, paper: &Paper) -> Option<Shape> {
+    pub fn get(&mut self, paper: &Paper) -> Option<Sheet> {
         if let Some(i) = self.ready.iter().position(|(p, _)| p == paper) {
             let entry = self.ready.remove(i);
-            let shape = entry.1.clone();
+            let sheet = entry.1.clone();
             self.ready.insert(0, entry);
-            return Some(shape);
+            return Some(sheet);
         }
         if !self.pending.contains(paper) {
             self.pending.push(paper.clone());
@@ -74,11 +86,14 @@ impl Papers {
                 return false;
             }
         };
-        let shape = Shape {
-            buffer,
-            rect: rendered.rect,
+        let sheet = Sheet {
+            shape: Shape {
+                buffer,
+                rect: rendered.rect,
+            },
+            hits: Rc::new(rendered.hits.clone()),
         };
-        self.ready.insert(0, (paper, shape));
+        self.ready.insert(0, (paper, sheet));
         true
     }
 
@@ -86,14 +101,14 @@ impl Papers {
     pub fn clear(&mut self) {
         self.pending.clear();
         self.stale
-            .extend(self.ready.drain(..).map(|(_, s)| s.buffer));
+            .extend(self.ready.drain(..).map(|(_, s)| s.shape.buffer));
     }
 
     /// Destroy the buffers no longer kept, but those in `shown`.
     pub fn trim(&mut self, shown: &[WlBuffer]) {
         while self.ready.len() > KEEP {
             if let Some((_, s)) = self.ready.pop() {
-                self.stale.push(s.buffer);
+                self.stale.push(s.shape.buffer);
             }
         }
         self.stale.retain(|b| {

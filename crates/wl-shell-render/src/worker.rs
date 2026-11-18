@@ -1,7 +1,8 @@
 //! A worker thread for everything slow: loading fonts, desktop entries and
 //! icons, and rendering labels, title pills, text lines, letter tiles,
-//! speech bubbles and sheets of paper. Results come back through a calloop
-//! channel, and the main thread turns them into shm buffers.
+//! speech bubbles, sheets of paper and documents. Results come back
+//! through a calloop channel, and the main thread turns them into shm
+//! buffers.
 //!
 //! The worker lives as long as the daemon, so its caches (font system,
 //! desktop entries, decoded icons) stay warm. The daemon asks it for every
@@ -15,6 +16,7 @@ use std::sync::{Arc, mpsc};
 use calloop::channel;
 
 use crate::bubble::{self, Bubble};
+use crate::doc::{self, Doc};
 use crate::files::{self, FileEntry, FolderRequest};
 use crate::icons::{self, Icons};
 use crate::image::Image;
@@ -49,6 +51,8 @@ enum Job {
     FileType { path: std::path::PathBuf, dir: bool },
     /// A sheet of paper (wl-note).
     Paper(paper::Paper),
+    /// A document (wl-note).
+    Doc { tag: u64, doc: Doc },
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -137,6 +141,12 @@ pub enum Done {
     Paper {
         paper: paper::Paper,
         rendered: paper::Rendered,
+    },
+    /// A document (`Assets::doc`).
+    Doc {
+        tag: u64,
+        doc: Doc,
+        rendered: doc::Rendered,
     },
 }
 
@@ -260,6 +270,11 @@ impl Assets {
         self.send(Job::Paper(paper.clone()));
     }
 
+    /// Render a document; arrives as `Done::Doc`.
+    pub fn doc(&self, tag: u64, doc: Doc) {
+        self.send(Job::Doc { tag, doc });
+    }
+
     /// Check for changed desktop entries (answered with `IconsReloaded` if so).
     pub fn refresh(&self) {
         self.send(Job::Refresh);
@@ -289,7 +304,8 @@ impl Assets {
             | Done::FileIcons { .. }
             | Done::FileType { .. }
             | Done::Apps(_)
-            | Done::Paper { .. } => {}
+            | Done::Paper { .. }
+            | Done::Doc { .. } => {}
         }
     }
 }
@@ -423,8 +439,18 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 Done::FileType { path, types, assoc }
             }
             Job::Paper(paper) => {
-                let rendered = paper::render(&paper);
+                let rendered = match &paper.content {
+                    Some(c) => {
+                        let doc = text.get_or_insert_with(Text::new).doc(&c.doc);
+                        paper::render_with(&paper, Some(&doc))
+                    }
+                    None => paper::render(&paper),
+                };
                 Done::Paper { paper, rendered }
+            }
+            Job::Doc { tag, doc } => {
+                let rendered = text.get_or_insert_with(Text::new).doc(&doc);
+                Done::Doc { tag, doc, rendered }
             }
             Job::ClearIcons => {
                 icons.clear();

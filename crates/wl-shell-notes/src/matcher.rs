@@ -24,6 +24,12 @@ impl Window {
     }
 }
 
+/// A glob matching exactly `s` (an app ID, say), its special characters
+/// escaped.
+pub fn escape(s: &str) -> String {
+    globset::escape(s)
+}
+
 /// A glob as written, and compiled; None if it doesn't parse.
 #[derive(Clone, Debug)]
 pub struct Pattern {
@@ -178,3 +184,4 @@ mod tests {
         assert!(!broken.matches(&Window::new("foot", "{a")));
     }
 }
+

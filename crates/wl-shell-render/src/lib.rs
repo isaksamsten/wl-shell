@@ -4,6 +4,7 @@
 //! Wayland.
 
 pub mod bubble;
+pub mod doc;
 pub mod files;
 pub mod icons;
 pub mod image;

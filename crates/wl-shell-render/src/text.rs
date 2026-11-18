@@ -52,8 +52,8 @@ pub struct Pill {
 /// The font system and glyph cache. Loading the system fonts takes a while,
 /// so this is created on the worker thread.
 pub struct Text {
-    fonts: FontSystem,
-    glyphs: SwashCache,
+    pub(crate) fonts: FontSystem,
+    pub(crate) glyphs: SwashCache,
 }
 
 impl Default for Text {
@@ -264,7 +264,7 @@ impl Text {
 }
 
 /// CSS generic family names, or a family name.
-fn family(name: &str) -> Family<'_> {
+pub(crate) fn family(name: &str) -> Family<'_> {
     match name {
         "sans-serif" | "sans" => Family::SansSerif,
         "serif" => Family::Serif,
@@ -276,7 +276,7 @@ fn family(name: &str) -> Family<'_> {
 }
 
 /// Premultiplied `src` (B, G, R, 0-255) with `alpha` over a BGRA pixel.
-fn blend(dst: &mut [u8], src: [f64; 3], alpha: f64) {
+pub(crate) fn blend(dst: &mut [u8], src: [f64; 3], alpha: f64) {
     let keep = 1.0 - alpha;
     for k in 0..3 {
         dst[k] = (src[k] + dst[k] as f64 * keep).round().min(255.0) as u8;

@@ -4,8 +4,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 /// Sticky notes along a screen edge, belonging to apps: the notes shown
-/// follow the focused window. Start it with the compositor. The
-/// subcommands only read the notes, so they work without it.
+/// follow the focused window. Start it with the compositor. `new` and
+/// `focus` ask the running wl-note; the others only read the notes, so
+/// they work without it.
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Options {
@@ -34,6 +35,28 @@ pub enum Cmd {
     },
     /// Print the notes directory
     Path,
+    /// Make a note for the focused app (or shown everywhere), and focus
+    /// it; without --text, open it in the editor
+    New {
+        /// Shown everywhere, not only for the focused app
+        #[arg(long)]
+        global: bool,
+        /// A preset (yellow, orange, pink, purple, blue, green, gray,
+        /// white) or #rrggbb
+        #[arg(long, value_name = "COLOR")]
+        color: Option<String>,
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
+        /// The note's text; - reads it from stdin
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+    },
+    /// Focus a note (a path, file name or title); without one, the first
+    /// note shown, or tuck the focused one back
+    Focus {
+        #[arg(value_name = "NOTE")]
+        note: Option<String>,
+    },
 }
 
 impl Options {
@@ -93,5 +116,29 @@ mod tests {
         );
         assert_eq!(parse(&["path"]).unwrap().command, Some(Cmd::Path));
         assert!(parse(&["path", "x"]).is_err());
+    }
+
+    #[test]
+    fn new_and_focus() {
+        let o = parse(&["new", "--global", "--color", "pink", "--text", "-"]).unwrap();
+        assert_eq!(
+            o.command,
+            Some(Cmd::New {
+                global: true,
+                color: Some("pink".into()),
+                title: None,
+                text: Some("-".into()),
+            })
+        );
+        let o = parse(&["focus"]).unwrap();
+        assert_eq!(o.command, Some(Cmd::Focus { note: None }));
+        let o = parse(&["focus", "work/release.md"]).unwrap();
+        assert_eq!(
+            o.command,
+            Some(Cmd::Focus {
+                note: Some("work/release.md".into())
+            })
+        );
+        assert!(parse(&["focus", "a", "b"]).is_err());
     }
 }

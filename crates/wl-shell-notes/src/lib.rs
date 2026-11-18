@@ -1,20 +1,25 @@
 //! Notes as wl-note keeps them, for every program that reads them (wl-note
 //! itself, and later wl-dock's launcher). Pure, apart from reading the
-//! notes directory in [`index`].
+//! notes directory in [`index`] and writing notes in [`write`].
 //!
 //! - [`note`]: one note: a markdown file with an optional TOML frontmatter
 //!   between `+++` lines, parsed and edited in place.
 //! - [`matcher`]: which windows a note belongs to (app ID and title
 //!   globs).
 //! - [`index`]: every note in a directory, kept up to date by rescanning.
+//! - [`write`]: writing notes atomically, and new ones without replacing
+//!   any.
 
 pub mod index;
 pub mod matcher;
 pub mod note;
+pub mod write;
 
 pub use index::{Changes, Entry, Index};
 pub use matcher::{Matcher, Window};
 pub use note::{Color, Meta, Note, PRESETS};
+pub use write::{create_new, write_atomic};
 
 /// The TOML editing crate `Note::set` takes values of.
 pub use toml_edit;
+

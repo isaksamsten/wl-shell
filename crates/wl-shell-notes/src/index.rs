@@ -37,8 +37,10 @@ impl Stamp {
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub note: Note,
-    /// When the file was created (else last modified): newer notes come
-    /// first.
+    /// When the file was created (else last modified), or first seen by
+    /// this index if later: newer notes come first. A file replaced under
+    /// the same name (a save by rename) keeps its time, so editing a note
+    /// never moves it.
     pub created: SystemTime,
     stamp: Stamp,
 }
@@ -163,9 +165,12 @@ impl Index {
                 }
             };
             let note = Note::parse(text);
-            let created = (meta.created().ok())
-                .or(stamp.modified)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let created = match old {
+                Some(e) => e.created,
+                None => (meta.created().ok())
+                    .or(stamp.modified)
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            };
             match old {
                 Some(e) if e.note == note => {}
                 Some(_) => changes.changed.push(rel.clone()),
@@ -318,6 +323,13 @@ mod tests {
         std::fs::write(t.0.join("tmp"), "c").unwrap();
         std::fs::rename(t.0.join("tmp"), t.0.join("sub/c.md")).unwrap();
         assert!(index.scan().is_empty());
+        // Nor does a new file under an old name move it.
+        let before = index.ordered().iter().map(|p| p.to_path_buf()).collect::<Vec<_>>();
+        std::fs::write(t.0.join("tmp"), "c2").unwrap();
+        std::fs::rename(t.0.join("tmp"), t.0.join("a.md")).unwrap();
+        assert_eq!(index.scan().changed, [PathBuf::from("a.md")]);
+        let after = index.ordered().iter().map(|p| p.to_path_buf()).collect::<Vec<_>>();
+        assert_eq!(before, after);
         // The directory going away removes everything.
         std::fs::remove_dir_all(&t.0).unwrap();
         let changes = index.scan();

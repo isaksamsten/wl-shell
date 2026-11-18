@@ -14,15 +14,20 @@
 //! edge-on, with a 1 px light line along the side that sticks out, where
 //! the paper's thickness catches the light.
 //!
-//! Subsurfaces can't rotate, so a sheet's small tilt is drawn into it.
+//! A sheet may carry `content`: a document (doc.rs) drawn onto it, as a
+//! note's preview is.
+//!
+//! Subsurfaces can't rotate, so a sheet's small tilt is drawn into it,
+//! its content included.
 
 use std::sync::OnceLock;
 
 use resvg::tiny_skia::{
-    Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point,
-    Rect as SkRect, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, IntSize, LinearGradient, Paint, PathBuilder,
+    Pixmap, PixmapPaint, Point, Rect as SkRect, SpreadMode, Transform,
 };
 
+use crate::doc::{self, Doc, Hit};
 use crate::image::Image;
 use crate::shadow::{self, IconShadow};
 
@@ -50,6 +55,17 @@ pub struct Paper {
     /// onto the screen).
     pub shadow: Option<IconShadow>,
     pub scale: i32,
+    /// Drawn onto the sheet.
+    pub content: Option<Content>,
+}
+
+/// A document on a sheet, its top left corner at (`x`, `y`) logical
+/// pixels from the sheet's (before the tilt).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Content {
+    pub doc: Doc,
+    pub x: i32,
+    pub y: i32,
 }
 
 /// A rendered sheet, and where its image goes relative to the sheet's top
@@ -58,6 +74,9 @@ pub struct Paper {
 pub struct Rendered {
     pub image: Image,
     pub rect: shadow::Rect,
+    /// The content's checkboxes and links, in sheet coordinates (the tilt
+    /// left out).
+    pub hits: Vec<Hit>,
 }
 
 /// The grain's contrast: pixels are lightened or darkened by up to this.
@@ -99,16 +118,28 @@ impl Paper {
     }
 }
 
+/// Render a sheet without its content.
 pub fn render(p: &Paper) -> Rendered {
+    render_with(p, None)
+}
+
+/// Render a sheet with its content, rendered already (`p.content`'s doc).
+pub fn render_with(p: &Paper, content: Option<&doc::Rendered>) -> Rendered {
     let (w, h) = (p.w.max(1), p.h.max(1));
     let scale = p.scale.max(1);
     let (px, py) = p.tilt_pad();
     let (bw, bh) = (((w + 2 * px) * scale) as u32, ((h + 2 * py) * scale) as u32);
-    let sheet = draw(p, w, h, (px, py), scale, bw, bh);
+    let placed = p.content.as_ref().zip(content);
+    let sheet = draw(p, w, h, (px, py), scale, bw, bh, placed);
     let (image, pad) = match p.placed_shadow() {
         Some(s) => (shadow::icon(&sheet, &s, scale), s.pad()),
         None => (sheet, 0),
     };
+    let hits = placed.map_or(Vec::new(), |(c, r)| {
+        (r.hits.iter())
+            .map(|hit| hit.offset(c.x as f64, c.y as f64))
+            .collect()
+    });
     Rendered {
         image,
         rect: shadow::Rect {
@@ -117,12 +148,23 @@ pub fn render(p: &Paper) -> Rendered {
             w: w + 2 * (px + pad),
             h: h + 2 * (py + pad),
         },
+        hits,
     }
 }
 
 /// The sheet alone, `bw`x`bh` buffer pixels, its top left corner at
 /// `pad` logical pixels.
-fn draw(p: &Paper, w: i32, h: i32, pad: (i32, i32), scale: i32, bw: u32, bh: u32) -> Image {
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    p: &Paper,
+    w: i32,
+    h: i32,
+    pad: (i32, i32),
+    scale: i32,
+    bw: u32,
+    bh: u32,
+    content: Option<(&Content, &doc::Rendered)>,
+) -> Image {
     let blank = || Image {
         width: bw,
         height: bh,
@@ -135,10 +177,11 @@ fn draw(p: &Paper, w: i32, h: i32, pad: (i32, i32), scale: i32, bw: u32, bh: u32
     // Sheet coordinates: logical pixels from its top left corner, drawn
     // as if tucked behind the right edge (sticking out to the left), and
     // mirrored for the left edge.
-    let mut xf = Transform::from_scale(s, s)
+    let upright = Transform::from_scale(s, s)
         .pre_translate(pad.0 as f32 + w / 2.0, pad.1 as f32 + h / 2.0)
         .pre_rotate(p.tilt as f32)
         .pre_translate(-w / 2.0, -h / 2.0);
+    let mut xf = upright;
     if p.edge == Edge::Left {
         xf = xf.pre_translate(w, 0.0).pre_scale(-1.0, 1.0);
     }
@@ -219,6 +262,10 @@ fn draw(p: &Paper, w: i32, h: i32, pad: (i32, i32), scale: i32, bw: u32, bh: u32
     }
 
     grain(&mut pixmap);
+    // The content on top of the grain, never mirrored.
+    if let Some((c, r)) = content {
+        draw_content(&mut pixmap, c, r, upright, s, p.tilt != 0.0);
+    }
     let mut data = Vec::with_capacity((bw * bh * 4) as usize);
     for px in pixmap.data().as_chunks::<4>().0 {
         // Premultiplied RGBA to premultiplied BGRA.
@@ -229,6 +276,40 @@ fn draw(p: &Paper, w: i32, h: i32, pad: (i32, i32), scale: i32, bw: u32, bh: u32
         height: bh,
         data,
     }
+}
+
+/// Draw a rendered document onto the sheet: `upright` maps sheet
+/// coordinates to the buffer's (scale `s`, tilt included).
+fn draw_content(
+    pixmap: &mut Pixmap,
+    c: &Content,
+    r: &doc::Rendered,
+    upright: Transform,
+    s: f32,
+    tilted: bool,
+) {
+    let Some(size) = IntSize::from_wh(r.image.width, r.image.height) else {
+        return;
+    };
+    let mut rgba = Vec::with_capacity(r.image.data.len());
+    for px in r.image.data.as_chunks::<4>().0 {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    let Some(image) = Pixmap::from_vec(rgba, size) else {
+        return;
+    };
+    let paint = PixmapPaint {
+        // Straight, pixels land on pixels: keep the text crisp.
+        quality: match tilted {
+            true => FilterQuality::Bilinear,
+            false => FilterQuality::Nearest,
+        },
+        ..PixmapPaint::default()
+    };
+    let xf = upright
+        .pre_translate(c.x as f32, c.y as f32)
+        .pre_scale(1.0 / s, 1.0 / s);
+    pixmap.draw_pixmap(0, 0, image.as_ref(), &paint, xf, None);
 }
 
 /// Lighten (`amount` > 0, toward white) or darken (toward black) an
@@ -338,6 +419,7 @@ mod tests {
             sliver: false,
             shadow: None,
             scale: 1,
+            content: None,
         }
     }
 
