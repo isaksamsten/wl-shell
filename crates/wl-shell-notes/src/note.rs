@@ -32,7 +32,7 @@ pub const PRESETS: [&str; 8] = [
 ];
 
 /// A note's `color`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     /// One of `PRESETS`.
     Preset(&'static str),
@@ -667,6 +667,16 @@ mod tests {
             n.text()
         );
         assert!(n.text().ends_with("+++\n# Body\n\n- [ ] x\n"));
+    }
+
+    #[test]
+    fn recolor_keeps_the_colors_inline_comment() {
+        let mut note = Note::parse("+++\n# paper\ncolor  =  '#112233'  # keep\n+++\nExact body\n");
+        note.set_value("color", "pink").unwrap();
+        assert_eq!(
+            note.text(),
+            "+++\n# paper\ncolor  =  \"pink\"  # keep\n+++\nExact body\n"
+        );
     }
 
     #[test]

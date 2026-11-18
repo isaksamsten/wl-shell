@@ -69,6 +69,7 @@ use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::reexports::calloop::RegistrationToken;
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
+use wl_shell_notes::{Color, PRESETS};
 use wl_shell_render::Image;
 use wl_shell_render::doc::{self, Doc, DocStyle, Hit, Target};
 use wl_shell_render::icons::NamedIcon;
@@ -108,6 +109,8 @@ const TITLE_SCALE: f64 = 1.15;
 /// File bar icons and the gap between them.
 const ICON: f64 = 16.0;
 const ICON_GAP: f64 = 8.0;
+const TRASH_RED: u32 = 0xcb3535ff;
+const PALETTE_TIME: Duration = Duration::from_millis(150);
 /// The most of an open note's text that is rendered, logical pixels.
 const DOC_MAX: i32 = 3000;
 /// Documents kept rendered (the open one, and the last revealed).
@@ -152,6 +155,7 @@ pub struct Style {
     /// The `+` button's color and its plus's.
     pub plus_color: u32,
     pub plus_glyph: u32,
+    palette: [u32; PRESETS.len()],
 }
 
 impl Style {
@@ -186,6 +190,7 @@ impl Style {
             link: theme.link_color,
             plus_color: (white & !0xff) | 0xe6,
             plus_glyph: (ink & !0xff) | 0xb0,
+            palette: PRESETS.map(|name| config.paper_color(Some(&Color::Preset(name)))),
         }
     }
 
@@ -288,6 +293,7 @@ pub struct Shown {
     pub text: u32,
     pub files: Vec<FileLink>,
     pub pin: Pin,
+    pub color: Color,
 }
 
 /// What the column knows of a note shown.
@@ -296,6 +302,8 @@ struct NoteView {
     text: u32,
     files: Vec<FileLink>,
     pin: Pin,
+    color: Color,
+    paper: u32,
 }
 
 /// What a pointer event or a key asks of the program.
@@ -323,6 +331,9 @@ pub enum Act {
     Title(String, String),
     /// Hide this note.
     Hide(String),
+    Color(String, Color),
+    Trash(String),
+    RemoveFile(String, PathBuf),
     /// This note was dropped at this slot of the column (its keys, in
     /// order).
     Reorder(String, Vec<String>, usize),
@@ -335,6 +346,7 @@ pub enum Timer {
     Reveal,
     /// The pointer left the column: back to markers.
     Hide,
+    Trash,
 }
 
 /// A card's subsurface, and the paper it shows.
@@ -379,8 +391,12 @@ struct Sized {
 enum BarHit {
     /// The n-th file's icon.
     File(usize),
+    RemoveFile(usize),
     /// The `+n` for those that don't fit.
     More,
+    Color,
+    Swatch(Color),
+    Trash,
     Archive,
     Pin,
 }
@@ -391,8 +407,12 @@ struct BarLayout {
     icons: Vec<(usize, Rect)>,
     /// How many more, and where the `+n` is.
     more: Option<(usize, Rect)>,
+    color: Option<Rect>,
+    swatches: Vec<(Color, Rect)>,
+    trash: Option<Rect>,
     archive: Option<Rect>,
     pin: Option<Rect>,
+    hit_pad: f64,
     /// Where names go: from `name_x`, up to `name_end`, centered on
     /// `mid`.
     name_x: f64,
@@ -407,6 +427,7 @@ struct BarSubs {
     name: Sub,
     archive: Sub,
     pin: Sub,
+    labels: Vec<Sub>,
 }
 
 /// A press on a margin or a revealed sheet: a click, or the start of a
@@ -494,6 +515,11 @@ pub struct Column {
     lines: Vec<(LineKey, Option<Sized>)>,
     /// What the bars hover.
     bar_hover: Option<(String, BarHit)>,
+    trash: bar::Trash,
+    palette_since: Option<Instant>,
+    dots: HashMap<(u32, u32, bool), WlBuffer>,
+    /// All-files views on the open and revealed sheets, respectively.
+    all_files: [Option<(String, usize)>; 2],
     /// The surfaces' order last applied, bottom first.
     stacking: Vec<WlSurface>,
     /// The input region last set.
@@ -528,11 +554,12 @@ impl BarSubs {
             name: Sub::new(g, parent, no_input, qh),
             pin: Sub::new(g, parent, no_input, qh),
             archive: Sub::new(g, parent, no_input, qh),
+            labels: Vec::new(),
         }
     }
 
     fn clear(&mut self) {
-        for s in self.icons.iter_mut().chain([
+        for s in self.icons.iter_mut().chain(&mut self.labels).chain([
             &mut self.more,
             &mut self.name,
             &mut self.archive,
@@ -558,6 +585,15 @@ impl BarSubs {
                 None => sub.clear(),
             }
         }
+        while self.labels.len() < plan.labels.len() {
+            self.labels.push(new());
+        }
+        for (i, sub) in self.labels.iter_mut().enumerate() {
+            match plan.labels.get(i) {
+                Some((buffer, rect)) => sub.present(Some(buffer), *rect, plan.alpha),
+                None => sub.clear(),
+            }
+        }
         let one = |sub: &mut Sub, part: &Option<(WlBuffer, Rect)>| match part {
             Some((buffer, rect)) => sub.present(Some(buffer), *rect, plan.alpha),
             None => sub.clear(),
@@ -570,7 +606,7 @@ impl BarSubs {
         };
         icon(&mut self.archive, &plan.archive);
         icon(&mut self.pin, &plan.pin);
-        (plan.more.iter().chain(&plan.name))
+        (plan.more.iter().chain(&plan.name).chain(&plan.labels))
             .map(|(b, _)| b.clone())
             .collect()
     }
@@ -664,6 +700,10 @@ impl Column {
             icon_buffers: HashMap::new(),
             lines: Vec::new(),
             bar_hover: None,
+            trash: bar::Trash::default(),
+            palette_since: None,
+            dots: HashMap::new(),
+            all_files: [None, None],
             stacking: Vec::new(),
             input: None,
             pointer: None,
@@ -764,6 +804,7 @@ impl Column {
         self.plus.clear();
         self.title.clear();
         self.stale.extend(self.icon_buffers.drain().map(|(_, b)| b));
+        self.stale.extend(self.dots.drain().map(|(_, b)| b));
         self.stale.extend(
             self.lines
                 .drain(..)
@@ -784,14 +825,19 @@ impl Column {
                     text: n.text,
                     files: n.files.clone(),
                     pin: n.pin.clone(),
+                    color: n.color,
+                    paper: n.item.look.color,
                 };
                 (n.item.key.clone(), view)
             })
             .collect();
         self.deck.set(notes.into_iter().map(|n| n.item).collect());
+        self.reset_file_views();
         // The open note went (removed, hidden): the keyboard goes back.
         if self.deck.open().is_none() {
             self.editing = None;
+            self.palette_since = None;
+            self.trash.clear();
             self.set_keyboard(KeyboardInteractivity::None);
         }
         // Forget the documents of notes gone; render the others again if
@@ -855,6 +901,9 @@ impl Column {
         self.cancel_reveal(core);
         self.deck.open_note(key);
         if !again {
+            self.palette_since = None;
+            self.trash.clear();
+            self.reset_file_views();
             self.scroll = 0.0;
             self.ensure_doc(key);
         }
@@ -868,6 +917,9 @@ impl Column {
     pub fn close(&mut self) -> Vec<Act> {
         let acts = self.commit_title();
         self.deck.close();
+        self.palette_since = None;
+        self.trash.clear();
+        self.reset_file_views();
         self.set_keyboard(KeyboardInteractivity::None);
         self.kick();
         acts
@@ -957,6 +1009,8 @@ impl Column {
             PointerEventKind::Leave { .. } => {
                 self.pointer = None;
                 self.bar_hover = None;
+                self.trash.clear();
+                self.all_files = [None, None];
                 if self.press.take().is_some() {
                     self.deck.drag_cancel();
                 }
@@ -973,11 +1027,18 @@ impl Column {
                 self.release(core, x, y)
             }
             PointerEventKind::Axis { vertical, .. } => {
-                if let Some(key) = self.deck.open()
-                    && let Some(face) = self.face(key)
-                    && self.text_rect(face).contains(x, y)
+                if let On::Sheet(key) = self.on_at(x, y)
+                    && let Some(area) = self.grid_area(&key)
+                    && area.contains(x, y)
                 {
-                    self.scroll_by(axis(vertical));
+                    let d = axis(vertical);
+                    if self.showing_files(&key) {
+                        if d != 0.0 {
+                            self.scroll_files(&key, d.signum(), x, y);
+                        }
+                    } else if self.deck.open() == Some(&key) {
+                        self.scroll_by(d);
+                    }
                 }
                 Vec::new()
             }
@@ -1013,6 +1074,11 @@ impl Column {
         let page =
             (self.style.metrics.sheet_height - self.style.text_top() - self.style.file_bar) * 0.9;
         match event.keysym {
+            Keysym::Escape if self.palette_since.take().is_some() => self.kick(),
+            Keysym::Escape if self.showing_files(&key) => {
+                self.all_files[0] = None;
+                self.kick();
+            }
             Keysym::Escape => return vec![Act::Close],
             Keysym::Return | Keysym::KP_Enter if mods.ctrl => return vec![Act::Close],
             Keysym::e | Keysym::E if mods.ctrl => return vec![Act::Edit(key)],
@@ -1046,6 +1112,7 @@ impl Column {
                     self.deck.hide_due();
                 }
             }
+            Timer::Trash => {}
         }
         self.kick();
     }
@@ -1105,15 +1172,14 @@ impl Column {
     fn hover_at(&mut self, core: &Core<WlNote>, x: f64, y: f64) {
         self.pointer = Some((x, y));
         self.cancel_hide(core);
-        let bar = self.bar_at(x, y);
-        let mut changed = bar != self.bar_hover;
-        self.bar_hover = bar;
+        let on = self.on_at(x, y);
+        let mut changed = self.leave_file_views(&on);
+        changed |= self.update_bar_hover(x, y);
         let before = (
             self.deck.level(),
             self.deck.revealed().map(String::from),
             self.deck.hover().map(String::from),
         );
-        let on = self.on_at(x, y);
         match self.deck.point(on) {
             Some(key) => self.start_reveal(core, key),
             None => self.cancel_reveal(core),
@@ -1168,20 +1234,32 @@ impl Column {
             return Vec::new();
         };
         let act = match (p.dragging, p.revealed) {
-            (false, false) => Act::Open(p.key),
+            (false, false) => Some(Act::Open(p.key)),
             (false, true) => self.revealed_click(p.key, p.x, p.y),
-            (true, _) => match self.deck.drag_end() {
-                Some((key, gap)) => Act::Reorder(key, self.keys().map(String::from).collect(), gap),
-                None => return Vec::new(),
-            },
+            (true, _) => self
+                .deck
+                .drag_end()
+                .map(|(key, gap)| Act::Reorder(key, self.keys().map(String::from).collect(), gap)),
         };
         self.hover_at(core, x, y);
         self.kick();
-        vec![act]
+        act.into_iter().collect()
     }
 
     fn click(&mut self, core: &Core<WlNote>, x: f64, y: f64, shift: bool) -> Vec<Act> {
         let on = self.on_at(x, y);
+        let left_files = self.leave_file_views(&on);
+        if self.update_bar_hover(x, y) || left_files {
+            self.kick();
+        }
+        let hit = self.bar_hover.clone();
+        if self.palette_since.is_some()
+            && !matches!(hit, Some((_, BarHit::Color | BarHit::Swatch(_))))
+        {
+            self.palette_since = None;
+            self.kick();
+            return self.commit_title();
+        }
         let open = self.deck.open().map(String::from);
         let on_title = (open.as_deref())
             .and_then(|k| self.face(k))
@@ -1191,6 +1269,10 @@ impl Column {
             true => Vec::new(),
             false => self.commit_title(),
         };
+        if let Some((key, hit)) = hit {
+            acts.extend(self.bar_click(core, &key, hit, shift));
+            return acts;
+        }
         match on {
             On::Plus => acts.push(Act::New),
             // Opened on release, unless it is dragged.
@@ -1209,37 +1291,27 @@ impl Column {
                 });
             }
             On::Sheet(k) if open.as_deref() == Some(k.as_str()) => {
-                acts.extend(self.open_click(&k, x, y, shift))
+                acts.extend(self.open_click(&k, x, y));
             }
-            // The file bar acts at once; the rest of a revealed sheet on
-            // release, unless it is dragged (folding back to its margin,
-            // under the pointer).
-            On::Sheet(k) => match self.bar_at(x, y) {
-                Some((b, _)) if b == k => acts.push(self.revealed_click(k, x, y)),
-                _ => {
-                    self.cancel_reveal(core);
-                    self.press = Some(Press {
-                        key: k,
-                        x,
-                        y,
-                        offset: 0.0,
-                        revealed: true,
-                        dragging: false,
-                    });
-                }
-            },
+            On::Sheet(k) if self.showing_files(&k) => {}
+            On::Sheet(k) => {
+                self.cancel_reveal(core);
+                self.press = Some(Press {
+                    key: k,
+                    x,
+                    y,
+                    offset: 0.0,
+                    revealed: true,
+                    dragging: false,
+                });
+            }
             On::Strip | On::Outside => {}
         }
         acts
     }
 
     /// What a click at (`x`, `y`) on the open note `key` does.
-    fn open_click(&mut self, key: &str, x: f64, y: f64, shift: bool) -> Option<Act> {
-        if let Some((k, hit)) = self.bar_at(x, y)
-            && k == key
-        {
-            return self.bar_click(key, hit, shift);
-        }
+    fn open_click(&mut self, key: &str, x: f64, y: f64) -> Option<Act> {
         let face = self.face(key)?;
         if self.margin_rect(face).contains(x, y) {
             return Some(Act::Close);
@@ -1249,7 +1321,7 @@ impl Column {
             return None;
         }
         let area = self.text_rect(face);
-        if !area.contains(x, y) {
+        if self.showing_files(key) || !area.contains(x, y) {
             return None;
         }
         let d = self.docs.iter().find(|d| d.key == key)?.shown.as_ref()?;
@@ -1261,34 +1333,172 @@ impl Column {
 
     /// What a click at (`x`, `y`) on the revealed note `key` does: its
     /// files, checkboxes and links work; anywhere else opens it.
-    fn revealed_click(&mut self, key: String, x: f64, y: f64) -> Act {
-        if let Some((k, hit)) = self.bar_at(x, y)
-            && k == key
-            && let Some(act) = self.bar_click(&key, hit, false)
-        {
-            return act;
+    fn revealed_click(&self, key: String, x: f64, y: f64) -> Option<Act> {
+        if self.showing_files(&key) {
+            return None;
         }
         let target = (self.slots.iter().find(|s| s.key == key))
             .and_then(|s| Some((s.paper, s.shown.as_ref()?)))
             .and_then(|(r, (_, sheet))| doc::hit(&sheet.hits, x - r.x, y - r.y));
-        match target {
+        Some(match target {
             Some(Target::Task(n)) => Act::Task(key, n),
             Some(Target::Link(n)) => Act::Link(key, n),
             None => Act::Open(key),
-        }
+        })
     }
 
-    fn bar_click(&self, key: &str, hit: BarHit, shift: bool) -> Option<Act> {
+    fn bar_click(
+        &mut self,
+        core: &Core<WlNote>,
+        key: &str,
+        hit: BarHit,
+        shift: bool,
+    ) -> Option<Act> {
         let note = self.notes.get(key)?;
         match hit {
             BarHit::File(i) => Some(Act::File(note.files.get(i)?.path.clone())),
-            BarHit::More => None,
+            BarHit::RemoveFile(i) => {
+                Some(Act::RemoveFile(key.into(), note.files.get(i)?.path.clone()))
+            }
+            BarHit::More => {
+                let i = self.view_index(key);
+                self.all_files[i] = (!self.showing_files(key)).then(|| (key.into(), 0));
+                self.kick();
+                None
+            }
+            BarHit::Color => {
+                self.palette_since = if self.palette_since.is_some() || note.pin == Pin::Locked {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
+                self.kick();
+                None
+            }
+            BarHit::Swatch(color) => {
+                let changed = note.color != color;
+                self.palette_since = None;
+                self.kick();
+                changed.then(|| Act::Color(key.into(), color))
+            }
+            BarHit::Trash => {
+                let confirmed = self.trash.click(Instant::now());
+                if !confirmed {
+                    let surface = self.surface().clone();
+                    if let Err(e) = core.timer(bar::TRASH_TIMEOUT, move |app: &mut WlNote, core| {
+                        app.column_timer(core, &surface, Timer::Trash);
+                    }) {
+                        warn!("trash confirmation: {e}");
+                    }
+                }
+                self.kick();
+                confirmed.then(|| Act::Trash(key.into()))
+            }
             BarHit::Archive => Some(Act::Hide(key.to_string())),
             BarHit::Pin => match &note.pin {
                 Pin::Unpinned(_) => Some(Act::Pin(key.to_string(), shift)),
                 Pin::Pinned { .. } => Some(Act::Unpin(key.to_string())),
                 Pin::None | Pin::Locked => None,
             },
+        }
+    }
+
+    fn update_bar_hover(&mut self, x: f64, y: f64) -> bool {
+        let next = self.bar_at(x, y);
+        if next == self.bar_hover {
+            return false;
+        }
+        self.trash.clear();
+        self.bar_hover = next;
+        true
+    }
+
+    fn view_index(&self, key: &str) -> usize {
+        usize::from(self.deck.open() != Some(key))
+    }
+
+    fn showing_files(&self, key: &str) -> bool {
+        self.all_files[self.view_index(key)]
+            .as_ref()
+            .is_some_and(|(k, _)| k == key)
+    }
+
+    fn reset_file_views(&mut self) {
+        for (view, key) in self
+            .all_files
+            .iter_mut()
+            .zip([self.deck.open(), self.deck.revealed()])
+        {
+            if view.as_ref().is_some_and(|(k, _)| {
+                Some(k.as_str()) != key || self.notes.get(k).is_none_or(|n| n.files.is_empty())
+            }) {
+                *view = None;
+            }
+        }
+    }
+
+    fn leave_file_views(&mut self, on: &On) -> bool {
+        let mut changed = false;
+        for view in &mut self.all_files {
+            if view
+                .as_ref()
+                .is_some_and(|(k, _)| !matches!(on, On::Sheet(s) if s == k))
+            {
+                *view = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn grid_area(&self, key: &str) -> Option<Rect> {
+        let face = self.face(key)?;
+        let mut area = self.text_rect(face);
+        if self.deck.open() != Some(key) {
+            area = Rect::new(
+                area.x,
+                face.y + PAD_Y,
+                area.w,
+                area.bottom() - face.y - PAD_Y,
+            );
+        }
+        let hit = self.slots.iter().find(|s| s.key == key)?.hit?;
+        intersect(area, hit)
+    }
+
+    fn file_grid(&self, key: &str) -> Option<bar::Grid> {
+        let (k, row) = self.all_files[self.view_index(key)].as_ref()?;
+        (k == key).then_some(())?;
+        Some(bar::grid(
+            self.grid_area(key)?,
+            self.notes.get(key)?.files.len(),
+            *row,
+        ))
+    }
+
+    fn scroll_files(&mut self, key: &str, direction: f64, x: f64, y: f64) {
+        let Some(grid) = self.file_grid(key) else {
+            return;
+        };
+        let i = self.view_index(key);
+        if let Some((_, row)) = &mut self.all_files[i] {
+            let old = (*row).min(grid.last_row);
+            *row = old
+                .saturating_add_signed(direction as isize)
+                .min(grid.last_row);
+            if *row != old {
+                self.update_bar_hover(x, y);
+                self.kick();
+            }
+        }
+    }
+
+    fn file_hit(&self, key: &str, i: usize, icon: Rect, x: f64, y: f64) -> BarHit {
+        let over = matches!(self.bar_hover.as_ref(), Some((k, BarHit::File(j) | BarHit::RemoveFile(j))) if k == key && *j == i);
+        if over && !self.notes[key].files[i].path.exists() && remove_rect(icon).contains(x, y) {
+            BarHit::RemoveFile(i)
+        } else {
+            BarHit::File(i)
         }
     }
 
@@ -1317,19 +1527,38 @@ impl Column {
         let On::Sheet(key) = self.on_at(x, y) else {
             return None;
         };
+        if self.deck.open() == Some(&key) && self.open_alpha(&key) <= 0.0 {
+            return None;
+        }
         let layout = self.bar_layout(&key)?;
-        let near = |r: &Rect| r.outset(ICON_GAP / 2.0).contains(x, y);
-        if let Some((i, _)) = layout.icons.iter().find(|(_, r)| near(r)) {
-            return Some((key, BarHit::File(*i)));
+        let near = |r: &Rect| r.outset(layout.hit_pad).contains(x, y);
+        if !layout.color.is_some_and(|r| r.contains(x, y))
+            && let Some((color, _)) = layout.swatches.iter().rev().find(|(_, r)| r.contains(x, y))
+        {
+            return Some((key, BarHit::Swatch(*color)));
         }
-        if layout.more.is_some_and(|(_, r)| near(&r)) {
-            return Some((key, BarHit::More));
+        for (rect, hit) in [
+            (layout.color, BarHit::Color),
+            (layout.trash, BarHit::Trash),
+            (layout.archive, BarHit::Archive),
+            (layout.pin, BarHit::Pin),
+            (layout.more.map(|(_, r)| r), BarHit::More),
+        ] {
+            if rect.is_some_and(|r| near(&r)) {
+                return Some((key, hit));
+            }
         }
-        if layout.archive.is_some_and(|r| near(&r)) {
-            return Some((key, BarHit::Archive));
+        for (i, r) in layout.icons {
+            if near(&r) {
+                let hit = self.file_hit(&key, i, r, x, y);
+                return Some((key, hit));
+            }
         }
-        if layout.pin.is_some_and(|r| near(&r)) {
-            return Some((key, BarHit::Pin));
+        if let Some(grid) = self.file_grid(&key)
+            && let Some((i, cell)) = grid.cells.into_iter().find(|(_, cell)| cell.contains(x, y))
+        {
+            let hit = self.file_hit(&key, i, grid_icon(cell), x, y);
+            return Some((key, hit));
         }
         None
     }
@@ -1537,6 +1766,10 @@ impl Column {
         self.named(&["builtin:archive"])
     }
 
+    fn trash_icon(&self) -> NamedIcon {
+        self.named(&["builtin:trash"])
+    }
+
     /// A file's own icon, once its names are known.
     fn file_icon(&self, path: &PathBuf) -> Option<NamedIcon> {
         let names = self.file_icons.get(path)?;
@@ -1550,6 +1783,8 @@ impl Column {
             self.pin_icon(false),
             self.pin_icon(true),
             self.archive_icon(),
+            self.trash_icon(),
+            self.named(&["builtin:close"]),
         ] {
             self.assets.named_icon(&key);
         }
@@ -1617,6 +1852,46 @@ impl Column {
         }
         let generic = self.generic_icon();
         self.icon_buffer(&generic, tint)
+    }
+
+    fn dot(&mut self, paper: u32, ink: u32, selected: bool) -> Option<WlBuffer> {
+        let key = (paper, ink, selected);
+        if let Some(buffer) = self.dots.get(&key) {
+            return Some(buffer.clone());
+        }
+        let size = ICON as u32 * self.scale as u32;
+        let mut rgba = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                let coord = |i| ((i as f64 + 0.5) / size as f64 - 0.5) * ICON;
+                let r = coord(x).hypot(coord(y));
+                let (color, coverage) = if r <= 4.5 {
+                    (paper, 1.0)
+                } else if selected && r >= 6.0 {
+                    (
+                        ink,
+                        ((r - 6.0).min(7.8 - r) * self.scale as f64 + 0.5).clamp(0.0, 1.0),
+                    )
+                } else {
+                    (ink, (5.7 - r).clamp(0.0, 1.0))
+                };
+                let [r, g, b, a] = color.to_be_bytes();
+                rgba.extend([r, g, b, (a as f64 * coverage).round() as u8]);
+            }
+        }
+        let image = Image {
+            width: size,
+            height: size,
+            data: wl_shell_render::image::to_argb8888(&rgba),
+        };
+        let buffer = shm_buffer(&self.g, &image, &self.qh)
+            .inspect_err(|e| warn!("color dot: {e}"))
+            .ok()?;
+        if self.dots.len() >= 64 {
+            self.stale.extend(self.dots.drain().map(|(_, b)| b));
+        }
+        self.dots.insert(key, buffer.clone());
+        Some(buffer)
     }
 
     /// A name label: None until the worker drew it (it is asked for).
@@ -1715,7 +1990,10 @@ impl Column {
             return;
         }
         self.place_all();
-        if self.deck.moving() && !self.frame_pending {
+        let animating_palette = self
+            .palette_since
+            .is_some_and(|t| t.elapsed() < PALETTE_TIME);
+        if (self.deck.moving() || animating_palette) && !self.frame_pending {
             self.request_frame();
         }
         self.layer.commit();
@@ -1819,28 +2097,46 @@ impl Column {
         let face = self.face(key)?;
         let bar = self.bar_rect(face);
         let mid = bar.y + bar.h / 2.0;
-        // The archive and pin icons at the end of an open sheet's.
-        let controls_w = if open { 2.0 * (ICON + ICON_GAP) } else { 0.0 };
-        let (n, more) = bar::fit(note.files.len(), bar.w - controls_w, ICON, ICON_GAP);
-        let slot = |i: usize| {
-            Rect::new(
-                bar.x + i as f64 * (ICON + ICON_GAP),
-                mid - ICON / 2.0,
-                ICON,
-                ICON,
-            )
+        let pitch = (ICON + ICON_GAP).min(bar.w / if open { 6.0 } else { 1.0 });
+        let size = ICON.min(pitch * 0.85);
+        let rect = |x| Rect::new(x, mid - size / 2.0, size, size);
+        let slot = |i: usize| rect(bar.x + i as f64 * pitch);
+        let control = |i: usize| open.then(|| rect(bar.right() - size - i as f64 * pitch));
+        let color = control(3);
+        let file_end = color.map_or(bar.right(), |r| r.x - (pitch - size));
+        let (n, more) = bar::fit(note.files.len(), file_end - bar.x, size, pitch - size);
+        let grid = self.showing_files(key);
+        let swatches = match (color, self.palette_since) {
+            (Some(dot), Some(start)) => {
+                let p = (start.elapsed().as_secs_f64() / PALETTE_TIME.as_secs_f64()).min(1.0);
+                let colors: Vec<_> = bar::colors(note.color).collect();
+                let rects = bar::palette(bar.x, dot, colors.len(), 1.0 - (1.0 - p).powi(3));
+                colors.into_iter().zip(rects).collect()
+            }
+            _ => Vec::new(),
         };
-        let used = n + more.map_or(0, |_| 1);
+        let used = n + usize::from(more.is_some());
         let mut layout = BarLayout {
-            icons: (0..n).map(|i| (i, slot(i))).collect(),
-            more: more.map(|count| (count, slot(n))),
-            pin: open.then(|| Rect::new(bar.right() - ICON, mid - ICON / 2.0, ICON, ICON)),
-            archive: open.then(|| {
-                let x = bar.right() - 2.0 * ICON - ICON_GAP;
-                Rect::new(x, mid - ICON / 2.0, ICON, ICON)
-            }),
-            name_x: bar.x + used as f64 * (ICON + ICON_GAP),
-            name_end: bar.right() - controls_w,
+            icons: if grid || !swatches.is_empty() {
+                Vec::new()
+            } else {
+                (0..n).map(|i| (i, slot(i))).collect()
+            },
+            more: if !swatches.is_empty() {
+                None
+            } else if grid {
+                Some((0, slot(more.map_or(0, |_| n))))
+            } else {
+                more.map(|count| (count, slot(n)))
+            },
+            pin: control(0),
+            archive: control(1),
+            trash: control(2),
+            color,
+            swatches,
+            hit_pad: (pitch - size) / 2.0,
+            name_x: bar.x + used.max(usize::from(grid)) as f64 * pitch,
+            name_end: file_end,
             mid,
         };
         // On a tilted sheet, the icons follow the tilt.
@@ -1927,26 +2223,28 @@ impl Column {
                 } else {
                     0.0
                 };
-                let content = note.filter(|_| !open).map(|n| {
-                    let clip = m.sheet_height - PAD_Y - bar.max(PAD_Y);
-                    let line = text::line_height(self.style.font_size) as f64;
-                    let x = match self.style.edge {
-                        Edge::Right => m.header + PAD_X,
-                        Edge::Left => BEHIND + PAD_X,
-                    };
-                    paper::Content {
-                        doc: Doc {
-                            blocks: n.content.sheet(),
-                            style: self.style.doc_style(n.text),
-                            width: self.style.content_w() as i32,
-                            max_height: (clip + 2.0 * line) as i32,
-                            scale: self.scale,
-                        },
-                        x: x as i32,
-                        y: PAD_Y as i32,
-                        clip: Some(clip as i32),
-                    }
-                });
+                let content = note
+                    .filter(|_| !open && !self.showing_files(&card.key))
+                    .map(|n| {
+                        let clip = m.sheet_height - PAD_Y - bar.max(PAD_Y);
+                        let line = text::line_height(self.style.font_size) as f64;
+                        let x = match self.style.edge {
+                            Edge::Right => m.header + PAD_X,
+                            Edge::Left => BEHIND + PAD_X,
+                        };
+                        paper::Content {
+                            doc: Doc {
+                                blocks: n.content.sheet(),
+                                style: self.style.doc_style(n.text),
+                                width: self.style.content_w() as i32,
+                                max_height: (clip + 2.0 * line) as i32,
+                                scale: self.scale,
+                            },
+                            x: x as i32,
+                            y: PAD_Y as i32,
+                            clip: Some(clip as i32),
+                        }
+                    });
                 Paper {
                     w: (m.sheet_width + BEHIND).round() as i32,
                     h: m.sheet_height.round() as i32,
@@ -2076,6 +2374,17 @@ impl Column {
         }
 
         self.place_plus();
+        if self.press.is_none()
+            && let Some((x, y)) = self.pointer
+        {
+            // Geometry can move under a stationary pointer, including
+            // away from an armed trash button.
+            let on = self.on_at(x, y);
+            if self.leave_file_views(&on) {
+                self.kick();
+            }
+            self.update_bar_hover(x, y);
+        }
         self.place_open();
         let revealed = self.deck.revealed().map(String::from);
         let plan = revealed.as_deref().and_then(|k| self.bar_plan(k, false));
@@ -2185,7 +2494,10 @@ impl Column {
             .filter(|_| alpha > 0.0);
         // The text, scrolled.
         let mut shown_text = None;
-        let doc = (key.as_deref().zip(face))
+        let doc = key
+            .as_deref()
+            .zip(face)
+            .filter(|(k, _)| !self.showing_files(k))
             .and_then(|(k, f)| Some((self.docs.iter().find(|d| d.key == k)?.shown.as_ref()?, f)));
         match doc {
             Some((d, f)) => {
@@ -2246,9 +2558,7 @@ impl Column {
                 let card = self.deck.cards().iter().find(|c| c.key == key)?;
                 let shown = (self.slots.iter().find(|s| s.key == key))
                     .and_then(|s| s.shown.as_ref())
-                    .is_some_and(|(p, _)| {
-                        p.content.is_some() && *p == self.paper(card, Role::Sheet)
-                    });
+                    .is_some_and(|(p, _)| *p == self.paper(card, Role::Sheet));
                 let m = &self.style.metrics;
                 let t = ((card.out.value - m.header) / (m.sheet_width - m.header)).clamp(0.0, 1.0);
                 if shown { t * t } else { 0.0 }
@@ -2256,6 +2566,9 @@ impl Column {
         };
         let note = self.notes.get(key)?;
         let (ink, files, pin) = (note.text, note.files.clone(), note.pin.clone());
+        let (current, paper) = (note.color, note.paper);
+        let grid = self.file_grid(key);
+        let armed = open && self.trash.armed(Instant::now());
         let hover = (self.bar_hover.as_ref())
             .filter(|(k, _)| k == key)
             .map(|(_, h)| *h);
@@ -2263,24 +2576,88 @@ impl Column {
             alpha,
             ..BarPlan::default()
         };
-        for (i, rect) in &layout.icons {
-            let f = &files[*i];
-            let lit = hover == Some(BarHit::File(*i));
+        if alpha <= 0.0 {
+            return Some(plan);
+        }
+        let entries = grid.as_ref().map_or_else(
+            || {
+                layout
+                    .icons
+                    .iter()
+                    .map(|(i, r)| (*i, *r, None))
+                    .collect::<Vec<_>>()
+            },
+            |g| {
+                g.cells
+                    .iter()
+                    .map(|(i, cell)| (*i, grid_icon(*cell), Some(*cell)))
+                    .collect()
+            },
+        );
+        for (i, rect, cell) in entries {
+            let f = &files[i];
+            let lit = matches!(hover, Some(BarHit::File(j) | BarHit::RemoveFile(j)) if i == j);
+            let exists = if lit { f.path.exists() } else { f.exists };
             let buffer = self.file_buffer(&f.path, (!lit).then_some(ink));
-            let a = if f.exists { 1.0 } else { 0.4 };
-            plan.icons.push((buffer, *rect, a));
+            plan.icons
+                .push((buffer, rect, if exists { 1.0 } else { 0.4 }));
+            if !exists && lit {
+                let icon = self.named(&["builtin:close"]);
+                plan.icons
+                    .push((self.icon_buffer(&icon, None), remove_rect(rect), 1.0));
+            }
+            if let Some(cell) = cell
+                && let Some(l) = self.line(LineKey {
+                    text: bar::name(&f.path),
+                    color: ink,
+                    width: (cell.w - 4.0) as i32,
+                    strike: !exists,
+                })
+            {
+                let r = Rect::new(cell.x + (cell.w - l.w) / 2.0, rect.bottom() + 2.0, l.w, l.h);
+                if r.bottom() <= cell.bottom() {
+                    plan.labels.push((l.buffer, r));
+                }
+            }
         }
         if let Some((count, rect)) = layout.more {
-            let key = LineKey {
+            if count == 0 {
+                let icon = self.named(&["builtin:close"]);
+                plan.icons.push((self.icon_buffer(&icon, None), rect, 1.0));
+            } else if let Some(l) = self.line(LineKey {
                 text: format!("+{count}"),
                 color: ink,
-                width: 40,
+                width: rect.w.ceil() as i32 + 6,
                 strike: false,
-            };
-            if let Some(l) = self.line(key) {
+            }) {
                 let r = Rect::new(rect.x, rect.y + (rect.h - l.h) / 2.0, l.w, l.h);
                 plan.more = Some((l.buffer, r));
             }
+        }
+        for &(color, rect) in &layout.swatches {
+            let fill = match color {
+                Color::Preset(name) => PRESETS
+                    .iter()
+                    .position(|p| *p == name)
+                    .map_or(paper, |i| self.style.palette[i]),
+                Color::Rgb(_) => paper,
+            };
+            plan.icons
+                .push((self.dot(fill, ink, current == color), rect, 1.0));
+        }
+        if let Some(rect) = layout.color {
+            let a = if pin == Pin::Locked { 0.4 } else { 1.0 };
+            plan.icons.push((self.dot(paper, ink, false), rect, a));
+        }
+        if let Some(rect) = layout.trash {
+            let tint = if armed { TRASH_RED } else { ink };
+            let a = if hover == Some(BarHit::Trash) {
+                1.0
+            } else {
+                0.75
+            };
+            plan.icons
+                .push((self.icon_buffer(&self.trash_icon(), Some(tint)), rect, a));
         }
         if let Some(rect) = layout.pin {
             let lit = hover == Some(BarHit::Pin);
@@ -2300,39 +2677,73 @@ impl Column {
         }
         // The name of what is hovered.
         let name = match hover {
-            Some(BarHit::File(i)) => files.get(i).map(|f| (bar::name(&f.path), !f.exists)),
-            Some(BarHit::More) => {
-                let rest: Vec<String> = (files.iter().skip(layout.icons.len()))
-                    .map(|f| bar::name(&f.path))
-                    .collect();
-                Some((rest.join(", "), false))
+            Some(BarHit::File(i)) if grid.is_none() => {
+                files.get(i).map(|f| (bar::name(&f.path), !f.path.exists()))
             }
+            Some(BarHit::RemoveFile(_)) => Some(("Remove missing link".into(), false)),
+            Some(BarHit::More) => Some((
+                if grid.is_some() {
+                    "Back to note"
+                } else {
+                    "Show all files"
+                }
+                .into(),
+                false,
+            )),
+            Some(BarHit::Color) => Some((
+                if pin == Pin::Locked {
+                    "The frontmatter doesn't parse"
+                } else {
+                    "Change color"
+                }
+                .into(),
+                false,
+            )),
+            Some(BarHit::Swatch(color)) => Some((bar::color_name(color), false)),
+            Some(BarHit::Trash) => Some((
+                if armed {
+                    "Move to Trash?"
+                } else {
+                    "Move to Trash"
+                }
+                .into(),
+                false,
+            )),
             Some(BarHit::Archive) => Some((ARCHIVE_LABEL.to_string(), false)),
             Some(BarHit::Pin) => Some((pin_label(&pin), false)),
-            None => None,
+            _ => None,
         };
-        if let Some((text, strike)) = name.filter(|(t, _)| !t.is_empty()) {
-            // The controls' names end before the first of them.
-            let right_aligned = matches!(hover, Some(BarHit::Pin | BarHit::Archive));
-            let first = layout.archive.or(layout.pin);
-            let end = match (right_aligned, first) {
-                (true, Some(r)) => r.x - ICON_GAP,
-                _ => layout.name_end,
-            };
-            let width = (end - layout.name_x).max(1.0) as i32;
-            let key = LineKey {
+        if let Some((text, strike)) = name {
+            let control = matches!(
+                hover,
+                Some(
+                    BarHit::Pin
+                        | BarHit::Archive
+                        | BarHit::Trash
+                        | BarHit::Color
+                        | BarHit::Swatch(_)
+                )
+            );
+            let area = self.bar_rect(self.face(key)?);
+            let start = if control { area.x } else { layout.name_x };
+            let end = layout.name_end;
+            let above = end - start < 90.0 || !layout.swatches.is_empty();
+            let width = if above { area.w } else { end - start };
+            if let Some(l) = self.line(LineKey {
                 text,
                 color: ink,
-                width,
+                width: width as i32,
                 strike,
-            };
-            if let Some(l) = self.line(key) {
-                let x = if right_aligned {
-                    end - l.w
+            }) {
+                let (x, y) = if above {
+                    (area.right() - l.w, area.y - l.h - 3.0)
                 } else {
-                    layout.name_x
+                    (
+                        if control { end - l.w } else { start },
+                        layout.mid - l.h / 2.0,
+                    )
                 };
-                plan.name = Some((l.buffer, Rect::new(x, layout.mid - l.h / 2.0, l.w, l.h)));
+                plan.name = Some((l.buffer, Rect::new(x, y, l.w, l.h)));
             }
         }
         Some(plan)
@@ -2396,6 +2807,7 @@ struct BarPlan {
     /// The bar's, times each part's.
     alpha: f64,
     icons: Vec<(Option<WlBuffer>, Rect, f64)>,
+    labels: Vec<(WlBuffer, Rect)>,
     more: Option<(WlBuffer, Rect)>,
     archive: Option<(Option<WlBuffer>, Rect, f64)>,
     pin: Option<(Option<WlBuffer>, Rect, f64)>,
@@ -2405,8 +2817,23 @@ struct BarPlan {
 impl BarSubs {
     /// Bottom first.
     fn subs(&self) -> impl Iterator<Item = &Sub> {
-        (self.icons.iter()).chain([&self.more, &self.archive, &self.pin, &self.name])
+        self.icons.iter().chain(&self.labels).chain([
+            &self.more,
+            &self.archive,
+            &self.pin,
+            &self.name,
+        ])
     }
+}
+
+fn grid_icon(cell: Rect) -> Rect {
+    let size = 24.0_f64.min(cell.w).min(cell.h);
+    Rect::new(cell.x + (cell.w - size) / 2.0, cell.y, size, size)
+}
+
+fn remove_rect(icon: Rect) -> Rect {
+    let size = (icon.w * 0.65).min(12.0);
+    Rect::new(icon.right() - size, icon.y, size, size)
 }
 
 /// What the pin icon says it does.

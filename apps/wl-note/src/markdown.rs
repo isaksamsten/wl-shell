@@ -13,6 +13,8 @@
 
 use std::ops::Range;
 
+use std::path::Path;
+
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use wl_shell_notes::Note;
 use wl_shell_render::doc::{Block, Kind, Marker, Run};
@@ -112,6 +114,84 @@ pub fn toggle(text: &str, range: Range<usize>) -> Option<String> {
     Some(format!("{}{new}{}", &text[..at + 1], &text[at + 2..]))
 }
 
+/// Remove every occurrence of a local file link (the bar groups them by
+/// path). Use source ranges so unrelated Markdown and TOML stay intact.
+pub fn remove_file(note: &Note, path: &Path) -> Option<String> {
+    let body = note.body();
+    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let mut items = Vec::new();
+    let mut cuts = Vec::new();
+    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Item) => items.push(range),
+            Event::End(TagEnd::Item) => {
+                items.pop();
+            }
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. })
+                if wl_shell_render::files::uri_path(dest_url.trim()).as_deref() == Some(path) =>
+            {
+                let item = items.last().and_then(|item| {
+                    let prefix = body.get(item.start..range.start)?.trim();
+                    let marker = prefix
+                        .strip_suffix("[ ]")
+                        .or_else(|| prefix.strip_suffix("[x]"))
+                        .or_else(|| prefix.strip_suffix("[X]"))
+                        .unwrap_or(prefix)
+                        .trim_end();
+                    let numbered = marker
+                        .strip_suffix(['.', ')'])
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
+                    if !(numbered || matches!(marker, "-" | "+" | "*"))
+                        || !body.get(range.end..item.end)?.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    let line = body[..item.start].rfind('\n').map_or(0, |i| i + 1);
+                    let start = if body[line..item.start].trim().is_empty() {
+                        line
+                    } else {
+                        item.start
+                    };
+                    let end = body[range.end..item.end]
+                        .find('\n')
+                        .map_or(item.end, |i| range.end + i + 1);
+                    Some(start..end)
+                });
+                cuts.push(item.unwrap_or(range));
+            }
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.sort_by_key(|r| (r.start, r.end));
+    let mut text = String::with_capacity(note.text().len());
+    let mut at = 0;
+    let offset = note.text().len() - body.len();
+    text.push_str(&note.text()[..offset]);
+    for r in cuts {
+        if r.start >= at {
+            text.push_str(&body[at..r.start]);
+        }
+        at = at.max(r.end);
+    }
+    text.push_str(&body[at..]);
+    Some(text)
+}
+
+#[test]
+fn removing_a_file_preserves_other_source() {
+    let note = Note::parse(
+        "+++\r\n# keep\r\ncolor = 'pink'\r\n+++\r\n\r\n- [x] [gone](file:///a%20b)\r\n- Keep [gone][ref] and [other](file:///c)\r\n  - [gone](file:///a%20b)\r\n\r\n[ref]: file:///a%20b\r\n",
+    );
+    let new = remove_file(&note, Path::new("/a b")).unwrap();
+    assert_eq!(
+        new,
+        "+++\r\n# keep\r\ncolor = 'pink'\r\n+++\r\n\r\n- Keep  and [other](file:///c)\r\n\r\n[ref]: file:///a%20b\r\n"
+    );
+    assert!(remove_file(&note, Path::new("/missing")).is_none());
+}
 #[derive(Default)]
 struct Builder {
     offset: usize,

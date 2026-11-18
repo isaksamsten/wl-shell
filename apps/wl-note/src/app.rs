@@ -42,7 +42,7 @@
 //!   are loaded on a thread of their own at the start.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -101,6 +101,8 @@ pub struct WlNote {
     tree: Option<RegistrationToken>,
     /// Renames in the notes directory not followed yet, as (from, to).
     moves: Vec<(PathBuf, PathBuf)>,
+    /// Notes with a Move to Trash command in flight (absolute paths).
+    trash_pending: HashSet<PathBuf>,
     /// The order and the hidden notes.
     state: State,
     /// Where they are kept; None: nowhere (no `$HOME`), so only for now.
@@ -153,6 +155,7 @@ impl WlNote {
             notes_touched: false,
             tree: None,
             moves: Vec::new(),
+            trash_pending: HashSet::new(),
             state: State::default(),
             state_dir: None,
             state_touched: false,
@@ -374,6 +377,14 @@ impl WlNote {
             return;
         }
         let changes = self.index.scan();
+        for rel in &changes.removed {
+            if self.trash_pending.contains(&self.index.dir().join(rel)) {
+                let key = rel.to_string_lossy();
+                for column in &mut self.columns {
+                    column.crumple(&key);
+                }
+            }
+        }
         for e in &changes.errors {
             warn!("{e}");
         }
@@ -738,6 +749,7 @@ impl WlNote {
             text: self.config.text_color(color),
             files,
             pin: pin_state(&entry.note, window),
+            color: color.copied().unwrap_or(self.config.default_color),
         })
     }
 
@@ -831,6 +843,20 @@ impl WlNote {
                 self.edit_note(&key, |note| note.unpin(&window));
             }
             Act::Hide(key) => self.hide_note(core, &key),
+            Act::Color(key, color) => {
+                self.edit_note(&key, |note| note.set_value("color", bar::color_name(color)))
+            }
+            Act::Trash(key) => self.trash_note(core, &key),
+            Act::RemoveFile(key, path) => {
+                if !path.exists() {
+                    self.edit_note(&key, |note| {
+                        if let Some(text) = markdown::remove_file(note, &path) {
+                            *note = Note::parse(text);
+                        }
+                        Ok(())
+                    });
+                }
+            }
             Act::Reorder(key, shown, gap) => self.reorder(&key, &shown, gap),
         }
     }
@@ -868,6 +894,71 @@ impl WlNote {
             self.save_state(false, true);
         }
         self.dirty = true;
+    }
+
+    /// Run only the configured trash command. The filesystem scan, not
+    /// the click or the command's launch, removes the note from the deck.
+    fn trash_note(&mut self, core: &Core<Self>, key: &str) {
+        if self.index.get(Path::new(key)).is_none() {
+            return;
+        }
+        let path = self.path(key);
+        if self.trash_pending.contains(&path) {
+            return;
+        }
+        let template = &self.config.trash_command;
+        if !spawn::uses(template, "paths") {
+            return warn!("trash-command: expected {{paths}}");
+        }
+        // Pass the path as a standalone shell argument, including when
+        // its filename is not UTF-8.
+        let command = spawn::fill(template, &[("paths", "\"$1\"")]);
+        let (send, results) = channel::channel();
+        let tracked = path.clone();
+        let registered = core
+            .loop_handle
+            .insert_source(results, move |event, _, shell| {
+                if let channel::Event::Msg(result) = event {
+                    if let Err(e) = result {
+                        warn!("trash-command: {}: {e}", tracked.display());
+                    }
+                    let app = &mut shell.program;
+                    app.notes_touched = true;
+                    app.rescan(&mut shell.core);
+                    app.trash_pending.remove(&tracked);
+                }
+            });
+        let token = match registered {
+            Ok(token) => token,
+            Err(e) => return warn!("trash-command: {e}"),
+        };
+        let target = path.clone();
+        let started = std::thread::Builder::new()
+            .name("wl-note-trash".into())
+            .spawn(move || {
+                let result = std::process::Command::new("sh")
+                    .args(["-c", &command, "wl-note-trash"])
+                    .arg(&target)
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .and_then(|s| {
+                        if s.success() {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::other(s.to_string()))
+                        }
+                    });
+                let _ = send.send(result);
+            });
+        match started {
+            Ok(_) => {
+                self.trash_pending.insert(path);
+            }
+            Err(e) => {
+                core.loop_handle.remove(token);
+                warn!("trash-command: {e}");
+            }
+        }
     }
 
     /// `key` was dropped at slot `gap` of a column showing `shown`: move it
