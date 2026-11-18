@@ -289,7 +289,8 @@ impl Builder {
 }
 
 fn same_style(a: &Run, b: &Run) -> bool {
-    (a.bold, a.italic, a.code, a.strike, a.dim, a.link) == (b.bold, b.italic, b.code, b.strike, b.dim, b.link)
+    (a.bold, a.italic, a.code, a.strike, a.dim, a.link)
+        == (b.bold, b.italic, b.code, b.strike, b.dim, b.link)
 }
 
 #[cfg(test)]
@@ -348,7 +349,10 @@ mod tests {
         assert_eq!(c.blocks[2].marker, Marker::Task(false));
         assert!(c.blocks[2].runs.iter().all(|r| !r.dim));
         let once = toggle(&text, c.tasks[0].clone()).unwrap();
-        assert_eq!(once, format!("{front}- [x] bump\n- [x] tag *it*\n  - [ ] sub\n"));
+        assert_eq!(
+            once,
+            format!("{front}- [x] bump\n- [x] tag *it*\n  - [ ] sub\n")
+        );
         let twice = toggle(&once, c.tasks[1].clone()).unwrap();
         assert!(twice.contains("- [ ] tag *it*"));
         // Not a checkbox there (anymore).
@@ -362,7 +366,10 @@ mod tests {
         let c = parse(body, 0);
         assert_eq!(c.links, ["https://example.com"]);
         let runs = &c.blocks[0].runs;
-        assert!(runs.iter().any(|r| r.link == Some(0) && r.text == "the docs"));
+        assert!(
+            runs.iter()
+                .any(|r| r.link == Some(0) && r.text == "the docs")
+        );
         assert!(runs.iter().any(|r| r.code && r.text == "code"));
         assert!(c.blocks[1].quote);
         assert_eq!(c.blocks[1].depth, 1);

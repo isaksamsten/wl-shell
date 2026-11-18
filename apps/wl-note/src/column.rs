@@ -3,9 +3,10 @@
 //!
 //! A layer surface anchored to the edge and both sides, as wide as a
 //! sheet and its shadow (so revealing or opening never resizes it), with
-//! an exclusive zone of 0. The surface itself shows a transparent pixel,
-//! and its input region is only what shows of the notes and the edge
-//! band along them, so clicks anywhere else go through.
+//! an exclusive zone of 0, or of the edge band with `reserve-edge-band`.
+//! The surface itself shows a transparent pixel, and its input region is
+//! only what shows of the notes and the edge bands, so clicks anywhere
+//! else go through.
 //!
 //! Each note is a sync subsurface showing its paper (papers.rs), placed by
 //! the deck's springs (deck.rs). A paper is drawn at its natural size, its
@@ -123,6 +124,8 @@ pub struct Style {
     pub layer: NoteLayer,
     pub metrics: Metrics,
     pub marker_radius: f64,
+    /// Keep windows off the edge band.
+    pub reserve_band: bool,
     pub file_bar: f64,
     pub reveal_delay: Duration,
     pub hide_delay: Duration,
@@ -149,6 +152,7 @@ impl Style {
                 marker_width: config.marker_width as f64,
                 marker_length: config.marker_length as f64,
                 marker_gap: config.marker_gap as f64,
+                band: config.edge_band as f64,
                 padding: config.marker_padding as f64,
                 header: config.header as f64,
                 header_length: config.header_length as f64,
@@ -157,6 +161,7 @@ impl Style {
                 plus: 22.0,
             },
             marker_radius: config.marker_radius as f64,
+            reserve_band: config.reserve_edge_band,
             file_bar: config.file_bar as f64,
             reveal_delay: Duration::from_millis(config.reveal_delay as u64),
             hide_delay: Duration::from_millis(config.hide_delay as u64),
@@ -230,6 +235,14 @@ impl Style {
     /// The width text wraps at on a sheet.
     fn content_w(&self) -> f64 {
         (self.body_w() - 2.0 * PAD_X).max(20.0)
+    }
+
+    /// The exclusive zone: the edge band, if reserved.
+    fn exclusive_zone(&self) -> i32 {
+        match self.reserve_band {
+            true => self.metrics.band.round() as i32,
+            false => 0,
+        }
     }
 }
 
@@ -553,7 +566,7 @@ impl Column {
         };
         layer.set_anchor(side | Anchor::TOP | Anchor::BOTTOM);
         layer.set_size(style.width(), 0);
-        layer.set_exclusive_zone(0);
+        layer.set_exclusive_zone(style.exclusive_zone());
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         // Nothing takes input until there are notes.
         (layer.wl_surface()).set_input_region(Some(no_input.wl_region()));
@@ -649,6 +662,7 @@ impl Column {
             return;
         }
         self.layer.set_size(style.width(), 0);
+        self.layer.set_exclusive_zone(style.exclusive_zone());
         self.deck.set_metrics(style.metrics, style.response);
         self.style = style;
         self.forget_drawn();
@@ -1143,7 +1157,7 @@ impl Column {
         if self.plus_rect.is_some_and(|r| r.contains(x, y)) {
             return On::Plus;
         }
-        match self.band_rect().is_some_and(|r| r.contains(x, y)) {
+        match self.band_rects().iter().any(|r| r.contains(x, y)) {
             true => On::Strip,
             false => On::Outside,
         }
@@ -1631,10 +1645,11 @@ impl Column {
         Rect::new(body.x + PAD_X, face.bottom() - h, self.style.content_w(), h)
     }
 
-    /// The edge band along the column (see `Deck::band`).
-    fn band_rect(&self) -> Option<Rect> {
-        let (top, bottom, w) = self.deck.band()?;
-        Some(self.out_rect(w, w, top, bottom - top))
+    /// The edge bands (see `Deck::bands`).
+    fn band_rects(&self) -> Vec<Rect> {
+        (self.deck.bands().into_iter())
+            .map(|(top, bottom, w)| self.out_rect(w, w, top, bottom - top))
+            .collect()
     }
 
     /// Where the parts of `key`'s file bar are, if it shows one.
@@ -1884,11 +1899,15 @@ impl Column {
         self.show_bar(false, plan);
         self.restack();
 
-        // Input: what shows of the notes, the button and the band.
+        // Input: what shows of the notes, the button and the bands.
         let mut input: Vec<IRect> = (self.slots.iter())
             .filter_map(|s| s.hit)
             .chain(self.plus_rect)
-            .chain(self.band_rect().and_then(|r| intersect(r, surface)))
+            .chain(
+                self.band_rects()
+                    .into_iter()
+                    .filter_map(|r| intersect(r, surface)),
+            )
             .map(IRect::round)
             .collect();
         input.dedup();

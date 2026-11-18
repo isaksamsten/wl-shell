@@ -40,10 +40,7 @@ pub fn find<'a>(
             [one] => Some(Ok(*one)),
             many => {
                 let list: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
-                Some(Err(format!(
-                    "'{q}' could be any of: {}",
-                    list.join(", ")
-                )))
+                Some(Err(format!("'{q}' could be any of: {}", list.join(", "))))
             }
         }
     };
@@ -92,11 +89,13 @@ mod tests {
         assert_eq!(f("groceries"), Ok(b));
         // Not unique.
         let e = f("release").unwrap_err();
-        assert!(e.contains("work/release.md") && e.contains("home/release.md"), "{e}");
+        assert!(
+            e.contains("work/release.md") && e.contains("home/release.md"),
+            "{e}"
+        );
         let e = f("GROCERIES ").unwrap_err();
         assert!(e.contains("could be any of"), "{e}");
         assert!(f("nope").unwrap_err().contains("no note"));
         assert!(f(" ").is_err());
     }
 }
-

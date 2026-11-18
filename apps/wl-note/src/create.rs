@@ -72,7 +72,13 @@ mod tests {
     fn texts() {
         assert_eq!(text(None, None, None, None).unwrap(), "");
         assert_eq!(text(None, None, None, Some("milk")).unwrap(), "milk\n");
-        let t = text(Some("firefox"), Some("pink"), Some(" Release "), Some("- [ ] tag\n")).unwrap();
+        let t = text(
+            Some("firefox"),
+            Some("pink"),
+            Some(" Release "),
+            Some("- [ ] tag\n"),
+        )
+        .unwrap();
         assert_eq!(
             t,
             "+++\ntitle = \"Release\"\napps = [\"firefox\"]\ncolor = \"pink\"\n+++\n- [ ] tag\n"
@@ -99,4 +105,3 @@ mod tests {
         assert_eq!(now.len(), "2026-11-17-2059".len(), "{now}");
     }
 }
-

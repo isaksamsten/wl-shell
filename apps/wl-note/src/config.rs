@@ -43,6 +43,12 @@ pub struct Config {
     /// Kept free at both ends of the column.
     #[serde(deserialize_with = "de::px")]
     pub marker_padding: u32,
+    /// The band along the whole edge where the pointer brings the
+    /// headers out (0: only the markers do).
+    #[serde(deserialize_with = "edge_band")]
+    pub edge_band: u32,
+    /// Keep windows off the edge band (an exclusive zone).
+    pub reserve_edge_band: bool,
     /// How far a header (a note's margin) comes out of the edge.
     #[serde(deserialize_with = "header")]
     pub header: u32,
@@ -114,6 +120,8 @@ impl Default for Config {
             marker_radius: 3,
             marker_gap: 8,
             marker_padding: 12,
+            edge_band: 2,
+            reserve_edge_band: false,
             header: 28,
             header_length: 96,
             sheet_width: 300,
@@ -376,6 +384,10 @@ fn marker_length<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 8, 1000)
 }
 
+fn edge_band<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 0, 64)
+}
+
 fn header<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 12, 200)
 }
@@ -523,4 +535,3 @@ mod tests {
         assert_eq!(c.paper_color(Some(&Color::Rgb(0x804020))), 0x804020ff);
     }
 }
-

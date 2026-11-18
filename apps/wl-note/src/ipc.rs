@@ -92,4 +92,3 @@ mod tests {
         assert!(NoteRequest::decode(b"hide x\nend\n").is_err());
     }
 }
-

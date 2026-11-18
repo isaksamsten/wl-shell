@@ -15,8 +15,15 @@
 //! shingle: later ones cover the tails of earlier ones, at a pitch of
 //! `SHINGLE` of their length, tighter when crowded. Markers keep apart:
 //! with more than fit, their gap shrinks first, down to `MIN_GAP`, then
-//! their length, down to `MIN_MARKER`. A sheet is centered on its slot,
-//! moved as little as needed to fit on the output.
+//! their length, down to `MIN_MARKER`.
+//!
+//! A sheet (revealed or open) takes its whole height in the column
+//! (`places`): it comes down from its header's top, so its title stays
+//! where it was, and the notes after it and the `+` button move down to
+//! below it, never hidden under it. If that runs off the output, the
+//! column moves up as little as needed, then the headers' pitch shrinks.
+//! Moving from a header that shows onto the next one, that one's sheet is
+//! under the pointer, so browsing down the column never skips a note.
 //!
 //! Each card has springs: `y`, its center along the edge; `presence`,
 //! from 0 (behind the edge, out of sight) to 1 (in place); `out`, how far
@@ -35,13 +42,14 @@
 //! more frames are drawn.
 //!
 //! The pointer (`point`, from what the column finds under it, `On`): at
-//! the edge the column goes to header level at once; resting on a margin
-//! asks for a reveal after `reveal-delay` (`reveal_due`); once a sheet was
-//! revealed, other margins reveal at once, as a menu bar does, until the
-//! column goes back to markers (`hide_due`, after the pointer left it).
-//! Moving onto the strip between headers turns a revealed sheet back into
-//! a header; moving from a margin onto its own sheet keeps it out, as the
-//! sheet is one target from margin to bottom.
+//! the edge (in the `band` along all of it) the column goes to header
+//! level at once; resting on a margin asks for a reveal after
+//! `reveal-delay` (`reveal_due`); once a sheet was revealed, other margins
+//! reveal at once, as a menu bar does, until the column goes back to
+//! markers (`hide_due`, after the pointer left it). Moving onto the strip
+//! between headers turns a revealed sheet back into a header; moving from
+//! a margin onto its own sheet keeps it out, as the sheet is one target
+//! from margin to bottom.
 
 use wl_shell_ui::Spring;
 
@@ -52,9 +60,6 @@ pub const LIFT: f64 = 6.0;
 /// Header level holds this far past a lifted header, so a pointer
 /// drifting while reading the labels doesn't drop back to markers.
 pub const HOLD: f64 = 6.0;
-/// The edge band at marker level is this wide: the pointer pushed against
-/// the screen edge is in it.
-pub const BAND: f64 = 2.0;
 /// Headers shingle at this much of their length.
 const SHINGLE: f64 = 0.7;
 /// Crowded markers' gaps shrink to this, then their lengths to
@@ -107,6 +112,9 @@ pub struct Metrics {
     pub marker_width: f64,
     pub marker_length: f64,
     pub marker_gap: f64,
+    /// The edge band's width: the pointer in it, anywhere along the edge,
+    /// brings the headers out (0: only the markers do).
+    pub band: f64,
     /// Kept free at both ends of the column.
     pub padding: f64,
     /// How far a header is out.
@@ -312,33 +320,76 @@ impl Deck {
         }
     }
 
-    /// Where a card in `role` centers along the edge, its slot's center
-    /// at `slot`: a sheet is moved onto the output.
-    fn center(&self, role: Role, slot: f64) -> f64 {
-        if role != Role::Sheet {
-            return slot;
-        }
+    /// A sheet's center `y`, moved onto the output (centered on it if it
+    /// is too short).
+    fn fit(&self, y: f64) -> f64 {
         let (h, pad) = (self.metrics.sheet_height, self.metrics.padding);
         let (lo, hi) = (pad + h / 2.0, self.length - pad - h / 2.0);
         match lo <= hi {
-            true => slot.clamp(lo, hi),
+            true => y.clamp(lo, hi),
             false => self.length / 2.0,
         }
     }
 
+    /// Where the cards that stay center along the edge, in the column's
+    /// order: on their slots while none is a sheet; else each sheet comes
+    /// down from its header's top and what is after it goes below it (see
+    /// the module's comment).
+    fn places(&self) -> Vec<f64> {
+        let m = &self.metrics;
+        let (l, h) = (m.header_length, m.sheet_height);
+        let cards: Vec<&Card> = self.cards.iter().filter(|c| !c.leaving).collect();
+        let held: Vec<bool> = cards.iter().map(|c| self.held(&c.key)).collect();
+        if !held.contains(&true) {
+            return cards.iter().map(|c| c.slot).collect();
+        }
+        let n = cards.len();
+        // From each card's top to the next one's: a sheet's height after a
+        // sheet, the headers' pitch after a header.
+        let pitch: Vec<f64> = (1..n)
+            .map(|i| (cards[i].slot - cards[i - 1].slot).max(0.0))
+            .collect();
+        let sheets = (0..n - 1).filter(|&i| held[i]).count() as f64 * h;
+        let headers: f64 = (0..n - 1).filter(|&i| !held[i]).map(|i| pitch[i]).sum();
+        // The last card, and the `+` button after it.
+        let tail = (if held[n - 1] { h } else { l }) + PLUS_GAP + m.plus;
+        let avail = (self.length - 2.0 * m.padding).max(0.0);
+        let fixed = sheets + tail;
+        let squeeze = match headers > 0.0 && fixed + headers > avail {
+            true => ((avail - fixed) / headers).clamp(0.0, 1.0),
+            false => 1.0,
+        };
+        let span = fixed + headers * squeeze;
+        let mut top = (cards[0].slot - l / 2.0)
+            .min(self.length - m.padding - span)
+            .max(m.padding);
+        let mut places = Vec::with_capacity(n);
+        for i in 0..n {
+            places.push(match held[i] {
+                true => self.fit(top + h / 2.0),
+                false => top + l / 2.0,
+            });
+            if i + 1 < n {
+                top += if held[i] { h } else { pitch[i] * squeeze };
+            }
+        }
+        places
+    }
+
     /// Point every spring at where the levels want it.
     fn retarget(&mut self) {
-        let targets: Vec<(f64, f64, f64)> = (self.cards.iter())
+        let mut places = self.places().into_iter();
+        let targets: Vec<(f64, f64, Option<f64>)> = (self.cards.iter())
             .map(|c| {
-                let role = self.role(&c.key);
-                let (out, len) = self.size(role);
-                (out, len, self.center(role, c.slot))
+                let (out, len) = self.size(self.role(&c.key));
+                let y = if c.leaving { None } else { places.next() };
+                (out, len, y)
             })
             .collect();
         for (c, (out, len, y)) in self.cards.iter_mut().zip(targets) {
             c.out.retarget(out);
             c.len.retarget(len);
-            if !c.leaving {
+            if let Some(y) = y {
                 c.y.retarget(y);
             }
         }
@@ -427,13 +478,13 @@ impl Deck {
 
     // -- the layout --------------------------------------------------------
 
-    /// The `+` button's center along the edge: past the last note
-    /// (centered without notes), within the column.
+    /// The `+` button's center along the edge: past the last note, or
+    /// below a sheet reaching farther (centered without notes), within the
+    /// column.
     pub fn plus_center(&self) -> f64 {
         let m = &self.metrics;
-        let last = self.cards.iter().rev().find(|c| !c.leaving);
-        let center = match last {
-            Some(c) => c.slot + m.header_length / 2.0 + PLUS_GAP + m.plus / 2.0,
+        let center = match self.extent() {
+            Some((_, bottom)) => bottom + PLUS_GAP + m.plus / 2.0,
             None => self.length / 2.0,
         };
         center
@@ -441,22 +492,42 @@ impl Deck {
             .max(m.plus / 2.0)
     }
 
-    /// The edge band along the column, as (top, bottom, width out of the
-    /// edge): the pointer in it is at the column. At header level it is as
-    /// wide as a lifted header and a little more (the hysteresis), and
-    /// reaches over the `+` button.
-    pub fn band(&self) -> Option<(f64, f64, f64)> {
+    /// What the notes that stay span along the edge where they are going,
+    /// as (top, bottom): their headers, or sheets.
+    fn extent(&self) -> Option<(f64, f64)> {
         let m = &self.metrics;
-        let (first, last) = (self.slots.centers.first()?, self.slots.centers.last()?);
-        let top = first - m.header_length / 2.0;
-        let bottom = last + m.header_length / 2.0;
-        Some(match self.level {
-            Level::Marker => (top, bottom, BAND),
-            Level::Header => {
-                let plus = self.plus_center() + m.plus / 2.0;
-                (top, bottom.max(plus), m.header + LIFT + HOLD)
-            }
-        })
+        (self.cards.iter().filter(|c| !c.leaving))
+            .map(|c| {
+                let half = match self.held(&c.key) {
+                    true => m.sheet_height / 2.0,
+                    false => m.header_length / 2.0,
+                };
+                (c.y.target - half, c.y.target + half)
+            })
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    }
+
+    /// The edge bands, as (top, bottom, width out of the edge): the
+    /// pointer in one is at the column. One is `band` wide along the whole
+    /// edge; at header level, another is along the notes and over the `+`
+    /// button, as wide as a lifted header and a little more (the
+    /// hysteresis).
+    pub fn bands(&self) -> Vec<(f64, f64, f64)> {
+        let m = &self.metrics;
+        let mut bands = Vec::new();
+        if m.band > 0.0 && self.length > 0.0 {
+            bands.push((0.0, self.length, m.band));
+        }
+        if self.level == Level::Header {
+            let plus = self.plus_center();
+            let (top, bottom) = self.extent().unwrap_or((plus, plus));
+            let (top, bottom) = (
+                top.min(plus - m.plus / 2.0),
+                bottom.max(plus + m.plus / 2.0),
+            );
+            bands.push((top, bottom, m.header + LIFT + HOLD));
+        }
+        bands
     }
 
     /// The cards, leaving ones included, in the column's order.
@@ -590,6 +661,7 @@ impl Deck {
         let mut old: Vec<Card> = self.cards.drain(..).filter(|c| !c.leaving).collect();
         self.slots = slots(self.wanted.len(), self.length, &self.metrics);
         let mut rank = 0.0;
+        let mut new = Vec::new();
         let wanted = self.wanted.clone();
         for (item, slot) in wanted.iter().zip(self.slots.centers.clone()) {
             match old.iter().position(|c| c.key == item.key) {
@@ -605,7 +677,7 @@ impl Deck {
                     let mut c = Card {
                         key: item.key.clone(),
                         look: item.look.clone(),
-                        y: Spring::new(self.center(role, slot), r),
+                        y: Spring::new(slot, r),
                         slot,
                         presence: Spring::new(0.0, r),
                         out: Spring::new(out, r),
@@ -617,11 +689,16 @@ impl Deck {
                     if c.delay == 0.0 {
                         c.presence.retarget(1.0);
                     }
+                    new.push(item.key.clone());
                     self.cards.push(c);
                 }
             }
         }
         self.retarget();
+        // The new ones come out of the edge where they go.
+        for c in self.cards.iter_mut().filter(|c| new.contains(&c.key)) {
+            c.y.snap(c.y.target);
+        }
     }
 
     /// Advance by `dt` seconds. Returns whether anything still moves.
@@ -673,6 +750,7 @@ mod tests {
         marker_width: 6.0,
         marker_length: 28.0,
         marker_gap: 8.0,
+        band: 2.0,
         padding: 12.0,
         header: 28.0,
         header_length: 100.0,
@@ -860,16 +938,87 @@ mod tests {
     }
 
     #[test]
-    fn the_band_holds_header_level() {
+    fn the_band_runs_along_the_edge_and_holds_header_level() {
         let mut d = deck(&["a", "b"]);
-        let (top, bottom, width) = d.band().unwrap();
-        assert_eq!(width, BAND);
-        assert_eq!((top, bottom), (415.0, 585.0));
+        // At markers: the whole edge, `band` wide.
+        assert_eq!(d.bands(), [(0.0, 1000.0, M.band)]);
+        // At headers, also the column, wider.
         d.point(On::Strip);
-        let (_, bottom, width) = d.band().unwrap();
+        let bands = d.bands();
+        assert_eq!(bands.len(), 2);
+        let (top, bottom, width) = bands[1];
         assert_eq!(width, M.header + LIFT + HOLD);
+        assert_eq!(top, 415.0);
         assert!(bottom >= d.plus_center() + M.plus / 2.0);
-        assert!(Deck::new(M, 150.0).band().is_none());
+        assert!(Deck::new(M, 150.0).bands().is_empty());
+        // Without a band, only the markers take the pointer.
+        let mut d = Deck::new(Metrics { band: 0.0, ..M }, 150.0);
+        d.resize(1000.0);
+        assert!(d.bands().is_empty());
+    }
+
+    /// Where `key`'s header or sheet is, along the edge, once settled.
+    fn span(d: &Deck, key: &str) -> (f64, f64) {
+        let c = card(d, key);
+        (c.y.value - c.len.value / 2.0, c.y.value + c.len.value / 2.0)
+    }
+
+    #[test]
+    fn sheets_push_what_comes_after_them_down() {
+        let mut d = deck(&["a", "b", "c", "d"]);
+        d.point(On::Strip);
+        settle(&mut d);
+        let before: Vec<(f64, f64)> = ["a", "b"].iter().map(|k| span(&d, k)).collect();
+        d.point(margin("b"));
+        d.reveal_due("b");
+        settle(&mut d);
+        // Above it, nothing moves; it comes down from its header's top.
+        assert_eq!(span(&d, "a"), before[0]);
+        assert_eq!(span(&d, "b").0, before[1].0);
+        assert_eq!(span(&d, "b").1 - span(&d, "b").0, M.sheet_height);
+        // The next header starts below it, and keeps its pitch to the one
+        // after.
+        assert_eq!(span(&d, "c").0, span(&d, "b").1);
+        assert_eq!(span(&d, "d").0 - span(&d, "c").0, 70.0);
+        // The `+` button too.
+        d.point(margin("d"));
+        settle(&mut d);
+        assert_eq!(d.revealed(), Some("d"));
+        assert!(d.plus_center() - M.plus / 2.0 >= span(&d, "d").1);
+        // Back to headers: back on their slots.
+        d.point(On::Strip);
+        settle(&mut d);
+        assert_eq!(span(&d, "b"), before[1]);
+    }
+
+    #[test]
+    fn browsing_down_lands_on_the_next_sheet() {
+        let mut d = deck(&["a", "b", "c", "d"]);
+        d.point(margin("b"));
+        d.reveal_due("b");
+        settle(&mut d);
+        // What shows of c: down to d's top.
+        let (top, bottom) = (span(&d, "c").0, span(&d, "d").0);
+        d.point(margin("c"));
+        settle(&mut d);
+        let (sheet_top, sheet_bottom) = span(&d, "c");
+        assert!(sheet_top <= top && bottom <= sheet_bottom);
+    }
+
+    #[test]
+    fn sheets_near_the_end_move_the_column_up() {
+        let mut d = Deck::new(M, 150.0);
+        d.resize(500.0);
+        d.set(items(&["a", "b", "c"]));
+        settle(&mut d);
+        d.point(margin("c"));
+        d.reveal_due("c");
+        settle(&mut d);
+        // The sheet and the `+` button fit, and the headers still show.
+        assert!(span(&d, "c").1 + PLUS_GAP + M.plus <= 500.0 - M.padding + 1e-9);
+        assert!(span(&d, "a").0 >= M.padding - 1e-9);
+        assert!(span(&d, "b").0 < span(&d, "c").0);
+        assert!(span(&d, "a").0 < span(&d, "b").0);
     }
 
     #[test]
