@@ -30,6 +30,8 @@ const DIM: f64 = 0.55;
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocStyle {
     pub font: String,
+    /// Headings', if not `font`.
+    pub heading_font: Option<String>,
     /// Logical pixels.
     pub size: f64,
     /// 0xRRGGBBAA, not premultiplied.
@@ -328,7 +330,10 @@ impl Text {
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, line_h));
         buffer.set_wrap(&mut self.fonts, Wrap::WordOrGlyph);
         buffer.set_size(&mut self.fonts, Some(width), None);
-        let base = Attrs::new().family(family(&st.font)).color(color(st.color));
+        let mut base = Attrs::new().family(family(&st.font)).color(color(st.color));
+        if let (Kind::Heading(_), Some(font)) = (b.kind, &st.heading_font) {
+            base = base.family(family(font));
+        }
         let code_block = b.kind == Kind::Code;
         let mut spans: Vec<(&str, Attrs)> = (b.runs.iter())
             .filter(|r| !r.text.is_empty())
@@ -630,6 +635,7 @@ mod tests {
             blocks,
             style: DocStyle {
                 font: "sans-serif".into(),
+                heading_font: None,
                 size: 13.0,
                 color: 0x202020ff,
                 link: 0x1a5fb4ff,

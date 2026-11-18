@@ -235,6 +235,38 @@ impl Note {
     /// a frontmatter gets one; one left empty goes. Fails if the
     /// frontmatter doesn't parse.
     pub fn set(&mut self, key: &str, value: Option<Item>) -> Result<(), String> {
+        self.edit(|doc| {
+            match value {
+                // A new value keeps the old one's comment and spacing.
+                Some(Item::Value(mut v)) => {
+                    if let Some(old) = doc.get(key).and_then(Item::as_value) {
+                        *v.decor_mut() = old.decor().clone();
+                    }
+                    doc[key] = Item::Value(v);
+                }
+                Some(v) => doc[key] = v,
+                None => {
+                    doc.remove(key);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// `set` with a plain value: a string, a number, an array, ….
+    pub fn set_value(
+        &mut self,
+        key: &str,
+        value: impl Into<toml_edit::Value>,
+    ) -> Result<(), String> {
+        self.set(key, Some(toml_edit::value(value)))
+    }
+
+    /// Edit the frontmatter with `f`, in place (see `set`).
+    pub fn edit(
+        &mut self,
+        f: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
+    ) -> Result<(), String> {
         if let Some(e) = &self.error {
             return Err(format!("not editing a broken frontmatter: {e}"));
         }
@@ -248,19 +280,7 @@ impl Note {
             Some(toml) => toml.parse::<DocumentMut>().map_err(|e| e.to_string())?,
             None => DocumentMut::new(),
         };
-        match value {
-            // A new value keeps the old one's comment and spacing.
-            Some(Item::Value(mut v)) => {
-                if let Some(old) = doc.get(key).and_then(Item::as_value) {
-                    *v.decor_mut() = old.decor().clone();
-                }
-                doc[key] = Item::Value(v);
-            }
-            Some(v) => doc[key] = v,
-            None => {
-                doc.remove(key);
-            }
-        }
+        f(&mut doc)?;
         let mut front = doc.to_string().replace("\r\n", "\n");
         if nl != "\n" {
             front = front.replace('\n', nl);
@@ -278,13 +298,98 @@ impl Note {
         Ok(())
     }
 
-    /// `set` with a plain value: a string, a number, an array, ….
-    pub fn set_value(
-        &mut self,
-        key: &str,
-        value: impl Into<toml_edit::Value>,
-    ) -> Result<(), String> {
-        self.set(key, Some(toml_edit::value(value)))
+    /// Whether one of the note's own matchers matches `window`: it is
+    /// pinned to it.
+    pub fn pinned_to(&self, window: &Window) -> bool {
+        self.meta.matchers.iter().any(|m| m.matches(window))
+    }
+
+    /// Whether `unpin(window)` would leave the note global.
+    pub fn unpin_leaves_global(&self, window: &Window) -> bool {
+        self.meta.tags.is_empty() && self.meta.matchers.iter().all(|m| m.matches(window))
+    }
+
+    /// Pin the note to `window`'s app (its app ID, as is, added to
+    /// `apps`), or with `exact` to this very window (a `match` table with
+    /// its app ID and title, as they are).
+    pub fn pin(&mut self, window: &Window, exact: bool) -> Result<(), String> {
+        if window.app_id.is_empty() {
+            return Err("the window has no app ID".into());
+        }
+        let app = crate::matcher::escape(&window.app_id);
+        if !exact {
+            return self.edit(|doc| {
+                if !doc.contains_key("apps") {
+                    doc["apps"] = toml_edit::value(toml_edit::Array::new());
+                }
+                let apps = (doc.get_mut("apps").and_then(Item::as_array_mut))
+                    .ok_or("apps: expected a list")?;
+                if !apps.iter().any(|v| v.as_str() == Some(app.as_str())) {
+                    apps.push(app);
+                }
+                Ok(())
+            });
+        }
+        let title = crate::matcher::escape(&window.title);
+        self.edit(|doc| {
+            let item = doc
+                .entry("match")
+                .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+            if let Some(aot) = item.as_array_of_tables_mut() {
+                let mut table = toml_edit::Table::new();
+                table["app"] = toml_edit::value(app);
+                table["title"] = toml_edit::value(title);
+                aot.push(table);
+            } else if let Some(array) = item.as_array_mut() {
+                let mut table = toml_edit::InlineTable::new();
+                table.insert("app", app.into());
+                table.insert("title", title.into());
+                array.push(table);
+            } else {
+                return Err("match: expected a list of tables".into());
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove each of the note's own matchers that matches `window`, from
+    /// `apps` and `match`. A key left empty goes; a note left without
+    /// matchers (or tags) is global.
+    pub fn unpin(&mut self, window: &Window) -> Result<(), String> {
+        let app_matches = |v: &toml_edit::Value| {
+            v.as_str()
+                .is_some_and(|s| Matcher::new(Some(s), None).0.matches(window))
+        };
+        let table_matches = |t: &dyn TableLike| {
+            let get = |k: &str| t.get(k).and_then(Item::as_str);
+            Matcher::new(get("app"), get("title")).0.matches(window)
+        };
+        self.edit(|doc| {
+            if let Some(apps) = doc.get_mut("apps").and_then(Item::as_array_mut) {
+                apps.retain(|v| !app_matches(v));
+                if apps.is_empty() {
+                    doc.remove("apps");
+                }
+            }
+            let empty = match doc.get_mut("match") {
+                Some(item) => {
+                    if let Some(aot) = item.as_array_of_tables_mut() {
+                        aot.retain(|t| !table_matches(t));
+                        aot.is_empty()
+                    } else if let Some(array) = item.as_array_mut() {
+                        array.retain(|v| !v.as_inline_table().is_some_and(|t| table_matches(t)));
+                        array.is_empty()
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+            if empty {
+                doc.remove("match");
+            }
+            Ok(())
+        })
     }
 }
 
@@ -593,5 +698,70 @@ mod tests {
         assert_eq!(heading("~~~\n# a\n```\n# b\n~~~\n# c"), Some("c"));
         let n = Note::parse("+++\ntitle = \"  \"\n+++\n# Heading");
         assert_eq!(n.title(), Some("Heading"));
+    }
+
+    #[test]
+    fn pinning_to_an_app_keeps_comments() {
+        let ff = w("firefox", "Mozilla Firefox");
+        let mut n = Note::parse("+++\n# mine\ntitle = \"T\" # kept\n+++\nbody\n");
+        assert!(n.global() && !n.pinned_to(&ff));
+        n.pin(&ff, false).unwrap();
+        assert_eq!(
+            n.text(),
+            "+++\n# mine\ntitle = \"T\" # kept\napps = [\"firefox\"]\n+++\nbody\n"
+        );
+        assert!(n.pinned_to(&ff) && !n.global());
+        // Not twice; another app joins.
+        n.pin(&ff, false).unwrap();
+        n.pin(&w("org.x[1]", ""), false).unwrap();
+        assert!(
+            n.text().contains("apps = [\"firefox\", \"org.x[[]1[]]\"]"),
+            "{}",
+            n.text()
+        );
+        assert!(n.pinned_to(&w("org.x[1]", "")));
+        // Unpinning leaves the other app.
+        assert!(!n.unpin_leaves_global(&ff));
+        n.unpin(&ff).unwrap();
+        assert!(!n.pinned_to(&ff) && !n.global());
+        n.unpin(&w("org.x[1]", "")).unwrap();
+        assert_eq!(n.text(), "+++\n# mine\ntitle = \"T\" # kept\n+++\nbody\n");
+        assert!(n.global());
+    }
+
+    #[test]
+    fn pinning_to_a_window() {
+        let foot = w("foot", "~/projects/wl-shell");
+        let mut n = Note::parse("+++\napps = [\"firefox\"]\n+++\n");
+        n.pin(&foot, true).unwrap();
+        assert!(n.pinned_to(&foot));
+        assert!(!n.pinned_to(&w("foot", "~/other")));
+        assert!(
+            n.text()
+                .contains("[[match]]\napp = \"foot\"\ntitle = \"~/projects/wl-shell\"\n"),
+            "{}",
+            n.text()
+        );
+        // Inline tables stay inline.
+        let mut n = Note::parse("+++\nmatch = [{ title = \"*Jira*\" }]\n+++\n");
+        n.pin(&foot, true).unwrap();
+        assert!(n.pinned_to(&foot) && n.error.is_none(), "{}", n.text());
+        assert_eq!(n.meta.matchers.len(), 2);
+        // Unpinning removes every matcher that matches, apps and tables.
+        let mut n = Note::parse(
+            "+++\napps = [\"foot\", \"firefox\"]\n[[match]]\ntitle = \"*wl-shell*\"\n[[match]]\ntitle = \"*jira*\"\n+++\n",
+        );
+        assert!(!n.unpin_leaves_global(&foot));
+        n.unpin(&foot).unwrap();
+        assert!(!n.pinned_to(&foot));
+        assert_eq!(n.meta.matchers.len(), 2, "{}", n.text());
+        let mut n = Note::parse("+++\nmatch = [{ app = \"foot\" }]\n+++\nx");
+        assert!(n.unpin_leaves_global(&foot));
+        n.unpin(&foot).unwrap();
+        assert_eq!(n.text(), "x");
+        // Tags keep it from being global.
+        let n = Note::parse("+++\napps = [\"foot\"]\ntags = [\"t\"]\n+++\n");
+        assert!(!n.unpin_leaves_global(&foot));
+        assert!(Note::parse("").pin(&w("", "x"), false).is_err());
     }
 }

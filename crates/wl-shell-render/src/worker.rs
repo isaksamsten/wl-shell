@@ -439,13 +439,12 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 Done::FileType { path, types, assoc }
             }
             Job::Paper(paper) => {
-                let rendered = match &paper.content {
-                    Some(c) => {
-                        let doc = text.get_or_insert_with(Text::new).doc(&c.doc);
-                        paper::render_with(&paper, Some(&doc))
-                    }
-                    None => paper::render(&paper),
-                };
+                let text = text.get_or_insert_with(Text::new);
+                let doc = paper.content.as_ref().map(|c| text.doc(&c.doc));
+                let label = (paper.margin.as_ref())
+                    .and_then(|m| m.label.as_ref())
+                    .map(|l| text.label(&l.text, &l.style, true, l.spacing, paper.scale));
+                let rendered = paper::render_with(&paper, doc.as_ref(), label.as_ref());
                 Done::Paper { paper, rendered }
             }
             Job::Doc { tag, doc } => {

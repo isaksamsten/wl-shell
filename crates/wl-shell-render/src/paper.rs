@@ -1,35 +1,41 @@
 //! Sheets of paper, as wl-note shows its notes: tucked behind a screen
-//! edge, with only a sliver of them sticking out.
+//! edge, coming out of it as far as the note is out.
 //!
 //! A sheet is its color with a slight vertical gradient (lighter at the
 //! top, as if lit from above) and a grain: a tileable value noise at a few
 //! percent of contrast, made once, that makes it read as paper rather than
-//! a rectangle. Its corners are barely rounded, and the bottom corner on
-//! the side that sticks out from the edge curls: a lighter triangle folded
-//! over, with the corner cut away under it, so the shadow is pulled in
-//! there too. The shadow (shadow.rs's `icon`, of the sheet's own shape)
-//! falls down and away from the edge.
+//! a rectangle. Its corners are rounded by `radius`, and the bottom corner
+//! on the side that comes out of the edge may curl: a lighter triangle
+//! folded over, with the corner cut away under it. The shadow (shadow.rs's
+//! `icon`, of the sheet's own shape) falls down and away from the edge.
 //!
-//! A `sliver` is the sheet as tucked: a little darker, since it is seen
-//! edge-on, with a 1 px light line along the side that sticks out, where
+//! A `sliver` is the sheet seen edge-on, as a note's marker is: a little
+//! darker, with a 1 px light line along the side that sticks out, where
 //! the paper's thickness catches the light.
 //!
-//! A sheet may carry `content`: a document (doc.rs) drawn onto it, as a
-//! note's preview is.
+//! A sheet may have a `margin`: a strip on the side that comes out first
+//! (the side away from the edge), with the note's title set in it turned
+//! a quarter (reading up on the right edge, down on the left), cut with a
+//! short fade if it is too long, and a faint dashed crease between it and
+//! the body. A `bar` along the bottom is set off by a faint line. And it
+//! may carry `content`: a document (doc.rs) drawn onto it, as a note's
+//! text is, cut with a fade at `clip`.
 //!
 //! Subsurfaces can't rotate, so a sheet's small tilt is drawn into it,
-//! its content included.
+//! its content and label included.
 
 use std::sync::OnceLock;
 
 use resvg::tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, IntSize, LinearGradient, Paint, PathBuilder,
-    Pixmap, PixmapPaint, Point, Rect as SkRect, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, IntSize, LineCap, LinearGradient, Paint,
+    PathBuilder, Pixmap, PixmapPaint, Point, Rect as SkRect, SpreadMode, Stroke, StrokeDash,
+    Transform,
 };
 
 use crate::doc::{self, Doc, Hit};
 use crate::image::Image;
 use crate::shadow::{self, IconShadow};
+use crate::text;
 
 /// The screen edge a sheet is tucked behind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -49,14 +55,52 @@ pub struct Paper {
     pub edge: Edge,
     /// Degrees, clockwise.
     pub tilt: f64,
-    /// Drawn as tucked: darker, with a light line.
+    /// Drawn edge-on: darker, with a light line.
     pub sliver: bool,
+    /// The corners' radius.
+    pub radius: f64,
+    /// The bottom corner on the side that comes out curls.
+    pub curl: bool,
+    /// A strip on the side that comes out, with a label.
+    pub margin: Option<Margin>,
+    /// A bar this high along the bottom (beside the margin), set off by a
+    /// faint line; 0 for none.
+    pub bar: i32,
     /// The shadow; its x offset is away from the edge (positive moves it
     /// onto the screen).
     pub shadow: Option<IconShadow>,
     pub scale: i32,
     /// Drawn onto the sheet.
     pub content: Option<Content>,
+}
+
+/// A sheet's margin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Margin {
+    /// Across the sheet, from the side that comes out.
+    pub width: i32,
+    /// The crease's color (0xRRGGBBAA), drawn faint.
+    pub ink: u32,
+    /// A dashed crease between the margin and the body.
+    pub crease: bool,
+    pub label: Option<Label>,
+}
+
+/// A label set in a margin, turned a quarter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Label {
+    /// As shown (uppercase it first, say).
+    pub text: String,
+    /// Its background is left out.
+    pub style: text::Style,
+    /// Between letters, ems.
+    pub spacing: f32,
+    /// Where it may be along the margin: from `top`, `len` long. A label
+    /// that fits ends at `top` on the right edge (it reads up) and starts
+    /// there on the left; a longer one is cut at `top + len` (right: at
+    /// `top`) with a fade.
+    pub top: i32,
+    pub len: i32,
 }
 
 /// A document on a sheet, its top left corner at (`x`, `y`) logical
@@ -66,6 +110,8 @@ pub struct Content {
     pub doc: Doc,
     pub x: i32,
     pub y: i32,
+    /// Cut this far below `y`, with a fade, if it is longer.
+    pub clip: Option<i32>,
 }
 
 /// A rendered sheet, and where its image goes relative to the sheet's top
@@ -83,17 +129,21 @@ pub struct Rendered {
 const GRAIN: f32 = 0.035;
 /// The grain's tile, in buffer pixels.
 const TILE: usize = 128;
-/// Corner radius, logical pixels.
-const RADIUS: f32 = 1.5;
 /// Light from above: the top this much lighter, the bottom darker.
 const LIGHT: f64 = 0.06;
 /// How much darker a sliver is.
 const EDGE_ON: f64 = 0.1;
+/// The fades that cut content and labels, logical pixels.
+const CONTENT_FADE: u32 = 28;
+const LABEL_FADE: u32 = 12;
+/// A quarter circle as a cubic Bézier: the controls' distance, of the
+/// radius.
+const KAPPA: f32 = 0.5523;
 
 impl Paper {
     /// The curled corner's size.
-    fn curl(&self) -> f32 {
-        (self.w.min(self.h) as f32 * 0.18).clamp(5.0, 14.0)
+    fn curl_size(&self) -> f32 {
+        (self.w.min(self.h) as f32 * 0.12).clamp(5.0, 12.0)
     }
 
     /// The margins the tilt needs around the sheet, logical pixels.
@@ -116,27 +166,55 @@ impl Paper {
             ..s
         })
     }
+
+    /// Where the margin is across the sheet: (from, to).
+    pub fn margin_x(&self) -> Option<(f32, f32)> {
+        let m = self.margin.as_ref()?;
+        let (w, mw) = (self.w as f32, m.width.clamp(0, self.w) as f32);
+        Some(match self.edge {
+            Edge::Right => (0.0, mw),
+            Edge::Left => (w - mw, w),
+        })
+    }
+
+    /// Where the body is across the sheet: beside the margin.
+    pub fn body_x(&self) -> (f32, f32) {
+        let w = self.w as f32;
+        match (self.margin_x(), self.edge) {
+            (None, _) => (0.0, w),
+            (Some((_, to)), Edge::Right) => (to, w),
+            (Some((from, _)), Edge::Left) => (0.0, from),
+        }
+    }
 }
 
-/// Render a sheet without its content.
+/// Render a sheet without its content or label.
 pub fn render(p: &Paper) -> Rendered {
-    render_with(p, None)
+    render_with(p, None, None)
 }
 
-/// Render a sheet with its content, rendered already (`p.content`'s doc).
-pub fn render_with(p: &Paper, content: Option<&doc::Rendered>) -> Rendered {
+/// Render a sheet with its content and its margin's label, rendered
+/// already (`p.content`'s doc, and `p.margin`'s label with
+/// `text::Text::label`).
+pub fn render_with(
+    p: &Paper,
+    content: Option<&doc::Rendered>,
+    label: Option<&text::Pill>,
+) -> Rendered {
     let (w, h) = (p.w.max(1), p.h.max(1));
     let scale = p.scale.max(1);
     let (px, py) = p.tilt_pad();
     let (bw, bh) = (((w + 2 * px) * scale) as u32, ((h + 2 * py) * scale) as u32);
     let placed = p.content.as_ref().zip(content);
-    let sheet = draw(p, w, h, (px, py), scale, bw, bh, placed);
+    let sheet = draw(p, (px, py), scale, (bw, bh), placed, label);
     let (image, pad) = match p.placed_shadow() {
         Some(s) => (shadow::icon(&sheet, &s, scale), s.pad()),
         None => (sheet, 0),
     };
     let hits = placed.map_or(Vec::new(), |(c, r)| {
+        let clip = c.clip.map_or(f64::INFINITY, |clip| clip as f64);
         (r.hits.iter())
+            .filter(|hit| hit.y + hit.h <= clip)
             .map(|hit| hit.offset(c.x as f64, c.y as f64))
             .collect()
     });
@@ -154,16 +232,13 @@ pub fn render_with(p: &Paper, content: Option<&doc::Rendered>) -> Rendered {
 
 /// The sheet alone, `bw`x`bh` buffer pixels, its top left corner at
 /// `pad` logical pixels.
-#[allow(clippy::too_many_arguments)]
 fn draw(
     p: &Paper,
-    w: i32,
-    h: i32,
     pad: (i32, i32),
     scale: i32,
-    bw: u32,
-    bh: u32,
+    (bw, bh): (u32, u32),
     content: Option<(&Content, &doc::Rendered)>,
+    label: Option<&text::Pill>,
 ) -> Image {
     let blank = || Image {
         width: bw,
@@ -173,9 +248,9 @@ fn draw(
     let Some(mut pixmap) = Pixmap::new(bw, bh) else {
         return blank();
     };
-    let (w, h, s) = (w as f32, h as f32, scale as f32);
+    let (w, h, s) = (p.w.max(1) as f32, p.h.max(1) as f32, scale as f32);
     // Sheet coordinates: logical pixels from its top left corner, drawn
-    // as if tucked behind the right edge (sticking out to the left), and
+    // as if tucked behind the right edge (coming out to the left), and
     // mirrored for the left edge.
     let upright = Transform::from_scale(s, s)
         .pre_translate(pad.0 as f32 + w / 2.0, pad.1 as f32 + h / 2.0)
@@ -185,21 +260,12 @@ fn draw(
     if p.edge == Edge::Left {
         xf = xf.pre_translate(w, 0.0).pre_scale(-1.0, 1.0);
     }
-    let c = p.curl().min(w / 2.0).min(h / 2.0);
-    let r = RADIUS.min(w / 4.0).min(h / 4.0);
-
-    let mut pb = PathBuilder::new();
-    pb.move_to(r, 0.0);
-    pb.line_to(w - r, 0.0);
-    pb.quad_to(w, 0.0, w, r);
-    pb.line_to(w, h - r);
-    pb.quad_to(w, h, w - r, h);
-    pb.line_to(c, h);
-    pb.line_to(0.0, h - c);
-    pb.line_to(0.0, r);
-    pb.quad_to(0.0, 0.0, r, 0.0);
-    pb.close();
-    let Some(outline) = pb.finish() else {
+    let r = (p.radius as f32).clamp(0.0, w.min(h) / 2.0);
+    let c = match p.curl {
+        true => p.curl_size().min(w / 2.0).min(h / 2.0),
+        false => 0.0,
+    };
+    let Some(outline) = outline(w, h, r, c) else {
         return blank();
     };
 
@@ -235,7 +301,7 @@ fn draw(
     pb.line_to(c, h);
     pb.line_to(c, h - c);
     pb.close();
-    if let Some(flap) = pb.finish() {
+    if let Some(flap) = pb.finish().filter(|_| c > 0.0) {
         let stops = vec![
             GradientStop::new(0.0, color(shade(base, 0.3))),
             GradientStop::new(1.0, color(shade(base, 0.05))),
@@ -256,13 +322,46 @@ fn draw(
     }
 
     if p.sliver
-        && let Some(line) = SkRect::from_xywh(0.0, r, 1.0, (h - c - r).max(0.0))
+        && let Some(line) = SkRect::from_xywh(0.0, r, 1.0, (h - c.max(r) - r).max(0.0))
     {
         pixmap.fill_rect(line, &solid(0xffffff70), xf, None);
     }
 
     grain(&mut pixmap);
-    // The content on top of the grain, never mirrored.
+
+    // The rest on top of the grain, never mirrored.
+    if let Some(m) = &p.margin
+        && let Some((from, to)) = p.margin_x()
+    {
+        if m.crease {
+            let x = match p.edge {
+                Edge::Right => to,
+                Edge::Left => from,
+            };
+            let mut pb = PathBuilder::new();
+            pb.move_to(x, r.max(4.0));
+            pb.line_to(x, h - r.max(c).max(4.0));
+            if let Some(path) = pb.finish() {
+                let stroke = Stroke {
+                    width: 1.0,
+                    dash: StrokeDash::new(vec![3.0, 3.0], 0.0),
+                    ..Stroke::default()
+                };
+                pixmap.stroke_path(&path, &solid(faint(m.ink, 0.35)), &stroke, upright, None);
+            }
+        }
+        if let (Some(l), Some(img)) = (&m.label, label) {
+            draw_label(&mut pixmap, l, img, p.edge, (from + to) / 2.0, upright, s);
+        }
+    }
+    if p.bar > 0 {
+        let (from, to) = p.body_x();
+        let y = h - p.bar as f32;
+        let ink = p.margin.as_ref().map_or(0x00000040, |m| faint(m.ink, 0.18));
+        if let Some(line) = SkRect::from_xywh(from + 8.0, y, (to - from - 16.0).max(0.0), 1.0) {
+            pixmap.fill_rect(line, &solid(ink), upright, None);
+        }
+    }
     if let Some((c, r)) = content {
         draw_content(&mut pixmap, c, r, upright, s, p.tilt != 0.0);
     }
@@ -278,6 +377,62 @@ fn draw(
     }
 }
 
+/// A sheet's outline, `w`x`h`, with corners of radius `r`, the bottom
+/// left one (on the side that comes out) cut by a curl of `c` if any.
+fn outline(w: f32, h: f32, r: f32, c: f32) -> Option<resvg::tiny_skia::Path> {
+    let k = r * (1.0 - KAPPA);
+    let mut pb = PathBuilder::new();
+    pb.move_to(r, 0.0);
+    pb.line_to(w - r, 0.0);
+    pb.cubic_to(w - k, 0.0, w, k, w, r);
+    pb.line_to(w, h - r);
+    pb.cubic_to(w, h - k, w - k, h, w - r, h);
+    if c > 0.0 {
+        pb.line_to(c, h);
+        pb.line_to(0.0, h - c);
+    } else {
+        pb.line_to(r, h);
+        pb.cubic_to(k, h, 0.0, h - k, 0.0, h - r);
+    }
+    pb.line_to(0.0, r);
+    pb.cubic_to(0.0, k, k, 0.0, r, 0.0);
+    pb.close();
+    pb.finish()
+}
+
+/// Set a label turned a quarter in the margin centered on `cx`: reading
+/// up on the right edge, down on the left (see `Label`).
+fn draw_label(
+    pixmap: &mut Pixmap,
+    l: &Label,
+    img: &text::Pill,
+    edge: Edge,
+    cx: f32,
+    upright: Transform,
+    s: f32,
+) {
+    let keep = (l.len.max(1) as f32 * s) as u32;
+    let cut = cut(&img.image, keep, (LABEL_FADE as f32 * s) as u32, false);
+    let Some(image) = pixmap_of(&cut) else {
+        return;
+    };
+    let (len, thick) = (cut.width as f32 / s, cut.height as f32 / s);
+    let y0 = l.top as f32;
+    // Image (u along the text, v down its line) to sheet coordinates.
+    let turn = match edge {
+        // A quarter counterclockwise: the text's start at the bottom.
+        Edge::Right => Transform::from_row(0.0, -1.0, 1.0, 0.0, cx - thick / 2.0, y0 + len),
+        // A quarter clockwise: its start at the top.
+        Edge::Left => Transform::from_row(0.0, 1.0, -1.0, 0.0, cx + thick / 2.0, y0),
+    };
+    let xf = upright.pre_concat(turn).pre_scale(1.0 / s, 1.0 / s);
+    let paint = PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    pixmap.draw_pixmap(0, 0, image.as_ref(), &paint, xf, None);
+}
+
 /// Draw a rendered document onto the sheet: `upright` maps sheet
 /// coordinates to the buffer's (scale `s`, tilt included).
 fn draw_content(
@@ -288,14 +443,16 @@ fn draw_content(
     s: f32,
     tilted: bool,
 ) {
-    let Some(size) = IntSize::from_wh(r.image.width, r.image.height) else {
-        return;
+    let clipped;
+    let img = match c.clip {
+        Some(clip) => {
+            let keep = (clip.max(1) as f32 * s) as u32;
+            clipped = cut(&r.image, keep, (CONTENT_FADE as f32 * s) as u32, true);
+            &clipped
+        }
+        None => &r.image,
     };
-    let mut rgba = Vec::with_capacity(r.image.data.len());
-    for px in r.image.data.as_chunks::<4>().0 {
-        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-    }
-    let Some(image) = Pixmap::from_vec(rgba, size) else {
+    let Some(image) = pixmap_of(img) else {
         return;
     };
     let paint = PixmapPaint {
@@ -310,6 +467,120 @@ fn draw_content(
         .pre_translate(c.x as f32, c.y as f32)
         .pre_scale(1.0 / s, 1.0 / s);
     pixmap.draw_pixmap(0, 0, image.as_ref(), &paint, xf, None);
+}
+
+/// A BGRA image as a pixmap.
+fn pixmap_of(img: &Image) -> Option<Pixmap> {
+    let size = IntSize::from_wh(img.width, img.height)?;
+    let mut rgba = Vec::with_capacity(img.data.len());
+    for px in img.data.as_chunks::<4>().0 {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    Pixmap::from_vec(rgba, size)
+}
+
+/// `img` cut to `keep` pixels (rows if `vertical`, else columns) from its
+/// start, the last `fade` of them fading out, if it is longer; else as
+/// it is.
+pub fn cut(img: &Image, keep: u32, fade: u32, vertical: bool) -> Image {
+    let len = if vertical { img.height } else { img.width };
+    if len <= keep || keep == 0 {
+        return img.clone();
+    }
+    let (w, h) = match vertical {
+        true => (img.width, keep),
+        false => (keep, img.height),
+    };
+    let fade = fade.min(keep).max(1);
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let at = if vertical { y } else { x };
+            let f = match keep - at {
+                left if left <= fade => (left as f32 - 0.5) / fade as f32,
+                _ => 1.0,
+            };
+            let i = ((y * img.width + x) * 4) as usize;
+            for c in &img.data[i..i + 4] {
+                data.push((*c as f32 * f).round() as u8);
+            }
+        }
+    }
+    Image {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
+/// A round button `size` logical pixels across in `color`, with a plus
+/// in `glyph`, over its `shadow`. Its rect is relative to the button's
+/// top left corner.
+pub fn button(
+    size: i32,
+    color: u32,
+    glyph: u32,
+    shadow: Option<IconShadow>,
+    scale: i32,
+) -> Rendered {
+    let s = scale.max(1);
+    let side = (size.max(1) * s) as u32;
+    let mut image = Image {
+        width: side,
+        height: side,
+        data: vec![0; (side * side * 4) as usize],
+    };
+    if let Some(mut pixmap) = Pixmap::new(side, side) {
+        let r = side as f32 / 2.0;
+        if let Some(disc) = PathBuilder::from_circle(r, r, r - 0.5) {
+            pixmap.fill_path(
+                &disc,
+                &solid(color),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        let arm = side as f32 * 0.21;
+        let mut pb = PathBuilder::new();
+        pb.move_to(r - arm, r);
+        pb.line_to(r + arm, r);
+        pb.move_to(r, r - arm);
+        pb.line_to(r, r + arm);
+        if let Some(plus) = pb.finish() {
+            let stroke = Stroke {
+                width: (side as f32 * 0.085).max(1.5),
+                line_cap: LineCap::Round,
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(&plus, &solid(glyph), &stroke, Transform::identity(), None);
+        }
+        let mut data = Vec::with_capacity(image.data.len());
+        for px in pixmap.data().as_chunks::<4>().0 {
+            data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        image.data = data;
+    }
+    let (image, pad) = match shadow {
+        Some(sh) => (shadow::icon(&image, &sh, s), sh.pad()),
+        None => (image, 0),
+    };
+    Rendered {
+        image,
+        rect: shadow::Rect {
+            x: -pad,
+            y: -pad,
+            w: size + 2 * pad,
+            h: size + 2 * pad,
+        },
+        hits: Vec::new(),
+    }
+}
+
+/// `rgba` with its alpha times `f`.
+fn faint(rgba: u32, f: f64) -> u32 {
+    let a = ((rgba & 0xff) as f64 * f).round().clamp(0.0, 255.0) as u32;
+    (rgba & !0xff) | a
 }
 
 /// Lighten (`amount` > 0, toward white) or darken (toward black) an
@@ -417,6 +688,10 @@ mod tests {
             edge: Edge::Right,
             tilt: 0.0,
             sliver: false,
+            radius: 1.5,
+            curl: true,
+            margin: None,
+            bar: 0,
             shadow: None,
             scale: 1,
             content: None,
@@ -428,6 +703,19 @@ mod tests {
         let (i, j) = ((x - r.rect.x) * scale, (y - r.rect.y) * scale);
         let k = ((j as u32 * r.image.width + i as u32) * 4) as usize;
         r.image.data[k..k + 4].try_into().unwrap()
+    }
+
+    /// A white label image, `w`x`h` buffer pixels.
+    fn label_image(w: u32, h: u32) -> text::Pill {
+        text::Pill {
+            width: w as i32,
+            height: h as i32,
+            image: Image {
+                width: w,
+                height: h,
+                data: vec![255; (w * h * 4) as usize],
+            },
+        }
     }
 
     #[test]
@@ -489,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn the_curl_cuts_the_corner_that_sticks_out() {
+    fn the_curl_cuts_the_corner_that_comes_out() {
         let right = render(&paper());
         // Bottom left is cut, bottom right is paper.
         assert_eq!(at(&right, 1, 1, 59)[3], 0);
@@ -511,6 +799,20 @@ mod tests {
     }
 
     #[test]
+    fn rounded_corners() {
+        let r = render(&Paper {
+            radius: 8.0,
+            curl: false,
+            ..paper()
+        });
+        for (x, y) in [(0, 0), (119, 0), (0, 59), (119, 59)] {
+            assert_eq!(at(&r, 1, x, y)[3], 0, "({x}, {y})");
+        }
+        assert_eq!(at(&r, 1, 8, 1)[3], 255);
+        assert_eq!(at(&r, 1, 1, 30)[3], 255);
+    }
+
+    #[test]
     fn slivers_are_darker_with_a_light_line() {
         let sheet = render(&paper());
         let sliver = render(&Paper {
@@ -519,7 +821,7 @@ mod tests {
         });
         let sum = |r: &Rendered, x: i32| (20..40).map(|y| at(r, 1, x, y)[1] as u32).sum::<u32>();
         assert!(sum(&sliver, 60) < sum(&sheet, 60));
-        // The line along the side that sticks out.
+        // The line along the side that comes out.
         assert!(sum(&sliver, 0) > sum(&sliver, 3));
     }
 
@@ -544,6 +846,97 @@ mod tests {
         });
         let (left, right) = (at(&r, 1, -3, 30)[3], at(&r, 1, 122, 30)[3]);
         assert!(right > left, "{left} {right}");
+    }
+
+    #[test]
+    fn labels_turn_into_the_margin() {
+        let label = Label {
+            text: "X".into(),
+            style: text::Style {
+                font: "sans-serif".into(),
+                size: 10.0,
+                color: 0xffffffff,
+                background: 0,
+            },
+            spacing: 0.1,
+            top: 6,
+            len: 30,
+        };
+        let margin = Margin {
+            width: 20,
+            ink: 0x000000ff,
+            crease: true,
+            label: Some(label),
+        };
+        let p = Paper {
+            color: 0x000000ff,
+            margin: Some(margin),
+            curl: false,
+            ..paper()
+        };
+        assert_eq!(p.margin_x(), Some((0.0, 20.0)));
+        assert_eq!(p.body_x(), (20.0, 120.0));
+        // A white label 50 long (cut to 30) and 10 thick, turned.
+        let r = render_with(&p, None, Some(&label_image(50, 10)));
+        let white = |x, y| at(&r, 1, x, y)[2] > 200;
+        // In the margin from the top, 30 long, 10 wide around its middle.
+        assert!(white(10, 25) && white(6, 25) && white(14, 25));
+        assert!(!white(10, 40) && !white(30, 20) && !white(2, 20));
+        // Faded toward the top, where it is cut (it reads up).
+        assert!(at(&r, 1, 10, 7)[2] < at(&r, 1, 10, 30)[2]);
+        // On the left edge, in the margin on the right, faded at the bottom.
+        let left = Paper {
+            edge: Edge::Left,
+            ..p.clone()
+        };
+        assert_eq!(left.margin_x(), Some((100.0, 120.0)));
+        assert_eq!(left.body_x(), (0.0, 100.0));
+        let r = render_with(&left, None, Some(&label_image(50, 10)));
+        let white = |x, y| at(&r, 1, x, y)[2] > 200;
+        assert!(white(110, 10) && white(110, 20) && !white(10, 20));
+        assert!(at(&r, 1, 110, 35)[2] < at(&r, 1, 110, 10)[2]);
+    }
+
+    #[test]
+    fn cutting_with_a_fade() {
+        let img = Image {
+            width: 4,
+            height: 10,
+            data: vec![200; 4 * 10 * 4],
+        };
+        let c = cut(&img, 6, 3, true);
+        assert_eq!((c.width, c.height), (4, 6));
+        let row = |y: u32| c.data[(y * 4 * 4) as usize];
+        assert_eq!(row(2), 200);
+        assert!(row(3) > row(4) && row(4) > row(5) && row(5) > 0);
+        // Short enough: as it is.
+        assert_eq!(cut(&img, 10, 3, true), img);
+        let c = cut(&img, 2, 1, false);
+        assert_eq!((c.width, c.height), (2, 10));
+    }
+
+    #[test]
+    fn buttons() {
+        let b = button(20, 0xffffffff, 0x000000ff, None, 2);
+        assert_eq!((b.image.width, b.image.height), (40, 40));
+        let px = |x: u32, y: u32| &b.image.data[((y * 40 + x) * 4) as usize..][..4];
+        // Clear corners, the plus in the middle, the disc around it.
+        assert_eq!(px(0, 0)[3], 0);
+        assert_eq!(px(20, 20)[..3], [0, 0, 0]);
+        assert_eq!(px(20, 4), [255, 255, 255, 255]);
+        let shadowed = button(
+            20,
+            0xffffffff,
+            0x000000ff,
+            Some(IconShadow {
+                color: 0x00000080,
+                softness: 4,
+                offset: (0, 2),
+            }),
+            1,
+        );
+        assert!(shadowed.rect.x < 0 && shadowed.rect.w > 20);
+        assert_eq!(shadowed.image.width as i32, shadowed.rect.w);
     }
 
     #[test]

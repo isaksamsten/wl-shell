@@ -14,15 +14,20 @@
 //!   closes, the most recent one left takes over. Without a stream, only
 //!   global notes show.
 //! - **The column** (column.rs) is on one output for now: the one `output`
-//!   names, or the first. It peeks, focuses and tucks back by itself, and
-//!   asks for the rest (`Act`): toggling a checkbox (written to the file,
-//!   which inotify brings back), opening a link (`open-command`) or the
-//!   note (`editor-command`), and making a note.
+//!   names, or the first. Its levels follow the pointer by themselves; it
+//!   asks for the rest (`Act`): opening and closing notes, toggling a
+//!   checkbox, retitling, pinning and unpinning (written to the file,
+//!   which inotify brings back), opening a link or a file
+//!   (`open-command`) or the note (`editor-command`), and making a note.
+//!   An open note stays in the column whatever the context does, until it
+//!   is closed.
 //! - **The socket.** `wl-note new` and `wl-note focus` come over it
 //!   (ipc.rs). A new note is attached to the context's app (or global),
 //!   written at once, and opened in the editor if it has no text yet, else
-//!   focused. A note focused by name shows even if it doesn't belong to
-//!   the context, until it is tucked back.
+//!   opened. A note opened by name shows even if it doesn't belong to the
+//!   context, until it is closed.
+//! - **Fonts on the main thread**, for the open note's editable title,
+//!   are loaded on a thread of their own at the start.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -40,17 +45,18 @@ use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Incoming, Listener, Reply};
 use wl_shell_log::warn;
-use wl_shell_notes::{Index, Window};
+use wl_shell_notes::{Index, Note, Window};
+use wl_shell_render::text::Text;
 use wl_shell_render::worker::{Assets, Done};
 
-use crate::column::{Act, Column, Shown, Style, Timer};
+use crate::column::{Act, Column, FileLink, Fonts, Pin, Shown, Style, Timer};
 use crate::config::Config;
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Item, Look};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
-use crate::{create, find, list};
+use crate::{bar, create, find, list};
 
 pub struct WlNote {
     /// The config, reloaded when its file changes.
@@ -83,9 +89,11 @@ pub struct WlNote {
     /// The socket `new` and `focus` come over; None if it couldn't be
     /// bound.
     listener: Option<Listener<NoteRequest>>,
-    /// A note focused by name: shown while focused, even if it doesn't
-    /// belong to the context.
-    forced: Option<String>,
+    /// The note open when the notes were last shown: once it closes, the
+    /// notes are shown again (it may not belong to the context).
+    last_open: Option<String>,
+    /// Fonts for the main thread, once loaded.
+    fonts: Fonts,
 }
 
 impl WlNote {
@@ -110,7 +118,8 @@ impl WlNote {
             dirty: true,
             trim: false,
             listener: None,
-            forced: None,
+            last_open: None,
+            fonts: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -121,6 +130,7 @@ impl WlNote {
             .refresh(&core.loop_handle, &mut |m| warn!("{m}"));
         self.config = self.reloader.config().clone();
         self.start_worker(core)?;
+        self.load_fonts(core);
         self.watch_config(core);
         self.open_notes(core);
         self.use_stream(core);
@@ -148,6 +158,32 @@ impl WlNote {
         self.papers = Some(Rc::new(RefCell::new(Papers::new(assets.clone()))));
         self.assets = Some(assets);
         Ok(())
+    }
+
+    /// Load the fonts for the main thread on a thread of their own.
+    fn load_fonts(&mut self, core: &Core<Self>) {
+        let (send, fonts) = channel::channel::<Text>();
+        let spawned = std::thread::Builder::new()
+            .name("wl-note-fonts".into())
+            .spawn(move || {
+                let _ = send.send(Text::new());
+            });
+        if let Err(e) = spawned {
+            return warn!("no fonts for titles: {e}");
+        }
+        let inserted =
+            core.loop_handle
+                .insert_source(fonts, |event, _, shell: &mut Shell<Self>| {
+                    if let channel::Event::Msg(text) = event {
+                        *shell.program.fonts.borrow_mut() = Some(text);
+                        if let Some(column) = &mut shell.program.column {
+                            column.fonts_ready();
+                        }
+                    }
+                });
+        if let Err(e) = inserted {
+            warn!("no fonts for titles: {e}");
+        }
     }
 
     /// Reload the config when its file changes. Without its directory,
@@ -248,15 +284,12 @@ impl WlNote {
             self.sync_column(core);
         }
         self.serve(core);
-        // A note focused by name goes once it is tucked back.
-        if let Some(forced) = &self.forced
-            && (self.column.as_ref()).is_none_or(|c| c.focused() != Some(forced))
-        {
-            self.forced = None;
+        // A note kept open goes once it is closed.
+        if (self.column.as_ref()).and_then(Column::open_key) != self.last_open.as_deref() {
             self.dirty = true;
         }
         if std::mem::take(&mut self.dirty) {
-            self.show_notes(core);
+            self.show_notes();
         }
         if std::mem::take(&mut self.trim) {
             if let Some(papers) = &self.papers {
@@ -391,7 +424,16 @@ impl WlNote {
                 column.set_style(style);
                 column.set_scale(scale);
             }
-            None => match Column::new(core, output, name, scale, style, papers, assets) {
+            None => match Column::new(
+                core,
+                output,
+                name,
+                scale,
+                style,
+                papers,
+                assets,
+                self.fonts.clone(),
+            ) {
                 Ok(column) => {
                     self.column = Some(column);
                     self.dirty = true;
@@ -401,18 +443,21 @@ impl WlNote {
         }
     }
 
-    /// Show the context's notes (and a note focused by name).
-    fn show_notes(&mut self, core: &Core<Self>) {
+    /// Show the context's notes, and the open one.
+    fn show_notes(&mut self) {
         let Some(column) = &mut self.column else {
             return;
         };
         let window = self.context.value().as_ref();
         let mut paths = self.index.shown(window);
-        if let Some(forced) = &self.forced
-            && !paths.iter().any(|p| *p == Path::new(forced))
+        let open = column.open_key().map(String::from);
+        if let Some(open) = &open
+            && !paths.iter().any(|p| *p == Path::new(open))
+            && self.index.get(Path::new(open)).is_some()
         {
-            paths.push(Path::new(forced));
+            paths.push(Path::new(open));
         }
+        self.last_open = open.clone();
         let notes = (paths.into_iter())
             .filter_map(|path| {
                 let entry = self.index.get(path)?;
@@ -423,48 +468,80 @@ impl WlNote {
                     tilt: deck::tilt(&key, self.config.tilt),
                 };
                 let content = Content::of_note(&entry.note, &list::name(path));
+                let files = (bar::files(&content.links).into_iter())
+                    .map(|path| FileLink {
+                        exists: path.exists(),
+                        path,
+                    })
+                    .collect();
                 Some(Shown {
                     item: Item { key, look },
                     content: Rc::new(content),
                     text: self.config.text_color(color),
+                    files,
+                    pin: pin_state(&entry.note, window),
                 })
             })
             .collect();
-        column.set_notes(core, notes);
+        column.set_notes(notes);
     }
 
     /// One of the column's timers fired.
-    pub fn column_timer(&mut self, core: &mut Core<Self>, which: Timer) {
+    pub fn column_timer(&mut self, _: &mut Core<Self>, which: Timer) {
         if let Some(column) = &mut self.column {
-            column.timer_due(core, which);
+            column.timer_due(which);
         }
     }
 
     // -- what the column asks for ------------------------------------------
+
+    fn acts(&mut self, core: &mut Core<Self>, acts: Vec<Act>) {
+        for act in acts {
+            self.act(core, act);
+        }
+    }
 
     fn act(&mut self, core: &mut Core<Self>, act: Act) {
         let Some(column) = &mut self.column else {
             return;
         };
         match act {
-            Act::None => {}
-            Act::Focus(key) => column.focus(core, &key, false),
-            Act::Tuck => column.tuck(core),
-            Act::Task(key, n) => {
-                // A click while peeking took the keyboard for nothing.
-                column.release_keyboard();
-                self.toggle_task(&key, n as usize);
+            Act::Open(key) => {
+                let more = column.open(core, &key);
+                self.acts(core, more);
             }
+            Act::Close => {
+                let more = column.close();
+                self.acts(core, more);
+            }
+            Act::Task(key, n) => self.toggle_task(&key, n as usize),
             Act::Link(key, n) => self.open_link(core, &key, n as usize),
+            Act::File(path) => self.open_path(core, &path.to_string_lossy()),
             Act::Edit(key) => {
-                column.tuck(core);
+                let more = column.close();
+                self.acts(core, more);
                 self.edit(core, &key);
             }
             Act::New => {
-                column.tuck(core);
                 if let Err(e) = self.new_note(core, NewNote::default()) {
                     warn!("{e}");
                 }
+            }
+            Act::Title(key, title) => self.edit_note(&key, |note| match title.trim() {
+                "" => note.set("title", None),
+                t => note.set_value("title", t),
+            }),
+            Act::Pin(key, exact) => {
+                let Some(window) = self.context.value().clone() else {
+                    return;
+                };
+                self.edit_note(&key, |note| note.pin(&window, exact));
+            }
+            Act::Unpin(key) => {
+                let Some(window) = self.context.value().clone() else {
+                    return;
+                };
+                self.edit_note(&key, |note| note.unpin(&window));
             }
         }
     }
@@ -474,6 +551,34 @@ impl WlNote {
         self.index.dir().join(key)
     }
 
+    /// Change the note `key` with `f` and write it, but only over what was
+    /// read: a change on disk not seen yet wins.
+    fn edit_note(&mut self, key: &str, f: impl FnOnce(&mut Note) -> Result<(), String>) {
+        let Some(entry) = self.index.get(Path::new(key)) else {
+            return;
+        };
+        let path = self.path(key);
+        match std::fs::read_to_string(&path) {
+            Ok(now) if now == entry.note.text() => {}
+            Ok(_) => {
+                self.notes_touched = true;
+                return warn!("{}: changed on disk; not changed", path.display());
+            }
+            Err(e) => return warn!("{}: {e}", path.display()),
+        }
+        let mut note = entry.note.clone();
+        if let Err(e) = f(&mut note) {
+            return warn!("{}: {e}", path.display());
+        }
+        if note.text() == entry.note.text() {
+            return;
+        }
+        match wl_shell_notes::write_atomic(&path, note.text()) {
+            Ok(()) => self.notes_touched = true,
+            Err(e) => warn!("{}: {e}", path.display()),
+        }
+    }
+
     /// Check or uncheck the n-th checkbox of `key`, in its file.
     fn toggle_task(&mut self, key: &str, n: usize) {
         let rel = Path::new(key);
@@ -481,24 +586,25 @@ impl WlNote {
             return;
         };
         let content = Content::of_note(&entry.note, &list::name(rel));
-        let path = self.path(key);
-        // Only over what was read: a change not seen yet wins.
-        match std::fs::read_to_string(&path) {
-            Ok(now) if now == entry.note.text() => {}
-            Ok(_) => {
-                self.notes_touched = true;
-                return warn!("{}: changed on disk; not toggled", path.display());
-            }
-            Err(e) => return warn!("{}: {e}", path.display()),
-        }
-        let new = (content.tasks.get(n))
-            .and_then(|range| markdown::toggle(entry.note.text(), range.clone()));
-        let Some(new) = new else {
-            return warn!("{}: no checkbox to toggle", path.display());
+        let Some(range) = content.tasks.get(n).cloned() else {
+            return;
         };
-        match wl_shell_notes::write_atomic(&path, &new) {
-            Ok(()) => self.notes_touched = true,
-            Err(e) => warn!("{}: {e}", path.display()),
+        self.edit_note(key, |note| {
+            let new = markdown::toggle(note.text(), range).ok_or("no checkbox to toggle")?;
+            *note = Note::parse(new);
+            Ok(())
+        });
+    }
+
+    /// Open `target` (a path or URL) with `open-command`.
+    fn open_path(&self, core: &Core<Self>, target: &str) {
+        let command = spawn::fill(
+            &self.config.open_command,
+            &[("path", &spawn::quote(target))],
+        );
+        let output = Output::Prefixed("open-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("open-command: {e}");
         }
     }
 
@@ -524,17 +630,16 @@ impl WlNote {
                 dir.join(expand(dest)).to_string_lossy().into_owned()
             }
         };
-        let command = spawn::fill(&self.config.open_command, &[("path", &spawn::quote(&target))]);
-        let output = Output::Prefixed("open-command".into());
-        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
-            warn!("open-command: {e}");
-        }
+        self.open_path(core, &target);
     }
 
     /// Open the note `key` with `editor-command`.
     fn edit(&self, core: &Core<Self>, key: &str) {
         let path = self.path(key).to_string_lossy().into_owned();
-        let command = spawn::fill(&self.config.editor_command, &[("path", &spawn::quote(&path))]);
+        let command = spawn::fill(
+            &self.config.editor_command,
+            &[("path", &spawn::quote(&path))],
+        );
         let output = Output::Prefixed("editor-command".into());
         if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
             warn!("editor-command: {e}");
@@ -576,20 +681,17 @@ impl WlNote {
         Ok(())
     }
 
-    /// Focus `key` with the keyboard, showing it even if it doesn't belong
+    /// Open `key` with the keyboard, showing it even if it doesn't belong
     /// to the context.
     fn focus_note(&mut self, core: &mut Core<Self>, key: &str) {
-        let shown = (self.column.as_ref()).is_some_and(|c| c.keys().any(|k| k == key));
-        let matches = (self.index.get(Path::new(key)))
-            .is_some_and(|e| e.note.matches(self.context.value().as_ref()));
-        if !shown && !matches {
-            self.forced = Some(key.to_string());
-        }
-        self.show_notes(core);
+        let Some(column) = &mut self.column else {
+            return;
+        };
+        let acts = column.open(core, key);
+        // Among the notes before its card is made, so it is kept.
+        self.show_notes();
         self.dirty = false;
-        if let Some(column) = &mut self.column {
-            column.focus(core, key, true);
-        }
+        self.acts(core, acts);
     }
 
     // -- the socket --------------------------------------------------------
@@ -622,14 +724,18 @@ impl WlNote {
         };
         let key = match note {
             Some(q) => {
-                let notes: Vec<(&Path, Option<&str>)> =
-                    self.index.iter().map(|(p, e)| (p, e.note.title())).collect();
+                let notes: Vec<(&Path, Option<&str>)> = self
+                    .index
+                    .iter()
+                    .map(|(p, e)| (p, e.note.title()))
+                    .collect();
                 let found = find::find(self.index.dir(), &notes, q)?;
                 found.to_string_lossy().into_owned()
             }
             // Toggles.
-            None if column.focused().is_some() => {
-                column.tuck(core);
+            None if column.open_key().is_some() => {
+                let acts = column.close();
+                self.acts(core, acts);
                 return Ok(());
             }
             None => match column.keys().next() {
@@ -659,8 +765,36 @@ impl WlNote {
                     column.doc_ready(tag, &doc, &rendered);
                 }
             }
+            Done::FileIcons { path, icons } => {
+                if let Some(column) = &mut self.column {
+                    column.file_icons_ready(path, icons);
+                }
+            }
+            Done::Named { key, image } => {
+                if let Some(column) = &mut self.column {
+                    column.icon_ready(key, image);
+                }
+            }
+            Done::Pill { request, pill, .. } => {
+                if let Some(column) = &mut self.column {
+                    column.line_ready(&request, &pill);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// What the pin icon of `note` does with `window` as the context.
+fn pin_state(note: &Note, window: Option<&Window>) -> Pin {
+    match window {
+        _ if note.error.is_some() => Pin::Locked,
+        None => Pin::None,
+        Some(w) if w.app_id.is_empty() => Pin::None,
+        Some(w) if note.pinned_to(w) => Pin::Pinned {
+            global_after: note.unpin_leaves_global(w),
+        },
+        Some(w) => Pin::Unpinned(w.app_id.clone()),
     }
 }
 
@@ -742,8 +876,9 @@ impl Program for WlNote {
         let Some(column) = (self.column.as_mut()).filter(|c| *c.surface() == event.surface) else {
             return;
         };
-        let act = column.pointer(core, event);
-        self.act(core, act);
+        let mods = core.input.modifiers;
+        let acts = column.pointer(core, event, &mods);
+        self.acts(core, acts);
     }
 
     fn key(&mut self, core: &mut Core<Self>, event: &KeyEvent, _: bool) {
@@ -753,13 +888,20 @@ impl Program for WlNote {
         if core.input.keyboard_focus() != Some(column.surface()) {
             return;
         }
-        let act = column.key(event, &core.input.modifiers);
-        self.act(core, act);
+        let acts = column.key(event, &core.input.modifiers);
+        self.acts(core, acts);
+    }
+
+    fn keyboard_enter(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+        if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
+            column.keyboard_enter();
+        }
     }
 
     fn keyboard_leave(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
         if let Some(column) = self.column.as_mut().filter(|c| c.surface() == surface) {
-            column.keyboard_leave(core);
+            let acts = column.keyboard_leave();
+            self.acts(core, acts);
         }
     }
 

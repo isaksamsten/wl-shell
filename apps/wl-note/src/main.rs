@@ -2,6 +2,7 @@
 //! PLAN.md for the design.
 
 mod app;
+mod bar;
 mod column;
 mod config;
 mod context;
@@ -13,6 +14,7 @@ mod list;
 mod markdown;
 mod options;
 mod papers;
+mod title;
 
 use std::io::Read;
 use std::process::ExitCode;

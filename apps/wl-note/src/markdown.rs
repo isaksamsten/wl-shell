@@ -20,8 +20,13 @@ use wl_shell_render::doc::{Block, Kind, Marker, Run};
 /// A note, ready to render.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Content {
-    /// The title (see `of_note`), then the body.
+    /// The title: the frontmatter's, else the first heading's, else the
+    /// file's name.
+    pub title: String,
+    /// The body (after the frontmatter's error, if it is broken).
     pub blocks: Vec<Block>,
+    /// The block of `blocks` that is the title, if it came from there.
+    pub heading: Option<usize>,
     /// The byte range in the file of each task's `[ ]` or `[x]`, in order:
     /// `Target::Task(n)` is `tasks[n]`.
     pub tasks: Vec<Range<usize>>,
@@ -29,25 +34,18 @@ pub struct Content {
     pub links: Vec<String>,
 }
 
-/// The blocks a preview shows at most: it only has room for a few lines.
-const PREVIEW_BLOCKS: usize = 8;
-
 impl Content {
-    /// A note's content: its title as a heading (from the frontmatter, or
-    /// `name` if it has none and no heading either), the frontmatter's
-    /// error if it is broken, and its body.
+    /// A note's content: its title (`name` if it has none), the
+    /// frontmatter's error if it is broken, and its body.
     pub fn of_note(note: &Note, name: &str) -> Self {
         let body = note.body();
         let offset = note.text().len() - body.len();
         let mut content = parse(body, offset);
-        let mut head = Vec::new();
-        let title = (note.meta.title.as_deref()).map(str::trim).filter(|t| !t.is_empty());
-        match title {
-            Some(t) => head.push(Block::new(Kind::Heading(2), vec![Run::plain(t)])),
-            None if note.title().is_none() => {
-                head.push(Block::new(Kind::Heading(2), vec![Run::plain(name)]));
-            }
-            None => {}
+        content.title = note.title_or(name).to_string();
+        let own = (note.meta.title.as_deref()).is_some_and(|t| !t.trim().is_empty());
+        if !own && note.title().is_some() {
+            content.heading =
+                (content.blocks.iter()).position(|b| matches!(b.kind, Kind::Heading(_)));
         }
         if let Some(e) = &note.error {
             let run = Run {
@@ -55,24 +53,26 @@ impl Content {
                 italic: true,
                 ..Run::plain(format!("⚠ {e}"))
             };
-            head.push(Block::new(Kind::Paragraph, vec![run]));
+            content
+                .blocks
+                .insert(0, Block::new(Kind::Paragraph, vec![run]));
+            content.heading = content.heading.map(|h| h + 1);
         }
-        content.blocks.splice(0..0, head);
         content
     }
 
-    /// The first few blocks, every heading as large as the title: what a
-    /// peek has room for.
-    pub fn preview(&self) -> Vec<Block> {
-        (self.blocks.iter().take(PREVIEW_BLOCKS))
-            .map(|b| match b.kind {
-                Kind::Heading(_) => Block {
-                    kind: Kind::Heading(3),
-                    ..b.clone()
-                },
-                _ => b.clone(),
-            })
+    /// The body without the heading that is the title.
+    pub fn body(&self) -> Vec<Block> {
+        (self.blocks.iter().enumerate())
+            .filter(|(i, _)| Some(*i) != self.heading)
+            .map(|(_, b)| b.clone())
             .collect()
+    }
+
+    /// What a sheet shows: the title as a heading, then the body.
+    pub fn sheet(&self) -> Vec<Block> {
+        let title = Block::new(Kind::Heading(2), vec![Run::plain(self.title.clone())]);
+        std::iter::once(title).chain(self.body()).collect()
     }
 }
 
@@ -92,6 +92,7 @@ pub fn parse(body: &str, offset: usize) -> Content {
         blocks: b.blocks,
         tasks: b.tasks,
         links: b.links,
+        ..Default::default()
     }
 }
 
@@ -371,23 +372,29 @@ mod tests {
 
     #[test]
     fn titles() {
-        let n = Note::parse("+++\ntitle = \"Release\"\n+++\n- [ ] a\n");
+        let n = Note::parse("+++\ntitle = \"Release\"\n+++\n# Heading\n- [ ] a\n");
         let c = Content::of_note(&n, "file");
-        assert_eq!(texts(&c.blocks[0]), "Release");
-        assert_eq!(c.blocks[1].marker, Marker::Task(false));
-        // The first heading is the title already.
-        let n = Note::parse("# Groceries\nmilk\n");
+        assert_eq!((c.title.as_str(), c.heading), ("Release", None));
+        assert_eq!(c.body().len(), 2);
+        let sheet = c.sheet();
+        assert_eq!(texts(&sheet[0]), "Release");
+        assert_eq!(sheet[0].kind, Kind::Heading(2));
+        assert_eq!(texts(&sheet[1]), "Heading");
+        assert_eq!(sheet[2].marker, Marker::Task(false));
+        // The first heading is the title: not shown twice.
+        let n = Note::parse("intro\n# Groceries\nmilk\n");
         let c = Content::of_note(&n, "file");
-        assert_eq!(texts(&c.blocks[0]), "Groceries");
-        assert_eq!(c.blocks.len(), 2);
+        assert_eq!((c.title.as_str(), c.heading), ("Groceries", Some(1)));
+        let body: Vec<String> = c.body().iter().map(texts).collect();
+        assert_eq!(body, ["intro", "milk"]);
+        assert_eq!(c.sheet().len(), 3);
         // Else the file's name.
         let c = Content::of_note(&Note::parse("milk"), "2026-11-17-2059");
-        assert_eq!(texts(&c.blocks[0]), "2026-11-17-2059");
+        assert_eq!(c.title, "2026-11-17-2059");
+        assert_eq!(texts(&c.sheet()[0]), "2026-11-17-2059");
         // A broken frontmatter says so.
-        let c = Content::of_note(&Note::parse("+++\nx =\n+++\nbody"), "f");
-        assert!(texts(&c.blocks[1]).starts_with("⚠ frontmatter"));
-        // Previews have small headings.
-        assert!(c.preview().iter().all(|b| !matches!(b.kind, Kind::Heading(1 | 2))));
+        let c = Content::of_note(&Note::parse("+++\nx =\n+++\n# H\nbody"), "f");
+        assert!(texts(&c.blocks[0]).starts_with("⚠ frontmatter"));
+        assert_eq!((c.title.as_str(), c.heading), ("H", Some(1)));
     }
 }
-

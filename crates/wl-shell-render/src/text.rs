@@ -261,6 +261,190 @@ impl Text {
         self.draw(&buffer, &mut image, x, y, 0xffffffff);
         image
     }
+
+    /// One line of `text` as is (not cut), bold if `bold`, its letters
+    /// `spacing` ems apart, as tall as `line_height`, on a transparent
+    /// background: a label to set rotated, say.
+    pub fn label(
+        &mut self,
+        text: &str,
+        style: &Style,
+        bold: bool,
+        spacing: f32,
+        scale: i32,
+    ) -> Pill {
+        let s = scale.max(1);
+        let size = (style.size * s as f64) as f32;
+        let line_h = (line_height(style.size) * s) as f32;
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, line_h));
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, None);
+        let mut attrs = Attrs::new()
+            .family(family(&style.font))
+            .letter_spacing(spacing);
+        if bold {
+            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        }
+        let line: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        buffer.set_text(
+            &mut self.fonts,
+            line.trim(),
+            &attrs,
+            Shaping::Advanced,
+            None,
+        );
+        // To the last glyph's end, without spacing after it.
+        let w = (buffer.layout_runs())
+            .flat_map(|r| r.glyphs.iter().map(|g| g.x + g.w))
+            .fold(1.0, f32::max);
+        let width = (w / s as f32).ceil() as i32;
+        let height = line_height(style.size);
+        let mut image = Image {
+            width: (width * s) as u32,
+            height: (height * s) as u32,
+            data: vec![0; (width * s * height * s * 4) as usize],
+        };
+        self.draw(&buffer, &mut image, 0, 0, style.color);
+        Pill {
+            width,
+            height,
+            image,
+        }
+    }
+
+    /// Shape a field's text on one line.
+    fn field_buffer(&mut self, f: &Field) -> Buffer {
+        let s = f.scale.max(1);
+        let size = (f.style.size * s as f64) as f32;
+        let line_h = (line_height(f.style.size) * s) as f32;
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, line_h));
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, None);
+        let mut attrs = Attrs::new().family(family(&f.style.font));
+        if f.bold {
+            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        }
+        // Control characters can't be typed into a field; shown as spaces.
+        let line: String = (f.text.chars())
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        buffer.set_text(&mut self.fonts, &line, &attrs, Shaping::Advanced, None);
+        buffer
+    }
+
+    /// A one-line text field: `f.text` with a caret at `f.caret` (if
+    /// any), scrolled sideways to keep the caret in sight, on a
+    /// transparent background.
+    pub fn field(&mut self, f: &Field) -> FieldImage {
+        let s = f.scale.max(1) as f32;
+        let buffer = self.field_buffer(f);
+        let edges = caret_edges(&buffer);
+        let text_w = edges.last().map_or(0.0, |e| e.1) / s;
+        let width = f.width.max(1);
+        let caret_x = f.caret.map(|c| caret_x(&edges, c) / s);
+        let room = width as f32 - 2.0;
+        let mut scroll = (f.scroll as f32).clamp(0.0, (text_w - room).max(0.0));
+        if let Some(x) = caret_x {
+            scroll = scroll.min(x).max(x - room);
+        }
+        let height = line_height(f.style.size);
+        let (bw, bh) = (width * s as i32, height * s as i32);
+        let mut image = Image {
+            width: bw as u32,
+            height: bh as u32,
+            data: vec![0; (bw * bh * 4) as usize],
+        };
+        let x = (-scroll * s).round() as i32;
+        self.draw(&buffer, &mut image, x, 0, f.style.color);
+        if let Some(cx) = caret_x {
+            let px = ((cx - scroll) * s).round() as i32;
+            let [r, g, b, a] = f.style.color.to_be_bytes();
+            let alpha = a as f64 / 255.0;
+            let src = [b, g, r].map(|v| v as f64 * alpha);
+            let pad = (bh as f32 * 0.12).round() as i32;
+            for py in pad..bh - pad {
+                for qx in px.max(0)..(px + s.round() as i32).min(bw) {
+                    let i = ((py * bw + qx) * 4) as usize;
+                    blend(&mut image.data[i..i + 4], src, alpha);
+                }
+            }
+        }
+        FieldImage {
+            width,
+            height,
+            image,
+            scroll: scroll as f64,
+        }
+    }
+
+    /// The byte index in `f.text` nearest `x` logical pixels into the
+    /// field, scrolled by `f.scroll`.
+    pub fn field_index(&mut self, f: &Field, x: f64) -> usize {
+        let s = f.scale.max(1) as f32;
+        let buffer = self.field_buffer(f);
+        let at = (x + f.scroll) as f32 * s;
+        let edges = caret_edges(&buffer);
+        (edges.iter())
+            .min_by(|a, b| (a.1 - at).abs().total_cmp(&(b.1 - at).abs()))
+            .map_or(0, |e| e.0)
+            .min(f.text.len())
+    }
+}
+
+/// A one-line text field to draw.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub text: String,
+    /// A byte index of `text`; None: no caret.
+    pub caret: Option<usize>,
+    /// The background is left out.
+    pub style: Style,
+    pub bold: bool,
+    /// Logical pixels.
+    pub width: i32,
+    /// How far it was scrolled sideways, logical pixels.
+    pub scroll: f64,
+    pub scale: i32,
+}
+
+/// A drawn field.
+pub struct FieldImage {
+    /// Logical size.
+    pub width: i32,
+    pub height: i32,
+    pub image: Image,
+    /// How far it is scrolled now: the next `Field::scroll`.
+    pub scroll: f64,
+}
+
+/// Where a caret can be on a shaped line: (byte index, x in buffer
+/// pixels), in order, the end included.
+fn caret_edges(buffer: &Buffer) -> Vec<(usize, f32)> {
+    let mut out = Vec::new();
+    let mut end = (0, 0.0);
+    for run in buffer.layout_runs() {
+        for g in run.glyphs {
+            out.push((g.start, g.x));
+            if g.end >= end.0 {
+                end = (g.end, g.x + g.w);
+            }
+        }
+    }
+    out.push(end);
+    out.sort_by_key(|e| e.0);
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// The x of a caret at byte `at`: before the first glyph from it on.
+fn caret_x(edges: &[(usize, f32)], at: usize) -> f32 {
+    (edges.iter())
+        .find(|e| e.0 >= at)
+        .or(edges.last())
+        .map_or(0.0, |e| e.1)
 }
 
 /// CSS generic family names, or a family name.
@@ -499,5 +683,49 @@ mod tests {
     fn heights() {
         assert_eq!(line_height(14.0), 20);
         assert_eq!(pill_height(14.0), 32);
+    }
+
+    #[test]
+    fn carets() {
+        let edges = [(0, 0.0), (1, 10.0), (3, 20.0), (4, 30.0)];
+        assert_eq!(caret_x(&edges, 0), 0.0);
+        assert_eq!(caret_x(&edges, 2), 20.0);
+        assert_eq!(caret_x(&edges, 4), 30.0);
+        assert_eq!(caret_x(&edges, 9), 30.0);
+        assert_eq!(caret_x(&[], 0), 0.0);
+    }
+
+    #[test]
+    fn fields_scroll_to_the_caret() {
+        let mut text = Text::new();
+        let style = Style {
+            font: "sans-serif".into(),
+            size: 13.0,
+            color: 0x000000ff,
+            background: 0,
+        };
+        let mut f = Field {
+            text: "A long title that does not fit in the field".into(),
+            caret: Some(0),
+            style,
+            bold: true,
+            width: 60,
+            scroll: 0.0,
+            scale: 2,
+        };
+        let start = text.field(&f);
+        assert_eq!((start.width, start.image.width), (60, 120));
+        assert_eq!(start.scroll, 0.0);
+        f.caret = Some(f.text.len());
+        let end = text.field(&f);
+        assert!(end.scroll > 100.0, "{}", end.scroll);
+        // Clicks find the caret positions back.
+        f.scroll = end.scroll;
+        assert_eq!(text.field_index(&f, 59.0), f.text.len());
+        f.scroll = 0.0;
+        assert_eq!(text.field_index(&f, -5.0), 0);
+        let label = text.label("HOLD", &f.style, true, 0.12, 2);
+        assert_eq!(label.image.width as i32, label.width * 2);
+        assert!(label.width > 20 && label.width < 80, "{}", label.width);
     }
 }

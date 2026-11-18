@@ -29,23 +29,46 @@ pub struct Config {
     pub output: String,
     pub edge: Edge,
     pub layer: NoteLayer,
-    /// How much of a tucked note shows.
-    #[serde(deserialize_with = "tuck")]
-    pub tuck: u32,
-    /// Between the slivers.
+    /// How far a note's marker comes out of the edge.
+    #[serde(deserialize_with = "marker_width")]
+    pub marker_width: u32,
+    /// A marker's length along the edge.
+    #[serde(deserialize_with = "marker_length")]
+    pub marker_length: u32,
     #[serde(deserialize_with = "de::px")]
-    pub tab_gap: u32,
-    /// A sliver's length along the edge.
-    #[serde(deserialize_with = "tab_height")]
-    pub tab_height: u32,
-    /// How much of a peeking note shows.
-    #[serde(deserialize_with = "peek")]
-    pub peek: u32,
-    #[serde(deserialize_with = "focus_width")]
-    pub focus_width: u32,
-    /// Of the output's height, at most.
-    #[serde(deserialize_with = "de::fraction")]
-    pub focus_height: f64,
+    pub marker_radius: u32,
+    /// Between markers, at least (until they are crowded).
+    #[serde(deserialize_with = "de::px")]
+    pub marker_gap: u32,
+    /// Kept free at both ends of the column.
+    #[serde(deserialize_with = "de::px")]
+    pub marker_padding: u32,
+    /// How far a header (a note's margin) comes out of the edge.
+    #[serde(deserialize_with = "header")]
+    pub header: u32,
+    /// A header's length along the edge.
+    #[serde(deserialize_with = "header_length")]
+    pub header_length: u32,
+    #[serde(deserialize_with = "sheet_width")]
+    pub sheet_width: u32,
+    #[serde(deserialize_with = "sheet_height")]
+    pub sheet_height: u32,
+    /// The bar of file icons along a sheet's bottom.
+    #[serde(deserialize_with = "file_bar")]
+    pub file_bar: u32,
+    /// Replaced keys: never set, an error naming the new one.
+    #[serde(deserialize_with = "replaced::tuck")]
+    tuck: (),
+    #[serde(deserialize_with = "replaced::tab_gap")]
+    tab_gap: (),
+    #[serde(deserialize_with = "replaced::tab_height")]
+    tab_height: (),
+    #[serde(deserialize_with = "replaced::peek")]
+    peek: (),
+    #[serde(deserialize_with = "replaced::focus_width")]
+    focus_width: (),
+    #[serde(deserialize_with = "replaced::focus_height")]
+    focus_height: (),
     #[serde(deserialize_with = "de::duration")]
     pub reveal_delay: u32,
     #[serde(deserialize_with = "de::duration")]
@@ -86,12 +109,22 @@ impl Default for Config {
             output: "focused".into(),
             edge: Edge::default(),
             layer: NoteLayer::default(),
-            tuck: 10,
-            tab_gap: 4,
-            tab_height: 64,
-            peek: 180,
-            focus_width: 420,
-            focus_height: 0.7,
+            marker_width: 6,
+            marker_length: 28,
+            marker_radius: 3,
+            marker_gap: 8,
+            marker_padding: 12,
+            header: 28,
+            header_length: 96,
+            sheet_width: 300,
+            sheet_height: 220,
+            file_bar: 24,
+            tuck: (),
+            tab_gap: (),
+            tab_height: (),
+            peek: (),
+            focus_width: (),
+            focus_height: (),
             reveal_delay: 120,
             hide_delay: 400,
             settle: 120,
@@ -335,20 +368,65 @@ impl ConfigFile for Config {
     }
 }
 
-fn tuck<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+fn marker_width<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 2, 100)
 }
 
-fn tab_height<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    de::bounded(d, 16, 1000)
+fn marker_length<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 8, 1000)
 }
 
-fn peek<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    de::bounded(d, 20, 2000)
+fn header<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 12, 200)
 }
 
-fn focus_width<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    de::bounded(d, 100, 4000)
+fn header_length<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 24, 1000)
+}
+
+fn sheet_width<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 120, 4000)
+}
+
+fn sheet_height<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 80, 4000)
+}
+
+fn file_bar<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 16, 100)
+}
+
+/// Keys the redesign replaced: each is an error naming what to use.
+mod replaced {
+    use serde::{Deserializer, de::Error as _};
+
+    fn gone<'de, D: Deserializer<'de>>(old: &str, new: &str) -> Result<(), D::Error> {
+        Err(D::Error::custom(format!("`{old}` is gone: use {new}")))
+    }
+
+    pub fn tuck<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("tuck", "`marker-width`")
+    }
+
+    pub fn tab_gap<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("tab-gap", "`marker-gap` (headers overlap now)")
+    }
+
+    pub fn tab_height<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("tab-height", "`header-length`")
+    }
+
+    pub fn peek<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("peek", "`header`")
+    }
+
+    pub fn focus_width<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("focus-width", "`sheet-width`")
+    }
+
+    pub fn focus_height<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+        gone::<D>("focus-height", "`sheet-height` (in pixels)")
+    }
 }
 
 fn response<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -387,12 +465,13 @@ mod tests {
     #[test]
     fn keys() {
         let c = parse(
-            "notes-dir = \"/n\"\nedge = \"left\"\ntuck = 12\nsettle = 0\ndefault-color = \"#102030\"\n\
-             mru-event-stream = \"x\"\n[appearance]\npaper-pink = \"#ff0000\"\n[appearance.dark]\ndark-dim = 1.0\n",
+            "notes-dir = \"/n\"\nedge = \"left\"\nmarker-width = 12\nsettle = 0\ndefault-color = \"#102030\"\n\
+             mru-event-stream = \"x\"\nsheet-height = 300\n[appearance]\npaper-pink = \"#ff0000\"\n[appearance.dark]\ndark-dim = 1.0\n",
         )
         .unwrap();
         assert_eq!(c.notes_dir(), PathBuf::from("/n"));
-        assert_eq!((c.edge, c.tuck, c.settle), (Edge::Left, 12, 0));
+        assert_eq!((c.edge, c.marker_width, c.settle), (Edge::Left, 12, 0));
+        assert_eq!(c.sheet_height, 300);
         assert_eq!(c.default_color, Color::Rgb(0x102030));
         assert_eq!(c.appearance.dark.paper_pink, 0xff0000ff);
         assert_eq!(c.appearance.dark.dark_dim, 1.0);
@@ -403,13 +482,29 @@ mod tests {
     fn invalid() {
         for bad in [
             "edge = \"top\"",
-            "tuck = 0",
+            "marker-width = 0",
+            "header = 1000",
             "default-color = \"teal\"",
             "unknown = 1",
             "tilt = 20.0",
             "[appearance]\nunknown = 1",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn replaced_keys_name_their_replacement() {
+        for (old, new) in [
+            ("tuck = 10", "marker-width"),
+            ("tab-gap = 4", "marker-gap"),
+            ("tab-height = 64", "header-length"),
+            ("peek = 180", "`header`"),
+            ("focus-width = 420", "sheet-width"),
+            ("focus-height = 0.7", "sheet-height"),
+        ] {
+            let e = parse(old).unwrap_err();
+            assert!(e.contains(new), "{old}: {e}");
         }
     }
 
