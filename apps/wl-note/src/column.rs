@@ -128,6 +128,8 @@ const NOTICE_SCALE: f64 = 1.15;
 /// File bar icons and the gap between them.
 const ICON: f64 = 16.0;
 const ICON_GAP: f64 = 8.0;
+const ROW_ICON: u32 = 14;
+const ROW_COUNT_ICON: u32 = 10;
 const TRASH_RED: u32 = 0xcb3535ff;
 const PALETTE_TIME: Duration = Duration::from_millis(150);
 /// Name labels kept.
@@ -522,6 +524,17 @@ struct LineKey {
     color: u32,
     width: i32,
     strike: bool,
+    tooltip: bool,
+}
+
+impl LineKey {
+    fn style(&self, style: &Style) -> text::Style {
+        let mut style = style.small(self.color);
+        if self.tooltip {
+            style.background = 0x202020e6;
+        }
+        style
+    }
 }
 
 struct RowSlot {
@@ -1680,11 +1693,14 @@ impl Column {
     /// The pointer is at (`x`, `y`): follow it with the levels, and the
     /// bars' hover.
     fn hover_at(&mut self, core: &Core<WlNote>, x: f64, y: f64) {
+        let was_over_plus = self
+            .pointer
+            .is_some_and(|(x, y)| self.on_at(x, y) == On::Plus);
         self.pointer = Some((x, y));
         self.cancel_hide(core);
         let on = self.on_at(x, y);
         self.update_row_hover(core);
-        let mut changed = self.leave_file_views(&on);
+        let mut changed = self.leave_file_views(&on) || was_over_plus != (on == On::Plus);
         changed |= self.update_bar_hover(x, y);
         changed |= self.drawer.is_some() && self.update_drawer_hover(x, y);
         let before = (
@@ -2446,7 +2462,11 @@ impl Column {
 
     /// An icon arrived (None: there is none).
     pub fn icon_ready(&mut self, key: NamedIcon, image: Option<Arc<Image>>) {
-        if key.size != ICON as u32 * self.scale as u32 || key.shadow.is_some() {
+        let scale = self.scale as u32;
+        let bar_icon = key.size == ICON as u32 * scale;
+        let row_icon = [ROW_ICON * scale, ROW_COUNT_ICON * scale].contains(&key.size)
+            && Button::ALL.iter().any(|button| key.name == button.icon());
+        if key.shadow.is_some() || !(bar_icon || row_icon) {
             return;
         }
         self.icons.insert(key, image);
@@ -2547,9 +2567,13 @@ impl Column {
             spans: Vec::new(),
             max_width: key.width.max(1),
             scale: self.scale,
-            style: self.style.small(key.color),
+            style: key.style(&self.style),
         };
-        self.assets.line(0, request);
+        if key.tooltip {
+            self.assets.pill(0, request);
+        } else {
+            self.assets.line(0, request);
+        }
         self.lines.insert(0, (key, None));
         while self.lines.len() > LINES {
             if let Some((_, Some(s))) = self.lines.pop() {
@@ -2568,7 +2592,7 @@ impl Column {
         for (key, sized) in &mut self.lines {
             let same = key.text == request.text
                 && key.width.max(1) == request.max_width
-                && self.style.small(key.color) == request.style;
+                && key.style(&self.style) == request.style;
             if !same || sized.is_some() {
                 continue;
             }
@@ -4037,9 +4061,10 @@ impl Column {
                         color: self.style.plus_glyph,
                         width: m.plus as i32,
                         strike: false,
+                        tooltip: false,
                     })
                 });
-                let size = if count.is_some() { 10.0 } else { 14.0 };
+                let size = if count.is_some() { ROW_COUNT_ICON } else { ROW_ICON } as f64;
                 let mut key = self.named(&[button.icon()]);
                 key.size = (size * scale) as u32;
                 let count_width = count.as_ref().map_or(0.0, |image| image.w);
@@ -4100,21 +4125,42 @@ impl Column {
             let right = plus.right().max(end.right());
             self.row_hold = intersect(Rect::new(x, plus.y, right - x, plus.h), surface);
         }
-        let placed = label.and_then(|(button, rect)| {
-            let image = self.line(LineKey {
-                text: row::label(button, available),
-                color: self.style.plus_glyph,
-                width: 170,
-                strike: false,
-            })?;
-            let x = (rect.x + (rect.w - image.w) / 2.0).clamp(0.0, (width - image.w).max(0.0));
-            let area = Rect::new(x, rect.y - image.h - 4.0, image.w, image.h);
+        let label = if !self.row_drag
+            && !self.retiring
+            && self.press.is_none()
+            && self
+                .pointer
+                .is_some_and(|(x, y)| self.on_at(x, y) == On::Plus)
+        {
+            self.plus_rect
+                .map(|rect| ("New note (⇧: this window)".into(), rect))
+        } else {
+            label.map(|(button, rect)| (row::label(button, available), rect))
+        };
+        let placed = label.and_then(|(text, rect)| {
+            let (image, area) = self.tooltip(text, false, rect)?;
             place_image(&mut self.row_label, &image, area, surface, scale, alpha)
         });
         if placed.is_none() {
             self.row_label.clear();
         }
         self.attached.extend(placed);
+    }
+
+    fn tooltip(&mut self, text: String, strike: bool, anchor: Rect) -> Option<(Sized, Rect)> {
+        let surface = self.surface_rect();
+        let image = self.line(LineKey {
+            text,
+            color: 0xffffffff,
+            width: surface.w.min(320.0) as i32,
+            strike,
+            tooltip: true,
+        })?;
+        let x = (anchor.x + (anchor.w - image.w) / 2.0)
+            .clamp(surface.x, (surface.right() - image.w).max(surface.x));
+        let y = (anchor.y - image.h - 4.0).max(surface.y);
+        let area = Rect::new(x, y, image.w, image.h);
+        Some((image, area))
     }
 
     /// How much the open note's parts on top of its paper show: once its
@@ -4246,6 +4292,7 @@ impl Column {
                     color: ink,
                     width: (cell.w - 4.0) as i32,
                     strike: !exists,
+                    tooltip: false,
                 })
             {
                 let r = Rect::new(cell.x + (cell.w - l.w) / 2.0, rect.bottom() + 2.0, l.w, l.h);
@@ -4263,6 +4310,7 @@ impl Column {
                 color: ink,
                 width: rect.w.ceil() as i32 + 6,
                 strike: false,
+                tooltip: false,
             }) {
                 let r = Rect::new(rect.x, rect.y + (rect.h - l.h) / 2.0, l.w, l.h);
                 plan.more = Some((l.buffer, r));
@@ -4302,6 +4350,7 @@ impl Column {
                 color: ink,
                 width: rect.w.ceil() as i32 + 8,
                 strike: false,
+                tooltip: false,
             };
             if let Some(l) = self.line(key) {
                 let r = Rect::new(
@@ -4421,6 +4470,7 @@ impl Column {
                 color: ink,
                 width: width as i32,
                 strike,
+                tooltip: false,
             }) {
                 let (x, y) = if above {
                     (area.right() - l.w, area.y - l.h - 3.0)
@@ -4448,6 +4498,7 @@ impl Column {
                     color: if d.overdue { self.style.overdue } else { ink },
                     width: room as i32,
                     strike: false,
+                    tooltip: false,
                 })
             {
                 let r = Rect::new(layout.name_end - l.w, layout.mid - l.h / 2.0, l.w, l.h);
