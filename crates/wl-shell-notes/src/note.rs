@@ -14,7 +14,7 @@
 //! a global one, in the default color. Unknown keys are kept. A
 //! frontmatter that doesn't parse leaves the note global (with the error
 //! in `Note::error`), and `set` refuses to touch it. Smaller problems (a
-//! glob or a color that doesn't parse) are `Note::warnings`.
+//! glob, a color or a `due` that doesn't parse) are `Note::warnings`.
 //!
 //! `set` edits the frontmatter with `toml_edit`, so comments, key order and
 //! formatting survive, and never touches the body. The line endings of the
@@ -24,6 +24,7 @@ use std::ops::Range;
 
 use toml_edit::{DocumentMut, Item, TableLike};
 
+use crate::due::Due;
 use crate::matcher::{Matcher, Window};
 
 /// The paper colors every program knows by name.
@@ -67,6 +68,8 @@ pub struct Meta {
     pub matchers: Vec<Matcher>,
     pub tags: Vec<String>,
     pub color: Option<Color>,
+    /// When the note is due, if it says.
+    pub due: Option<Due>,
 }
 
 impl Meta {
@@ -218,6 +221,11 @@ impl Note {
             .or_else(|| heading(self.body()))
     }
 
+    /// When the note is due, if its `due` is a date or datetime.
+    pub fn due(&self) -> Option<Due> {
+        self.meta.due
+    }
+
     /// The title, or `name` (the file's) without one.
     pub fn title_or<'a>(&'a self, name: &'a str) -> &'a str {
         self.title().unwrap_or(name)
@@ -296,6 +304,12 @@ impl Note {
         };
         *self = Note::parse(text);
         Ok(())
+    }
+
+    /// Set the frontmatter's `due` (None: remove it), keeping everything
+    /// else as it is.
+    pub fn set_due(&mut self, due: Option<toml_edit::Datetime>) -> Result<(), String> {
+        self.set("due", due.map(toml_edit::value))
     }
 
     /// Whether one of the note's own matchers matches `window`: it is
@@ -479,6 +493,18 @@ fn parse_meta(toml: &str) -> Result<(Meta, Vec<String>), String> {
         match Color::parse(string(item, "color")?.trim()) {
             Ok(c) => meta.color = Some(c),
             Err(e) => warnings.push(e),
+        }
+    }
+    if let Some(item) = doc.get("due") {
+        match item
+            .as_datetime()
+            .ok_or(())
+            .and_then(|dt| Due::from_datetime(dt).map_err(|_| ()))
+        {
+            Ok(due) => meta.due = Some(due),
+            Err(()) => warnings.push(
+                "due: expected a date or datetime, such as 2026-11-20 or 2026-11-20T09:00".into(),
+            ),
         }
     }
     Ok((meta, warnings))
@@ -773,5 +799,63 @@ mod tests {
         let n = Note::parse("+++\napps = [\"foot\"]\ntags = [\"t\"]\n+++\n");
         assert!(!n.unpin_leaves_global(&foot));
         assert!(Note::parse("").pin(&w("", "x"), false).is_err());
+    }
+
+    #[test]
+    fn due_dates_and_datetimes() {
+        use crate::due::{Civil, Fixed};
+        let due = |v: &str| Note::parse(format!("+++\ndue = {v}\n+++\n")).due();
+        assert_eq!(
+            due("2026-11-20"),
+            Some(Due::Day(Civil::new(2026, 11, 20, 0, 0)))
+        );
+        assert_eq!(
+            due("2026-11-20T09:00"),
+            Some(Due::Local(Civil::new(2026, 11, 20, 9, 0)))
+        );
+        let at = due("2026-11-20T09:00:00+01:00").unwrap();
+        assert_eq!(at.at(&Fixed(0)), Civil::new(2026, 11, 20, 8, 0).as_utc());
+        assert!(Note::parse("no frontmatter").due().is_none());
+        let n = Note::parse("+++\ndue = 2026-11-20\n+++\n");
+        assert!(n.error.is_none() && n.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_bad_due_is_a_warning() {
+        for bad in [
+            "\"tomorrow\"",
+            "\"2026-11-20\"",
+            "09:00",
+            "3",
+            "[2026-11-20]",
+        ] {
+            let n = Note::parse(format!("+++\ndue = {bad}\ncolor = \"pink\"\n+++\n"));
+            assert!(n.error.is_none(), "{bad}: {:?}", n.error);
+            assert_eq!(n.due(), None, "{bad}");
+            assert_eq!(n.warnings.len(), 1, "{bad}: {:?}", n.warnings);
+            assert!(n.warnings[0].starts_with("due: "), "{:?}", n.warnings);
+            assert!(n.troubled());
+            // The rest of the frontmatter still counts.
+            assert_eq!(n.meta.color, Some(Color::Preset("pink")));
+        }
+    }
+
+    #[test]
+    fn setting_and_clearing_due_keeps_the_rest() {
+        let text = "+++\n# mine\ntitle = \"T\" # kept\n+++\nbody\n";
+        let mut n = Note::parse(text);
+        let dt: toml_edit::Datetime = "2026-11-20T09:00".parse().unwrap();
+        n.set_due(Some(dt)).unwrap();
+        assert_eq!(
+            n.text(),
+            "+++\n# mine\ntitle = \"T\" # kept\ndue = 2026-11-20T09:00\n+++\nbody\n"
+        );
+        assert!(n.due().is_some());
+        let day: toml_edit::Datetime = "2026-12-01".parse().unwrap();
+        n.set_due(Some(day)).unwrap();
+        assert!(n.text().contains("due = 2026-12-01\n"), "{}", n.text());
+        n.set_due(None).unwrap();
+        assert_eq!(n.text(), text);
+        assert!(n.due().is_none());
     }
 }

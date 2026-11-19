@@ -63,6 +63,19 @@ pub enum Cmd {
         /// The note's text; - reads it from stdin
         #[arg(long, value_name = "TEXT")]
         text: Option<String>,
+        /// When it is due: a date or datetime (2026-11-20,
+        /// 2026-11-20T09:00), HH:MM, +30m, +2h, +3d, today or tomorrow
+        #[arg(long, value_name = "WHEN")]
+        due: Option<String>,
+    },
+    /// Set when a note is due (see `new --due` for WHEN), or clear it with
+    /// `none`; a note past its due time is overdue
+    Due {
+        /// A path, file name or title
+        #[arg(value_name = "NOTE")]
+        note: String,
+        #[arg(value_name = "WHEN|none")]
+        when: String,
     },
     /// Keep a scratch note as an app note (asks the running wl-note)
     Keep {
@@ -170,6 +183,7 @@ mod tests {
                 color: Some("pink".into()),
                 title: None,
                 text: Some("-".into()),
+                due: None,
             })
         );
         let o = parse(&["focus"]).unwrap();
@@ -227,5 +241,30 @@ mod tests {
             })
         );
         assert_eq!(parse(&["prune"]).unwrap().command, Some(Cmd::Prune));
+    }
+
+    #[test]
+    fn due_commands() {
+        let o = parse(&["new", "--due", "+2h", "--title", "Call"]).unwrap();
+        assert!(matches!(
+            o.command,
+            Some(Cmd::New { due: Some(ref d), .. }) if d == "+2h"
+        ));
+        assert_eq!(
+            parse(&["due", "groceries", "tomorrow"]).unwrap().command,
+            Some(Cmd::Due {
+                note: "groceries".into(),
+                when: "tomorrow".into()
+            })
+        );
+        assert_eq!(
+            parse(&["due", "groceries", "none"]).unwrap().command,
+            Some(Cmd::Due {
+                note: "groceries".into(),
+                when: "none".into()
+            })
+        );
+        assert!(parse(&["due", "groceries"]).is_err());
+        assert!(parse(&["due"]).is_err());
     }
 }

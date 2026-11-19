@@ -70,6 +70,7 @@ use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::reexports::calloop::RegistrationToken;
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
+use wl_shell_notes::due::{self, Local, Preset, TimeOfDay};
 use wl_shell_notes::{Color, PRESETS};
 use wl_shell_render::Image;
 use wl_shell_render::doc::{self, Doc, DocStyle, Target};
@@ -159,6 +160,11 @@ pub struct Style {
     pub plus_glyph: u32,
     /// Behind each group's markers (alpha 0: none).
     pub backdrop: u32,
+    /// An overdue note's due time and clock.
+    pub overdue: u32,
+    /// The due presets' times of day.
+    pub morning: TimeOfDay,
+    pub evening: TimeOfDay,
     palette: [u32; PRESETS.len()],
 }
 
@@ -197,6 +203,9 @@ impl Style {
             plus_color: (white & !0xff) | 0xe6,
             plus_glyph: (ink & !0xff) | 0xb0,
             backdrop: theme.group_backdrop,
+            overdue: theme.overdue,
+            morning: config.due.morning,
+            evening: config.due.evening,
             palette: PRESETS.map(|name| config.paper_color(Some(&Color::Preset(name)))),
         }
     }
@@ -303,6 +312,15 @@ pub struct Shown {
     pub files: Vec<FileLink>,
     pub pin: Pin,
     pub color: Color,
+    pub due: Option<DueShown>,
+}
+
+/// A note's due time as its sheet shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DueShown {
+    /// "Due Fri 20 Nov 09:00".
+    pub label: String,
+    pub overdue: bool,
 }
 
 /// What the column knows of a note shown.
@@ -314,6 +332,9 @@ struct NoteView {
     color: Color,
     paper: u32,
     scratch: bool,
+    due: Option<DueShown>,
+    /// The color of its marker and margin, if not the paper's.
+    accent: Option<u32>,
 }
 
 /// What a pointer event or a key asks of the program.
@@ -353,6 +374,9 @@ pub enum Act {
     /// Hide this note.
     Hide(String),
     Color(String, Color),
+    /// Set this note's due time (a TOML date or datetime), or with None
+    /// clear it.
+    Due(String, Option<String>),
     Trash(String),
     RemoveFile(String, PathBuf),
     /// This note was dropped at this slot of these notes (the group it
@@ -406,6 +430,10 @@ enum BarHit {
     More,
     Color,
     Swatch(Color),
+    /// The clock that opens the due choices.
+    Clock,
+    /// One of the due choices (None: clear it).
+    Due(Option<Preset>),
     Trash,
     Archive,
     Pin,
@@ -419,6 +447,8 @@ struct BarLayout {
     more: Option<(usize, Rect)>,
     color: Option<Rect>,
     swatches: Vec<(Color, Rect)>,
+    clock: Option<Rect>,
+    due_row: Vec<(Option<Preset>, Rect)>,
     trash: Option<Rect>,
     archive: Option<Rect>,
     pin: Option<Rect>,
@@ -565,6 +595,8 @@ pub struct Column {
     dragged_file_note: Option<String>,
     trash: bar::Trash,
     palette_since: Option<Instant>,
+    /// The due choices are out, since then.
+    due_since: Option<Instant>,
     dots: HashMap<(u32, u32, bool), WlBuffer>,
     /// All-files views on the open and revealed sheets, respectively.
     all_files: [Option<(String, usize)>; 2],
@@ -638,7 +670,7 @@ impl BarSubs {
         }
         for (i, sub) in self.labels.iter_mut().enumerate() {
             match plan.labels.get(i) {
-                Some((buffer, rect)) => sub.present(Some(buffer), *rect, plan.alpha),
+                Some((buffer, rect, a)) => sub.present(Some(buffer), *rect, plan.alpha * a),
                 None => sub.clear(),
             }
         }
@@ -654,8 +686,9 @@ impl BarSubs {
         };
         icon(&mut self.archive, &plan.archive);
         icon(&mut self.pin, &plan.pin);
-        (plan.more.iter().chain(&plan.name).chain(&plan.labels))
+        (plan.more.iter().chain(&plan.name))
             .map(|(b, _)| b.clone())
+            .chain(plan.labels.iter().map(|(b, _, _)| b.clone()))
             .collect()
     }
 }
@@ -767,6 +800,7 @@ impl Column {
             dragged_file_note: None,
             trash: bar::Trash::default(),
             palette_since: None,
+            due_since: None,
             dots: HashMap::new(),
             all_files: [None, None],
             stacking: Vec::new(),
@@ -893,6 +927,17 @@ impl Column {
     /// Show `notes`, animating the change (see deck.rs). The program keeps
     /// the open note among them.
     pub fn set_notes(&mut self, notes: Vec<Shown>) {
+        // Notes that turned overdue since they were last shown pulse.
+        let overdue = |due: &Option<DueShown>| due.as_ref().is_some_and(|d| d.overdue);
+        let turned: Vec<String> = (notes.iter())
+            .filter(|n| overdue(&n.due))
+            .filter(|n| {
+                self.notes
+                    .get(&n.item.key)
+                    .is_some_and(|old| !overdue(&old.due))
+            })
+            .map(|n| n.item.key.clone())
+            .collect();
         self.notes = (notes.iter())
             .map(|n| {
                 let view = NoteView {
@@ -903,11 +948,16 @@ impl Column {
                     color: n.color,
                     paper: n.item.look.color,
                     scratch: n.item.group == Group::Scratch,
+                    due: n.due.clone(),
+                    accent: n.item.look.accent,
                 };
                 (n.item.key.clone(), view)
             })
             .collect();
         self.deck.set(notes.into_iter().map(|n| n.item).collect());
+        for key in &turned {
+            self.deck.pulse(key);
+        }
         self.reset_file_views();
         // The open note went (removed, hidden): the keyboard goes back.
         if self.deck.open().is_none() {
@@ -917,6 +967,7 @@ impl Column {
             self.selecting = false;
             self.paste_serial = self.paste_serial.wrapping_add(1);
             self.palette_since = None;
+            self.due_since = None;
             self.trash.clear();
             self.set_keyboard(KeyboardInteractivity::None);
         }
@@ -987,6 +1038,7 @@ impl Column {
         self.deck.open_note(key);
         if !again {
             self.palette_since = None;
+            self.due_since = None;
             self.trash.clear();
             self.reset_file_views();
             self.scroll = 0.0;
@@ -1013,6 +1065,7 @@ impl Column {
         self.paste_serial = self.paste_serial.wrapping_add(1);
         self.deck.close();
         self.palette_since = None;
+        self.due_since = None;
         self.trash.clear();
         self.reset_file_views();
         self.set_keyboard(KeyboardInteractivity::None);
@@ -1247,6 +1300,7 @@ impl Column {
         }
         match event.keysym {
             Keysym::Escape if self.palette_since.take().is_some() => self.kick(),
+            Keysym::Escape if self.due_since.take().is_some() => self.kick(),
             Keysym::Escape if self.showing_files(&key) => {
                 self.all_files[0] = None;
                 self.kick();
@@ -1699,10 +1753,13 @@ impl Column {
         {
             self.kick();
         }
-        if self.palette_since.is_some()
-            && !matches!(hit, Some((_, BarHit::Color | BarHit::Swatch(_))))
+        let keeps_palette = matches!(hit, Some((_, BarHit::Color | BarHit::Swatch(_))));
+        let keeps_due = matches!(hit, Some((_, BarHit::Clock | BarHit::Due(_))));
+        if (self.palette_since.is_some() && !keeps_palette)
+            || (self.due_since.is_some() && !keeps_due)
         {
             self.palette_since = None;
+            self.due_since = None;
             self.kick();
             return self.commit_title();
         }
@@ -1896,12 +1953,40 @@ impl Column {
                 } else {
                     Some(Instant::now())
                 };
+                self.due_since = None;
                 self.kick();
                 None
+            }
+            BarHit::Clock => {
+                self.due_since = if self.due_since.is_some() || note.pin == Pin::Locked {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
+                self.palette_since = None;
+                self.kick();
+                None
+            }
+            BarHit::Due(choice) => {
+                self.due_since = None;
+                self.kick();
+                match choice {
+                    None => Some(Act::Due(key.into(), None)),
+                    Some(preset) => {
+                        let now = due::now();
+                        let all = due::presets(now, &Local, self.style.morning, self.style.evening);
+                        let (_, when) = all.into_iter().find(|(p, _)| *p == preset)?;
+                        Some(Act::Due(
+                            key.into(),
+                            Some(when.datetime(&Local).to_string()),
+                        ))
+                    }
+                }
             }
             BarHit::Swatch(color) => {
                 let changed = note.color != color;
                 self.palette_since = None;
+                self.due_since = None;
                 self.kick();
                 changed.then(|| Act::Color(key.into(), color))
             }
@@ -2062,8 +2147,14 @@ impl Column {
         {
             return Some((key, BarHit::Swatch(*color)));
         }
+        if !layout.clock.is_some_and(|r| r.contains(x, y))
+            && let Some((choice, _)) = layout.due_row.iter().rev().find(|(_, r)| r.contains(x, y))
+        {
+            return Some((key, BarHit::Due(*choice)));
+        }
         for (rect, hit) in [
             (layout.color, BarHit::Color),
+            (layout.clock, BarHit::Clock),
             (layout.trash, BarHit::Trash),
             (layout.archive, BarHit::Archive),
             (layout.pin, BarHit::Pin),
@@ -2330,6 +2421,21 @@ impl Column {
         self.named(&["builtin:trash"])
     }
 
+    fn clock_icon(&self) -> NamedIcon {
+        self.named(&["builtin:clock"])
+    }
+
+    /// The due choices to offer now, in the order they are laid out:
+    /// the presets still to come, and to clear the due time if there is
+    /// one.
+    fn due_choices(&self, has_due: bool) -> Vec<Option<Preset>> {
+        let now = due::now();
+        let presets = due::presets(now, &Local, self.style.morning, self.style.evening);
+        (presets.into_iter().map(|(p, _)| Some(p)))
+            .chain(has_due.then_some(None))
+            .collect()
+    }
+
     /// A file's own icon, once its names are known.
     fn file_icon(&self, path: &PathBuf) -> Option<NamedIcon> {
         let names = self.file_icons.get(path)?;
@@ -2344,6 +2450,7 @@ impl Column {
             self.pin_icon(true),
             self.archive_icon(),
             self.trash_icon(),
+            self.clock_icon(),
             self.named(&["builtin:close"]),
         ] {
             self.assets.named_icon(&key);
@@ -2550,9 +2657,10 @@ impl Column {
             return;
         }
         self.place_all();
-        let animating_palette = self
-            .palette_since
-            .is_some_and(|t| t.elapsed() < PALETTE_TIME);
+        let animating_palette = [self.palette_since, self.due_since]
+            .into_iter()
+            .flatten()
+            .any(|t| t.elapsed() < PALETTE_TIME);
         if (self.deck.moving() || animating_palette) && !self.frame_pending {
             self.request_frame();
         }
@@ -2745,19 +2853,24 @@ impl Column {
     fn bar_layout(&self, key: &str) -> Option<BarLayout> {
         let note = self.notes.get(key)?;
         let open = self.deck.open() == Some(key);
-        if !self.deck.held(key) || (!open && note.files.is_empty()) {
+        if !self.deck.held(key) || (!open && note.files.is_empty() && note.due.is_none()) {
             return None;
         }
         let face = self.face(key)?;
         let bar = self.bar_rect(face);
         let mid = bar.y + bar.h / 2.0;
-        let pitch = (ICON + ICON_GAP).min(bar.w / if open { 6.0 } else { 1.0 });
+        let pitch = (ICON + ICON_GAP).min(bar.w / if open { 7.0 } else { 1.0 });
         let size = ICON.min(pitch * 0.85);
         let rect = |x| Rect::new(x, mid - size / 2.0, size, size);
         let slot = |i: usize| rect(bar.x + i as f64 * pitch);
         let control = |i: usize| open.then(|| rect(bar.right() - size - i as f64 * pitch));
         let color = control(if note.scratch { 2 } else { 3 });
-        let file_end = color.map_or(bar.right(), |r| r.x - (pitch - size));
+        let palette_open = self.palette_since.is_some();
+        // The color row slides over the clock, which is out of its way.
+        let clock = control(if note.scratch { 3 } else { 4 }).filter(|_| !palette_open);
+        let file_end = clock
+            .or(color)
+            .map_or(bar.right(), |r| r.x - (pitch - size));
         let (n, more) = bar::fit(note.files.len(), file_end - bar.x, size, pitch - size);
         let grid = self.showing_files(key);
         let swatches = match (color, self.palette_since) {
@@ -2769,25 +2882,48 @@ impl Column {
             }
             _ => Vec::new(),
         };
+        let due_row = match (clock, self.due_since) {
+            (Some(clock), Some(start)) if !grid => {
+                let p = (start.elapsed().as_secs_f64() / PALETTE_TIME.as_secs_f64()).min(1.0);
+                let choices = self.due_choices(note.due.is_some());
+                let widths: Vec<f64> = (choices.iter())
+                    .map(|c| bar::cell_width(due_label(*c)))
+                    .collect();
+                let cells = bar::row(
+                    bar.x,
+                    bar.right(),
+                    clock,
+                    &widths,
+                    4.0,
+                    1.0 - (1.0 - p).powi(3),
+                );
+                choices.into_iter().zip(cells).collect()
+            }
+            _ => Vec::new(),
+        };
+        let picking = !due_row.is_empty();
         let used = n + usize::from(more.is_some());
         let mut layout = BarLayout {
-            icons: if grid || !swatches.is_empty() {
+            icons: if grid || !swatches.is_empty() || !due_row.is_empty() {
                 Vec::new()
             } else {
                 (0..n).map(|i| (i, slot(i))).collect()
             },
-            more: if !swatches.is_empty() {
+            more: if !swatches.is_empty() || !due_row.is_empty() {
                 None
             } else if grid {
                 Some((0, slot(more.map_or(0, |_| n))))
             } else {
                 more.map(|count| (count, slot(n)))
             },
-            pin: control(0),
-            archive: if note.scratch { None } else { control(1) },
-            trash: control(if note.scratch { 1 } else { 2 }),
-            color,
+            // The due row takes the whole bar: the controls step aside.
+            pin: control(0).filter(|_| !picking),
+            archive: if note.scratch { None } else { control(1) }.filter(|_| !picking),
+            trash: control(if note.scratch { 1 } else { 2 }).filter(|_| !picking),
+            color: color.filter(|_| !picking),
             swatches,
+            clock: clock.filter(|_| !picking),
+            due_row,
             hit_pad: (pitch - size) / 2.0,
             name_x: bar.x + used.max(usize::from(grid)) as f64 * pitch,
             name_end: file_end,
@@ -2827,10 +2963,12 @@ impl Column {
             Role::Sheet => m.sheet_height,
             _ => m.header_length * 0.7,
         };
-        let ink = (note.text & !0xff) | 0xc8;
+        // On an accent color the text is whatever reads on that.
+        let text = note.accent.map_or(note.text, Config::ink_on);
+        let ink = (text & !0xff) | 0xc8;
         Some(paper::Margin {
             width: m.header as i32,
-            ink: note.text,
+            ink: text,
             crease: true,
             label: Some(paper::Label {
                 text: note.content.title.to_uppercase(),
@@ -2852,6 +2990,7 @@ impl Column {
             edge: self.style.edge.into(),
             tilt: card.look.tilt,
             sliver: true,
+            accent: card.look.accent,
             radius: self.style.marker_radius,
             curl: false,
             margin: None,
@@ -2877,7 +3016,7 @@ impl Column {
             Role::Sheet => {
                 let note = self.notes.get(&card.key);
                 let open = self.deck.open() == Some(card.key.as_str());
-                let files = note.is_some_and(|n| !n.files.is_empty());
+                let files = note.is_some_and(|n| !n.files.is_empty() || n.due.is_some());
                 let bar = if open || files {
                     self.style.file_bar
                 } else {
@@ -3292,6 +3431,7 @@ impl Column {
         let note = self.notes.get(key)?;
         let (ink, files, pin) = (note.text, note.files.clone(), note.pin.clone());
         let (current, paper) = (note.color, note.paper);
+        let due = note.due.clone();
         let grid = self.file_grid(key);
         let armed = open && self.trash.armed(Instant::now());
         let hover = (self.bar_hover.as_ref())
@@ -3352,7 +3492,7 @@ impl Column {
             {
                 let r = Rect::new(cell.x + (cell.w - l.w) / 2.0, rect.bottom() + 2.0, l.w, l.h);
                 if r.bottom() <= cell.bottom() {
-                    plan.labels.push((l.buffer, r));
+                    plan.labels.push((l.buffer, r, 1.0));
                 }
             }
         }
@@ -3384,6 +3524,36 @@ impl Column {
         if let Some(rect) = layout.color {
             let a = if pin == Pin::Locked { 0.4 } else { 1.0 };
             plan.icons.push((self.dot(paper, ink, false), rect, a));
+        }
+        if let Some(rect) = layout.clock {
+            let (tint, a) = match (&due, pin == Pin::Locked) {
+                (_, true) => (ink, 0.4),
+                (Some(d), _) if d.overdue => (self.style.overdue, 1.0),
+                (Some(_), _) => (ink, 1.0),
+                (None, _) if hover == Some(BarHit::Clock) => (ink, 1.0),
+                (None, _) => (ink, 0.75),
+            };
+            let icon = self.clock_icon();
+            plan.icons
+                .push((self.icon_buffer(&icon, Some(tint)), rect, a));
+        }
+        for &(choice, rect) in &layout.due_row {
+            let lit = hover == Some(BarHit::Due(choice));
+            let key = LineKey {
+                text: due_label(choice).into(),
+                color: ink,
+                width: rect.w.ceil() as i32 + 8,
+                strike: false,
+            };
+            if let Some(l) = self.line(key) {
+                let r = Rect::new(
+                    rect.x + (rect.w - l.w) / 2.0,
+                    rect.y + (rect.h - l.h) / 2.0,
+                    l.w,
+                    l.h,
+                );
+                plan.labels.push((l.buffer, r, if lit { 1.0 } else { 0.7 }));
+            }
         }
         if let Some(rect) = layout.trash {
             let tint = if armed { TRASH_RED } else { ink };
@@ -3437,6 +3607,25 @@ impl Column {
                 false,
             )),
             Some(BarHit::Swatch(color)) => Some((bar::color_name(color), false)),
+            Some(BarHit::Clock) => Some((
+                if pin == Pin::Locked {
+                    "The frontmatter doesn't parse"
+                } else if due.is_some() {
+                    "Change the due time"
+                } else {
+                    "Set a due time"
+                }
+                .into(),
+                false,
+            )),
+            Some(BarHit::Due(None)) => Some(("Clear the due time".into(), false)),
+            Some(BarHit::Due(Some(preset))) => {
+                let now = due::now();
+                let all = due::presets(now, &Local, self.style.morning, self.style.evening);
+                all.into_iter()
+                    .find(|(p, _)| *p == preset)
+                    .map(|(p, d)| (format!("{}: {}", p.name(), d.when(&Local, now)), false))
+            }
             Some(BarHit::Trash) => Some((
                 if armed {
                     "Move to Trash?"
@@ -3459,12 +3648,15 @@ impl Column {
                         | BarHit::Trash
                         | BarHit::Color
                         | BarHit::Swatch(_)
+                        | BarHit::Clock
+                        | BarHit::Due(_)
                 )
             );
             let area = self.bar_rect(self.face(key)?);
             let start = if control { area.x } else { layout.name_x };
             let end = layout.name_end;
-            let above = end - start < 90.0 || !layout.swatches.is_empty();
+            let above =
+                end - start < 90.0 || !layout.swatches.is_empty() || !layout.due_row.is_empty();
             let width = if above { area.w } else { end - start };
             if let Some(l) = self.line(LineKey {
                 text,
@@ -3481,6 +3673,27 @@ impl Column {
                     )
                 };
                 plan.name = Some((l.buffer, Rect::new(x, y, l.w, l.h)));
+            }
+        }
+        // With nothing hovered, the due time, beside the controls.
+        if plan.name.is_none()
+            && let Some(d) = &due
+            && grid.is_none()
+            && layout.swatches.is_empty()
+            && layout.due_row.is_empty()
+        {
+            let room = layout.name_end - layout.name_x;
+            let wanted = d.label.chars().count() as f64 * 6.0;
+            if room >= wanted
+                && let Some(l) = self.line(LineKey {
+                    text: d.label.clone(),
+                    color: if d.overdue { self.style.overdue } else { ink },
+                    width: room as i32,
+                    strike: false,
+                })
+            {
+                let r = Rect::new(layout.name_end - l.w, layout.mid - l.h / 2.0, l.w, l.h);
+                plan.name = Some((l.buffer, r));
             }
         }
         Some(plan)
@@ -3545,7 +3758,8 @@ struct BarPlan {
     /// The bar's, times each part's.
     alpha: f64,
     icons: Vec<(Option<WlBuffer>, Rect, f64)>,
-    labels: Vec<(WlBuffer, Rect)>,
+    /// Name labels and the due choices, with each one's alpha.
+    labels: Vec<(WlBuffer, Rect, f64)>,
     more: Option<(WlBuffer, Rect)>,
     archive: Option<(Option<WlBuffer>, Rect, f64)>,
     pin: Option<(Option<WlBuffer>, Rect, f64)>,
@@ -3595,6 +3809,11 @@ fn grid_icon(cell: Rect) -> Rect {
 fn remove_rect(icon: Rect) -> Rect {
     let size = (icon.w * 0.65).min(12.0);
     Rect::new(icon.right() - size, icon.y, size, size)
+}
+
+/// What a due choice says in the row.
+fn due_label(choice: Option<Preset>) -> &'static str {
+    choice.map_or("×", Preset::short)
 }
 
 /// What the pin icon says it does.

@@ -28,6 +28,8 @@ pub struct NewNote {
     pub title: Option<String>,
     /// Its body.
     pub text: Option<String>,
+    /// When it is due, as a TOML date or datetime.
+    pub due: Option<String>,
 }
 
 impl Request for NoteRequest {
@@ -42,7 +44,13 @@ impl Request for NoteRequest {
                 if n.window {
                     out += &line("window", None);
                 }
-                for (word, value) in [("color", &n.color), ("title", &n.title), ("text", &n.text)] {
+                let options = [
+                    ("color", &n.color),
+                    ("title", &n.title),
+                    ("text", &n.text),
+                    ("due", &n.due),
+                ];
+                for (word, value) in options {
                     if let Some(v) = value {
                         out += &line(word, Some(v));
                     }
@@ -66,6 +74,7 @@ impl Request for NoteRequest {
             ("color", p, NoteRequest::New(n)) => n.color = Some(payload(p, text)?),
             ("title", p, NoteRequest::New(n)) => n.title = Some(payload(p, text)?),
             ("text", p, NoteRequest::New(n)) => n.text = Some(payload(p, text)?),
+            ("due", p, NoteRequest::New(n)) => n.due = Some(payload(p, text)?),
             _ => return Err(unknown()),
         }
         Ok(())
@@ -87,6 +96,7 @@ mod tests {
                 color: Some("pink".into()),
                 title: Some("A title".into()),
                 text: Some("- [ ] one\n- [ ] two\n".into()),
+                due: Some("2026-11-20T09:00".into()),
             }),
             NoteRequest::New(NewNote {
                 window: true,

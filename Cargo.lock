@@ -2255,6 +2255,7 @@ name = "wl-shell-notes"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "libc",
  "toml_edit",
 ]
 

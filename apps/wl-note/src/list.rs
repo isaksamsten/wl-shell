@@ -1,16 +1,18 @@
 //! `wl-note list`: the notes, as text or JSON. Pure, unit tested.
 //!
 //! Text is one note per line: its path (relative to the notes directory),
-//! its title, and where it shows (`hidden` too, if it is), tab-separated:
+//! its title, and where it shows (`hidden` too, if it is, and `overdue` if
+//! its `due` has passed), tab-separated:
 //!
 //! ```text
 //! work/release.md<TAB>Release checklist<TAB>firefox, foot "*wl-shell*"
 //! groceries.md<TAB>Groceries<TAB>everywhere
-//! old.md<TAB>Old<TAB>everywhere, hidden
+//! old.md<TAB>Old<TAB>everywhere, hidden, overdue
 //! ```
 
 use std::path::Path;
 
+use wl_shell_notes::due::Local;
 use wl_shell_notes::{Color, Index, Matcher, Note, State, Window};
 
 /// Which notes to list, as to hiding.
@@ -61,8 +63,13 @@ pub fn name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether the note's `due` has passed at `now`.
+fn overdue(note: &Note, now: i64) -> bool {
+    note.due().is_some_and(|d| d.overdue(&Local, now))
+}
+
 /// One line per note.
-pub fn text(notes: &[Listed]) -> String {
+pub fn text(notes: &[Listed], now: i64) -> String {
     let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     let mut out = String::new();
     for (path, note, hidden) in notes {
@@ -70,6 +77,9 @@ pub fn text(notes: &[Listed]) -> String {
         let mut shows = shows(note);
         if *hidden {
             shows.push_str(", hidden");
+        }
+        if overdue(note, now) {
+            shows.push_str(", overdue");
         }
         out.push_str(&format!(
             "{}\t{}\t{}\n",
@@ -97,9 +107,10 @@ fn shows(note: &Note) -> String {
 }
 
 /// A JSON array of objects: `path`, `title`, `color` (null: the
-/// default), `global`, `hidden`, `match` (`app` and `title`, null if not
+/// default), `global`, `hidden`, `due` (a date or local datetime, null
+/// without one), `overdue`, `match` (`app` and `title`, null if not
 /// given), `tags`, `error` and `warnings`.
-pub fn json(notes: &[Listed]) -> String {
+pub fn json(notes: &[Listed], now: i64) -> String {
     let mut out = String::from("[");
     for (i, (path, note, hidden)) in notes.iter().enumerate() {
         if i > 0 {
@@ -121,12 +132,15 @@ pub fn json(notes: &[Listed]) -> String {
         };
         let list = |items: Vec<String>| format!("[{}]", items.join(","));
         out.push_str(&format!(
-            "\n  {{\"path\":{},\"title\":{},\"color\":{},\"global\":{},\"hidden\":{},\"match\":{},\"tags\":{},\"error\":{},\"warnings\":{}}}",
+            "\n  {{\"path\":{},\"title\":{},\"color\":{},\"global\":{},\"hidden\":{},\"due\":{},\"overdue\":{},\"match\":{},\"tags\":{},\"error\":{},\"warnings\":{}}}",
             string(&path.to_string_lossy()),
             string(note.title_or(&name)),
             color,
             note.global(),
             hidden,
+            note.due()
+                .map_or("null".into(), |d| string(&d.datetime(&Local).to_string())),
+            overdue(note, now),
             list(note.meta.matchers.iter().map(matcher).collect()),
             list(note.meta.tags.iter().map(|t| string(t)).collect()),
             note.error.as_deref().map_or("null".into(), string),
@@ -162,6 +176,7 @@ pub(crate) fn string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wl_shell_notes::due;
 
     fn note(text: &str) -> Note {
         Note::parse(text)
@@ -173,14 +188,20 @@ mod tests {
             "+++\napps = [\"firefox\"]\n[[match]]\napp = \"foot\"\ntitle = \"*wl-shell*\"\n[[match]]\ntitle = \"*Jira*\"\n+++\n# Release\n",
         );
         let b = note("groceries\twith a tab");
+        let c = note("+++\ndue = 2000-01-01\n+++\n# Old");
+        let d = note("+++\ndue = 2999-01-01T09:00\n+++\n# Far");
         let notes = [
             (Path::new("work/release.md"), &a, false),
             (Path::new("groceries.md"), &b, true),
+            (Path::new("old.md"), &c, true),
+            (Path::new("far.md"), &d, false),
         ];
         assert_eq!(
-            text(&notes),
+            text(&notes, due::now()),
             "work/release.md\tRelease\tfirefox, foot \"*wl-shell*\", \"*Jira*\"\n\
-             groceries.md\tgroceries\teverywhere, hidden\n"
+             groceries.md\tgroceries\teverywhere, hidden\n\
+             old.md\tOld\teverywhere, hidden, overdue\n\
+             far.md\tFar\teverywhere\n"
         );
     }
 
@@ -194,11 +215,11 @@ mod tests {
             (Path::new("a.md"), &a, false),
             (Path::new("b.md"), &b, true),
         ];
-        let out = json(&notes);
-        assert!(out.starts_with("[\n  {\"path\":\"a.md\",\"title\":\"Say \\\"hi\\\"\",\"color\":\"#0a0b0c\",\"global\":false,\"hidden\":false,\"match\":[{\"app\":\"ff\",\"title\":null}],\"tags\":[\"t\"],\"error\":null,\"warnings\":[]},\n"), "{out}");
-        assert!(out.contains("{\"path\":\"b.md\",\"title\":\"b\",\"color\":null,\"global\":true,\"hidden\":true,\"match\":[],\"tags\":[],\"error\":\"frontmatter, line 2: "), "{out}");
+        let out = json(&notes, due::now());
+        assert!(out.starts_with("[\n  {\"path\":\"a.md\",\"title\":\"Say \\\"hi\\\"\",\"color\":\"#0a0b0c\",\"global\":false,\"hidden\":false,\"due\":null,\"overdue\":false,\"match\":[{\"app\":\"ff\",\"title\":null}],\"tags\":[\"t\"],\"error\":null,\"warnings\":[]},\n"), "{out}");
+        assert!(out.contains("{\"path\":\"b.md\",\"title\":\"b\",\"color\":null,\"global\":true,\"hidden\":true,\"due\":null,\"overdue\":false,\"match\":[],\"tags\":[],\"error\":\"frontmatter, line 2: "), "{out}");
         assert!(out.ends_with("}\n]\n"));
-        assert_eq!(json(&[]), "[]\n");
+        assert_eq!(json(&[], 0), "[]\n");
         assert_eq!(string("a\u{1}\n"), "\"a\\u0001\\n\"");
     }
 
@@ -232,5 +253,24 @@ mod tests {
         let firefox = Window::new("firefox", "");
         assert_eq!(paths(Which::All, Some(&firefox)), ["c.md", "a.md", "b.md"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn due_in_json() {
+        let a = note("+++\ndue = 2000-01-01T08:30\n+++\n");
+        let b = note("+++\ndue = 2999-12-31\n+++\n");
+        let notes = [
+            (Path::new("a.md"), &a, true),
+            (Path::new("b.md"), &b, false),
+        ];
+        let out = json(&notes, due::now());
+        assert!(
+            out.contains("\"due\":\"2000-01-01T08:30\",\"overdue\":true,"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\"due\":\"2999-12-31\",\"overdue\":false,"),
+            "{out}"
+        );
     }
 }

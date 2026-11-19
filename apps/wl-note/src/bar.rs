@@ -97,6 +97,48 @@ pub fn palette(left: f64, dot: Rect, count: usize, progress: f64) -> Vec<Rect> {
         .collect()
 }
 
+/// How wide the cell of a choice labeled `label` in the due row is:
+/// its letters and some room around them.
+pub fn cell_width(label: &str) -> f64 {
+    label.chars().count() as f64 * 6.0 + 10.0
+}
+
+/// The row of due choices: cells (`widths` wide, in order) slide out of
+/// the clock icon `anchor` and settle side by side, `gap` apart, with
+/// the last one's right edge at `right` and the row within `left`. A row
+/// too wide for that room is scaled down to fit. `progress` is 0 with
+/// every cell on the clock, 1 with each in its place.
+pub fn row(
+    left: f64,
+    right: f64,
+    anchor: Rect,
+    widths: &[f64],
+    gap: f64,
+    progress: f64,
+) -> Vec<Rect> {
+    let room = (right - left).max(0.0);
+    let total = widths.iter().sum::<f64>() + gap * widths.len().saturating_sub(1) as f64;
+    let fit = if total > room && total > 0.0 {
+        room / total
+    } else {
+        1.0
+    };
+    let mut edge = right;
+    let mut cells: Vec<Rect> = widths
+        .iter()
+        .rev()
+        .map(|w| {
+            let w = w * fit;
+            let target = edge - w;
+            edge = target - gap * fit;
+            let x = anchor.x + (target - anchor.x) * progress;
+            Rect::new(x, anchor.y, w, anchor.h)
+        })
+        .collect();
+    cells.reverse();
+    cells
+}
+
 /// Fixed-height cells; scrolling by rows makes the last file reachable
 /// without drawing or requesting labels for offscreen cells.
 pub struct Grid {
@@ -200,5 +242,33 @@ mod tests {
         assert_eq!(fit(5, 100.0, 16.0, 8.0), (3, Some(2)));
         assert_eq!(fit(0, 100.0, 16.0, 8.0), (0, None));
         assert_eq!(fit(2, 10.0, 16.0, 8.0), (0, Some(2)));
+    }
+
+    #[test]
+    fn the_due_row_takes_the_whole_bar() {
+        let widths: Vec<f64> = ["1h", "Tonight", "Tomorrow", "Mon", "×"]
+            .iter()
+            .map(|l| cell_width(l))
+            .collect();
+        // The sheet's bar is 248 wide, the clock four icons from its end.
+        let (left, right) = (12.0, 260.0);
+        let clock = Rect::new(right - 16.0 - 4.0 * 24.0, 40.0, 16.0, 16.0);
+        let start = row(left, right, clock, &widths, 4.0, 0.0);
+        assert!(start.iter().all(|r| (r.x - clock.x).abs() < 1e-9));
+        let end = row(left, right, clock, &widths, 4.0, 1.0);
+        assert_eq!(end.len(), widths.len());
+        // Not scaled: every label has the room it asked for.
+        assert!(end.iter().zip(&widths).all(|(r, w)| (r.w - w).abs() < 1e-9));
+        // In order, apart, inside the bar, ending at its end.
+        assert!(end[0].x >= left && (end.last().unwrap().right() - right).abs() < 1e-9);
+        assert!(end.windows(2).all(|rs| rs[0].right() <= rs[1].x + 1e-9));
+        assert!(end.iter().all(|r| r.y == clock.y && r.h == clock.h));
+        // A narrower bar scales the row down to fit instead.
+        let narrow = row(left, 120.0, clock, &widths, 4.0, 1.0);
+        assert!(narrow[0].x >= left - 1e-9 && narrow.last().unwrap().right() <= 120.0 + 1e-9);
+        assert!(narrow.windows(2).all(|rs| rs[0].right() <= rs[1].x + 1e-9));
+        // No choices, no cells; no room, no panic.
+        assert!(row(left, right, clock, &[], 4.0, 1.0).is_empty());
+        assert_eq!(row(100.0, 90.0, clock, &widths, 4.0, 1.0).len(), 5);
     }
 }

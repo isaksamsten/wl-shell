@@ -43,6 +43,11 @@ trash-command = "gio trash -- {paths}"
 color = "white"                    # Shift+click + or run wl-note new --window
 on-close = "trash"                 # trash, delete, or keep as an app note
 
+[due]
+morning = "09:00"                  # Tomorrow's and next week's time
+evening = "18:00"                  # Tonight's time
+everywhere = false                 # Also show overdue notes in the global group, everywhere
+
 [integration]
 settle = 120                       # Milliseconds before notes follow focus
 # mru-event-stream = "~/.config/wl-dock/focus-stream.sh"     # Example: window ID per line
@@ -73,6 +78,7 @@ shadow-color = "#00000059"          # Alpha 0 disables shadows
 shadow-softness = 8
 shadow-offset = [2, 3]             # [away from the edge, down]
 group-backdrop = "#00000026"       # Behind each group of markers; alpha 0 hides
+overdue = "#d64541"                # Marker and margin of an overdue note
 
 # Override appearance keys for a particular color scheme:
 # [appearance.dark]

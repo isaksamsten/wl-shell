@@ -44,6 +44,9 @@
 //!    to their new places, and the new ones slide out of the edge at
 //!    theirs, staggered too.
 //!
+//! A note that turns due gets a `pulse`: its `out` spring is pushed, so
+//! the card goes out a few pixels and settles back.
+//!
 //! A note wanted again while it is still leaving comes back from where it
 //! is. (The program keeps the open note in its place in the column
 //! whatever the context does.) Once everything has arrived, `advance`
@@ -85,6 +88,9 @@ const MIN_GAP: f64 = 2.0;
 const MIN_MARKER: f64 = 12.0;
 /// Between the last header and the `+` button.
 const PLUS_GAP: f64 = 10.0;
+/// The speed a pulse pushes a card out with, pixels per second: it
+/// comes out a few pixels and goes back.
+const PULSE: f64 = 520.0;
 
 /// The column's two groups, in their order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -137,6 +143,9 @@ pub struct Look {
     pub color: u32,
     /// Degrees.
     pub tilt: f64,
+    /// 0xRRGGBBAA of its marker and margin, if they aren't the paper's
+    /// (an overdue note's).
+    pub accent: Option<u32>,
 }
 
 /// A note to show, by its key (its path in the notes directory).
@@ -817,6 +826,18 @@ impl Deck {
         }
     }
 
+    /// Make `key`'s card give one push outward, and settle back: its
+    /// springs' own motion, so nothing is drawn once it rests. A card on
+    /// its way out, or not yet in, doesn't.
+    pub fn pulse(&mut self, key: &str) {
+        if let Some(c) = self.cards.iter_mut().find(|c| c.key == key)
+            && !c.leaving
+            && c.presence.value > 0.5
+        {
+            c.out.velocity += PULSE;
+        }
+    }
+
     // -- reordering --------------------------------------------------------
 
     /// Start dragging `key`'s margin, its center at `y`. Only a note at
@@ -1307,6 +1328,7 @@ mod tests {
             look: Look {
                 color: 0xffff00ff,
                 tilt: 0.0,
+                accent: None,
             },
             group: Group::Global,
             cross: false,
@@ -2136,5 +2158,34 @@ mod tests {
             d.drag_end().map(|l| (l.group, l.gap, l.moved)),
             Some((Group::Global, 0, true))
         );
+    }
+
+    #[test]
+    fn a_pulse_goes_out_and_back_and_rests() {
+        let mut d = deck(&["a", "b"]);
+        settle(&mut d);
+        let rest = card(&d, "a").out.value;
+        d.pulse("a");
+        assert!(d.moving());
+        let mut peak = rest;
+        for _ in 0..1000 {
+            let moving = d.advance(1.0 / 60.0);
+            peak = peak.max(card(&d, "a").out.value);
+            if !moving {
+                break;
+            }
+        }
+        // Out by a few pixels, back to where it was, and still.
+        assert!(peak > rest + 2.0 && peak < rest + 12.0, "{peak}");
+        assert_eq!(card(&d, "a").out.value, rest);
+        assert!(!d.moving());
+        // The other card did not move.
+        assert_eq!(card(&d, "b").out.value, rest);
+        // Nothing to push: unknown or leaving notes.
+        d.pulse("nope");
+        assert!(!d.moving());
+        d.set(items(&["b"]));
+        d.pulse("a");
+        assert_eq!(card(&d, "a").out.velocity, 0.0);
     }
 }

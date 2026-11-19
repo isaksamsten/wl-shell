@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, de::Error as _};
 use wl_shell_config::{ConfigFile, Mode, Scheme, de};
-use wl_shell_notes::Color;
+use wl_shell_notes::{Color, TimeOfDay};
 use wl_shell_render::{paper, shadow};
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -33,6 +33,7 @@ pub struct Config {
     pub editor: EditorConfig,
     pub files: FilesConfig,
     pub scratch: ScratchConfig,
+    pub due: DueConfig,
     pub integration: IntegrationConfig,
     pub appearance: wl_shell_config::Appearance<Theme>,
 }
@@ -49,6 +50,7 @@ impl Default for Config {
             editor: EditorConfig::default(),
             files: FilesConfig::default(),
             scratch: ScratchConfig::default(),
+            due: DueConfig::default(),
             integration: IntegrationConfig::default(),
             appearance: wl_shell_config::Appearance::default(),
         }
@@ -68,6 +70,31 @@ impl Default for ScratchConfig {
         Self {
             color: Color::Preset("white"),
             on_close: OnClose::Trash,
+        }
+    }
+}
+
+/// When notes are due: the times of day the presets use.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DueConfig {
+    /// Tomorrow's and next week's time, `HH:MM`.
+    #[serde(deserialize_with = "time_of_day")]
+    pub morning: TimeOfDay,
+    /// Tonight's time, `HH:MM`.
+    #[serde(deserialize_with = "time_of_day")]
+    pub evening: TimeOfDay,
+    /// Show overdue notes in the global group everywhere, not only where
+    /// they match.
+    pub everywhere: bool,
+}
+
+impl Default for DueConfig {
+    fn default() -> Self {
+        Self {
+            morning: TimeOfDay::new(9, 0),
+            evening: TimeOfDay::new(18, 0),
+            everywhere: false,
         }
     }
 }
@@ -321,6 +348,9 @@ pub struct Theme {
     /// Behind each group of markers; alpha 0 hides them.
     #[serde(deserialize_with = "de::color")]
     pub group_backdrop: u32,
+    /// An overdue note's marker and margin.
+    #[serde(deserialize_with = "de::color")]
+    pub overdue: u32,
 }
 
 impl Default for Theme {
@@ -349,6 +379,7 @@ impl Default for Theme {
             shadow_softness: 8,
             shadow_offset: [2, 3],
             group_backdrop: 0x00000026,
+            overdue: 0xd64541ff,
         }
     }
 }
@@ -409,6 +440,21 @@ impl Config {
                     false => 0xf2f2f2ff,
                 }
             }
+        }
+    }
+
+    /// The color of an overdue note's marker and margin.
+    pub fn overdue_color(&self) -> u32 {
+        self.theme().overdue
+    }
+
+    /// The text on a margin in `rgba`: dark or light, whichever reads.
+    pub fn ink_on(rgba: u32) -> u32 {
+        let [r, g, b, _] = rgba.to_be_bytes();
+        let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+        match luma > 150.0 {
+            true => 0x2b2b2bff,
+            false => 0xfffffff2,
         }
     }
 
@@ -507,6 +553,10 @@ fn tilt<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     }
 }
 
+fn time_of_day<'de, D: Deserializer<'de>>(d: D) -> Result<TimeOfDay, D::Error> {
+    TimeOfDay::parse(&String::deserialize(d)?).map_err(D::Error::custom)
+}
+
 fn color_name<'de, D: Deserializer<'de>>(d: D) -> Result<Color, D::Error> {
     Color::parse(String::deserialize(d)?.trim()).map_err(D::Error::custom)
 }
@@ -538,6 +588,38 @@ mod tests {
         assert_eq!(settings.color, Color::Preset("blue"));
         assert_eq!(settings.on_close, OnClose::Keep);
         assert!(parse("[scratch]\non-close = 'invalid'").is_err());
+    }
+
+    #[test]
+    fn due_settings() {
+        let defaults = parse("").unwrap();
+        assert_eq!(defaults.due.morning, TimeOfDay::new(9, 0));
+        assert_eq!(defaults.due.evening, TimeOfDay::new(18, 0));
+        assert!(!defaults.due.everywhere);
+        assert_eq!(defaults.theme().overdue, 0xd64541ff);
+        let c = parse(
+            "[due]\nmorning = '07:30'\nevening = '19:00'\neverywhere = true\n\n[appearance]\noverdue = '#ff0000'\n\n[appearance.dark]\noverdue = '#aa0000'",
+        )
+        .unwrap();
+        assert_eq!(c.due.morning, TimeOfDay::new(7, 30));
+        assert!(c.due.everywhere);
+        assert_eq!(c.appearance.light.overdue, 0xff0000ff);
+        assert_eq!(c.appearance.dark.overdue, 0xaa0000ff);
+        for bad in [
+            "[due]\nmorning = '9'",
+            "[due]\nevening = '25:00'",
+            "[due]\nmorning = 9",
+            "[due]\nunknown = 1",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ink_reads_on_a_margin() {
+        // Dark on light colors, light on dark: the default red gets light.
+        assert_eq!(Config::ink_on(0xd64541ff), 0xfffffff2);
+        assert_eq!(Config::ink_on(0xffd600ff), 0x2b2b2bff);
     }
 
     #[test]

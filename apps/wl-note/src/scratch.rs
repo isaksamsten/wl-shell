@@ -215,19 +215,19 @@ mod tests {
         let first = create(
             &tmp.0,
             "a/1",
-            &create::text(None, Some("white"), None, Some("first")).unwrap(),
+            &create::text(None, Some("white"), None, Some("first"), None).unwrap(),
         )
         .unwrap();
         let second = create(
             &tmp.0,
             "a/1",
-            &create::text(None, Some("pink"), None, Some("second")).unwrap(),
+            &create::text(None, Some("pink"), None, Some("second"), None).unwrap(),
         )
         .unwrap();
         create(
             &tmp.0,
             "b/1",
-            &create::text(None, Some("white"), None, Some("other")).unwrap(),
+            &create::text(None, Some("white"), None, Some("other"), None).unwrap(),
         )
         .unwrap();
         let expected = [
@@ -236,7 +236,7 @@ mod tests {
         ];
         let (mut index, errors) = Index::load(&tmp.0);
         assert!(errors.is_empty());
-        let edited = create::text(None, Some("white"), None, Some("edited")).unwrap();
+        let edited = create::text(None, Some("white"), None, Some("edited"), None).unwrap();
         wl_shell_notes::write_atomic(&first, &edited).unwrap();
         index.scan();
         for index in [index, Index::load(&tmp.0).0] {
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn close_dispositions_protect_user_content() {
         for policy in [OnClose::Trash, OnClose::Delete, OnClose::Keep] {
-            let empty = create::text(None, Some("white"), None, Some(" \n")).unwrap();
+            let empty = create::text(None, Some("white"), None, Some(" \n"), None).unwrap();
             assert_eq!(disposition(policy, &Note::parse(empty)), OnClose::Delete);
             for txt in [
                 "some text\n",

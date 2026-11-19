@@ -38,6 +38,13 @@
 //!   editor if it has no text yet, else opened. A note opened by name is
 //!   shown again if hidden, and shows even if it doesn't belong to the
 //!   context, until it is closed.
+//! - **Due notes.** A note with a `due` that has passed is overdue: its
+//!   marker and margin turn `appearance.overdue`, and with
+//!   `due.everywhere` it shows in the global group wherever the context
+//!   is. One timer (alarm.rs, on the real-time clock) is armed for the
+//!   earliest `due` still to come among the notes, and armed again
+//!   whenever the notes change; when it fires, the notes are shown again,
+//!   and the ones that just turned overdue pulse. Nothing runs between.
 //! - **Fonts on the main thread**, for the open note's editable title,
 //!   are loaded on a thread of their own at the start.
 
@@ -55,17 +62,20 @@ use wayland_client::protocol::{
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::{Reloader, TreeEvent};
-use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
+use wl_shell_core::reexports::calloop::generic::Generic;
+use wl_shell_core::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken, channel};
 use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::stream::{Hooks, LineStream};
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Incoming, Listener, Reply};
 use wl_shell_log::warn;
-use wl_shell_notes::{Index, Note, State, Window, index::Entry, state};
+use wl_shell_notes::due::{self, Local};
+use wl_shell_notes::{Index, Note, State, Window, index::Entry, state, toml_edit};
 use wl_shell_render::text::Text;
 use wl_shell_render::worker::{Assets, Done};
 
-use crate::column::{Act, Column, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
+use crate::alarm::{Alarm, Wake};
+use crate::column::{Act, Column, DueShown, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
 use crate::config::{Config, OnClose};
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Group, Item, Look};
@@ -168,6 +178,10 @@ pub struct WlNote {
     last_open: Vec<Option<String>>,
     /// Fonts for the main thread, once loaded.
     fonts: Fonts,
+    /// The timer for the next due note.
+    alarm: Option<Alarm>,
+    /// The notes changed since the alarm was last armed.
+    alarm_stale: bool,
 }
 
 impl WlNote {
@@ -216,6 +230,8 @@ impl WlNote {
             listener: None,
             last_open: Vec::new(),
             fonts: Rc::new(RefCell::new(None)),
+            alarm: None,
+            alarm_stale: true,
         })
     }
 
@@ -232,6 +248,7 @@ impl WlNote {
         self.open_state(core);
         self.open_notes(core);
         self.open_scratch(core);
+        self.open_alarm(core);
         self.use_stream(core);
         self.use_output_stream(core);
         // The first context shows at once.
@@ -242,6 +259,52 @@ impl WlNote {
         }
         self.after_dispatch(core);
         Ok(())
+    }
+
+    /// Start the timer for due notes. Without it, notes still turn
+    /// overdue, but only when something else shows them again.
+    fn open_alarm(&mut self, core: &Core<Self>) {
+        let alarm = match Alarm::new() {
+            Ok(alarm) => alarm,
+            Err(e) => return warn!("no timer for due notes: {e}"),
+        };
+        let source = Generic::new(alarm.clone(), Interest::READ, Mode::Level);
+        let inserted = core
+            .loop_handle
+            .insert_source(source, |_, _, shell: &mut Shell<Self>| {
+                let app = &mut shell.program;
+                if let Some(alarm) = &app.alarm
+                    && alarm.wake() != Wake::Nothing
+                {
+                    // A note fell due, or the clock was set.
+                    app.alarm_stale = true;
+                    app.dirty = true;
+                }
+                Ok(PostAction::Continue)
+            });
+        match inserted {
+            Ok(_) => self.alarm = Some(alarm),
+            Err(e) => warn!("no timer for due notes: {e}"),
+        }
+    }
+
+    /// Arm the timer for the earliest due time to come, if the notes
+    /// changed since.
+    fn rearm_alarm(&mut self) {
+        if !std::mem::take(&mut self.alarm_stale) {
+            return;
+        }
+        let Some(alarm) = &self.alarm else {
+            return;
+        };
+        let notes = self
+            .index
+            .iter()
+            .chain(self.scratch.iter().flat_map(Index::iter));
+        let next = due::next_due(notes.filter_map(|(_, e)| e.note.due()), &Local, due::now());
+        if let Err(e) = alarm.set(next) {
+            warn!("arming the timer for due notes: {e}");
+        }
     }
 
     fn start_worker(&mut self, core: &Core<Self>) -> Result<(), String> {
@@ -437,6 +500,7 @@ impl WlNote {
         }
         if !changes.is_empty() {
             self.dirty = true;
+            self.alarm_stale = true;
             self.observe_drafts();
         }
     }
@@ -567,6 +631,7 @@ impl WlNote {
         }
         if !changes.is_empty() {
             self.dirty = true;
+            self.alarm_stale = true;
         }
         let moves = std::mem::take(&mut self.moves);
         let (mut order, mut hidden) = (false, false);
@@ -677,6 +742,7 @@ impl WlNote {
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_columns(core);
         }
+        self.rearm_alarm();
         if std::mem::take(&mut self.dirty) {
             self.show_notes();
         }
@@ -934,6 +1000,9 @@ impl WlNote {
         let note = self.entry(path).map(|e| &e.note).or(fallback)?;
         let key = path.to_string_lossy().into_owned();
         let scratch = self.scratch_rel(path).is_some();
+        let now = due::now();
+        let due = note.due();
+        let overdue = due.is_some_and(|d| d.overdue(&Local, now));
         let color = note
             .meta
             .color
@@ -942,6 +1011,7 @@ impl WlNote {
         let look = Look {
             color: self.config.paper_color(color),
             tilt: deck::tilt(&key, self.config.sheet.tilt),
+            accent: overdue.then(|| self.config.overdue_color()),
         };
         let content = Content::of_note(note, &list::name(path));
         let files = (bar::files(&content.links).into_iter())
@@ -959,7 +1029,9 @@ impl WlNote {
             )
         } else {
             let pin = pin_state(note, window);
-            let group = if note.global() {
+            // Overdue, and shown where it doesn't belong (`due.everywhere`).
+            let elsewhere = self.config.due.everywhere && overdue && !note.matches(window);
+            let group = if note.global() || elsewhere {
                 Group::Global
             } else {
                 Group::Window
@@ -983,6 +1055,10 @@ impl WlNote {
             files,
             pin,
             color: color.copied().unwrap_or(self.config.sheet.default_color),
+            due: due.map(|d| DueShown {
+                label: d.label(&Local, now),
+                overdue,
+            }),
         })
     }
 
@@ -991,7 +1067,12 @@ impl WlNote {
     fn show_notes(&mut self) {
         let window = self.window().cloned();
         let window = window.as_ref();
-        let mut paths: Vec<PathBuf> = (self.state.shown(&self.index, window).into_iter())
+        let (everywhere, now) = (self.config.due.everywhere, due::now());
+        let wanted = |note: &Note| {
+            note.matches(window)
+                || (everywhere && note.due().is_some_and(|d| d.overdue(&Local, now)))
+        };
+        let mut paths: Vec<PathBuf> = (self.state.shown_where(&self.index, wanted).into_iter())
             .map(Path::to_path_buf)
             .collect();
         if let (Some(index), Some(c)) = (&self.scratch, self.scratch_context()) {
@@ -1158,6 +1239,14 @@ impl WlNote {
             Act::Hide(key) => self.hide_note(core, &key),
             Act::Color(key, color) => {
                 self.edit_note(&key, |note| note.set_value("color", bar::color_name(color)))
+            }
+            Act::Due(key, when) => {
+                let due = match when.as_deref().map(str::parse::<toml_edit::Datetime>) {
+                    Some(Ok(dt)) => Some(dt),
+                    Some(Err(e)) => return warn!("due time {when:?}: {e}"),
+                    None => None,
+                };
+                self.edit_note(&key, |note| note.set_due(due));
             }
             Act::Trash(key) => self.trash_note(core, &key),
             Act::RemoveFile(key, path) => {
@@ -1557,6 +1646,7 @@ impl WlNote {
             new.color.as_deref(),
             new.title.as_deref(),
             new.text.as_deref(),
+            new.due.as_deref(),
         )?;
         let key = self.write_new_note(core, &text)?;
         self.focus_note(core, &key);
@@ -1574,6 +1664,7 @@ impl WlNote {
             Some(new.color.as_deref().unwrap_or(&color)),
             new.title.as_deref(),
             new.text.as_deref(),
+            new.due.as_deref(),
         )?;
         let path = scratch::create(index.dir(), &ctx.id, &text)?;
         self.scratch_touched = true;
@@ -1761,7 +1852,7 @@ impl WlNote {
                         },
                     )?
                 } else {
-                    let text = create::text(drop.app.as_deref(), None, None, Some(&body))?;
+                    let text = create::text(drop.app.as_deref(), None, None, Some(&body), None)?;
                     self.write_new_note(core, &text)?
                 };
                 if let Some(i) = self

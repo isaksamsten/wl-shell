@@ -302,6 +302,7 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
         "builtin:archive" => Some(include_bytes!("../assets/archive.svg")),
         "builtin:trash" => Some(include_bytes!("../assets/trash.svg")),
         "builtin:close" => Some(include_bytes!("../assets/close.svg")),
+        "builtin:clock" => Some(include_bytes!("../assets/clock.svg")),
         _ => None,
     };
     if let Some(data) = bundled {
@@ -1076,7 +1077,8 @@ mod tests {
             let archive = find("builtin:archive", size, "nonexistent-theme").unwrap();
             let trash = find("builtin:trash", size, "nonexistent-theme").unwrap();
             let close = find("builtin:close", size, "nonexistent-theme").unwrap();
-            for icon in [&pin, &unpin, &archive, &trash, &close] {
+            let clock = find("builtin:clock", size, "nonexistent-theme").unwrap();
+            for icon in [&pin, &unpin, &archive, &trash, &close, &clock] {
                 assert_eq!((icon.width, icon.height), (size, size));
                 assert!(icon.data.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
             }

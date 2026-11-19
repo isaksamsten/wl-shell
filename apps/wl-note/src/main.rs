@@ -1,6 +1,7 @@
 //! wl-note: sticky notes along a screen edge, belonging to apps. See
 //! PLAN.md for the design.
 
+mod alarm;
 mod app;
 mod bar;
 mod column;
@@ -28,7 +29,8 @@ use std::process::ExitCode;
 use wl_shell_config::ConfigFile;
 use wl_shell_core::{Error, Shell};
 use wl_shell_log::warn;
-use wl_shell_notes::{Color, Index, State, Window, state};
+use wl_shell_notes::due::{self, Local};
+use wl_shell_notes::{Color, Index, Note, State, Window, state, toml_edit};
 
 use crate::app::WlNote;
 use crate::config::Config;
@@ -66,11 +68,20 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
             color,
             title,
             text,
+            due,
         } => {
             if let Some(Err(e)) = color.as_deref().map(|c| Color::parse(c.trim())) {
                 warn!("{e}");
                 return ExitCode::FAILURE;
             }
+            let due = match due.as_deref().map(|when| resolve_when(opts, when)) {
+                Some(Ok(due)) => Some(due.datetime(&Local).to_string()),
+                Some(Err(e)) => {
+                    warn!("{e}");
+                    return ExitCode::FAILURE;
+                }
+                None => None,
+            };
             let text = match text.as_deref() {
                 Some("-") => {
                     let mut s = String::new();
@@ -88,6 +99,7 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
                 color: color.clone(),
                 title: title.clone(),
                 text,
+                due,
             });
             return wl_shell_daemon::client_to(&req, MISSING);
         }
@@ -148,6 +160,13 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Keep { .. } | Cmd::Path => {
             unreachable!("done above")
         }
+        Cmd::Due { note, when } => find_note(&index, note).and_then(|path| {
+            let due = match when.trim().eq_ignore_ascii_case("none") {
+                true => None,
+                false => Some(resolve_when(opts, when)?),
+            };
+            set_due(&dir.join(&path), &path, due)
+        }),
         Cmd::List {
             app,
             title,
@@ -174,9 +193,10 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
                     warn!("{}: {p}", path.display());
                 }
             }
+            let now = due::now();
             match json {
-                true => print!("{}", list::json(&notes)),
-                false => print!("{}", list::text(&notes)),
+                true => print!("{}", list::json(&notes, now)),
+                false => print!("{}", list::text(&notes, now)),
             }
             Ok(())
         }
@@ -224,6 +244,31 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `when` as `wl-note new --due` and `wl-note due` take it, by the config's
+/// morning and evening.
+fn resolve_when(opts: &Options, when: &str) -> Result<due::Due, String> {
+    let config = Config::read(opts.config.as_deref()).map_err(|e| format!("config: {e}"))?;
+    let (morning, evening) = (config.due.morning, config.due.evening);
+    due::parse_when(when, due::now(), &Local, morning, evening)
+}
+
+/// Write `due` (None: none) into the note at `file`, whose name in the
+/// notes directory is `name`.
+fn set_due(file: &Path, name: &Path, due: Option<due::Due>) -> Result<(), String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut note = Note::parse(text);
+    let datetime: Option<toml_edit::Datetime> = due.map(|d| d.datetime(&Local));
+    note.set_due(datetime)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    wl_shell_notes::write_atomic(file, note.text())
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    match datetime {
+        Some(dt) => println!("{} is due {dt}", name.display()),
+        None => println!("{} has no due time", name.display()),
+    }
+    Ok(())
 }
 
 /// The note `query` names (see find.rs), relative to the notes directory.

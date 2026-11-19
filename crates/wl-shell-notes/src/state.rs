@@ -246,9 +246,19 @@ impl State {
     /// The notes shown for `window` (None: only the global ones), in
     /// column order: those that match it and aren't hidden.
     pub fn shown<'a>(&self, index: &'a Index, window: Option<&Window>) -> Vec<&'a Path> {
+        self.shown_where(index, |note| note.matches(window))
+    }
+
+    /// The notes that aren't hidden and `wanted` says to show, in column
+    /// order.
+    pub fn shown_where<'a>(
+        &self,
+        index: &'a Index,
+        wanted: impl Fn(&crate::note::Note) -> bool,
+    ) -> Vec<&'a Path> {
         (self.arrange(index).into_iter())
             .filter(|p| !self.is_hidden(p))
-            .filter(|p| index.get(p).is_some_and(|e| e.note.matches(window)))
+            .filter(|p| index.get(p).is_some_and(|e| wanted(&e.note)))
             .collect()
     }
 

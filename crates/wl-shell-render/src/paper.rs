@@ -11,7 +11,9 @@
 //!
 //! A `sliver` is the sheet seen edge-on, as a note's marker is: a little
 //! darker, with a 1 px light line along the side that sticks out, where
-//! the paper's thickness catches the light.
+//! the paper's thickness catches the light. An `accent` is another color
+//! for the sliver and the margin (the body keeps the paper's, so the text
+//! on it keeps its contrast).
 //!
 //! A sheet may have a `margin`: a strip on the side that comes out first
 //! (the side away from the edge), with the note's title set in it turned
@@ -27,7 +29,7 @@
 use std::sync::OnceLock;
 
 use resvg::tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, IntSize, LineCap, LinearGradient, Paint,
+    Color, FillRule, FilterQuality, GradientStop, IntSize, LineCap, LinearGradient, Mask, Paint,
     PathBuilder, Pixmap, PixmapPaint, Point, Rect as SkRect, SpreadMode, Stroke, StrokeDash,
     Transform,
 };
@@ -57,6 +59,9 @@ pub struct Paper {
     pub tilt: f64,
     /// Drawn edge-on: darker, with a light line.
     pub sliver: bool,
+    /// The color of a sliver and of the margin instead of `color`, which
+    /// the body keeps (an overdue note's marker and margin).
+    pub accent: Option<u32>,
     /// The corners' radius.
     pub radius: f64,
     /// The bottom corner on the side that comes out curls.
@@ -270,29 +275,22 @@ fn draw(
     };
 
     let base = match p.sliver {
-        true => shade(p.color, -EDGE_ON),
+        true => shade(p.accent.unwrap_or(p.color), -EDGE_ON),
         false => p.color,
     };
-    let stops = vec![
-        GradientStop::new(0.0, color(shade(base, LIGHT))),
-        GradientStop::new(1.0, color(shade(base, -LIGHT * 0.8))),
-    ];
-    let fill = LinearGradient::new(
-        Point::from_xy(0.0, 0.0),
-        Point::from_xy(0.0, h),
-        stops,
-        SpreadMode::Pad,
-        Transform::identity(),
-    );
-    let paint = match fill {
-        Some(shader) => Paint {
-            shader,
-            anti_alias: true,
-            ..Paint::default()
-        },
-        None => solid(base),
-    };
+    let paint = sheet_paint(base, h);
     pixmap.fill_path(&outline, &paint, FillRule::Winding, xf, None);
+
+    // The margin in the accent color, over the paper's. (Sheet
+    // coordinates, mirrored by `xf`: the margin is on the left here.)
+    if let (Some(accent), false, Some(m)) = (p.accent, p.sliver, &p.margin)
+        && let Some(strip) = SkRect::from_ltrb(0.0, -1.0, m.width.clamp(0, p.w) as f32, h + 1.0)
+        && let Some(mut mask) = Mask::new(bw, bh)
+    {
+        mask.fill_path(&PathBuilder::from_rect(strip), FillRule::Winding, true, xf);
+        let paint = sheet_paint(accent, h);
+        pixmap.fill_path(&outline, &paint, FillRule::Winding, xf, Some(&mask));
+    }
 
     // The curl: the cut corner folded over, its back catching the light
     // along the fold.
@@ -374,6 +372,30 @@ fn draw(
         width: bw,
         height: bh,
         data,
+    }
+}
+
+/// The fill of a sheet `h` high in `base`: a slight vertical gradient,
+/// lighter at the top.
+fn sheet_paint(base: u32, h: f32) -> Paint<'static> {
+    let stops = vec![
+        GradientStop::new(0.0, color(shade(base, LIGHT))),
+        GradientStop::new(1.0, color(shade(base, -LIGHT * 0.8))),
+    ];
+    let fill = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(0.0, h),
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    );
+    match fill {
+        Some(shader) => Paint {
+            shader,
+            anti_alias: true,
+            ..Paint::default()
+        },
+        None => solid(base),
     }
 }
 
@@ -719,6 +741,7 @@ mod tests {
             edge: Edge::Right,
             tilt: 0.0,
             sliver: false,
+            accent: None,
             radius: 1.5,
             curl: true,
             margin: None,
@@ -984,5 +1007,49 @@ mod tests {
         assert_eq!(shade(0x808080ff, 0.0), 0x808080ff);
         assert_eq!(shade(0x000000ff, 0.5), 0x808080ff);
         assert_eq!(shade(0xffffff40, -0.5), 0x80808040);
+    }
+
+    #[test]
+    fn accent_colors_the_sliver_and_the_margin() {
+        let accent = 0xd64541ff;
+        // Red: little green, where the paper is yellow.
+        let red = |r: &Rendered, x, y| at(r, 1, x, y)[1] < 120;
+        // Edge-on, all of it.
+        let plain = render(&Paper {
+            sliver: true,
+            ..paper()
+        });
+        let sliver = render(&Paper {
+            sliver: true,
+            accent: Some(accent),
+            ..paper()
+        });
+        assert!(!red(&plain, 60, 30) && red(&sliver, 60, 30));
+        // With a margin: it, and not the body.
+        let margin = Margin {
+            width: 20,
+            ink: 0x000000ff,
+            crease: false,
+            label: None,
+        };
+        let with = |edge, accent| Paper {
+            edge,
+            accent,
+            margin: Some(margin.clone()),
+            curl: false,
+            ..paper()
+        };
+        let r = render(&with(Edge::Right, Some(accent)));
+        assert!(red(&r, 10, 30) && !red(&r, 60, 30) && !red(&r, 100, 30));
+        let r = render(&with(Edge::Left, Some(accent)));
+        assert!(red(&r, 110, 30) && !red(&r, 60, 30) && !red(&r, 10, 30));
+        // No margin and no sliver: nothing to color.
+        let r = render(&Paper {
+            accent: Some(accent),
+            ..paper()
+        });
+        assert!(!red(&r, 10, 30) && !red(&r, 60, 30));
+        // The accent is part of what a sheet is drawn from.
+        assert_ne!(with(Edge::Right, Some(accent)), with(Edge::Right, None));
     }
 }
