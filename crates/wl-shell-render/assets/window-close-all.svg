@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>Close All Windows</title>
+  <defs>
+    <linearGradient id="frame" x2="0%" y2="100%">
+      <stop stop-color="#66758a"/>
+      <stop offset="1" stop-color="#374354"/>
+    </linearGradient>
+    <linearGradient id="tile" x2="0%" y2="100%">
+      <stop stop-color="#f27b80"/>
+      <stop offset="1" stop-color="#c54151"/>
+    </linearGradient>
+  </defs>
+  <rect x="13" y="7" width="45" height="35" rx="8" fill="url(#frame)" stroke="#91a1b6" stroke-width="1.5"/>
+  <rect x="5" y="16" width="45" height="35" rx="8" fill="url(#frame)" stroke="#91a1b6" stroke-width="1.5"/>
+  <path d="M12 27h31" stroke="#acb9ca" stroke-width="2" stroke-linecap="round"/>
+  <rect x="32" y="29" width="27" height="27" rx="7" fill="url(#tile)" stroke="#ffadb0" stroke-width="1.5"/>
+  <path d="m41 38 9 9m0-9-9 9" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+</svg>
+

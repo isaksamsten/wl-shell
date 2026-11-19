@@ -387,7 +387,7 @@ const APP_ACTIONS: &[Action<App>] = &[
     Action {
         id: "new-window",
         name: |_, _| "New Window".into(),
-        icon: |_, _| names(&["window-new", "list-add", "document-new"]),
+        icon: |_, _| names(&["builtin:window-new"]),
         applies: |a, _| a.running() && a.launchable,
         does: |a, _| Does::NewWindow(a.id.clone()),
     },
@@ -397,7 +397,10 @@ const APP_ACTIONS: &[Action<App>] = &[
             1 => "Close".into(),
             _ => "Close All Windows".into(),
         },
-        icon: |_, _| names(&["window-close", "application-exit", "process-stop"]),
+        icon: |a, _| names(&[match a.windows.len() {
+            1 => "builtin:window-close",
+            _ => "builtin:window-close-all",
+        }]),
         applies: |a, cx| cx.close && a.running(),
         does: |a, _| Does::Close(a.window_ids()),
     },
@@ -419,7 +422,7 @@ const WINDOW_ACTIONS: &[Action<WindowSubject>] = &[
     Action {
         id: "close-window",
         name: |_, _| "Close Window".into(),
-        icon: |_, _| names(&["window-close", "application-exit", "process-stop"]),
+        icon: |_, _| names(&["builtin:window-close"]),
         applies: |_, cx| cx.close,
         does: |w, _| Does::Close(vec![w.id.clone()]),
     },
