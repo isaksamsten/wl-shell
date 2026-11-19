@@ -310,14 +310,6 @@ impl<P: Program> Core<P> {
         scales
     }
 
-    /// The output named `name` and its scale.
-    pub fn output_named(&self, name: &str) -> Option<(WlOutput, i32)> {
-        (self.output_state.outputs()).find_map(|o| {
-            let info = self.output_state.info(&o)?;
-            (info.name.as_deref() == Some(name)).then(|| (o, info.scale_factor.max(1)))
-        })
-    }
-
     /// Call `f` once after `after`. Remove the returned token to cancel.
     pub fn timer(
         &self,

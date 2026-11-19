@@ -27,11 +27,6 @@ pub struct Options {
     #[arg(value_name = "ID")]
     pub ids: Vec<String>,
 
-    /// Output to show on (a wl_output name, e.g. DP-1); default: the
-    /// focused one
-    #[arg(short, long, value_name = "NAME")]
-    pub output: Option<String>,
-
     /// Config file for the daemon (default:
     /// $XDG_CONFIG_HOME/wl-switcher/config.toml)
     #[arg(long, value_name = "PATH", conflicts_with = "action")]
@@ -39,7 +34,7 @@ pub struct Options {
 
     /// Run the daemon: track focus order and show the switcher for later
     /// invocations
-    #[arg(long, conflicts_with_all = ["action", "ids", "output"])]
+    #[arg(long, conflicts_with_all = ["action", "ids"])]
     pub daemon: bool,
 }
 
@@ -84,7 +79,6 @@ impl Options {
         Request {
             step: self.action.unwrap_or(Action::Next).step(),
             ids: self.ids.clone(),
-            output: self.output.clone(),
         }
     }
 }
@@ -101,11 +95,11 @@ mod tests {
     #[test]
     fn cli() {
         Options::command().debug_assert();
-        let o = parse(&["next-window", "-o", "DP-1", "3", "1"]).unwrap();
+        let o = parse(&["next-window", "3", "1"]).unwrap();
         assert_eq!(o.request().step, Step::NextWindow);
         assert_eq!(o.request().ids, ["3", "1"]);
-        assert_eq!(o.request().output.as_deref(), Some("DP-1"));
         assert!(!o.daemon);
+        assert!(parse(&["next", "-o", "DP-1"]).is_err());
         assert_eq!(parse(&["prev"]).unwrap().request().step, Step::PrevApp);
     }
 

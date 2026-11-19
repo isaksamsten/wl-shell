@@ -38,18 +38,13 @@ pub struct Options {
     #[arg(short, long, value_name = "MS", default_value = "500", value_parser = parse_ms)]
     pub timeout: u32,
 
-    /// Output to show on (a wl_output name, e.g. DP-1); default: the only
-    /// output, if there is just one
-    #[arg(short, long, value_name = "NAME")]
-    pub output: Option<String>,
-
     /// Config file for the daemon (default:
     /// $XDG_CONFIG_HOME/wl-expose/config.toml)
     #[arg(long, value_name = "PATH", requires = "daemon")]
     pub config: Option<PathBuf>,
 
     /// Run in the background and show the overlay for later invocations
-    #[arg(long, conflicts_with_all = ["ids", "list", "select", "static_", "cursors", "timeout", "output"])]
+    #[arg(long, conflicts_with_all = ["ids", "list", "select", "static_", "cursors", "timeout"])]
     pub daemon: bool,
 }
 
@@ -75,7 +70,6 @@ impl Options {
             live: !self.static_,
             cursors: self.cursors,
             timeout_ms: self.timeout,
-            output: self.output.clone(),
         }
     }
 }
@@ -102,12 +96,9 @@ mod tests {
     #[test]
     fn cli() {
         Options::command().debug_assert();
-        let o =
-            Options::try_parse_from(["wl-expose", "--static", "-s", "2", "-o", "DP-1", "1", "2"])
-                .unwrap();
+        let o = Options::try_parse_from(["wl-expose", "--static", "-s", "2", "1", "2"]).unwrap();
         assert!(!o.request().live);
         assert_eq!(o.select.as_deref(), Some("2"));
-        assert_eq!(o.request().output.as_deref(), Some("DP-1"));
         assert_eq!(o.ids, ["1", "2"]);
         assert_eq!(o.timeout, 500);
         assert!(o.config.is_none());
@@ -121,7 +112,6 @@ mod tests {
         assert!(parse(&["--daemon", "1"]).is_err());
         assert!(parse(&["--daemon", "--static"]).is_err());
         assert!(parse(&["--daemon", "-t", "100"]).is_err());
-        assert!(parse(&["--daemon", "-o", "DP-1"]).is_err());
         assert!(parse(&["--config", "c.toml"]).is_err());
         assert!(parse(&["--no-daemon"]).is_err());
     }

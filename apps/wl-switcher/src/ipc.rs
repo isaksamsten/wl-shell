@@ -15,8 +15,6 @@ pub struct Request {
     /// Ext toplevel identifiers of the windows to show; empty: all. A
     /// filter: the daemon orders them by focus.
     pub ids: Vec<String>,
-    /// The output to show on, by name.
-    pub output: Option<String>,
 }
 
 impl Default for Request {
@@ -24,7 +22,6 @@ impl Default for Request {
         Self {
             step: Step::NextApp,
             ids: Vec::new(),
-            output: None,
         }
     }
 }
@@ -54,9 +51,6 @@ impl ipc::Request for Request {
         for id in &self.ids {
             out += &line("id", Some(id));
         }
-        if let Some(output) = &self.output {
-            out += &line("output", Some(output));
-        }
         out
     }
 
@@ -67,7 +61,6 @@ impl ipc::Request for Request {
                 self.step = step_from_name(&name).ok_or(format!("'{text}': unknown command"))?;
             }
             ("id", p) => self.ids.push(payload(p, text)?),
-            ("output", p) => self.output = Some(payload(p, text)?),
             _ => return Err(format!("unknown request line '{text}'")),
         }
         Ok(())
@@ -98,7 +91,6 @@ mod tests {
         let req = Request {
             step: Step::PrevWindow,
             ids: vec!["1".into(), "x y".into(), "a\nb".into()],
-            output: Some("DP-1".into()),
         };
         assert_eq!(Request::decode(req.encode().as_bytes()), Ok(Some(req)));
         let default = Request::default();

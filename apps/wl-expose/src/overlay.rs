@@ -576,6 +576,19 @@ struct Screenshot {
     frame: Option<(WlBuffer, Transform)>,
 }
 
+impl Screenshot {
+    /// Start capturing `output`; None if it can't.
+    fn start(output: &WlOutput, g: &Globals, qh: &Qh) -> Option<Self> {
+        let id = CaptureId::next();
+        let capture = Capture::output(id, output, g, qh)?;
+        Some(Self {
+            id,
+            capture,
+            frame: None,
+        })
+    }
+}
+
 /// The opening transition, started at `start`.
 #[derive(Clone, Copy)]
 struct Opening {
@@ -680,6 +693,12 @@ pub struct Overlay {
     mapped: bool,
     /// The first-frame timeout expired: map even without all frames.
     deadline_passed: bool,
+    /// The opening screenshot waits for the output the overlay is on, which
+    /// `entered` tells; the overlay doesn't map before.
+    awaiting_output: bool,
+    /// A transparent buffer is attached, so the compositor shows the
+    /// surface (and says which output it is on) before the real map.
+    blank: bool,
     /// With WL_EXPOSE_TRACE set: when the overlay was created.
     trace: Option<Instant>,
     /// A frame callback for an animation is pending.
@@ -708,15 +727,15 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    /// Create the overlay for `toplevels`, in layout order, on `output`
-    /// (None: the compositor's choice), and start capturing them and, for
-    /// the opening transition, the output. Icons and titles come from
-    /// `assets`.
+    /// Create the overlay for `toplevels`, in layout order, on the focused
+    /// output, and start capturing them and, for the opening transition,
+    /// the output: at once if it is `only_output`, else when `entered`
+    /// tells which one it is. Icons and titles come from `assets`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         g: Rc<Globals>,
         toplevels: Vec<(ExtForeignToplevelHandleV1, Toplevel)>,
-        output: Option<&WlOutput>,
+        only_output: Option<&WlOutput>,
         req: &Request,
         config: &Config,
         wallpaper: Option<Rc<Wallpaper>>,
@@ -733,13 +752,13 @@ impl Overlay {
 
         let surface = g.compositor.create_surface(qh);
         let viewport = g.viewporter.get_viewport(&surface, qh, Ignore);
-        // Output None: the compositor picks the focused output.
+        // No output: the compositor puts it on the focused one.
         let layer = g.layer_shell.create_layer_surface(
             qh,
             surface,
             Layer::Overlay,
             Some("wl-expose"),
-            output,
+            None,
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_size(0, 0);
@@ -811,17 +830,11 @@ impl Overlay {
         let title = config.title_style();
         let pill_sub = title.is_some().then(|| Sub::new(&g, parent, &no_input, qh));
 
-        let screenshot = output
-            .filter(|_| config.open_duration > 0)
-            .and_then(|output| {
-                let id = CaptureId::next();
-                let capture = Capture::output(id, output, &g, qh)?;
-                Some(Screenshot {
-                    id,
-                    capture,
-                    frame: None,
-                })
-            });
+        let shot = config.open_duration > 0;
+        let awaiting_output = shot && only_output.is_none();
+        let screenshot = only_output
+            .filter(|_| shot)
+            .and_then(|output| Screenshot::start(output, &g, qh));
 
         // Initial commit without a buffer; the map happens once frames are in.
         layer.commit();
@@ -875,6 +888,8 @@ impl Overlay {
             configured: false,
             mapped: false,
             deadline_passed: false,
+            awaiting_output,
+            blank: false,
             trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
             frame_pending: false,
             card_rect: IRect::default(),
@@ -895,6 +910,37 @@ impl Overlay {
 
     pub fn mapped(&self) -> bool {
         self.mapped
+    }
+
+    /// Map the surface with nothing in it, to learn which output it is on.
+    fn show_blank(&mut self) {
+        self.blank = true;
+        let surface = self.layer.wl_surface();
+        surface.attach(Some(&self.transparent), 0, 0);
+        surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        self.layer.commit();
+        if let Some(t0) = self.trace {
+            trace(
+                t0,
+                format_args!("blank surface shown, waiting for the output"),
+            );
+        }
+    }
+
+    /// The overlay is on `output` (`wl_surface.enter`): its scale, and
+    /// the screenshot of it for the opening, if that is still wanted.
+    pub fn entered(&mut self, output: &WlOutput, scale: Option<i32>) {
+        if let Some(scale) = scale {
+            self.set_scale(scale);
+        }
+        if !self.awaiting_output || self.mapped {
+            return;
+        }
+        self.awaiting_output = false;
+        self.screenshot = Screenshot::start(output, &self.g, &self.qh);
+        if let Some(t0) = self.trace {
+            trace(t0, format_args!("entered the output, screenshot started"));
+        }
     }
 
     pub fn index_of(&self, id: CaptureId) -> Option<usize> {
@@ -923,6 +969,9 @@ impl Overlay {
         self.height = height;
         if width > 0 && height > 0 {
             self.viewport.set_destination(width as i32, height as i32);
+        }
+        if !self.mapped && self.awaiting_output && !self.blank {
+            self.show_blank();
         }
         if !self.mapped {
             return;
@@ -1825,12 +1874,14 @@ impl Overlay {
         if self.mapped || !self.configured {
             return;
         }
-        let shot_ready = self.screenshot.as_ref().is_none_or(|s| s.frame.is_some());
+        let shot_ready =
+            !self.awaiting_output && self.screenshot.as_ref().is_none_or(|s| s.frame.is_some());
         if !self.deadline_passed && !(shot_ready && self.windows.iter().all(|w| w.capture.sized()))
         {
             return;
         }
         self.mapped = true;
+        self.awaiting_output = false; // the deadline passed first
         // Without a screenshot, the card starts as the wallpaper in place.
         let shrink = self.screenshot.as_ref().is_some_and(|s| s.frame.is_some());
         if !shrink {

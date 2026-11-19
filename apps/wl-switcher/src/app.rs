@@ -16,7 +16,7 @@ use smithay_client_toolkit::{
         wlr_layer::{LayerSurface, LayerSurfaceConfigure},
     },
 };
-use wayland_client::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
+use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::Reloader;
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
@@ -196,24 +196,10 @@ impl WlSwitcher {
         }
     }
 
-    /// The output named `name` (None: the compositor's choice) and the
-    /// scale to start with: the output's, or the largest.
-    fn output(
-        core: &Core<Self>,
-        name: Option<&str>,
-        warn: &mut dyn FnMut(String),
-    ) -> (Option<WlOutput>, i32) {
-        let largest = core.scales().last().copied().unwrap_or(1);
-        let Some(name) = name else {
-            return (None, largest);
-        };
-        match core.output_named(name) {
-            Some((output, scale)) => (Some(output), scale),
-            None => {
-                warn(format!("no output named '{name}'"));
-                (None, largest)
-            }
-        }
+    /// The scale to start with: the largest, until the surface enters the
+    /// focused output and the compositor says.
+    fn start_scale(core: &Core<Self>) -> i32 {
+        core.scales().last().copied().unwrap_or(1)
     }
 
     /// Run `f` after `after`, replacing the show's previous timer.
@@ -506,13 +492,12 @@ impl Daemon for WlSwitcher {
                 (handles[i].clone(), window)
             })
             .collect();
-        let (output, scale) = Self::output(core, req.output.as_deref(), warn);
+        let scale = Self::start_scale(core);
         let assets = self.assets(core)?;
         let mut overlay = Overlay::new(
             core.g.clone(),
             windows,
             req.step,
-            output.as_ref(),
             scale,
             &self.config,
             self.cache.clone(),

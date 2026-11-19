@@ -46,7 +46,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     QueueHandle,
-    protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
+    protocol::{wl_buffer::WlBuffer, wl_seat::WlSeat, wl_surface::WlSurface},
 };
 use wayland_protocols::{
     ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -339,14 +339,12 @@ fn card_count(switcher: &Switcher) -> usize {
 
 impl Overlay {
     /// Create the switcher for `windows` (MRU order, not empty), opened
-    /// with `step`, on `output` (None: the compositor's choice) at a
-    /// guessed `scale`.
+    /// with `step`, on the focused output at a guessed `scale`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         g: Rc<Globals>,
         windows: Vec<(ExtForeignToplevelHandleV1, Window)>,
         step: Step,
-        output: Option<&WlOutput>,
         scale: i32,
         config: &Config,
         cache: Rc<RefCell<Cache>>,
@@ -368,12 +366,13 @@ impl Overlay {
 
         let surface = g.compositor.create_surface(qh);
         let viewport = g.viewporter.get_viewport(&surface, qh, Ignore);
+        // No output: the compositor puts it on the focused one.
         let layer = g.layer_shell.create_layer_surface(
             qh,
             surface,
             Layer::Overlay,
             Some("wl-switcher"),
-            output,
+            None,
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_size(0, 0);

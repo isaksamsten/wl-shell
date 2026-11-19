@@ -172,23 +172,13 @@ impl Expose {
         }
     }
 
-    /// The output named `name`, or without a name, the only one. None (the
-    /// compositor picks one and there is no screenshot) otherwise.
-    fn output(
-        core: &Core<Self>,
-        name: Option<&str>,
-        warn: &mut dyn FnMut(String),
-    ) -> Option<WlOutput> {
-        let Some(name) = name else {
-            let mut outputs = core.output_state.outputs();
-            let first = outputs.next();
-            return first.filter(|_| outputs.next().is_none());
-        };
-        let found = core.output_named(name).map(|(output, _)| output);
-        if found.is_none() {
-            warn(format!("no output named '{name}'"));
-        }
-        found
+    /// The output to take the opening screenshot of right away: the only
+    /// one. With several, the overlay waits to learn which one it is on
+    /// (`surface_enter`).
+    fn only_output(core: &Core<Self>) -> Option<WlOutput> {
+        let mut outputs = core.outputs().into_iter();
+        let first = outputs.next()?;
+        outputs.next().is_none().then_some(first.wl)
     }
 
     /// The first outcome wins.
@@ -316,6 +306,16 @@ impl Program for Expose {
         }
     }
 
+    /// The overlay is on the focused output now: take its screenshot.
+    fn surface_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface, output: &WlOutput) {
+        if let Some(overlay) = &mut self.overlay
+            && overlay.surface() == surface
+        {
+            let scale = core.output(output).map(|o| o.scale);
+            overlay.entered(output, scale);
+        }
+    }
+
     fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
         if let Some(overlay) = &mut self.overlay
             && overlay.surface() == surface
@@ -436,13 +436,13 @@ impl Daemon for Expose {
         let windows: Vec<_> = (shown.iter())
             .map(|&i| (handles[i].clone(), toplevels[i].clone()))
             .collect();
-        let output = Self::output(core, req.output.as_deref(), warn);
+        let only_output = Self::only_output(core);
         let assets = self.assets(core)?;
         let config = self.config().clone();
         let mut overlay = Overlay::new(
             core.g.clone(),
             windows,
-            output.as_ref(),
+            only_output.as_ref(),
             &req,
             &config,
             self.wallpaper.clone(),

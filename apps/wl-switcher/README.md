@@ -141,7 +141,6 @@ which key cycles windows.
 
 ```sh
 wl-switcher next                    # All windows
-wl-switcher prev -o DP-1             # Show on a particular output
 wl-switcher next-window 4 7 9        # Only these window IDs
 wl-switcher --daemon --config /path/to/config.toml
 ```
