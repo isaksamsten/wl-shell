@@ -329,11 +329,19 @@ mod tests {
         std::fs::rename(t.0.join("tmp"), t.0.join("sub/c.md")).unwrap();
         assert!(index.scan().is_empty());
         // Nor does a new file under an old name move it.
-        let before = index.ordered().iter().map(|p| p.to_path_buf()).collect::<Vec<_>>();
+        let before = index
+            .ordered()
+            .iter()
+            .map(|p| p.to_path_buf())
+            .collect::<Vec<_>>();
         std::fs::write(t.0.join("tmp"), "c2").unwrap();
         std::fs::rename(t.0.join("tmp"), t.0.join("a.md")).unwrap();
         assert_eq!(index.scan().changed, [PathBuf::from("a.md")]);
-        let after = index.ordered().iter().map(|p| p.to_path_buf()).collect::<Vec<_>>();
+        let after = index
+            .ordered()
+            .iter()
+            .map(|p| p.to_path_buf())
+            .collect::<Vec<_>>();
         assert_eq!(before, after);
         // The directory going away removes everything.
         std::fs::remove_dir_all(&t.0).unwrap();

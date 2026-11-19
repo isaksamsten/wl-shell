@@ -397,10 +397,12 @@ const APP_ACTIONS: &[Action<App>] = &[
             1 => "Close".into(),
             _ => "Close All Windows".into(),
         },
-        icon: |a, _| names(&[match a.windows.len() {
-            1 => "builtin:window-close",
-            _ => "builtin:window-close-all",
-        }]),
+        icon: |a, _| {
+            names(&[match a.windows.len() {
+                1 => "builtin:window-close",
+                _ => "builtin:window-close-all",
+            }])
+        },
         applies: |a, cx| cx.close && a.running(),
         does: |a, _| Does::Close(a.window_ids()),
     },

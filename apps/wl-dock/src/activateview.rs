@@ -10,7 +10,7 @@ use smithay_client_toolkit::shell::wlr_layer::{KeyboardInteractivity, Layer, Lay
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1;
 
-use wl_shell_core::{globals::Ignore, Core};
+use wl_shell_core::{Core, globals::Ignore};
 use wl_shell_ui::cache;
 
 use crate::app::WlDock;
