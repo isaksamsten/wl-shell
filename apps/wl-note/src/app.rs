@@ -45,6 +45,12 @@
 //!   earliest `due` still to come among the notes, and armed again
 //!   whenever the notes change; when it fires, the notes are shown again,
 //!   and the ones that just turned overdue pulse. Nothing runs between.
+//! - **Drawers.** The Hidden button of the `+` row opens a drawer (the
+//!   column's, drawer.rs) listing the hidden notes: every one of them is
+//!   handed over (`drawer_entries`), each saying whether it belongs to the
+//!   context, and the drawer decides what shows. It is handed them again
+//!   whenever the notes are shown again. Picking one takes it out of the
+//!   `hidden` file, which is all that is written.
 //! - **Fonts on the main thread**, for the open note's editable title,
 //!   are loaded on a thread of their own at the start.
 
@@ -80,6 +86,7 @@ use crate::config::{Config, OnClose};
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Group, Item, Look};
 use crate::draft::{Draft, SaveBody, read_note, save_body};
+use crate::drawer::{self, Entry as DrawerEntry};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
@@ -960,8 +967,11 @@ impl WlNote {
             "all" => return outputs,
             "focused" => {
                 let current = self.columns.iter().find(|c| !c.retiring);
-                let held =
-                    current.filter(|c| c.open_key().is_some() || c.dragged_file_note().is_some());
+                let held = current.filter(|c| {
+                    c.open_key().is_some()
+                        || c.drawer_kind().is_some()
+                        || c.dragged_file_note().is_some()
+                });
                 (held.and_then(|c| on(&c.output)))
                     .or_else(|| {
                         let name = self.context_output()?;
@@ -1065,7 +1075,11 @@ impl WlNote {
     fn open_keys(&self) -> Vec<Option<String>> {
         (self.columns.iter())
             .filter(|c| !c.retiring)
-            .map(|c| c.open_key().map(String::from))
+            .map(|c| {
+                // A drawer counts as open, too.
+                (c.open_key().map(String::from))
+                    .or_else(|| c.drawer_kind().map(|k| format!("\0{}", k.label())))
+            })
             .collect()
     }
 
@@ -1205,7 +1219,114 @@ impl WlNote {
                 column.set_notes(notes);
             }
         }
+        // The drawers list what they do now.
+        let drawers: Vec<_> = (self.columns.iter().enumerate())
+            .filter_map(|(i, c)| Some((i, c.drawer_kind()?)))
+            .collect();
+        for (i, kind) in drawers {
+            let entries = self.drawer_entries(kind);
+            self.columns[i].set_drawer_entries(kind, entries);
+        }
         self.last_open = self.open_keys();
+    }
+
+    /// Whether the note at `path` (absolute) is being trashed: it is
+    /// gone, even if its file isn't yet.
+    fn trashing(&self, path: &Path) -> bool {
+        self.trash_pending.contains(path)
+            || matches!(self.undo.action(), Some(Removal::Trash(trash)) if trash.path == path)
+    }
+
+    /// How many notes are hidden from this context, and how many
+    /// anywhere (those still to be trashed aren't).
+    fn hidden_counts(&self) -> (usize, usize) {
+        let window = self.window();
+        let hidden: Vec<bool> = (self.state.hidden.paths().iter())
+            .filter_map(|rel| {
+                let note = &self.index.get(rel)?.note;
+                (!self.trashing(&self.index.dir().join(rel))).then(|| note.matches(window))
+            })
+            .collect();
+        (hidden.iter().filter(|&&here| here).count(), hidden.len())
+    }
+
+    /// What a drawer of `kind` can list: for the hidden notes, the one
+    /// hidden last first.
+    fn drawer_entries(&self, kind: drawer::Kind) -> Vec<DrawerEntry> {
+        let window = self.window();
+        let now = due::now();
+        match kind {
+            drawer::Kind::Hidden => (self.state.hidden.paths().iter().rev())
+                .filter_map(|rel| {
+                    let note = &self.index.get(rel)?.note;
+                    if self.trashing(&self.index.dir().join(rel)) {
+                        return None;
+                    }
+                    Some(DrawerEntry::of(
+                        rel.to_string_lossy().into_owned(),
+                        &list::name(rel),
+                        note,
+                        self.config.paper_color(note.meta.color.as_ref()),
+                        note.matches(window),
+                        note.due().is_some_and(|d| d.overdue(&Local, now)),
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// The Hidden button (or another's): open its drawer in the column
+    /// `from`, or close it if it is open. A note or drawer open anywhere
+    /// goes first: one at a time.
+    fn toggle_drawer(&mut self, core: &mut Core<Self>, from: &WlSurface, kind: drawer::Kind) {
+        let Some(i) = self.column_at(from) else {
+            return;
+        };
+        if self.columns[i].drawer_kind() == Some(kind) {
+            let acts = self.columns[i].close();
+            return self.acts(core, from, acts);
+        }
+        for j in 0..self.columns.len() {
+            if !self.save_draft(j, false) {
+                return;
+            }
+        }
+        self.close_elsewhere(core, i);
+        let entries = self.drawer_entries(kind);
+        let acts = self.columns[i].open_drawer(kind, entries);
+        self.acts(core, from, acts);
+    }
+
+    /// Close the notes and drawers open in the columns but `i`.
+    fn close_elsewhere(&mut self, core: &mut Core<Self>, i: usize) {
+        for j in 0..self.columns.len() {
+            let open = self.columns[j].open_key().is_some();
+            if j != i && (open || self.columns[j].drawer_kind().is_some()) {
+                let more = self.columns[j].close();
+                let surface = self.columns[j].surface().clone();
+                self.acts(core, &surface, more);
+            }
+        }
+    }
+
+    /// A hidden note picked from a drawer: it is shown again, and opened
+    /// where it belongs unless `open` is false (then the drawer stays, to
+    /// bring back several). Only the `hidden` file changes.
+    fn show_hidden(&mut self, core: &mut Core<Self>, from: &WlSurface, key: &str, open: bool) {
+        let Some(i) = self.column_at(from) else {
+            return;
+        };
+        if self.state.hidden.remove(Path::new(key)) {
+            self.save_state(false, true);
+        }
+        self.dirty = true;
+        if open && self.index.get(Path::new(key)).is_some() {
+            // The drawer goes as the note comes out (see `Column::open`).
+            self.open_in(core, i, key);
+            // Among the notes before its card is made, so it is kept.
+            self.show_notes();
+            self.dirty = false;
+        }
     }
 
     /// One of a column's timers fired.
@@ -1294,6 +1415,8 @@ impl WlNote {
                 }
             }
             Act::Row(Button::Undo) => self.undo_removal(core),
+            Act::Row(Button::Hidden) => self.toggle_drawer(core, from, drawer::Kind::Hidden),
+            Act::Show(key, open) => self.show_hidden(core, from, &key, open),
             Act::Row(Button::Paste) => self.paste_note(core, from),
             Act::Row(button @ (Button::Window | Button::Global)) => {
                 let new = NewNote {
@@ -1382,13 +1505,7 @@ impl WlNote {
                 .flatten()
                 .map(|source| Draft::new(key.to_owned(), Note::parse(source)))
         });
-        for j in 0..self.columns.len() {
-            if j != i && self.columns[j].open_key().is_some() {
-                let more = self.columns[j].close();
-                let surface = self.columns[j].surface().clone();
-                self.acts(core, &surface, more);
-            }
-        }
+        self.close_elsewhere(core, i);
         let Some(column) = self.columns.get_mut(i) else {
             return;
         };
@@ -1989,10 +2106,13 @@ impl WlNote {
             self.cancel_undo_timer(core);
             self.undo.take();
         }
+        let (hidden_here, hidden_all) = self.hidden_counts();
         let available = Available {
             undo: self.undo.action().is_some(),
             window: self.scratch.is_some() && self.scratch_context().is_some(),
             paste: !clipboard_mimes(core).is_empty(),
+            hidden_here,
+            hidden_all,
         };
         for column in &mut self.columns {
             column.set_row_available(available);
@@ -2574,6 +2694,137 @@ mod tests {
         assert!(!is_note(Path::new("a.md~")));
         assert!(!is_note(Path::new(".a.md.swp")));
         assert!(!is_note(Path::new(".git/a.md")));
+    }
+
+    /// A program with the notes in `dir` read, `hidden` hidden, and no
+    /// window in focus.
+    fn app_with_hidden(dir: &Path, hidden: &[&str]) -> WlNote {
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let mut app = WlNote::new(Some(config)).unwrap();
+        app.index = Index::load(dir.join("notes")).0;
+        app.state.hidden.set(hidden.iter().map(PathBuf::from));
+        app
+    }
+
+    fn focus(app: &mut WlNote, app_id: &str) {
+        app.context.set(Some(Ctx {
+            window: Window::new(app_id, "a window"),
+            id: app_id.into(),
+        }));
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("wl-note-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("notes")).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_hidden_drawer_lists_what_belongs_to_the_context() {
+        let dir = TempDir::new("drawer-entries");
+        let notes = dir.0.join("notes");
+        for (name, text) in [
+            (
+                "web.md",
+                "+++\napps = [\"firefox\"]\ntitle = \"Web\"\n+++\nlinks\n",
+            ),
+            (
+                "term.md",
+                "+++\napps = [\"foot\"]\n+++\n# Shell tips\nuse fzf\n",
+            ),
+            ("any.md", "# Groceries\nmilk\n"),
+            ("visible.md", "not hidden\n"),
+            ("old.md", "+++\ndue = 2000-01-01\n+++\nlate\n"),
+        ] {
+            std::fs::write(notes.join(name), text).unwrap();
+        }
+        // Hidden in this order: the drawer shows the last one first.
+        let mut app = app_with_hidden(
+            &dir.0,
+            &["web.md", "term.md", "any.md", "old.md", "gone.md"],
+        );
+        let keys = |app: &WlNote| -> Vec<(String, bool)> {
+            (app.drawer_entries(drawer::Kind::Hidden).into_iter())
+                .map(|e| (e.key, e.here))
+                .collect()
+        };
+        // Without a window: only the global notes belong.
+        assert_eq!(
+            keys(&app),
+            [
+                ("old.md".to_string(), true),
+                ("any.md".to_string(), true),
+                ("term.md".to_string(), false),
+                ("web.md".to_string(), false),
+            ]
+        );
+        assert_eq!(app.hidden_counts(), (2, 4));
+        // On two apps, the right ones.
+        focus(&mut app, "firefox");
+        let here: Vec<_> = (keys(&app).into_iter()).filter(|(_, h)| *h).collect();
+        assert_eq!(
+            here.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["old.md", "any.md", "web.md"]
+        );
+        assert_eq!(app.hidden_counts(), (3, 4));
+        focus(&mut app, "foot");
+        let here: Vec<_> = (keys(&app).into_iter()).filter(|(_, h)| *h).collect();
+        assert_eq!(
+            here.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["old.md", "any.md", "term.md"]
+        );
+        assert_eq!(app.hidden_counts(), (3, 4));
+        // What they say.
+        let entries = app.drawer_entries(drawer::Kind::Hidden);
+        let find = |k: &str| entries.iter().find(|e| e.key == k).unwrap();
+        assert_eq!(
+            (find("web.md").title.as_str(), find("web.md").app.as_str()),
+            ("Web", "firefox")
+        );
+        assert_eq!(
+            (
+                find("term.md").title.as_str(),
+                find("term.md").line.as_str()
+            ),
+            ("Shell tips", "use fzf")
+        );
+        assert_eq!(find("any.md").app, "global");
+        assert!(find("old.md").overdue && !find("any.md").overdue);
+        // A note being trashed is gone from the drawer and the count.
+        let trash = Trash {
+            path: notes.join("any.md"),
+            identity: Trash::identity(&notes.join("any.md")).unwrap(),
+            command: "true".into(),
+        };
+        app.undo.replace(
+            Instant::now() + Duration::from_secs(5),
+            Removal::Trash(trash),
+        );
+        assert!(keys(&app).iter().all(|(k, _)| k != "any.md"));
+        assert_eq!(app.hidden_counts(), (2, 3));
+        // Showing a note again takes it out of the list of hidden ones and
+        // leaves its file alone.
+        let before = std::fs::read(notes.join("web.md")).unwrap();
+        let mtime = notes.join("web.md").metadata().unwrap().modified().unwrap();
+        assert!(app.state.hidden.remove(Path::new("web.md")));
+        assert_eq!(std::fs::read(notes.join("web.md")).unwrap(), before);
+        assert_eq!(
+            notes.join("web.md").metadata().unwrap().modified().unwrap(),
+            mtime
+        );
+        assert!(keys(&app).iter().all(|(k, _)| k != "web.md"));
     }
 
     #[test]

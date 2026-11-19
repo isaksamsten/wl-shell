@@ -14,10 +14,17 @@ pub enum Button {
     Window,
     Global,
     Paste,
+    Hidden,
 }
 
 impl Button {
-    pub const ALL: [Self; 4] = [Self::Undo, Self::Window, Self::Global, Self::Paste];
+    pub const ALL: [Self; 5] = [
+        Self::Undo,
+        Self::Window,
+        Self::Global,
+        Self::Paste,
+        Self::Hidden,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -25,6 +32,7 @@ impl Button {
             Self::Window => "Window",
             Self::Global => "Global",
             Self::Paste => "Paste",
+            Self::Hidden => "Hidden",
         }
     }
 
@@ -34,6 +42,7 @@ impl Button {
             Self::Window => "▭",
             Self::Global => "◯",
             Self::Paste => "⎘",
+            Self::Hidden => "≡",
         }
     }
 }
@@ -43,6 +52,30 @@ pub struct Available {
     pub undo: bool,
     pub window: bool,
     pub paste: bool,
+    /// The notes hidden from this context, and those hidden anywhere.
+    pub hidden_here: usize,
+    pub hidden_all: usize,
+}
+
+/// What a button shows: its glyph, with a count where it has one (`9+`
+/// past nine, so it stays within the button).
+pub fn glyph(button: Button, state: Available) -> String {
+    if button != Button::Hidden || state.hidden_here == 0 {
+        return button.glyph().into();
+    }
+    match state.hidden_here {
+        n @ 1..=9 => format!("{}{n}", button.glyph()),
+        _ => format!("{}9+", button.glyph()),
+    }
+}
+
+/// What a button says it does on hover.
+pub fn label(button: Button, state: Available) -> String {
+    match (button, state.hidden_here, state.hidden_all) {
+        (Button::Hidden, 0, all) => format!("Hidden notes ({all} elsewhere)"),
+        (Button::Hidden, here, _) => format!("Hidden notes ({here} here)"),
+        _ => button.label().into(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,6 +93,7 @@ pub fn buttons(order: &[Button], state: Available, mode: Mode) -> Vec<Button> {
             Button::Window => state.window && mode != Mode::Closed,
             Button::Global => mode != Mode::Closed,
             Button::Paste => state.paste && mode == Mode::Rest,
+            Button::Hidden => state.hidden_all > 0 && mode == Mode::Rest,
         };
         if show && !result.contains(&button) {
             result.push(button);
@@ -169,6 +203,7 @@ mod tests {
                         undo,
                         window,
                         paste,
+                        ..Available::default()
                     };
                     assert_eq!(
                         buttons(&order, state, Mode::Closed),
@@ -196,6 +231,42 @@ mod tests {
             }
         }
         assert!(buttons(&[], Available::default(), Mode::Rest).is_empty());
+    }
+
+    #[test]
+    fn hidden_button_is_for_rest_and_when_something_is_hidden() {
+        let order = [Hidden, Paste];
+        let none = Available::default();
+        let some = Available {
+            hidden_all: 2,
+            ..none
+        };
+        for mode in [Mode::Closed, Mode::Drag, Mode::Rest] {
+            assert!(!buttons(&order, none, mode).contains(&Hidden));
+        }
+        assert!(!buttons(&order, some, Mode::Closed).contains(&Hidden));
+        assert!(!buttons(&order, some, Mode::Drag).contains(&Hidden));
+        assert_eq!(buttons(&order, some, Mode::Rest), [Hidden]);
+        // Hidden elsewhere only: still there, with no count.
+        assert_eq!(glyph(Hidden, some), "≡");
+        assert_eq!(label(Hidden, some), "Hidden notes (2 elsewhere)");
+    }
+
+    #[test]
+    fn the_hidden_count_stays_in_the_button() {
+        let with = |n| Available {
+            hidden_here: n,
+            hidden_all: n,
+            ..Available::default()
+        };
+        assert_eq!(glyph(Hidden, with(3)), "≡3");
+        assert_eq!(glyph(Hidden, with(9)), "≡9");
+        assert_eq!(glyph(Hidden, with(10)), "≡9+");
+        assert_eq!(glyph(Hidden, with(300)), "≡9+");
+        assert_eq!(label(Hidden, with(12)), "Hidden notes (12 here)");
+        // Other buttons never carry it.
+        assert_eq!(glyph(Paste, with(3)), "⎘");
+        assert_eq!(label(Paste, with(3)), "Paste");
     }
 
     #[test]

@@ -370,6 +370,9 @@ pub struct Theme {
     /// An overdue note's marker and margin.
     #[serde(deserialize_with = "de::color")]
     pub overdue: u32,
+    /// The drawers' paper: kraft, so a drawer reads as a box of notes.
+    #[serde(deserialize_with = "de::color")]
+    pub drawer: u32,
 }
 
 impl Default for Theme {
@@ -399,6 +402,7 @@ impl Default for Theme {
             shadow_offset: [2, 3],
             group_backdrop: 0x00000026,
             overdue: 0xd64541ff,
+            drawer: 0xd4b483ff,
         }
     }
 }
@@ -465,6 +469,15 @@ impl Config {
     /// The color of an overdue note's marker and margin.
     pub fn overdue_color(&self) -> u32 {
         self.theme().overdue
+    }
+
+    /// The drawers' paper, dimmed in dark mode like the notes'.
+    pub fn drawer_color(&self) -> u32 {
+        let theme = self.theme();
+        match self.appearance.scheme {
+            Scheme::Dark => dim(theme.drawer, theme.dark_dim),
+            Scheme::Light => theme.drawer,
+        }
     }
 
     /// The text on a margin in `rgba`: dark or light, whichever reads.
@@ -632,6 +645,25 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn row_buttons_and_the_drawer_paper() {
+        use crate::row::Button;
+        let defaults = parse("").unwrap();
+        assert!(defaults.row.buttons.contains(&Button::Hidden));
+        assert_eq!(defaults.theme().drawer, 0xd4b483ff);
+        let c = parse("[row]\nbuttons = ['hidden', 'undo']\n\n[appearance]\ndrawer = '#102030'")
+            .unwrap();
+        assert_eq!(c.row.buttons, [Button::Hidden, Button::Undo]);
+        assert_eq!(c.appearance.light.drawer, 0x102030ff);
+        // Dimmed in dark mode, like paper.
+        let mut c = parse("[appearance.dark]\ndrawer = '#804020'\ndark-dim = 0.5").unwrap();
+        c.apply_scheme(&mut || Scheme::Dark);
+        assert_eq!(c.drawer_color(), 0x402010ff);
+        c.apply_scheme(&mut || Scheme::Light);
+        assert_eq!(c.drawer_color(), 0xd4b483ff);
+        assert!(parse("[row]\nbuttons = ['drawers']").is_err());
     }
 
     #[test]

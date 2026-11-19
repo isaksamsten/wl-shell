@@ -10,6 +10,8 @@ mod context;
 mod create;
 mod deck;
 mod draft;
+mod drawer;
+mod drawerview;
 mod editor;
 mod files;
 mod find;

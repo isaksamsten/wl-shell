@@ -2217,6 +2217,7 @@ dependencies = [
  "calloop",
  "clap",
  "libc",
+ "nucleo-matcher",
  "pulldown-cmark",
  "serde",
  "smithay-client-toolkit",

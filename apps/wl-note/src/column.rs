@@ -34,6 +34,14 @@
 //! unless the pointer moved along the edge first. A hidden note crumples
 //! into the edge: its paper shrinks toward it and fades.
 //!
+//! An open drawer (drawer.rs) is the deck's open card under the key
+//! `drawer::KEY`, last in the column: a kraft sheet whose margin names it
+//! and whose body (the filter, the scope, the rows, drawn as one image by
+//! drawerview.rs on the main thread, drawn again only when something
+//! changed) takes the pointer and the keys. It is closed by a note opening,
+//! its margin, Escape or its button; picking a row asks the program to
+//! show the note again (`Act::Show`).
+//!
 //! The keyboard is only taken by an open note: opening asks for it
 //! (`exclusive`), and once it has it, `on-demand` lets a click elsewhere
 //! take it away while the note stays open. Closing gives it back.
@@ -88,8 +96,10 @@ use wl_shell_ui::{IRect, Rect, Sub, cache, lerp};
 use crate::app::WlNote;
 use crate::bar;
 use crate::config::{Config, Edge, NoteLayer};
-use crate::deck::{Card, Deck, Group, Item, LIFT, Metrics, On, Role};
+use crate::deck::{Card, Deck, Group, Item, LIFT, Look, Metrics, On, Role};
 use crate::draft::Draft;
+use crate::drawer::{self, Drawer};
+use crate::drawerview::{self, Lines};
 use crate::files;
 use crate::markdown::{self, Content};
 use crate::papers::{Papers, Sheet};
@@ -165,6 +175,8 @@ pub struct Style {
     pub backdrop: u32,
     /// An overdue note's due time and clock.
     pub overdue: u32,
+    /// The drawers' paper.
+    pub drawer: u32,
     /// The due presets' times of day.
     pub morning: TimeOfDay,
     pub evening: TimeOfDay,
@@ -208,6 +220,7 @@ impl Style {
             plus_glyph: (ink & !0xff) | 0xb0,
             backdrop: theme.group_backdrop,
             overdue: theme.overdue,
+            drawer: config.drawer_color(),
             morning: config.due.morning,
             evening: config.due.evening,
             palette: PRESETS.map(|name| config.paper_color(Some(&Color::Preset(name)))),
@@ -378,6 +391,8 @@ pub enum Act {
     Title(String, String),
     /// Hide this note.
     Hide(String),
+    /// Show this hidden note again, and open it (or not).
+    Show(String, bool),
     Color(String, Color),
     /// Set this note's due time (a TOML date or datetime), or with None
     /// clear it.
@@ -536,6 +551,29 @@ struct RowSlot {
     out: Spring,
 }
 
+/// What of the drawer's body is somewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawerHit {
+    Filter,
+    Scope,
+    /// The n-th row in view.
+    Row(usize),
+    /// The trash icon on the n-th row in view.
+    Trash(usize),
+}
+
+/// The open drawer.
+struct DrawerState {
+    drawer: Drawer,
+    /// The filter, being typed.
+    filter: Title,
+    /// How far the filter is scrolled sideways.
+    field_scroll: f64,
+    hover: Option<DrawerHit>,
+    /// Wheel movement not yet a row.
+    wheel: f64,
+}
+
 pub struct Column {
     pub output: WlOutput,
     pub name: String,
@@ -587,6 +625,16 @@ pub struct Column {
     title_shown: Option<TitleShown>,
     /// The title being edited.
     editing: Option<Title>,
+    /// The notes to show, without the drawer.
+    items: Vec<Item>,
+    /// The drawer, while open (a card of the deck, `drawer::KEY`), the
+    /// kind it last was (its margin shows it while it leaves), its body
+    /// as drawn, and whether that is out of date.
+    drawer: Option<DrawerState>,
+    drawer_kind: drawer::Kind,
+    drawer_shown: Option<Sized>,
+    drawer_dirty: bool,
+    drawer_lines: Lines,
     pub draft: Option<Draft>,
     layout: EditLayout,
     links: Vec<String>,
@@ -816,6 +864,12 @@ impl Column {
             text_shown: None,
             title_shown: None,
             editing: None,
+            items: Vec::new(),
+            drawer: None,
+            drawer_kind: drawer::Kind::Hidden,
+            drawer_shown: None,
+            drawer_dirty: true,
+            drawer_lines: Lines::default(),
             draft: None,
             layout: EditLayout::default(),
             links: Vec::new(),
@@ -875,7 +929,7 @@ impl Column {
 
     /// The open note, if any.
     pub fn open_key(&self) -> Option<&str> {
-        self.deck.open()
+        self.deck.open().filter(|k| *k != drawer::KEY)
     }
 
     /// Retiring, and its notes are gone (or were never shown): it can go.
@@ -892,7 +946,7 @@ impl Column {
     /// The notes shown, in order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         (self.deck.cards().iter())
-            .filter(|c| !c.leaving)
+            .filter(|c| !c.leaving && c.key != drawer::KEY)
             .map(|c| c.key.as_str())
     }
 
@@ -906,6 +960,10 @@ impl Column {
         self.deck.set_metrics(style.metrics, style.response);
         self.style = style;
         self.forget_drawn();
+        // The drawer's paper.
+        if self.drawer.is_some() {
+            self.sync_deck();
+        }
         self.kick();
     }
 
@@ -956,6 +1014,10 @@ impl Column {
         self.text.clear();
         self.notice.clear();
         self.stale
+            .extend(self.drawer_shown.take().map(|s| s.buffer));
+        self.drawer_lines.clear();
+        self.drawer_dirty = true;
+        self.stale
             .extend(self.body_shown.take().map(|b| b.image.buffer));
         self.stale
             .extend(self.notice_shown.take().map(|(_, s)| s.buffer));
@@ -1002,7 +1064,8 @@ impl Column {
                 (n.item.key.clone(), view)
             })
             .collect();
-        self.deck.set(notes.into_iter().map(|n| n.item).collect());
+        self.items = notes.into_iter().map(|n| n.item).collect();
+        self.sync_deck();
         for key in &turned {
             self.deck.pulse(key);
         }
@@ -1077,6 +1140,8 @@ impl Column {
     /// Open `key`: its sheet comes out and stays, and it asks for the
     /// keyboard. The program has already saved any previous draft.
     pub fn open(&mut self, core: &Core<WlNote>, key: &str) -> Vec<Act> {
+        // One drawer or note at a time.
+        self.drop_drawer();
         let again = self.deck.open() == Some(key);
         let acts = match again {
             true => Vec::new(),
@@ -1106,6 +1171,7 @@ impl Column {
     /// edit to save.
     pub fn close(&mut self) -> Vec<Act> {
         let acts = self.commit_title();
+        self.drop_drawer();
         self.draft = None;
         self.body_dirty = true;
         self.selecting = false;
@@ -1168,6 +1234,7 @@ impl Column {
     /// elsewhere takes it.
     pub fn keyboard_enter(&mut self) {
         self.focused = true;
+        self.drawer_dirty = true;
         self.body_dirty = true;
         self.kick();
         if self.keyboard == KeyboardInteractivity::Exclusive {
@@ -1179,6 +1246,7 @@ impl Column {
     /// stays open, a title edit is kept.
     pub fn keyboard_leave(&mut self) -> Vec<Act> {
         self.focused = false;
+        self.drawer_dirty = true;
         self.selecting = false;
         self.body_dirty = true;
         self.paste_serial = self.paste_serial.wrapping_add(1);
@@ -1243,6 +1311,10 @@ impl Column {
                 self.release(core, x, y)
             }
             PointerEventKind::Axis { vertical, .. } => {
+                if self.drawer.is_some() && self.on_at(x, y) == On::Sheet(drawer::KEY.into()) {
+                    self.drawer_wheel(axis(vertical));
+                    return Vec::new();
+                }
                 if let On::Sheet(key) = self.on_at(x, y)
                     && let Some(area) = self.grid_area(&key)
                     && area.contains(x, y)
@@ -1264,6 +1336,9 @@ impl Column {
 
     /// A key while the column has the keyboard.
     pub fn key(&mut self, event: &KeyEvent, mods: &Modifiers) -> Vec<Act> {
+        if self.drawer.is_some() {
+            return self.drawer_key(event, mods);
+        }
         let Some(key) = self.deck.open().map(String::from) else {
             return Vec::new();
         };
@@ -1435,6 +1510,11 @@ impl Column {
         if serial != self.paste_serial || self.deck.open().is_none() || text.is_empty() {
             return false;
         }
+        if let Some(st) = &mut self.drawer {
+            st.filter.insert(text);
+            self.drawer_filter_changed();
+            return false;
+        }
         if let Some(title) = &mut self.editing {
             title.insert(text);
             self.kick();
@@ -1463,7 +1543,7 @@ impl Column {
                     self.deck.hide_due();
                 }
             }
-            Timer::Trash => {}
+            Timer::Trash => self.drawer_dirty = true,
             Timer::RowRest => {
                 self.row_timer = None;
                 if self
@@ -1536,6 +1616,11 @@ impl Column {
         self.selecting = false;
         self.bar_hover = None;
         self.trash.clear();
+        if let Some(st) = &mut self.drawer
+            && st.hover.take().is_some()
+        {
+            self.drawer_dirty = true;
+        }
         self.all_files = [None, None];
         if self.press.take().is_some() {
             self.deck.drag_cancel();
@@ -1584,6 +1669,8 @@ impl Column {
             return None;
         }
         let key = match self.on_at(x, y) {
+            // Nothing is dropped on a drawer.
+            On::Sheet(key) if key == drawer::KEY => return None,
             On::Margin(key) if self.notes.get(&key).is_some_and(|n| n.scratch) => {
                 return Some(FileTarget::NewScratch);
             }
@@ -1717,6 +1804,7 @@ impl Column {
         self.update_row_hover(core);
         let mut changed = self.leave_file_views(&on);
         changed |= self.update_bar_hover(x, y);
+        changed |= self.drawer.is_some() && self.update_drawer_hover(x, y);
         let before = (
             self.deck.level(),
             self.deck.revealed().map(String::from),
@@ -1778,7 +1866,7 @@ impl Column {
             (false, false) => vec![Act::Open(p.key)],
             (false, true) => self.revealed_click(p.key, p.x, p.y).into_iter().collect(),
             (true, _) => match self.deck.drag_end() {
-                Some(l) if l.group == Group::Scratch => Vec::new(),
+                Some(l) if matches!(l.group, Group::Scratch | Group::Drawer) => Vec::new(),
                 Some(l) => {
                     // The slot is among the notes of the group it lands
                     // in, which the order is changed among.
@@ -1794,7 +1882,7 @@ impl Column {
                             acts.push(match l.group {
                                 Group::Window => Act::Pin(l.key, false),
                                 Group::Global => Act::Unpin(l.key),
-                                Group::Scratch => unreachable!(),
+                                Group::Scratch | Group::Drawer => unreachable!(),
                             });
                         }
                         acts
@@ -1825,6 +1913,9 @@ impl Column {
         }
         if on == On::Strip && self.row_hold.is_some_and(|r| r.contains(x, y)) {
             return Vec::new();
+        }
+        if self.drawer.is_some() && on == On::Sheet(drawer::KEY.into()) {
+            return self.drawer_click(core, x, y, mods);
         }
         let left_files = self.leave_file_views(&on);
         if self.update_bar_hover(x, y) || left_files {
@@ -2568,6 +2659,8 @@ impl Column {
             return;
         }
         self.icons.insert(key, image);
+        // The drawer's trash icon may be this one.
+        self.drawer_dirty = true;
         self.kick();
     }
 
@@ -2706,6 +2799,520 @@ impl Column {
         }
         if changed {
             self.kick();
+        }
+    }
+
+    // -- the drawer --------------------------------------------------------
+
+    /// What the open drawer lists, if one is open.
+    pub fn drawer_kind(&self) -> Option<drawer::Kind> {
+        self.drawer.as_ref().map(|st| st.drawer.kind())
+    }
+
+    /// The notes to show, and the drawer if it is open, as the deck's
+    /// cards: the drawer is the last one, a sheet of its own.
+    fn sync_deck(&mut self) {
+        let mut items = self.items.clone();
+        if self.drawer.is_some() {
+            items.push(Item {
+                key: drawer::KEY.into(),
+                look: Look {
+                    color: self.style.drawer,
+                    tilt: 0.0,
+                    accent: None,
+                },
+                group: Group::Drawer,
+                cross: false,
+            });
+        }
+        self.deck.set(items);
+    }
+
+    /// Open a drawer of `entries`: its sheet comes out and stays, and it
+    /// asks for the keyboard. The program has already saved any draft.
+    pub fn open_drawer(&mut self, kind: drawer::Kind, entries: Vec<drawer::Entry>) -> Vec<Act> {
+        // A note or another drawer goes.
+        let acts = self.close();
+        self.drawer_kind = kind;
+        self.drawer = Some(DrawerState {
+            drawer: Drawer::new(kind, entries),
+            filter: Title::new(""),
+            field_scroll: 0.0,
+            hover: None,
+            wheel: 0.0,
+        });
+        self.deck.open_note(drawer::KEY);
+        self.sync_deck();
+        self.drawer_dirty = true;
+        self.set_keyboard(KeyboardInteractivity::Exclusive);
+        self.kick();
+        acts
+    }
+
+    /// The drawer `kind`, if open, lists `entries` now.
+    pub fn set_drawer_entries(&mut self, kind: drawer::Kind, entries: Vec<drawer::Entry>) {
+        if let Some(st) = self.drawer.as_mut().filter(|st| st.drawer.kind() == kind) {
+            st.drawer.set_entries(entries);
+            self.drawer_changed();
+        }
+    }
+
+    /// Close the drawer, if open, without giving the keyboard back (the
+    /// caller does, or asks for it again): its card leaves.
+    fn drop_drawer(&mut self) {
+        if self.drawer.take().is_none() {
+            return;
+        }
+        self.stale
+            .extend(self.drawer_shown.take().map(|s| s.buffer));
+        self.trash.clear();
+        if self.deck.open() == Some(drawer::KEY) {
+            self.deck.close();
+        }
+        self.sync_deck();
+    }
+
+    /// The drawer's margin: its name, turned.
+    fn drawer_margin(&self, role: Role) -> paper::Margin {
+        let m = &self.style.metrics;
+        let room = match role {
+            Role::Sheet => m.sheet_height,
+            _ => m.header_length * 0.7,
+        };
+        let ink = self.drawer_ink();
+        paper::Margin {
+            width: m.header as i32,
+            ink,
+            crease: true,
+            label: Some(paper::Label {
+                text: self.drawer_kind.label().to_uppercase(),
+                style: self.style.small((ink & !0xff) | 0xc8),
+                spacing: LABEL_SPACING,
+                top: LABEL_PAD as i32,
+                len: (room - 2.0 * LABEL_PAD).max(8.0) as i32,
+            }),
+        }
+    }
+
+    /// The text's color on the drawer's paper.
+    fn drawer_ink(&self) -> u32 {
+        Config::ink_on(self.style.drawer)
+    }
+
+    /// Something about the drawer changed: draw it again.
+    fn drawer_changed(&mut self) {
+        self.drawer_dirty = true;
+        self.kick();
+    }
+
+    /// Where the drawer's body is on an open sheet.
+    fn drawer_area(&self, face: Rect) -> Rect {
+        let body = self.body_rect(face);
+        Rect::new(
+            body.x + PAD_X,
+            face.y + PAD_Y,
+            self.style.content_w(),
+            (face.h - 2.0 * PAD_Y).max(0.0),
+        )
+    }
+
+    /// The drawer's body and what is where on it (from its corner), and
+    /// how many rows that has room for.
+    fn drawer_geometry(&mut self) -> Option<(Rect, drawer::Layout)> {
+        self.drawer.as_ref()?;
+        let face = self.face(drawer::KEY)?;
+        let area = self.drawer_area(face);
+        let size = self.style.font_size;
+        let (row, foot) = (drawerview::row_height(size), drawerview::foot_height(size));
+        let st = self.drawer.as_mut()?;
+        let layout = drawer::layout(area.w, area.h, row, foot, st.drawer.len());
+        if st.drawer.set_capacity(layout.capacity()) {
+            self.drawer_dirty = true;
+        }
+        Some((area, layout))
+    }
+
+    /// What of the drawer is at (`x`, `y`).
+    fn drawer_hit(&mut self, x: f64, y: f64) -> Option<DrawerHit> {
+        let (area, layout) = self.drawer_geometry()?;
+        let (x, y) = (x - area.x, y - area.y);
+        if !Rect::new(0.0, 0.0, area.w, area.h).contains(x, y) {
+            return None;
+        }
+        if layout.scope.contains(x, y) {
+            return Some(DrawerHit::Scope);
+        }
+        if layout.filter.contains(x, y) {
+            return Some(DrawerHit::Filter);
+        }
+        let shown = self.drawer.as_ref()?.drawer.window().len();
+        for (n, row) in layout.rows.iter().enumerate().take(shown) {
+            if row.contains(x, y) {
+                return Some(
+                    match drawer::trash_rect(*row, drawerview::ICON).contains(x, y) {
+                        true => DrawerHit::Trash(n),
+                        false => DrawerHit::Row(n),
+                    },
+                );
+            }
+        }
+        None
+    }
+
+    /// The pointer moved over the drawer (or it moved under it). Returns
+    /// whether what is hovered changed.
+    fn update_drawer_hover(&mut self, x: f64, y: f64) -> bool {
+        let hit = self.drawer_hit(x, y);
+        let Some(st) = &mut self.drawer else {
+            return false;
+        };
+        if st.hover == hit {
+            return false;
+        }
+        st.hover = hit;
+        // An armed trash button is for the row it was armed on.
+        self.trash.clear();
+        self.drawer_dirty = true;
+        true
+    }
+
+    /// A click at (`x`, `y`) on the drawer's sheet.
+    fn drawer_click(&mut self, core: &Core<WlNote>, x: f64, y: f64, mods: &Modifiers) -> Vec<Act> {
+        let Some(face) = self.face(drawer::KEY) else {
+            return Vec::new();
+        };
+        if self.margin_rect(face).contains(x, y) {
+            return vec![Act::Close];
+        }
+        let Some(hit) = self.drawer_hit(x, y) else {
+            return Vec::new();
+        };
+        let row_key = |st: &DrawerState, n: usize| st.drawer.row(n).map(|e| e.key.clone());
+        match hit {
+            DrawerHit::Scope => {
+                if let Some(st) = &mut self.drawer {
+                    st.drawer.toggle_scope();
+                }
+                self.drawer_changed();
+                Vec::new()
+            }
+            DrawerHit::Filter => {
+                self.drawer_place_caret(x);
+                Vec::new()
+            }
+            DrawerHit::Row(n) => {
+                let key = self.drawer.as_mut().and_then(|st| {
+                    st.drawer.select(n);
+                    row_key(st, n)
+                });
+                self.drawer_changed();
+                // Ctrl: show it again and leave the drawer, to bring back
+                // several.
+                key.map(|k| Act::Show(k, !mods.ctrl)).into_iter().collect()
+            }
+            DrawerHit::Trash(n) => {
+                let Some(key) = self.drawer.as_ref().and_then(|st| row_key(st, n)) else {
+                    return Vec::new();
+                };
+                let confirmed = self.trash.click(Instant::now());
+                if !confirmed {
+                    let surface = self.surface().clone();
+                    if let Err(e) = core.timer(bar::TRASH_TIMEOUT, move |app: &mut WlNote, core| {
+                        app.column_timer(core, &surface, Timer::Trash);
+                    }) {
+                        warn!("trash confirmation: {e}");
+                    }
+                }
+                self.drawer_changed();
+                confirmed.then_some(Act::Trash(key)).into_iter().collect()
+            }
+        }
+    }
+
+    /// The wheel moved `d` over the drawer: whole rows scroll.
+    fn drawer_wheel(&mut self, d: f64) {
+        let row = drawerview::row_height(self.style.font_size);
+        let Some(st) = &mut self.drawer else {
+            return;
+        };
+        st.wheel += d;
+        let rows = (st.wheel / row).trunc();
+        if rows != 0.0 {
+            st.wheel -= rows * row;
+            st.drawer.scroll(rows as isize);
+            self.drawer_changed();
+        }
+    }
+
+    /// The filter's text changed: list what matches it.
+    fn drawer_filter_changed(&mut self) {
+        if let Some(st) = &mut self.drawer {
+            let text = st.filter.text.clone();
+            st.drawer.set_filter(&text);
+        }
+        self.drawer_changed();
+    }
+
+    /// A key while the drawer is open: typing filters, the arrows move,
+    /// Enter picks (Ctrl: and the drawer stays), Tab switches the scope,
+    /// Escape closes.
+    fn drawer_key(&mut self, event: &KeyEvent, mods: &Modifiers) -> Vec<Act> {
+        self.paste_serial = self.paste_serial.wrapping_add(1);
+        let serial = self.paste_serial;
+        let sym = event.keysym;
+        let Some(st) = &mut self.drawer else {
+            return Vec::new();
+        };
+        let (ctrl, shift) = (mods.ctrl, mods.shift);
+        let anchor = st.filter.anchor();
+        let mut acts = Vec::new();
+        let mut edited = false;
+        let mut moved = true;
+        match sym {
+            Keysym::Escape => return vec![Act::Close],
+            Keysym::Return | Keysym::KP_Enter => {
+                return (st.drawer.selected())
+                    .map(|e| Act::Show(e.key.clone(), !ctrl))
+                    .into_iter()
+                    .collect();
+            }
+            Keysym::v | Keysym::V if ctrl => return vec![Act::Paste(serial)],
+            Keysym::c | Keysym::C | Keysym::x | Keysym::X if ctrl => {
+                let cut = matches!(sym, Keysym::x | Keysym::X);
+                let text = match cut {
+                    true => st.filter.cut(),
+                    false => st.filter.selected().map(str::to_owned),
+                };
+                edited = cut && text.is_some();
+                acts.extend(text.map(Act::Copy));
+            }
+            Keysym::a | Keysym::A if ctrl => st.filter.select_all(),
+            Keysym::u | Keysym::U if ctrl => {
+                st.filter.select_all();
+                edited = st.filter.cut().is_some();
+            }
+            Keysym::n | Keysym::N if ctrl => st.drawer.step(1),
+            Keysym::p | Keysym::P if ctrl => st.drawer.step(-1),
+            Keysym::Down | Keysym::KP_Down => st.drawer.step(1),
+            Keysym::Up | Keysym::KP_Up => st.drawer.step(-1),
+            Keysym::Page_Down => st.drawer.step(st.drawer.page()),
+            Keysym::Page_Up => st.drawer.step(-st.drawer.page()),
+            Keysym::Home | Keysym::KP_Home if ctrl => st.drawer.jump(false),
+            Keysym::End | Keysym::KP_End if ctrl => st.drawer.jump(true),
+            Keysym::Tab | Keysym::ISO_Left_Tab => st.drawer.toggle_scope(),
+            Keysym::BackSpace => {
+                st.filter.backspace(ctrl);
+                edited = true;
+            }
+            Keysym::Delete | Keysym::KP_Delete => {
+                st.filter.delete(ctrl);
+                edited = true;
+            }
+            Keysym::Left | Keysym::KP_Left => st.filter.left(ctrl),
+            Keysym::Right | Keysym::KP_Right => st.filter.right(ctrl),
+            Keysym::Home | Keysym::KP_Home => st.filter.home(),
+            Keysym::End | Keysym::KP_End => st.filter.end(),
+            _ if !ctrl && !mods.alt => match &event.utf8 {
+                Some(s) => {
+                    st.filter.insert(s);
+                    edited = true;
+                }
+                None => moved = false,
+            },
+            _ => moved = false,
+        }
+        if shift
+            && matches!(
+                sym,
+                Keysym::Left
+                    | Keysym::KP_Left
+                    | Keysym::Right
+                    | Keysym::KP_Right
+                    | Keysym::Home
+                    | Keysym::KP_Home
+                    | Keysym::End
+                    | Keysym::KP_End
+            )
+            && !ctrl
+        {
+            st.filter.extend_from(anchor);
+        }
+        match (edited, moved) {
+            (true, _) => self.drawer_filter_changed(),
+            (false, true) => self.drawer_changed(),
+            (false, false) => {}
+        }
+        acts
+    }
+
+    /// The filter as a field to draw.
+    fn drawer_filter_field(&self) -> Option<Field> {
+        let st = self.drawer.as_ref()?;
+        let width = drawer::field_width(self.style.content_w());
+        Some(Field {
+            text: st.filter.text.clone(),
+            caret: self.focused.then_some(st.filter.caret),
+            selection: st
+                .filter
+                .selection()
+                .map(|r| (r, (self.style.link & !0xff) | 0x48)),
+            style: text::Style {
+                font: UI_FONT.into(),
+                size: drawerview::title_size(self.style.font_size),
+                color: self.drawer_ink(),
+                background: 0,
+            },
+            bold: false,
+            width: width.round() as i32,
+            scroll: st.field_scroll,
+            scale: self.scale,
+        })
+    }
+
+    /// A click at `x` on the filter: the caret goes there.
+    fn drawer_place_caret(&mut self, x: f64) {
+        let Some((area, layout)) = self.drawer_geometry() else {
+            return;
+        };
+        let Some(field) = self.drawer_filter_field() else {
+            return;
+        };
+        let from = area.x + layout.filter.x + drawer::INSET;
+        let at = {
+            let mut fonts = self.fonts.borrow_mut();
+            let Some(fonts) = fonts.as_mut() else {
+                return;
+            };
+            fonts.field_index(&field, x - from)
+        };
+        if let Some(st) = &mut self.drawer {
+            st.filter.set_caret(at);
+        }
+        self.drawer_changed();
+    }
+
+    /// Draw the drawer's body if anything about it changed (and the fonts
+    /// are there).
+    fn draw_drawer(&mut self) {
+        let Some((area, layout)) = self.drawer_geometry() else {
+            return;
+        };
+        if !self.drawer_dirty && self.drawer_shown.is_some() {
+            return;
+        }
+        let Some(field) = self.drawer_filter_field() else {
+            return;
+        };
+        let Some(st) = &self.drawer else {
+            return;
+        };
+        let ink = self.drawer_ink();
+        let armed = self.trash.armed(Instant::now());
+        let hover = st.hover;
+        let d = &st.drawer;
+        let rows: Vec<drawerview::Row> = (0..d.window().len())
+            .filter_map(|n| {
+                let e = d.row(n)?;
+                let sub = match e.line.is_empty() {
+                    true => e.app.clone(),
+                    false => format!("{} · {}", e.app, e.line),
+                };
+                Some(drawerview::Row {
+                    title: e.title.clone(),
+                    sub,
+                    color: e.color,
+                    overdue: e.overdue,
+                    selected: d.is_selected(n),
+                    hovered: matches!(
+                        hover,
+                        Some(DrawerHit::Row(i) | DrawerHit::Trash(i)) if i == n
+                    ),
+                })
+            })
+            .collect();
+        let trash = match hover {
+            Some(DrawerHit::Row(n) | DrawerHit::Trash(n)) if n < rows.len() => {
+                let lit = matches!(hover, Some(DrawerHit::Trash(_)));
+                let tint = match (lit, armed) {
+                    (true, true) => TRASH_RED,
+                    (true, false) => ink,
+                    _ => (ink & !0xff) | 0xa0,
+                };
+                (self.icons.get(&self.trash_icon()))
+                    .and_then(|i| i.as_ref())
+                    .map(|image| (n, tinted(image, tint)))
+            }
+            _ => None,
+        };
+        let empty = d.is_empty().then(|| {
+            match (d.filter().trim().is_empty(), d.elsewhere()) {
+                (true, elsewhere) => d.kind().empty(elsewhere),
+                (false, false) => "No matches",
+                (false, true) => "No matches here (Tab: all)",
+            }
+            .to_owned()
+        });
+        let view = drawerview::View {
+            scale: self.scale,
+            w: area.w,
+            h: area.h,
+            layout: &layout,
+            font: UI_FONT,
+            size: self.style.font_size,
+            ink,
+            overdue: self.style.overdue,
+            filter: field,
+            placeholder: "Filter",
+            scope: d.scope().label().to_owned(),
+            scope_lit: hover == Some(DrawerHit::Scope),
+            rows,
+            trash,
+            empty,
+            above: d.above(),
+            more: d.below(),
+        };
+        let (image, scroll) = {
+            let mut fonts = self.fonts.borrow_mut();
+            let Some(fonts) = fonts.as_mut() else {
+                return;
+            };
+            drawerview::compose(fonts, &mut self.drawer_lines, &view)
+        };
+        let buffer = match shm_buffer(&self.g, &image, &self.qh) {
+            Ok(buffer) => buffer,
+            Err(e) => return warn!("drawer buffer: {e}"),
+        };
+        let s = self.scale as f64;
+        let sized = Sized {
+            buffer,
+            w: image.width as f64 / s,
+            h: image.height as f64 / s,
+        };
+        self.stale
+            .extend(self.drawer_shown.replace(sized).map(|s| s.buffer));
+        if let Some(st) = &mut self.drawer {
+            st.field_scroll = scroll;
+        }
+        self.drawer_dirty = false;
+    }
+
+    /// The drawer's body, on its sheet.
+    fn place_drawer(&mut self, face: Option<Rect>, alpha: f64, surface: Rect) {
+        self.notice.clear();
+        self.title.clear();
+        self.show_bar(true, None);
+        let Some(face) = face else {
+            self.text.clear();
+            return;
+        };
+        self.draw_drawer();
+        let area = self.drawer_area(face);
+        if let Some(image) = &self.drawer_shown {
+            let s = self.scale as f64;
+            self.text_shown = place_image(&mut self.text, image, area, surface, s, alpha);
+        }
+        if self.text_shown.is_none() {
+            self.text.clear();
         }
     }
 
@@ -3050,6 +3657,9 @@ impl Column {
     /// title may take the whole margin, so as the sheet comes down from
     /// its header the title comes down with it.
     fn margin(&self, key: &str, role: Role) -> Option<paper::Margin> {
+        if key == drawer::KEY {
+            return Some(self.drawer_margin(role));
+        }
         let note = self.notes.get(key)?;
         let m = &self.style.metrics;
         let room = match role {
@@ -3110,7 +3720,10 @@ impl Column {
                 let note = self.notes.get(&card.key);
                 let open = self.deck.open() == Some(card.key.as_str());
                 let files = note.is_some_and(|n| !n.files.is_empty() || n.due.is_some());
-                let bar = if open || files {
+                let drawer = card.key == drawer::KEY;
+                let bar = if drawer {
+                    0.0
+                } else if open || files {
                     self.style.file_bar
                 } else {
                     0.0
@@ -3284,6 +3897,9 @@ impl Column {
                 self.kick();
             }
             self.update_bar_hover(x, y);
+            if self.drawer.is_some() {
+                self.update_drawer_hover(x, y);
+            }
         }
         self.place_open();
         let revealed = self.deck.revealed().map(String::from);
@@ -3593,7 +4209,7 @@ impl Column {
                     );
                 }
                 if let Some(image) = self.line(LineKey {
-                    text: button.glyph().into(),
+                    text: row::glyph(button, available),
                     color: self.style.plus_glyph,
                     width: m.plus as i32,
                     strike: false,
@@ -3631,9 +4247,9 @@ impl Column {
         }
         let placed = label.and_then(|(button, rect)| {
             let image = self.line(LineKey {
-                text: button.label().into(),
+                text: row::label(button, available),
                 color: self.style.plus_glyph,
-                width: 100,
+                width: 170,
                 strike: false,
             })?;
             let x = (rect.x + (rect.w - image.w) / 2.0).clamp(0.0, (width - image.w).max(0.0));
@@ -3674,6 +4290,9 @@ impl Column {
             .and_then(|k| self.face(k))
             .filter(|_| alpha > 0.0);
         self.text_shown = None;
+        if key.as_deref() == Some(drawer::KEY) {
+            return self.place_drawer(face, alpha, surface);
+        }
         if let Some(f) = face {
             self.place_notice(f, surface, alpha);
             if key.as_deref().is_some_and(|k| !self.showing_files(k)) {

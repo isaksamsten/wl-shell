@@ -49,7 +49,7 @@ evening = "18:00"                  # Tonight's time
 everywhere = false                 # Also show overdue notes in the global group, everywhere
 
 [row]
-buttons = ["undo", "window", "global", "paste"] # Nearest + first; omit unwanted buttons
+buttons = ["undo", "window", "global", "paste", "hidden"] # Nearest + first; omit unwanted buttons
 undo-time = 5000                   # Milliseconds; 0 disables undo
 # Paste without keyboard focus needs compositor support for ext-data-control.
 
@@ -84,6 +84,7 @@ shadow-softness = 8
 shadow-offset = [2, 3]             # [away from the edge, down]
 group-backdrop = "#00000026"       # Behind each group of markers; alpha 0 hides
 overdue = "#d64541"                # Marker and margin of an overdue note
+drawer = "#d4b483"                 # Paper of the Hidden drawer
 
 # Override appearance keys for a particular color scheme:
 # [appearance.dark]

@@ -92,7 +92,7 @@ pub fn text(notes: &[Listed], now: i64) -> String {
 }
 
 /// Where a note shows, in words.
-fn shows(note: &Note) -> String {
+pub fn shows(note: &Note) -> String {
     if note.global() {
         return "everywhere".into();
     }

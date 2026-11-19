@@ -24,6 +24,11 @@
 //! extent, fading in with its first note and out with its last, and out
 //! at header level.
 //!
+//! A drawer (drawer.rs), while open, is one more card: a group of its own
+//! (`Group::Drawer`), last, as an open sheet that can't be dragged and has
+//! no backdrop. It is open in the deck's sense (`open_note`), so one
+//! drawer or note is open at a time.
+//!
 //! A sheet (revealed or open) takes its whole height in the column
 //! (`places`): it comes down from its header's top, so its title stays
 //! where it was, and the notes after it and the `+` button move down to
@@ -102,16 +107,20 @@ pub enum Group {
     Window,
     /// Scratch notes for this particular toplevel.
     Scratch,
+    /// The drawer, while it is open: a sheet of its own, last, just
+    /// before the `+` button.
+    Drawer,
 }
 
 impl Group {
-    pub const ALL: [Self; 3] = [Self::Global, Self::Window, Self::Scratch];
+    pub const ALL: [Self; 4] = [Self::Global, Self::Window, Self::Scratch, Self::Drawer];
 
     fn destinations(self) -> &'static [Self] {
         match self {
             Self::Global => &[Self::Window],
             Self::Window => &[Self::Global],
             Self::Scratch => &[Self::Global, Self::Window],
+            Self::Drawer => &[],
         }
     }
 }
@@ -706,7 +715,8 @@ impl Deck {
     /// at marker level; one coming out of sight starts at its extent.
     fn retarget_backdrops(&mut self) {
         let level = self.level == Level::Marker || self.metrics.backdrop_headers;
-        for g in Group::ALL {
+        // The drawer is a sheet, which has no backdrop.
+        for g in Group::ALL.into_iter().filter(|g| *g != Group::Drawer) {
             let extent = (self.cards.iter())
                 .filter(|c| !c.leaving && self.group_of(c) == g)
                 .map(|c| {
@@ -857,6 +867,9 @@ impl Deck {
         let Some(from) = self.cards.iter().find(|c| c.key == key).map(|c| c.group) else {
             return false;
         };
+        if from == Group::Drawer {
+            return false;
+        }
         if from == Group::Scratch && !self.cards.iter().any(|c| c.key == key && c.cross) {
             return false;
         }
@@ -1613,6 +1626,94 @@ mod tests {
         assert_eq!(span(&d, "b"), before[1]);
     }
 
+    /// The drawer's item.
+    fn drawer() -> Item {
+        Item {
+            group: Group::Drawer,
+            ..item("\0drawer")
+        }
+    }
+
+    /// `keys` and the open drawer, coming out.
+    fn with_drawer(d: &mut Deck, keys: &[&str]) {
+        let mut all = items(keys);
+        all.push(drawer());
+        d.open_note("\0drawer");
+        d.set(all);
+        settle(d);
+    }
+
+    #[test]
+    fn the_drawer_is_a_sheet_after_the_notes() {
+        let mut d = deck(&["a", "b", "c"]);
+        d.point(On::Strip);
+        settle(&mut d);
+        with_drawer(&mut d, &["a", "b", "c"]);
+        assert_eq!(d.open(), Some("\0drawer"));
+        assert_eq!(*keys(&d).last().unwrap(), "\0drawer");
+        let c = card(&d, "\0drawer");
+        assert_eq!(c.group, Group::Drawer);
+        assert_eq!((c.out.value, c.len.value), (M.sheet_width, M.sheet_height));
+        // After the last note (a sheet comes down from the header it
+        // would be, over the end of the one before), and above the `+`
+        // button's corner.
+        assert!(span(&d, "c").0 < span(&d, "\0drawer").0);
+        assert!(span(&d, "c").1 < span(&d, "\0drawer").1);
+        assert!(span(&d, "\0drawer").1 <= d.plus_center() - M.plus / 2.0 + 1e-9);
+        // It takes the pointer as a sheet.
+        assert!(d.held("\0drawer"));
+        // A sheet has no backdrop, and the notes keep theirs.
+        assert_eq!(d.backdrops()[Group::Drawer as usize].alpha.target, 0.0);
+        // Closed, with the notes shown without it, it leaves.
+        d.close();
+        d.set(items(&["a", "b", "c"]));
+        settle(&mut d);
+        assert_eq!(keys(&d), ["a", "b", "c"]);
+        assert_eq!(d.open(), None);
+    }
+
+    #[test]
+    fn the_drawer_is_never_dragged_and_never_reorders() {
+        let mut d = deck(&["a", "b"]);
+        d.point(On::Strip);
+        settle(&mut d);
+        // Another sheet is open, so the drawer is a marker or a header.
+        let mut all = items(&["a", "b"]);
+        all.push(drawer());
+        d.set(all);
+        settle(&mut d);
+        let y = card(&d, "\0drawer").y.value;
+        assert!(!d.drag_start("\0drawer", y));
+        assert!(d.drag_start("a", card(&d, "a").y.value));
+        d.drag_to(y + 400.0);
+        // The note stays among the notes: the drawer's group is nobody's
+        // destination.
+        let l = d.drag_end().unwrap();
+        assert_eq!((l.group, l.moved), (Group::Global, false));
+        assert!(l.gap < 2);
+    }
+
+    #[test]
+    fn the_drawer_comes_with_scratch_and_window_notes() {
+        let mut d = Deck::new(M, 150.0);
+        d.resize(1000.0);
+        let mut all = vec![item("g"), win("w")];
+        d.set(all.clone());
+        settle(&mut d);
+        d.point(On::Strip);
+        settle(&mut d);
+        let before = span(&d, "w");
+        all.push(drawer());
+        d.open_note("\0drawer");
+        d.set(all);
+        settle(&mut d);
+        // Groups in order, the drawer last.
+        assert_eq!(keys(&d), ["g", "w", "\0drawer"]);
+        assert!(span(&d, "\0drawer").0 > span(&d, "w").0);
+        // The notes above the drawer don't have to move for it.
+        assert!(span(&d, "w").0 <= before.0 + 1e-9);
+    }
+
     #[test]
     fn browsing_down_lands_on_the_next_sheet() {
         let mut d = deck(&["a", "b", "c", "d"]);
@@ -2032,7 +2133,7 @@ mod tests {
     #[test]
     fn backdrops_follow_their_groups() {
         let mut d = grouped_deck(false);
-        let [g, w, scratch] = *d.backdrops();
+        let [g, w, scratch, _] = *d.backdrops();
         assert_eq!(scratch.alpha.value, 0.0);
         assert_eq!(
             (g.top.value, g.bottom.value, g.alpha.value),
