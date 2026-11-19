@@ -51,6 +51,13 @@ pub enum Cmd {
     },
     /// Print the pins, in dock order
     Pins,
+    /// List the outputs, what to call them in the config, and what the
+    /// config makes of each
+    Outputs {
+        /// Config file (default: $XDG_CONFIG_HOME/wl-dock/config.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 impl Options {
@@ -133,6 +140,13 @@ mod tests {
             })
         );
         assert_eq!(cmd(&["pins"]), Some(Cmd::Pins));
+        assert_eq!(cmd(&["outputs"]), Some(Cmd::Outputs { config: None }));
+        assert_eq!(
+            cmd(&["outputs", "--config", "c.toml"]),
+            Some(Cmd::Outputs {
+                config: Some("c.toml".into())
+            })
+        );
         assert!(parse(&["pin"]).is_err());
         assert!(parse(&["pins", "x"]).is_err());
     }

@@ -272,7 +272,7 @@ impl Overlay for Bare {
 }
 
 /// One `[outputs.<pattern>]` table.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Table<T> {
     pub enabled: Option<bool>,
     /// The program's own keys.
@@ -369,7 +369,7 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for WithoutEnabled<'_, A> {
 }
 
 /// `[outputs.<pattern>]`, in the order of the file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tables<T>(Vec<(Pattern, Table<T>)>);
 
 impl<T> Default for Tables<T> {

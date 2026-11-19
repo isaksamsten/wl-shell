@@ -548,8 +548,11 @@ pub struct DockView {
     transparent: WlBuffer,
 
     pub output: WlOutput,
-    /// The output's name.
+    /// The output's key (see `wl_shell_core::output::Output::key`).
     pub name: String,
+    /// The output's connector name, which `output-event-stream` refers to;
+    /// None if the compositor says none.
+    pub connector: Option<String>,
     style: Style,
     cache: Rc<RefCell<Cache>>,
     assets: Rc<Assets>,
@@ -646,11 +649,14 @@ pub struct DockView {
 }
 
 impl DockView {
-    /// An empty dock on `output` (named `name`) at `scale`.
+    /// An empty dock on `output` (keyed `name`, with the connector
+    /// `connector`) at `scale`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         core: &Core<WlDock>,
         output: WlOutput,
         name: String,
+        connector: Option<String>,
         scale: i32,
         style: Style,
         cache: Rc<RefCell<Cache>>,
@@ -709,6 +715,7 @@ impl DockView {
             transparent,
             output,
             name,
+            connector,
             style,
             cache,
             assets,

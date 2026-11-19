@@ -21,6 +21,7 @@ mod layout;
 mod menu;
 mod menuview;
 mod options;
+mod outputs;
 mod pins;
 mod row;
 mod search;
@@ -68,12 +69,16 @@ fn main() -> ExitCode {
 }
 
 /// `pin`, `unpin` and `pins` only edit the pins file; a running dock
-/// notices the change by itself.
+/// notices the change by itself. `outputs` lists the outputs.
 fn pins_command(cmd: &Cmd) -> ExitCode {
     let result = match cmd {
         Cmd::Pin { item } => pins::cli::add(item),
         Cmd::Unpin { item } => pins::cli::remove(item),
         Cmd::Pins => pins::cli::list().map(|list| {
+            print!("{list}");
+            None
+        }),
+        Cmd::Outputs { config } => outputs::run(config.as_deref()).map(|list| {
             print!("{list}");
             None
         }),

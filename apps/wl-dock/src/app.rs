@@ -2700,23 +2700,38 @@ impl WlDock {
             return; // not started yet
         };
         let reload = std::mem::take(&mut self.reload);
-        let wanted: Vec<(WlOutput, String, i32, Style)> = (core.output_state.outputs())
-            .filter_map(|output| {
-                let info = core.output_state.info(&output)?;
-                let name = info.name?;
-                let layout = self.config.dock(&name)?;
+        let outputs = core.outputs();
+        let idents: Vec<wl_shell_config::output::Ident> = outputs
+            .iter()
+            .map(|o| crate::config::ident(&o.ident))
+            .collect();
+        // While `output` names one that isn't connected, the first output
+        // stands in.
+        let fallback = self.config.output.unmatched(&idents).then_some(0);
+        let wanted: Vec<(WlOutput, String, Option<String>, i32, Style)> = outputs
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, output)| {
+                let layout = self.config.dock(&idents[i], fallback == Some(i))?;
                 let style = Style::new(&self.config, layout);
-                Some((output, name, info.scale_factor.max(1), style))
+                Some((
+                    output.wl,
+                    output.key,
+                    output.ident.name,
+                    output.scale,
+                    style,
+                ))
             })
             .collect();
         self.docks.retain(|dock| {
-            (wanted.iter()).any(|(o, name, _, style)| {
+            (wanted.iter()).any(|(o, name, _, _, style)| {
                 *o == dock.output && *name == dock.name && !dock.style().needs_new_surface(style)
             })
         });
-        for (output, name, scale, style) in wanted {
+        for (output, name, connector, scale, style) in wanted {
             match self.docks.iter_mut().find(|d| d.output == output) {
                 Some(dock) => {
+                    dock.connector = connector;
                     dock.set_output_size(Self::output_size(core, &output));
                     dock.set_style(style, reload);
                     dock.set_scale(scale);
@@ -2725,6 +2740,7 @@ impl WlDock {
                     core,
                     output,
                     name,
+                    connector,
                     scale,
                     style,
                     self.cache.clone(),
@@ -2792,9 +2808,14 @@ impl WlDock {
             .collect();
         let trash = self.config.trash.enabled.then_some(self.trash_full);
         for dock in &mut self.docks {
-            let by_output = streaming && dock.style().layout.windows == Windows::Output;
+            // The stream names connectors: an output without one can't be
+            // told apart in it, so its dock shows every window.
+            let by_output = streaming
+                && dock.connector.is_some()
+                && dock.style().layout.windows == Windows::Output;
+            let connector = dock.connector.as_deref().unwrap_or("");
             let mut items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
-                self.placement.place(id, &dock.name, by_output)
+                self.placement.place(id, connector, by_output)
             });
             dock::add_tail(&mut items, &folders, trash);
             dock.set_items(core, &items);

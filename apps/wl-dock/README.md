@@ -128,7 +128,7 @@ settings live in the tables below; the old flat spellings are not supported.
 ### Dock, autohide, windows and launcher
 
 ```toml
-outputs = "all"                 # Or ["DP-1", "eDP-1"]
+output = "all"                  # all, or an output pattern (see Outputs)
 position = "bottom"             # bottom, left, right
 layer = "top"                   # top, overlay
 icon-size = 48                  # 16–256
@@ -236,13 +236,26 @@ move-command = "mv -n -- {paths} {dest}"
 dropped onto the Trash or a folder. `{paths}` is the source list; `{dest}` is
 the destination folder. Install `gio` for the default Trash commands.
 
-### Per-output settings
+### Outputs
 
-An output table inherits global settings. These are **all** the keys it can
-override; `enabled` can also include or exclude an output regardless of `outputs`.
+`output = "all"` puts a dock on every enabled output. `output = "<pattern>"`
+puts it only on the output the pattern matches (on the first output while that
+one isn't connected). A pattern is, in order of preference:
+
+1. a connector name, exactly: `eDP-1`
+2. a monitor's description or `<make> <model>`, exactly: `"Dell Inc. DELL U2720Q"`
+3. a glob (`*`, `?`, `[…]`) over those: `"Dell Inc. DELL U2720Q*"`, `"*"` for all
+
+Run `wl-dock outputs` to list your outputs, what to write for each, and what
+the config makes of them. The same patterns and tables work in every wl-shell
+app that lives on outputs; see [PLAN-outputs.md](../../PLAN-outputs.md).
+
+An `[outputs.<pattern>]` table applies to every output it matches, least
+specific first, key by key, so `"*"` holds defaults. Outputs are enabled unless
+a table says `enabled = false`. These are **all** the keys a table can set:
 
 ```toml
-[output."eDP-1"]
+[outputs."eDP-1"]
 enabled = true
 position = "bottom"
 icon-size = 48
@@ -250,13 +263,24 @@ magnification = 1.8
 reserve = true
 margin = 6
 
-[output."eDP-1".autohide]
+[outputs."eDP-1".autohide]
 enabled = false
 
-[output."eDP-1".windows]
+[outputs."eDP-1".windows]
 scope = "all"
 max-columns = 3
 max-rows = 3
+```
+
+For example, to show the dock only on one monitor, whichever connector it is
+on, disable `"*"` and enable the monitor:
+
+```toml
+# [outputs."*"]
+# enabled = false
+#
+# [outputs."Dell Inc. DELL U2720Q*"]
+# enabled = true
 ```
 
 ### Per-app settings

@@ -5,8 +5,9 @@
 //! missing default file means the defaults; every key is optional.
 //!
 //! General dock keys live at the root; feature settings have their own
-//! tables. Output overrides mirror that structure under `[output.<name>]`.
-//! `outputs` picks the outputs that get a dock.
+//! tables. `output` picks the outputs that get a dock, and
+//! `[outputs.<pattern>]` overrides the layout keys per output (see
+//! `wl_shell_config::output`).
 //! Per-app settings (menu actions, middle click and scroll commands, the
 //! icon, name and launch command, and what dropping files does) live in
 //! `[app."<app-id>"]` tables (see `AppConfig`), and per-folder ones (how
@@ -18,18 +19,20 @@
 //! mode (or the one `mode` forces). The menu's look is there too.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
-use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use wl_shell_config::output::{self, Ident, Mode, Overlay, Tables, overlay_option};
 use wl_shell_config::{ConfigFile, Scheme, de};
 use wl_shell_render::{files, shadow, text};
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    /// The outputs that get a dock.
-    pub outputs: Outputs,
+    /// Where docks show: `"all"` or an output pattern.
+    #[serde(deserialize_with = "output::mode::<_, { output::ALL | output::ONLY }>")]
+    pub output: Mode,
+    /// `[outputs.<pattern>]`: enabling and layout, per output.
+    pub outputs: Tables<OutputOverride>,
     pub position: Position,
     pub layer: DockLayer,
     /// App icon size at rest.
@@ -64,7 +67,6 @@ pub struct Config {
     pub files: FilesConfig,
     pub trash: TrashConfig,
     pub appearance: Appearance,
-    pub output: BTreeMap<String, OutputOverride>,
     pub app: BTreeMap<String, AppConfig>,
     pub folder: BTreeMap<String, FolderConfig>,
 }
@@ -72,7 +74,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            outputs: Outputs::All,
+            output: Mode::All,
+            outputs: Tables::default(),
             position: Position::default(),
             layer: DockLayer::default(),
             icon_size: 48,
@@ -95,7 +98,6 @@ impl Default for Config {
             files: FilesConfig::default(),
             trash: TrashConfig::default(),
             appearance: Appearance::default(),
-            output: BTreeMap::new(),
             app: BTreeMap::new(),
             folder: BTreeMap::new(),
         }
@@ -454,51 +456,11 @@ pub enum LauncherEnter {
     Launch,
 }
 
-/// The outputs that get a dock: `"all"`, or a list of output names.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Outputs {
-    #[default]
-    All,
-    Only(Vec<String>),
-}
-
-impl<'de> Deserialize<'de> for Outputs {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Outputs;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("\"all\" or a list of output names")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Outputs, E> {
-                match s {
-                    "all" => Ok(Outputs::All),
-                    _ => Err(E::custom(format!(
-                        "expected \"all\" or a list of output names, got \"{s}\""
-                    ))),
-                }
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Outputs, A::Error> {
-                let mut names = Vec::new();
-                while let Some(name) = seq.next_element::<String>()? {
-                    names.push(name);
-                }
-                Ok(Outputs::Only(names))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-/// An `[output.<name>]` table: the layout keys, for one output.
+/// The keys an `[outputs.<pattern>]` table takes besides `enabled`: the
+/// layout, for the matching outputs.
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct OutputOverride {
-    /// False: no dock on this output.
-    pub enabled: Option<bool>,
     pub position: Option<Position>,
     #[serde(deserialize_with = "some_icon_size")]
     pub icon_size: Option<u32>,
@@ -509,6 +471,31 @@ pub struct OutputOverride {
     pub margin: Option<u32>,
     pub autohide: OutputAutohide,
     pub windows: OutputWindows,
+}
+
+impl Overlay for OutputOverride {
+    fn overlay(&mut self, over: &Self) {
+        overlay_option(&mut self.position, &over.position);
+        overlay_option(&mut self.icon_size, &over.icon_size);
+        overlay_option(&mut self.magnification, &over.magnification);
+        overlay_option(&mut self.reserve, &over.reserve);
+        overlay_option(&mut self.margin, &over.margin);
+        overlay_option(&mut self.autohide.enabled, &over.autohide.enabled);
+        overlay_option(&mut self.windows.scope, &over.windows.scope);
+        overlay_option(&mut self.windows.max_columns, &over.windows.max_columns);
+        overlay_option(&mut self.windows.max_rows, &over.windows.max_rows);
+    }
+}
+
+/// `wl_shell_core`'s identification of an output, as the config crate
+/// matches patterns against it.
+pub fn ident(ident: &wl_shell_core::output::Ident) -> Ident {
+    Ident {
+        name: ident.name.clone(),
+        description: ident.description.clone(),
+        make: ident.make.clone(),
+        model: ident.model.clone(),
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
@@ -651,8 +638,8 @@ pub enum When {
     Running,
 }
 
-/// The layout of one output's dock: the global keys with its
-/// `[output.<name>]` table over them.
+/// The layout of one output's dock: the global keys with the
+/// `[outputs.<pattern>]` tables that match it over them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DockLayout {
     pub position: Position,
@@ -841,17 +828,13 @@ impl Config {
         self.appearance.theme.theme()
     }
 
-    /// The layout of the dock on the output named `name`; None if that
-    /// output gets no dock.
-    pub fn dock(&self, name: &str) -> Option<DockLayout> {
-        let listed = match &self.outputs {
-            Outputs::All => true,
-            Outputs::Only(names) => names.iter().any(|n| n == name),
-        };
-        let o = self.output.get(name).cloned().unwrap_or_default();
-        if !o.enabled.unwrap_or(listed) {
-            return None;
-        }
+    /// The layout of the dock on the output `ident`; None if that output
+    /// gets no dock. `fallback` is true for the output that stands in
+    /// while `output` names one that isn't connected (see
+    /// `Mode::unmatched`).
+    pub fn dock(&self, ident: &Ident, fallback: bool) -> Option<DockLayout> {
+        let shown = fallback || self.output.matches(ident);
+        let o = self.outputs.resolve_as(shown, ident)?;
         Some(DockLayout {
             position: o.position.unwrap_or(self.position),
             icon_size: o.icon_size.unwrap_or(self.icon_size),
@@ -1144,7 +1127,7 @@ mod tests {
     fn full() {
         let c = parse(
             r##"
-            outputs = ["DP-1", "eDP-1"]
+            output = "DP-1"
             position = "left"
             layer = "overlay"
             icon-size = 64
@@ -1202,10 +1185,7 @@ mod tests {
             "##,
         )
         .unwrap();
-        assert_eq!(
-            c.outputs,
-            Outputs::Only(vec!["DP-1".into(), "eDP-1".into()])
-        );
+        assert_eq!(c.output, Mode::Only(output::Pattern::new("DP-1").unwrap()));
         assert_eq!((c.position, c.layer), (Position::Left, DockLayer::Overlay));
         assert_eq!(
             (c.icon_size, c.icon_gap, c.margin, c.padding),
@@ -1569,6 +1549,32 @@ mod tests {
         assert!(err("[launcher.windows]\nunknown = 1"));
     }
 
+    fn id(name: &str) -> Ident {
+        Ident {
+            name: Some(name.into()),
+            ..Ident::default()
+        }
+    }
+
+    /// A Dell monitor, on whichever connector.
+    fn dell(connector: &str) -> Ident {
+        Ident {
+            name: Some(connector.into()),
+            description: Some(format!("Dell Inc. DELL U2720Q 8XYZ123 ({connector})")),
+            make: "Dell Inc.".into(),
+            model: "DELL U2720Q".into(),
+        }
+    }
+
+    fn boe() -> Ident {
+        Ident {
+            name: Some("eDP-1".into()),
+            description: Some("BOE 0x0BCA Unknown (eDP-1)".into()),
+            make: "BOE".into(),
+            model: "0x0BCA".into(),
+        }
+    }
+
     #[test]
     fn per_output() {
         let c = parse(
@@ -1576,25 +1582,25 @@ mod tests {
             position = "bottom"
             icon-size = 40
 
-            [output.eDP-1]
+            [outputs.eDP-1]
             position = "left"
             magnification = 1
             margin = 2
-            [output.eDP-1.autohide]
+            [outputs.eDP-1.autohide]
             enabled = true
-            [output.eDP-1.windows]
+            [outputs.eDP-1.windows]
             scope = "output"
             max-rows = 1
 
-            [output.HDMI-A-1]
+            [outputs.HDMI-A-1]
             enabled = false
             "#,
         )
         .unwrap();
-        let global = c.dock("DP-1").unwrap();
+        let global = c.dock(&id("DP-1"), false).unwrap();
         assert_eq!(global.position, Position::Bottom);
         assert_eq!((global.icon_size, global.magnification), (40, 1.8));
-        let edp = c.dock("eDP-1").unwrap();
+        let edp = c.dock(&id("eDP-1"), false).unwrap();
         assert_eq!(edp.position, Position::Left);
         assert_eq!((edp.icon_size, edp.magnification, edp.margin), (40, 1.0, 2));
         assert!(edp.reserve && edp.autohide && !global.autohide);
@@ -1604,25 +1610,111 @@ mod tests {
         );
         assert_eq!((global.strip_max_columns, global.strip_max_rows), (3, 3));
         assert_eq!((edp.strip_max_columns, edp.strip_max_rows), (3, 1));
-        assert!(c.dock("HDMI-A-1").is_none());
+        assert!(c.dock(&id("HDMI-A-1"), false).is_none());
     }
 
     #[test]
-    fn listed_outputs_only() {
+    fn output_as_a_pattern() {
         let c = parse(
             r#"
-            outputs = ["DP-1"]
-            [output.eDP-1]
+            output = "DP-1"
+            [outputs.eDP-1]
             enabled = true
-            [output.DP-1]
+            [outputs.DP-1]
             reserve = false
             "#,
         )
         .unwrap();
-        assert!(!c.dock("DP-1").unwrap().reserve);
-        assert!(c.dock("eDP-1").is_some());
-        assert!(c.dock("HDMI-A-1").is_none());
-        assert_eq!(parse("outputs = \"all\"").unwrap().outputs, Outputs::All);
+        assert!(!c.dock(&id("DP-1"), false).unwrap().reserve);
+        assert!(c.dock(&id("eDP-1"), false).is_some());
+        assert!(c.dock(&id("HDMI-A-1"), false).is_none());
+        // While DP-1 isn't connected, the fallback output gets the dock.
+        assert!(c.dock(&id("HDMI-A-1"), true).is_some());
+        assert!(c.output.unmatched([&id("HDMI-A-1")]));
+        assert!(!c.output.unmatched([&id("HDMI-A-1"), &id("DP-1")]));
+        assert_eq!(parse("output = \"all\"").unwrap().output, Mode::All);
+    }
+
+    #[test]
+    fn one_monitor_on_any_connector() {
+        let c = parse(
+            r#"
+            [outputs."*"]
+            enabled = false
+
+            [outputs."Dell Inc. DELL U2720Q*"]
+            enabled = true
+            position = "left"
+            "#,
+        )
+        .unwrap();
+        for connector in ["DP-2", "DP-5"] {
+            let dock = c.dock(&dell(connector), false).unwrap();
+            assert_eq!(dock.position, Position::Left);
+        }
+        assert!(c.dock(&boe(), false).is_none());
+    }
+
+    #[test]
+    fn tables_overlay_least_specific_first() {
+        let c = parse(
+            r#"
+            [outputs.DP-2]
+            icon-size = 60
+
+            [outputs."Dell Inc. DELL U2720Q*"]
+            position = "left"
+            icon-size = 50
+            magnification = 2
+
+            [outputs."*"]
+            position = "right"
+            icon-size = 40
+            margin = 1
+            "#,
+        )
+        .unwrap();
+        let d = c.dock(&dell("DP-2"), false).unwrap();
+        assert_eq!(d.position, Position::Left); // the glob over "*"
+        assert_eq!((d.icon_size, d.magnification, d.margin), (60, 2.0, 1));
+        let b = c.dock(&boe(), false).unwrap();
+        assert_eq!(b.position, Position::Right);
+        assert_eq!((b.icon_size, b.magnification, b.margin), (40, 1.8, 1));
+    }
+
+    #[test]
+    fn outputs_that_say_little() {
+        let c = parse("[outputs.\"Acme*\"]\nposition = \"right\"\n").unwrap();
+        let acme = Ident {
+            make: "Acme".into(),
+            model: "Panel 1".into(),
+            ..Ident::default()
+        };
+        // Without a name or a description, matched by make and model.
+        assert_eq!(c.dock(&acme, false).unwrap().position, Position::Right);
+        assert_eq!(
+            c.dock(&Ident::default(), false).unwrap().position,
+            Position::Bottom
+        );
+    }
+
+    #[test]
+    fn output_errors() {
+        let err = |s: &str| parse(s).unwrap_err();
+        // A dock is on every enabled output.
+        let e = err("output = \"focused\"");
+        assert!(e.contains("focused"), "{e}");
+        // Bad patterns name where they are.
+        let e = err("output = \"[\"");
+        assert!(e.contains("invalid output pattern"), "{e}");
+        let e = err("[outputs.\"[\"]\nenabled = true");
+        assert!(e.contains("outputs"), "{e}");
+        // A key that isn't a layout key names its table.
+        let e = err("[outputs.\"*\"]\nhide-delay = 1");
+        assert!(e.contains("\"*\"") && e.contains("hide-delay"), "{e}");
+        // The old forms are plain errors.
+        assert!(parse("outputs = [\"DP-1\"]").is_err());
+        assert!(parse("[output.DP-1]\nenabled = false").is_err());
     }
 
     #[test]
@@ -1650,10 +1742,10 @@ mod tests {
             assert!(parse(&format!("{section} = 1")).is_err(), "{section}");
         }
         for field in [
-            "[output.X.autohide]\nreveal-delay = 10",
-            "[output.X.windows]\npreviews = 'off'",
-            "[output.X.windows]\nmax-columns = 101",
-            "[output.X.launcher]\nwidth = 0.5",
+            "[outputs.X.autohide]\nreveal-delay = 10",
+            "[outputs.X.windows]\npreviews = 'off'",
+            "[outputs.X.windows]\nmax-columns = 101",
+            "[outputs.X.launcher]\nwidth = 0.5",
             "[appearance]\nfont-size = 0",
             "[appearance]\nresponse = 0",
             "[files]\nopen-command = false",
@@ -1703,10 +1795,10 @@ mod tests {
             "font = 'sans-serif'",
             "font-size = 13",
             "response = 150",
-            "[output.X]\nautohide = true",
-            "[output.X]\nwindows = 'all'",
-            "[output.X]\nstrip-max-columns = 3",
-            "[output.X]\nstrip-max-rows = 3",
+            "[outputs.X]\nautohide = true",
+            "[outputs.X]\nwindows = 'all'",
+            "[outputs.X]\nstrip-max-columns = 3",
+            "[outputs.X]\nstrip-max-rows = 3",
         ] {
             assert!(parse(old).is_err(), "accepted old key: {old}");
         }
@@ -1755,7 +1847,7 @@ mod tests {
         assert!(err("[windows]\nscope = \"some\""));
         assert!(err("[integration]\nlaunch-timeout = 100000"));
         assert!(err("[autohide]\ntrigger = 0"));
-        assert!(err("[output.X]\nhide-delay = 1"));
+        assert!(err("[outputs.X]\nhide-delay = 1"));
         assert!(err("[windows]\nmin-windows = 0"));
         assert!(err("drag-threshold = 0"));
         assert!(err("[trash]\nenabled = \"yes\""));
@@ -1777,8 +1869,8 @@ mod tests {
         assert!(err("[appearance]\nmenu-tail = [10, 101]"));
         assert!(err("[appearance]\nmenu-row-height = 4"));
         assert!(err("[appearance]\nicon-size = 1"));
-        assert!(err("[output.X]\nicon-size = 8"));
-        assert!(err("[output.X]\nfont = \"Inter\""));
+        assert!(err("[outputs.X]\nicon-size = 8"));
+        assert!(err("[outputs.X]\nfont = \"Inter\""));
         assert!(
             parse("[appearance]\nshadow-color = \"00000000\"")
                 .unwrap()

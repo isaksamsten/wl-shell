@@ -2523,7 +2523,11 @@ mod tests {
     use super::*;
 
     fn style() -> LauncherStyle {
-        LauncherStyle::new(&Config::default(), &Config::default().dock("X").unwrap())
+        let ident = wl_shell_config::output::Ident::default();
+        LauncherStyle::new(
+            &Config::default(),
+            &Config::default().dock(&ident, false).unwrap(),
+        )
     }
 
     #[test]

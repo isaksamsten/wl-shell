@@ -13,7 +13,7 @@
 # --- Dock -----------------------------------------------------------------
 # General settings stay at the root, before any [table] header.
 
-#outputs = "all"                 # Or a list, e.g. ["DP-1", "eDP-1"]
+#output = "all"                  # all, or an output pattern (see Outputs)
 #position = "bottom"             # bottom, left, right
 #layer = "top"                   # top, overlay
 #icon-size = 48                  # 16–256
@@ -211,20 +211,25 @@
 #label-color = "202020"
 #label-background = "eeeeeeee"
 
-# --- Per-output overrides (example) ---------------------------------------
-# These are all the keys an output can override. enabled = true/false
-# includes or excludes the output regardless of `outputs`.
+# --- Outputs (example) ----------------------------------------------------
+# `output` is "all" or a pattern. A pattern is a connector name ("eDP-1"),
+# a monitor's description or "<make> <model>" ("Dell Inc. DELL U2720Q"), or
+# a glob over those ("Dell*", "*" for every output). `wl-dock outputs` lists
+# yours. Every [outputs.<pattern>] table that matches an output applies, least
+# specific first; outputs are enabled unless a table says enabled = false.
+# To show the dock on one monitor only: disable "*", enable the monitor.
+# These are all the keys a table can set.
 
-#[output."eDP-1"]
+#[outputs."eDP-1"]
 #enabled = true
 #position = "left"
 #icon-size = 40
 #magnification = 1.5
 #reserve = true
 #margin = 4
-#[output."eDP-1".autohide]
+#[outputs."eDP-1".autohide]
 #enabled = true
-#[output."eDP-1".windows]
+#[outputs."eDP-1".windows]
 #scope = "output"
 #max-columns = 2
 #max-rows = 2
