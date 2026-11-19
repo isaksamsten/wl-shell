@@ -619,8 +619,8 @@ fn unit(it: &Item) -> usize {
 
 /// Indentation `ws` with `unit` columns (or a tab) taken off its end.
 fn outdented(ws: &str, unit: usize) -> String {
-    if ws.ends_with('\t') {
-        return ws[..ws.len() - 1].to_string();
+    if let Some(rest) = ws.strip_suffix('\t') {
+        return rest.to_string();
     }
     let spaces = ws.len() - ws.trim_end_matches(' ').len();
     ws[..ws.len() - spaces.min(unit)].to_string()
