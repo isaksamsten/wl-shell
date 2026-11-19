@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/c8d8fa05-990d-422d-a8fe-25f4da24ad62
+
 # wl-note
 
 Sticky notes for Wayland, tucked behind the edge of your screen, that follow
