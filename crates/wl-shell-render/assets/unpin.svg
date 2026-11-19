@@ -1,29 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-  <title>Remove from Dock</title>
-  <defs>
-    <linearGradient id="body" x1="0" y1="16" x2="0" y2="40" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#62a0ea"/>
-      <stop offset="1" stop-color="#3584e4"/>
-    </linearGradient>
-    <linearGradient id="steel" x1="29" y1="38" x2="35" y2="38" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#9a9996"/>
-      <stop offset="0.5" stop-color="#deddda"/>
-      <stop offset="1" stop-color="#77767b"/>
-    </linearGradient>
-  </defs>
-  <ellipse cx="30" cy="56" rx="18" ry="3" fill="#241f31" opacity="0.12"/>
-  <g transform="rotate(35 32 30)">
-    <path d="M29 36h6v14l-3 8-3-8z" fill="url(#steel)"/>
-    <path d="M24 16h16v12l7 7v5H17v-5l7-7z" fill="#1c71d8"/>
-    <path d="M25 16h14v12l7 7v2H18v-2l7-7z" fill="url(#body)"/>
-    <path d="M26 18h3v10l-7 7h-3l7-8z" fill="#99c1f1" opacity="0.75"/>
-    <rect x="20" y="9" width="24" height="10" rx="4" fill="#1c71d8"/>
-    <rect x="20" y="8" width="24" height="9" rx="4" fill="#62a0ea"/>
-    <path d="M24 10h16" fill="none" stroke="#99c1f1" stroke-width="2" stroke-linecap="round"/>
+  <title>Unpin</title>
+  <g fill="none" stroke="#454545" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M30 12h24v8h-6v12l5 6v5H31v-5l5-6V20h-6z M42 43v15"
+          transform="translate(-10 -4) rotate(42 42 32)"/>
+    <path d="M41 48h15"/>
   </g>
-  <circle cx="48" cy="48" r="12" fill="#241f31" opacity="0.15"/>
-  <circle cx="48" cy="47" r="11" fill="#c01c28"/>
-  <circle cx="48" cy="46" r="10" fill="#e01b24"/>
-  <path d="M43 46h10" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
 </svg>
 
