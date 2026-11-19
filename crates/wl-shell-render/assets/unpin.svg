@@ -1,9 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
   <title>Unpin</title>
+  <mask id="slash-gap" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+    <rect width="64" height="64" fill="#fff"/>
+    <path d="M10 10l44 44" stroke="#000" stroke-width="10" stroke-linecap="round"/>
+  </mask>
   <g fill="none" stroke="#454545" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M30 12h24v8h-6v12l5 6v5H31v-5l5-6V20h-6z M42 43v15"
-          transform="translate(-10 -4) rotate(42 42 32)"/>
-    <path d="M41 48h15"/>
+    <g mask="url(#slash-gap)">
+      <path d="M30 12h24v8h-6v12l5 6v5H31v-5l5-6V20h-6z M42 43v15"
+            transform="translate(-10 -4) rotate(42 42 32)"/>
+    </g>
+    <path d="M10 10l44 44"/>
   </g>
 </svg>
 
