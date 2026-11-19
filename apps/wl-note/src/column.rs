@@ -527,6 +527,7 @@ struct LineKey {
 struct RowSlot {
     disc: Sub,
     glyph: Sub,
+    count: Sub,
     out: Spring,
 }
 
@@ -806,6 +807,7 @@ impl Column {
         let row_slots = std::array::from_fn(|i| RowSlot {
             disc: sub(),
             glyph: sub(),
+            count: sub(),
             out: Spring::new(0.0, style.response + i as f64 * 35.0),
         });
         let row_label = sub();
@@ -993,6 +995,7 @@ impl Column {
         for slot in &mut self.row_slots {
             slot.disc.clear();
             slot.glyph.clear();
+            slot.count.clear();
         }
         self.stale.extend(self.row_disc.take().map(|s| s.buffer));
         for sub in self.backdrops.iter_mut().flatten() {
@@ -4014,6 +4017,7 @@ impl Column {
             let shown = rect.filter(|_| alpha * p > 0.0 && !self.retiring);
             let mut disc = None;
             let mut glyph = None;
+            let mut badge = None;
             if let Some(rect) = shown {
                 let start = self.plus_rect.map_or(plus.x, |r| r.x);
                 let area = Rect::new(lerp(start, rect.x, p), rect.y, rect.w, rect.h);
@@ -4027,14 +4031,26 @@ impl Column {
                         alpha * p,
                     );
                 }
-                if let Some(image) = self.line(LineKey {
-                    text: row::glyph(button, available),
-                    color: self.style.plus_glyph,
-                    width: m.plus as i32,
-                    strike: false,
-                }) {
-                    let x = area.x + (area.w - image.w) / 2.0;
-                    let y = area.y + (area.h - image.h) / 2.0;
+                let count = row::count(button, available).and_then(|text| {
+                    self.line(LineKey {
+                        text,
+                        color: self.style.plus_glyph,
+                        width: m.plus as i32,
+                        strike: false,
+                    })
+                });
+                let size = if count.is_some() { 10.0 } else { 14.0 };
+                let mut key = self.named(&[button.icon()]);
+                key.size = (size * scale) as u32;
+                let count_width = count.as_ref().map_or(0.0, |image| image.w);
+                if let Some(buffer) = self.icon_buffer(&key, Some(self.style.plus_glyph)) {
+                    let image = Sized {
+                        buffer,
+                        w: size,
+                        h: size,
+                    };
+                    let x = area.x + (area.w - size - count_width) / 2.0;
+                    let y = area.y + (area.h - size) / 2.0;
                     glyph = place_image(
                         &mut self.row_slots[i].glyph,
                         &image,
@@ -4043,6 +4059,22 @@ impl Column {
                         scale,
                         alpha * p,
                     );
+                    if let Some(count) = count {
+                        let rect = Rect::new(
+                            x + size,
+                            area.y + (area.h - count.h) / 2.0,
+                            count.w,
+                            count.h,
+                        );
+                        badge = place_image(
+                            &mut self.row_slots[i].count,
+                            &count,
+                            rect,
+                            surface,
+                            scale,
+                            alpha * p,
+                        );
+                    }
                 }
                 if active && alpha > 0.5 && p > 0.5 && disc.is_some() && glyph.is_some() {
                     self.row_hits.push((button, area));
@@ -4057,7 +4089,11 @@ impl Column {
             if glyph.is_none() {
                 self.row_slots[i].glyph.clear();
             }
-            self.attached.extend(disc.into_iter().chain(glyph));
+            if badge.is_none() {
+                self.row_slots[i].count.clear();
+            }
+            self.attached
+                .extend(disc.into_iter().chain(glyph).chain(badge));
         }
         if let (Some(plus), Some((_, end))) = (self.plus_rect, targets.last()) {
             let x = plus.x.min(end.x);
@@ -4452,7 +4488,7 @@ impl Column {
             }
         }
         for slot in &self.row_slots {
-            order.extend([&slot.disc, &slot.glyph]);
+            order.extend([&slot.disc, &slot.glyph, &slot.count]);
         }
         order.push(&self.row_label);
         let surfaces: Vec<WlSurface> = order.iter().map(|s| s.surface().clone()).collect();

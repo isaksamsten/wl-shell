@@ -42,15 +42,15 @@ impl Button {
         }
     }
 
-    pub fn glyph(self) -> &'static str {
+    pub fn icon(self) -> &'static str {
         match self {
-            Self::Undo => "↶",
-            Self::Window => "▭",
-            Self::Global => "◯",
-            Self::Paste => "⎘",
-            Self::Templates => "◫",
-            Self::Hidden => "≡",
-            Self::Due => "◷",
+            Self::Undo => "builtin:note-undo",
+            Self::Window => "builtin:note-window",
+            Self::Global => "builtin:note-global",
+            Self::Paste => "builtin:note-paste",
+            Self::Templates => "builtin:note-templates",
+            Self::Hidden => "builtin:note-hidden",
+            Self::Due => "builtin:clock",
         }
     }
 }
@@ -72,7 +72,7 @@ pub struct Available {
 
 /// The count a button carries: `9+` past nine, so it stays within the
 /// button. None: it has none.
-fn count(button: Button, state: Available) -> Option<String> {
+pub fn count(button: Button, state: Available) -> Option<String> {
     let n = match button {
         Button::Hidden => state.hidden_here,
         Button::Due => state.due_overdue,
@@ -82,14 +82,6 @@ fn count(button: Button, state: Available) -> Option<String> {
         0 => None,
         1..=9 => Some(n.to_string()),
         _ => Some("9+".into()),
-    }
-}
-
-/// What a button shows: its glyph, with a count where it has one.
-pub fn glyph(button: Button, state: Available) -> String {
-    match count(button, state) {
-        Some(n) => format!("{}{n}", button.glyph()),
-        None => button.glyph().into(),
     }
 }
 
@@ -280,7 +272,7 @@ mod tests {
         assert!(!buttons(&order, some, Mode::Drag).contains(&Hidden));
         assert_eq!(buttons(&order, some, Mode::Rest), [Hidden]);
         // Hidden elsewhere only: still there, with no count.
-        assert_eq!(glyph(Hidden, some), "≡");
+        assert_eq!(count(Hidden, some), None);
         assert_eq!(label(Hidden, some), "Hidden notes (2 elsewhere)");
     }
 
@@ -291,13 +283,13 @@ mod tests {
             hidden_all: n,
             ..Available::default()
         };
-        assert_eq!(glyph(Hidden, with(3)), "≡3");
-        assert_eq!(glyph(Hidden, with(9)), "≡9");
-        assert_eq!(glyph(Hidden, with(10)), "≡9+");
-        assert_eq!(glyph(Hidden, with(300)), "≡9+");
+        assert_eq!(count(Hidden, with(3)).as_deref(), Some("3"));
+        assert_eq!(count(Hidden, with(9)).as_deref(), Some("9"));
+        assert_eq!(count(Hidden, with(10)).as_deref(), Some("9+"));
+        assert_eq!(count(Hidden, with(300)).as_deref(), Some("9+"));
         assert_eq!(label(Hidden, with(12)), "Hidden notes (12 here)");
         // Other buttons never carry it.
-        assert_eq!(glyph(Paste, with(3)), "⎘");
+        assert_eq!(count(Paste, with(3)), None);
         assert_eq!(label(Paste, with(3)), "Paste");
     }
 
@@ -339,11 +331,11 @@ mod tests {
             ..Available::default()
         };
         // Nothing overdue: no count.
-        assert_eq!(glyph(Due, with(4, 0)), "◷");
+        assert_eq!(count(Due, with(4, 0)), None);
         assert_eq!(label(Due, with(4, 0)), "Due notes (4)");
-        assert_eq!(glyph(Due, with(4, 2)), "◷2");
-        assert_eq!(glyph(Due, with(40, 9)), "◷9");
-        assert_eq!(glyph(Due, with(40, 10)), "◷9+");
+        assert_eq!(count(Due, with(4, 2)).as_deref(), Some("2"));
+        assert_eq!(count(Due, with(40, 9)).as_deref(), Some("9"));
+        assert_eq!(count(Due, with(40, 10)).as_deref(), Some("9+"));
         assert_eq!(label(Due, with(4, 2)), "Due notes (2 overdue)");
         // The hidden count isn't the due one, and the templates have none.
         let state = Available {
@@ -351,8 +343,8 @@ mod tests {
             templates: 5,
             ..with(4, 2)
         };
-        assert_eq!(glyph(Hidden, state), "≡3");
-        assert_eq!(glyph(Templates, state), "◫");
+        assert_eq!(count(Hidden, state).as_deref(), Some("3"));
+        assert_eq!(count(Templates, state), None);
         assert_eq!(label(Templates, state), "New from a template");
     }
 

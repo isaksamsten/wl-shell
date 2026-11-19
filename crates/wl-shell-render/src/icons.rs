@@ -308,6 +308,12 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
         "builtin:trash" => Some(include_bytes!("../assets/trash.svg")),
         "builtin:close" => Some(include_bytes!("../assets/close.svg")),
         "builtin:clock" => Some(include_bytes!("../assets/clock.svg")),
+        "builtin:note-undo" => Some(include_bytes!("../assets/note-undo.svg")),
+        "builtin:note-window" => Some(include_bytes!("../assets/note-window.svg")),
+        "builtin:note-global" => Some(include_bytes!("../assets/note-global.svg")),
+        "builtin:note-paste" => Some(include_bytes!("../assets/note-paste.svg")),
+        "builtin:note-templates" => Some(include_bytes!("../assets/note-templates.svg")),
+        "builtin:note-hidden" => Some(include_bytes!("../assets/note-hidden.svg")),
         _ => None,
     };
     if let Some(data) = bundled {
