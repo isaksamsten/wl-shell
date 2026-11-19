@@ -24,3 +24,12 @@ macro_rules! warn {
         eprintln!("{}: {}", $crate::name(), format_args!($($arg)*))
     };
 }
+
+/// Like [`warn!`], for things that are only worth knowing, not worrying
+/// about (an output appeared, a config was reloaded).
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {
+        eprintln!("{}: {}", $crate::name(), format_args!($($arg)*))
+    };
+}

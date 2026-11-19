@@ -64,6 +64,7 @@ use crate::focus;
 use crate::globals::Globals;
 use crate::input::Input;
 use crate::mru::Mru;
+use crate::output::Seen;
 use crate::stream::LineStream;
 use crate::toplevel::Toplevel;
 
@@ -200,6 +201,8 @@ pub struct Core<P> {
     registry: RegistryState,
     pub seat_state: SeatState,
     pub output_state: OutputState,
+    /// What was logged about each output (output.rs).
+    pub(crate) output_seen: Seen,
     pub toplevel_list: ForeignToplevelList,
     cursor_shape: Option<CursorShapeManager>,
     pub input: Input,
@@ -238,6 +241,7 @@ impl<P: Program> Shell<P> {
             registry: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
             output_state: OutputState::new(&globals, &qh),
+            output_seen: Seen::default(),
             toplevel_list: ForeignToplevelList::new(&globals, &qh),
             cursor_shape: CursorShapeManager::bind(&globals, &qh).ok(),
             input: Input::default(),
@@ -464,14 +468,17 @@ impl<P: Program> OutputHandler for Shell<P> {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.core.note_output(&output);
         self.program.output_new(&mut self.core, &output);
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.core.note_output(&output);
         self.program.output_update(&mut self.core, &output);
     }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.core.forget_output(&output);
         self.program.output_removed(&mut self.core, &output);
     }
 }
