@@ -19,6 +19,7 @@ mod ipc;
 mod list;
 mod markdown;
 mod options;
+mod outputs;
 mod papers;
 mod reorder;
 mod row;
@@ -134,6 +135,18 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        Cmd::Outputs => {
+            return match outputs::run(opts.config.as_deref()) {
+                Ok(list) => {
+                    print!("{list}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    warn!("{e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {}
     }
     let config = match Config::read(opts.config.as_deref()) {
@@ -161,7 +174,7 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         warn!("{e}");
     }
     let result = match cmd {
-        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Keep { .. } | Cmd::Path => {
+        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Keep { .. } | Cmd::Path | Cmd::Outputs => {
             unreachable!("done above")
         }
         Cmd::Due { note, when } => find_note(&index, note).and_then(|path| {

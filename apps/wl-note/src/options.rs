@@ -104,6 +104,9 @@ pub enum Cmd {
     },
     /// Drop the lines naming no note from the order and hidden files
     Prune,
+    /// List the outputs, what to call them in the config, and what the
+    /// config makes of each
+    Outputs,
 }
 
 impl Options {
@@ -241,6 +244,15 @@ mod tests {
             })
         );
         assert_eq!(parse(&["prune"]).unwrap().command, Some(Cmd::Prune));
+    }
+
+    #[test]
+    fn outputs_command() {
+        assert_eq!(parse(&["outputs"]).unwrap().command, Some(Cmd::Outputs));
+        let o = parse(&["outputs", "--config", "c.toml"]).unwrap();
+        assert_eq!(o.command, Some(Cmd::Outputs));
+        assert!(o.config.is_some());
+        assert!(parse(&["outputs", "--output", "DP-1"]).is_err());
     }
 
     #[test]

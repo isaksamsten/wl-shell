@@ -95,7 +95,7 @@ use wl_shell_ui::{IRect, Rect, Sub, cache, lerp};
 
 use crate::app::WlNote;
 use crate::bar;
-use crate::config::{Config, Edge, NoteLayer};
+use crate::config::{ColumnLayout, Config, Edge, NoteLayer};
 use crate::deck::{Card, Deck, Group, Item, LIFT, Look, Metrics, On, Role};
 use crate::draft::Draft;
 use crate::drawer::{self, Drawer};
@@ -184,12 +184,12 @@ pub struct Style {
 }
 
 impl Style {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, layout: ColumnLayout) -> Self {
         let theme = config.theme();
         let (white, ink) = theme.preset("white");
         Self {
-            edge: config.edge,
-            layer: config.layer,
+            edge: layout.edge,
+            layer: layout.layer,
             metrics: Metrics {
                 marker_width: config.column.marker_width as f64,
                 marker_length: config.column.marker_length as f64,
@@ -593,7 +593,10 @@ fn pick(kind: drawer::Kind, key: String, ctrl: bool) -> Act {
 
 pub struct Column {
     pub output: WlOutput,
+    /// The output's key.
     pub name: String,
+    /// Its connector name, which the output stream's lines use.
+    pub connector: Option<String>,
     layer: LayerSurface,
     viewport: WpViewport,
     transparent: WlBuffer,
@@ -784,12 +787,14 @@ impl BarSubs {
 }
 
 impl Column {
-    /// An empty column on `output` (named `name`) at `scale`.
+    /// An empty column on `output` (named `name`, whose connector is
+    /// `connector`, if it has one) at `scale`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         core: &Core<WlNote>,
         output: WlOutput,
         name: String,
+        connector: Option<String>,
         scale: i32,
         style: Style,
         papers: Rc<RefCell<Papers>>,
@@ -841,6 +846,7 @@ impl Column {
         let column = Self {
             output,
             name,
+            connector,
             layer,
             viewport,
             transparent,

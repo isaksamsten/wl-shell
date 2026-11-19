@@ -2,7 +2,7 @@
 # Every key is optional. The values below are the defaults unless marked as examples.
 
 notes-dir = "~/Notes/wl-note"
-output = "focused"                 # focused, all, or an output name
+output = "focused"                 # focused, all, or an output pattern (see Outputs)
 edge = "right"                     # left or right
 layer = "top"                      # top or overlay
 
@@ -91,4 +91,18 @@ drawer = "#d4b483"                 # Paper of the Hidden drawer
 # shadow-color = "#00000080"
 # [appearance.light]
 # shadow-color = "#00000040"
+
+# --- Outputs (example) ----------------------------------------------------
+# `output` is "focused", "all" or a pattern. A pattern is a connector name
+# ("eDP-1"), a monitor's description or "<make> <model>" ("Dell Inc. DELL
+# U2720Q"), or a glob over those ("Dell*", "*" for every output).
+# `wl-note outputs` lists yours. Every [outputs.<pattern>] table that matches
+# an output applies, least specific first; outputs are enabled unless a table
+# says enabled = false. To show the notes on one monitor only: disable "*",
+# enable the monitor. These are all the keys a table can set.
+
+#[outputs."eDP-1"]
+#enabled = true
+#edge = "left"
+#layer = "overlay"
 

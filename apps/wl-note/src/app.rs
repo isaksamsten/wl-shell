@@ -20,11 +20,14 @@
 //!   closes, the most recent one left takes over. Without a stream, only
 //!   global notes show.
 //! - **Outputs.** `output` says where the columns are (column.rs): on the
-//!   output it names (else the first), on every output (`all`), or on the
-//!   context's (`focused`, from the `output-event-stream`; without it, the
-//!   first). Following the focus, the column slides away on the old
-//!   output and in on the new one, but not while a note is open in it:
-//!   the user put it there. One note is open at a time, on any output.
+//!   outputs a pattern matches (else the first enabled one), on every
+//!   output (`all`), or on the context's (`focused`, from the
+//!   `output-event-stream`; without it, the first). `[outputs.<pattern>]`
+//!   tables disable outputs and set their `edge` and `layer`; a disabled
+//!   output has no column (outputs.rs). Following the focus, the column
+//!   slides away on the old output and in on the new one, but not while a
+//!   note is open in it: the user put it there. One note is open at a
+//!   time, on any output.
 //! - **The columns** follow the pointer by themselves; they ask for the
 //!   rest (`Act`): opening and closing notes, toggling a checkbox,
 //!   retitling, pinning and unpinning (written to the file, which inotify
@@ -87,13 +90,14 @@ use wl_shell_render::worker::{Assets, Done};
 
 use crate::alarm::{Alarm, Wake};
 use crate::column::{Act, Column, DueShown, FileLink, FileTarget, Fonts, Pin, Shown, Style, Timer};
-use crate::config::{Config, OnClose};
+use crate::config::{self, ColumnLayout, Config, OnClose};
 use crate::context::{Proposal, Settle};
 use crate::deck::{self, Group, Item, Look};
 use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::drawer::{self, Entry as DrawerEntry};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
+use crate::outputs::{self, Whereabouts};
 use crate::papers::Papers;
 use crate::row::{self, Available, Button};
 use crate::{bar, create, files, find, list, reorder, scratch, template};
@@ -111,8 +115,16 @@ struct Ctx {
     id: String,
 }
 
-/// An output a column can go on: it, its name and its scale.
-type Target = (WlOutput, String, i32);
+/// An output a column goes on, and its layout there.
+struct Target {
+    output: WlOutput,
+    /// The output's key, which names its column.
+    key: String,
+    /// Its connector name, if it has one.
+    connector: Option<String>,
+    scale: i32,
+    layout: ColumnLayout,
+}
 
 struct FileOffer {
     surface: WlSurface,
@@ -237,6 +249,8 @@ pub struct WlNote {
     settle_timer: Option<(Instant, RegistrationToken)>,
     /// Warned that there is no `mru-event-stream`.
     warned_stream: bool,
+    /// Warned that no output is enabled for a column.
+    warned_no_output: bool,
     /// The `output-event-stream`, for `output = "focused"`.
     output_stream: LineStream<Self>,
     /// Which output each window is on, by ID, as the stream says.
@@ -297,6 +311,7 @@ impl WlNote {
             context: Settle::new(None),
             settle_timer: None,
             warned_stream: false,
+            warned_no_output: false,
             output_stream: LineStream::new(
                 "output-event-stream",
                 Hooks {
@@ -825,7 +840,7 @@ impl WlNote {
             .integration
             .output_event_stream
             .as_deref()
-            .filter(|_| self.config.output.trim() == "focused");
+            .filter(|_| self.config.output == wl_shell_config::output::Mode::Focused);
         let handle = core.loop_handle.clone();
         self.output_stream.configure(command, &handle);
     }
@@ -1012,36 +1027,45 @@ impl WlNote {
         self.window_outputs.get(id).map(String::as_str)
     }
 
-    /// The outputs the columns go on (see the module's comment).
+    /// The outputs the columns go on, with their layouts (see the module's
+    /// comment).
     fn targets(&self, core: &Core<Self>) -> Vec<Target> {
-        let named = |o: &WlOutput| {
-            let info = core.output_state.info(o)?;
-            Some((o.clone(), info.name?, info.scale_factor.max(1)))
-        };
-        let outputs: Vec<Target> = (core.output_state.outputs())
-            .filter_map(|o| named(&o))
+        let list = core.outputs();
+        let idents: Vec<_> = list.iter().map(|o| config::ident(&o.ident)).collect();
+        let unmatched = self.config.output.unmatched(&idents);
+        let layouts: Vec<Option<ColumnLayout>> = (idents.iter())
+            .map(|ident| self.config.column(ident, unmatched))
             .collect();
-        let on = |output: &WlOutput| outputs.iter().find(|t| t.0 == *output);
-        let pick = match self.config.output.trim() {
-            "all" => return outputs,
-            "focused" => {
-                let current = self.columns.iter().find(|c| !c.retiring);
-                let held = current.filter(|c| {
-                    c.open_key().is_some()
-                        || c.drawer_kind().is_some()
-                        || c.dragged_file_note().is_some()
-                });
-                (held.and_then(|c| on(&c.output)))
-                    .or_else(|| {
-                        let name = self.context_output()?;
-                        outputs.iter().find(|t| t.1 == name)
-                    })
-                    .or_else(|| current.and_then(|c| on(&c.output)))
-                    .or(outputs.first())
-            }
-            name => outputs.iter().find(|t| t.1 == name).or(outputs.first()),
+        let enabled: Vec<bool> = layouts.iter().map(Option::is_some).collect();
+        let index = |output: &WlOutput| list.iter().position(|o| o.wl == *output);
+        let current = self.columns.iter().find(|c| !c.retiring);
+        // An open note, a drawer or a dragged file keep the column where
+        // it is.
+        let held = current.filter(|c| {
+            c.open_key().is_some() || c.drawer_kind().is_some() || c.dragged_file_note().is_some()
+        });
+        let at = Whereabouts {
+            held: held.and_then(|c| index(&c.output)),
+            context: self.context_output().and_then(|connector| {
+                list.iter()
+                    .position(|o| o.ident.name.as_deref() == Some(connector))
+            }),
+            current: current.and_then(|c| index(&c.output)),
         };
-        pick.cloned().into_iter().collect()
+        let rule = outputs::rule(&self.config.output, unmatched);
+        outputs::pick(rule, &enabled, at)
+            .into_iter()
+            .filter_map(|i| {
+                let o = &list[i];
+                Some(Target {
+                    output: o.wl.clone(),
+                    key: o.key.clone(),
+                    connector: o.ident.name.clone(),
+                    scale: o.scale,
+                    layout: layouts[i]?,
+                })
+            })
+            .collect()
     }
 
     /// Create, restyle, move or retire the columns to match the outputs,
@@ -1050,23 +1074,33 @@ impl WlNote {
         let (Some(papers), Some(assets)) = (self.papers.clone(), self.assets.clone()) else {
             return; // not started yet
         };
-        let style = Style::new(&self.config);
         let targets = self.targets(core);
+        if targets.is_empty() && !core.outputs().is_empty() {
+            if !std::mem::replace(&mut self.warned_no_output, true) {
+                warn!("no enabled output: no notes are shown (see `wl-note outputs`)");
+            }
+        } else {
+            self.warned_no_output = false;
+        }
+        let styles: Vec<Style> = (targets.iter())
+            .map(|t| Style::new(&self.config, t.layout))
+            .collect();
+        let target_of =
+            |c: &Column| (targets.iter()).position(|t| t.output == c.output && t.key == c.name);
         // A new edge or layer takes new surfaces.
-        self.remove_columns(core, |c| c.style().needs_new_surface(&style));
+        self.remove_columns(core, |c| {
+            target_of(c).is_some_and(|i| c.style().needs_new_surface(&styles[i]))
+        });
         let mut acts = Vec::new();
         for column in &mut self.columns {
-            match targets
-                .iter()
-                .find(|t| t.0 == column.output && t.1 == column.name)
-            {
-                Some((_, _, scale)) => {
+            match target_of(&*column) {
+                Some(i) => {
                     if column.retiring {
                         column.retiring = false;
                         self.dirty = true;
                     }
-                    column.set_style(style.clone());
-                    column.set_scale(*scale);
+                    column.set_style(styles[i].clone());
+                    column.set_scale(targets[i].scale);
                 }
                 None if !column.retiring => {
                     // Its notes slide away; it goes once they are gone.
@@ -1084,19 +1118,20 @@ impl WlNote {
                 None => {}
             }
         }
-        for (output, name, scale) in targets {
+        for (target, style) in targets.iter().zip(&styles) {
             if self
                 .columns
                 .iter()
-                .any(|c| c.output == output && c.name == name)
+                .any(|c| c.output == target.output && c.name == target.key)
             {
                 continue;
             }
             let column = Column::new(
                 core,
-                output,
-                name,
-                scale,
+                target.output.clone(),
+                target.key.clone(),
+                target.connector.clone(),
+                target.scale,
                 style.clone(),
                 papers.clone(),
                 assets.clone(),
@@ -1126,7 +1161,7 @@ impl WlNote {
         let shown = |c: &Column| !c.retiring;
         let output = self.context_output();
         (self.columns.iter())
-            .position(|c| shown(c) && output.is_some_and(|o| c.name == o))
+            .position(|c| shown(c) && output.is_some_and(|o| c.connector.as_deref() == Some(o)))
             .or_else(|| self.columns.iter().position(shown))
     }
 

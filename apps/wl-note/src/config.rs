@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, de::Error as _};
+use wl_shell_config::output::{self, Ident, Overlay, Tables, overlay_option};
 use wl_shell_config::{ConfigFile, Mode, Scheme, de};
 use wl_shell_notes::{Color, TimeOfDay};
 use wl_shell_render::{paper, shadow};
@@ -24,8 +25,14 @@ use wl_shell_render::{paper, shadow};
 pub struct Config {
     /// Where the notes are; `~/` expands.
     pub notes_dir: String,
-    /// `focused` (the context's output), `all`, or an output's name.
-    pub output: String,
+    /// Where the columns are: `"focused"` (the context's output), `"all"`
+    /// or an output pattern.
+    #[serde(
+        deserialize_with = "output::mode::<_, { output::ALL | output::FOCUSED | output::ONLY }>"
+    )]
+    pub output: output::Mode,
+    /// `[outputs.<pattern>]`: enabling and layout, per output.
+    pub outputs: Tables<OutputOverride>,
     pub edge: Edge,
     pub layer: NoteLayer,
     pub column: ColumnConfig,
@@ -43,7 +50,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             notes_dir: "~/Notes/wl-note".into(),
-            output: "focused".into(),
+            output: output::Mode::Focused,
+            outputs: Tables::default(),
             edge: Edge::default(),
             layer: NoteLayer::default(),
             column: ColumnConfig::default(),
@@ -312,6 +320,40 @@ pub enum NoteLayer {
     Overlay,
 }
 
+/// The keys an `[outputs.<pattern>]` table takes besides `enabled`.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct OutputOverride {
+    pub edge: Option<Edge>,
+    pub layer: Option<NoteLayer>,
+}
+
+impl Overlay for OutputOverride {
+    fn overlay(&mut self, over: &Self) {
+        overlay_option(&mut self.edge, &over.edge);
+        overlay_option(&mut self.layer, &over.layer);
+    }
+}
+
+/// What differs between the columns of different outputs: the root keys
+/// with the `[outputs.<pattern>]` tables that match over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnLayout {
+    pub edge: Edge,
+    pub layer: NoteLayer,
+}
+
+/// `wl_shell_core`'s identification of an output, as the config crate
+/// matches patterns against it.
+pub fn ident(ident: &wl_shell_core::output::Ident) -> Ident {
+    Ident {
+        name: ident.name.clone(),
+        description: ident.description.clone(),
+        make: ident.make.clone(),
+        model: ident.model.clone(),
+    }
+}
+
 /// Colors: the keys of `[appearance]`, and of its `dark` and `light`
 /// tables, which override them.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -427,6 +469,19 @@ impl Config {
     /// The colors in use.
     pub fn theme(&self) -> &Theme {
         self.appearance.theme()
+    }
+
+    /// The column on the output `ident`; None if that output gets none.
+    /// `fallback` is true while `output` names a pattern that no output
+    /// matches: every output then stands in, and the first enabled one is
+    /// picked (see `outputs::pick`).
+    pub fn column(&self, ident: &Ident, fallback: bool) -> Option<ColumnLayout> {
+        let shown = fallback || self.output.matches(ident);
+        let o = self.outputs.resolve_as(shown, ident)?;
+        Some(ColumnLayout {
+            edge: o.edge.unwrap_or(self.edge),
+            layer: o.layer.unwrap_or(self.layer),
+        })
     }
 
     /// The notes directory, `~/` expanded.
@@ -768,5 +823,113 @@ dark-dim = 1.0
         assert_eq!(c.paper_color(Some(&Color::Rgb(0x804020))), 0x402010ff);
         c.apply_scheme(&mut || Scheme::Light);
         assert_eq!(c.paper_color(Some(&Color::Rgb(0x804020))), 0x804020ff);
+    }
+
+    fn dell() -> Ident {
+        Ident {
+            name: Some("DP-2".into()),
+            description: Some("Dell Inc. DELL U2720Q 8XYZ123 (DP-2)".into()),
+            make: "Dell Inc.".into(),
+            model: "DELL U2720Q".into(),
+        }
+    }
+
+    fn boe() -> Ident {
+        Ident {
+            name: Some("eDP-1".into()),
+            description: Some("BOE 0x0BCA Unknown (eDP-1)".into()),
+            make: "BOE".into(),
+            model: "0x0BCA".into(),
+        }
+    }
+
+    #[test]
+    fn output_defaults() {
+        let c = parse("").unwrap();
+        assert_eq!(c.output, output::Mode::Focused);
+        assert!(c.outputs.is_empty());
+        let layout = c.column(&dell(), false).unwrap();
+        assert_eq!((layout.edge, layout.layer), (Edge::Right, NoteLayer::Top));
+        for (text, mode) in [
+            ("output = 'all'", output::Mode::All),
+            ("output = 'focused'", output::Mode::Focused),
+        ] {
+            assert_eq!(parse(text).unwrap().output, mode);
+        }
+        let c = parse("output = 'DP-1'").unwrap();
+        assert!(matches!(c.output, output::Mode::Only(_)));
+    }
+
+    #[test]
+    fn per_output_tables() {
+        let c = parse(
+            r#"
+            edge = "right"
+
+            [outputs.eDP-1]
+            enabled = false
+
+            [outputs."Dell Inc. DELL U2720Q*"]
+            edge = "left"
+            layer = "overlay"
+
+            [outputs.DP-2]
+            layer = "top"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.column(&boe(), false), None);
+        let d = c.column(&dell(), false).unwrap();
+        assert_eq!((d.edge, d.layer), (Edge::Left, NoteLayer::Top));
+        // On any connector, by its description.
+        let moved = Ident {
+            name: Some("DP-5".into()),
+            description: Some("Dell Inc. DELL U2720Q 8XYZ123 (DP-5)".into()),
+            ..dell()
+        };
+        let d = c.column(&moved, false).unwrap();
+        assert_eq!((d.edge, d.layer), (Edge::Left, NoteLayer::Overlay));
+    }
+
+    #[test]
+    fn only_one_monitor_with_star() {
+        let c = parse(
+            r#"
+            [outputs."*"]
+            enabled = false
+
+            [outputs."Dell*"]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(c.column(&dell(), false).is_some());
+        assert!(c.column(&boe(), false).is_none());
+    }
+
+    #[test]
+    fn a_pattern_as_output() {
+        let c = parse("output = 'DP-2'").unwrap();
+        assert!(c.column(&dell(), false).is_some());
+        assert!(c.column(&boe(), false).is_none());
+        // The fallback is enabled, unless a table says otherwise.
+        assert!(c.column(&boe(), true).is_some());
+        let c = parse("output = 'DP-2'\n[outputs.eDP-1]\nenabled = false").unwrap();
+        assert!(c.column(&boe(), true).is_none());
+    }
+
+    #[test]
+    fn bad_output_config() {
+        for bad in [
+            "output = ''",
+            "output = '['",
+            "[outputs.'[']\nenabled = true",
+            "[outputs.DP-1]\nmarker-width = 3",
+            "[outputs.DP-1]\nedge = 'top'",
+            "[outputs.DP-1]\nenabled = 'yes'",
+            "outputs = 3",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 }
