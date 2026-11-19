@@ -4132,8 +4132,7 @@ impl Column {
                 .pointer
                 .is_some_and(|(x, y)| self.on_at(x, y) == On::Plus)
         {
-            self.plus_rect
-                .map(|rect| ("New note (⇧: this window)".into(), rect))
+            self.plus_rect.map(|rect| ("New note".into(), rect))
         } else {
             label.map(|(button, rect)| (row::label(button, available), rect))
         };
