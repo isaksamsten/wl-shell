@@ -30,18 +30,6 @@ impl Button {
         Self::Due,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Undo => "Undo",
-            Self::Window => "Window",
-            Self::Global => "Global",
-            Self::Paste => "Paste",
-            Self::Templates => "Templates",
-            Self::Hidden => "Hidden",
-            Self::Due => "Due",
-        }
-    }
-
     pub fn icon(self) -> &'static str {
         match self {
             Self::Undo => "builtin:note-undo",
@@ -55,9 +43,16 @@ impl Button {
     }
 }
 
+/// What the Undo button would bring back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removed {
+    Hide,
+    Trash,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Available {
-    pub undo: bool,
+    pub undo: Option<Removed>,
     pub window: bool,
     pub paste: bool,
     /// How many templates there are.
@@ -85,18 +80,29 @@ pub fn count(button: Button, state: Available) -> Option<String> {
     }
 }
 
-/// What a button says it does on hover.
+/// What a button says it does on hover: what it makes or shows, and where
+/// that applies, in the words the README uses.
 pub fn label(button: Button, state: Available) -> String {
-    match (button, state.hidden_here, state.hidden_all) {
-        (Button::Hidden, 0, all) => return format!("Hidden notes ({all} elsewhere)"),
-        (Button::Hidden, here, _) => return format!("Hidden notes ({here} here)"),
-        _ => {}
-    }
-    match (button, state.due_overdue, state.due_all) {
-        (Button::Due, 0, all) => format!("Due notes ({all})"),
-        (Button::Due, over, _) => format!("Due notes ({over} overdue)"),
-        (Button::Templates, ..) => "New from a template".into(),
-        _ => button.label().into(),
+    match button {
+        Button::Undo => match state.undo {
+            Some(Removed::Hide) => "Undo hide".into(),
+            Some(Removed::Trash) => "Undo trash".into(),
+            None => "Undo".into(),
+        },
+        Button::Window => "New scratch note for this window".into(),
+        Button::Global => "New note for all apps".into(),
+        Button::Paste => "New note from clipboard".into(),
+        Button::Templates => "New note from template".into(),
+        Button::Hidden => match (state.hidden_here, state.hidden_all) {
+            (0, all) => format!("Hidden notes (none here, {all} elsewhere)"),
+            (here, all) if here == all => format!("Hidden notes ({here})"),
+            (here, all) => format!("Hidden notes ({here} here, {all} in all)"),
+        },
+        Button::Due => match (state.due_overdue, state.due_all) {
+            (0, all) => format!("Due notes ({all} upcoming)"),
+            (over, all) if over == all => format!("Due notes ({over} overdue)"),
+            (over, all) => format!("Due notes ({over} overdue, {all} in all)"),
+        },
     }
 }
 
@@ -111,7 +117,7 @@ pub fn buttons(order: &[Button], state: Available, mode: Mode) -> Vec<Button> {
     let mut result = Vec::new();
     for &button in order {
         let show = match button {
-            Button::Undo => state.undo && mode != Mode::Drag,
+            Button::Undo => state.undo.is_some() && mode != Mode::Drag,
             Button::Window => state.window && mode != Mode::Closed,
             Button::Global => mode != Mode::Closed,
             Button::Paste => state.paste && mode == Mode::Rest,
@@ -224,7 +230,7 @@ mod tests {
             for window in [false, true] {
                 for paste in [false, true] {
                     let state = Available {
-                        undo,
+                        undo: undo.then_some(Removed::Trash),
                         window,
                         paste,
                         ..Available::default()
@@ -273,7 +279,7 @@ mod tests {
         assert_eq!(buttons(&order, some, Mode::Rest), [Hidden]);
         // Hidden elsewhere only: still there, with no count.
         assert_eq!(count(Hidden, some), None);
-        assert_eq!(label(Hidden, some), "Hidden notes (2 elsewhere)");
+        assert_eq!(label(Hidden, some), "Hidden notes (none here, 2 elsewhere)");
     }
 
     #[test]
@@ -287,10 +293,26 @@ mod tests {
         assert_eq!(count(Hidden, with(9)).as_deref(), Some("9"));
         assert_eq!(count(Hidden, with(10)).as_deref(), Some("9+"));
         assert_eq!(count(Hidden, with(300)).as_deref(), Some("9+"));
-        assert_eq!(label(Hidden, with(12)), "Hidden notes (12 here)");
+        assert_eq!(label(Hidden, with(12)), "Hidden notes (12)");
+        let split = Available {
+            hidden_all: 15,
+            ..with(12)
+        };
+        assert_eq!(label(Hidden, split), "Hidden notes (12 here, 15 in all)");
         // Other buttons never carry it.
         assert_eq!(count(Paste, with(3)), None);
-        assert_eq!(label(Paste, with(3)), "Paste");
+        assert_eq!(label(Paste, with(3)), "New note from clipboard");
+    }
+
+    #[test]
+    fn undo_says_what_it_brings_back() {
+        let with = |undo| Available {
+            undo,
+            ..Available::default()
+        };
+        assert_eq!(label(Undo, with(Some(Removed::Hide))), "Undo hide");
+        assert_eq!(label(Undo, with(Some(Removed::Trash))), "Undo trash");
+        assert_eq!(label(Undo, with(None)), "Undo");
     }
 
     #[test]
@@ -332,11 +354,12 @@ mod tests {
         };
         // Nothing overdue: no count.
         assert_eq!(count(Due, with(4, 0)), None);
-        assert_eq!(label(Due, with(4, 0)), "Due notes (4)");
+        assert_eq!(label(Due, with(4, 0)), "Due notes (4 upcoming)");
         assert_eq!(count(Due, with(4, 2)).as_deref(), Some("2"));
         assert_eq!(count(Due, with(40, 9)).as_deref(), Some("9"));
         assert_eq!(count(Due, with(40, 10)).as_deref(), Some("9+"));
-        assert_eq!(label(Due, with(4, 2)), "Due notes (2 overdue)");
+        assert_eq!(label(Due, with(4, 2)), "Due notes (2 overdue, 4 in all)");
+        assert_eq!(label(Due, with(2, 2)), "Due notes (2 overdue)");
         // The hidden count isn't the due one, and the templates have none.
         let state = Available {
             hidden_here: 3,
@@ -345,7 +368,7 @@ mod tests {
         };
         assert_eq!(count(Hidden, state).as_deref(), Some("3"));
         assert_eq!(count(Templates, state), None);
-        assert_eq!(label(Templates, state), "New from a template");
+        assert_eq!(label(Templates, state), "New note from template");
     }
 
     #[test]

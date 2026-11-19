@@ -141,10 +141,10 @@ impl Entry {
         Self::build(key, name, note, color, here, overdue, "global")
     }
 
-    /// The entry of a template: it says where it shows only if it names
-    /// an app of its own.
+    /// The entry of a template: it says where its notes show (global if
+    /// it names nothing, its placeholders as they are).
     pub fn template(key: String, name: &str, note: &Note, color: u32) -> Self {
-        Self::build(key, name, note, color, true, false, "")
+        Self::build(key, name, note, color, true, false, "global")
     }
 
     fn build(
@@ -878,18 +878,21 @@ mod tests {
         assert_eq!(e.subtitle(), "Thu 20 Nov 09:00 · firefox · links");
         let blank = Note::parse("+++\ntitle = \"T\"\n+++\n");
         let e = Entry::template("t.md".into(), "t", &blank, 0);
-        assert_eq!(e.subtitle(), "");
+        assert_eq!(e.subtitle(), "global");
     }
 
     #[test]
-    fn a_template_says_where_it_shows_only_if_it_names_an_app() {
+    fn a_template_says_where_its_notes_show() {
         let any = Note::parse("# Meeting {date}\nagenda\n");
         let own = Note::parse("+++\napps = [\"thunderbird\"]\n+++\nreply\n");
         let e = Entry::template("any.md".into(), "any", &any, 0);
-        assert_eq!((e.app.as_str(), e.here), ("", true));
-        assert_eq!(e.subtitle(), "agenda");
+        assert_eq!((e.app.as_str(), e.here), ("global", true));
+        assert_eq!(e.subtitle(), "global · agenda");
         let e = Entry::template("own.md".into(), "own", &own, 0);
         assert_eq!((e.app.as_str(), e.here), ("thunderbird", true));
+        let focused = Note::parse("+++\napps = [\"{app}\"]\n+++\nx\n");
+        let e = Entry::template("f.md".into(), "f", &focused, 0);
+        assert_eq!(e.app, "{app}");
     }
 
     #[test]

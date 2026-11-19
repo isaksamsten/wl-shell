@@ -4064,7 +4064,11 @@ impl Column {
                         tooltip: false,
                     })
                 });
-                let size = if count.is_some() { ROW_COUNT_ICON } else { ROW_ICON } as f64;
+                let size = if count.is_some() {
+                    ROW_COUNT_ICON
+                } else {
+                    ROW_ICON
+                } as f64;
                 let mut key = self.named(&[button.icon()]);
                 key.size = (size * scale) as u32;
                 let count_width = count.as_ref().map_or(0.0, |image| image.w);

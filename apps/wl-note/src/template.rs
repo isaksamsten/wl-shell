@@ -3,14 +3,16 @@
 //!
 //! A template is a note itself (frontmatter and markdown), kept in a dot
 //! directory so it is never shown as one. A note made from it is a copy
-//! with `{date}`, `{time}`, `{app}` and `{window}` filled in, in its title
-//! and its text. It is attached the way `+` attaches a note (to the
-//! context's app, or global without one) unless the template names an
-//! `apps`, `match` or `tags` of its own: those are what it is for, so
-//! they win over the context.
+//! with `{date}`, `{time}`, `{app}` and `{window}` filled in, in its text
+//! and in the globs of its `apps` and `match` (escaped there, so they
+//! match as they are). It is attached to what those name, and nothing
+//! else: a template without matchers or tags makes a global note. A
+//! matcher whose placeholder has no value (`{app}` without a window) is
+//! left out.
 
 use std::path::{Path, PathBuf};
 
+use toml_edit::{DocumentMut, Item, TableLike, Value};
 use wl_shell_notes::due::{Local, Zone};
 use wl_shell_notes::{Note, matcher, toml_edit};
 
@@ -68,6 +70,23 @@ impl Vars {
 /// `text` with its placeholders filled in. Anything else in braces stays
 /// as it is, and so does what a value holds (it is not filled in again).
 pub fn fill(text: &str, vars: &Vars) -> String {
+    replace(text, vars, str::to_owned)
+}
+
+/// `glob` with its placeholders filled in, escaped so each matches as it
+/// is. None if one of them has no value: the glob would match more than
+/// meant.
+fn fill_glob(glob: &str, vars: &Vars) -> Option<String> {
+    let mut missing = false;
+    let out = replace(glob, vars, |value| {
+        missing |= value.is_empty();
+        matcher::escape(value)
+    });
+    (!missing).then_some(out)
+}
+
+/// `text` with each placeholder replaced by `f` of its value.
+fn replace(text: &str, vars: &Vars, mut f: impl FnMut(&str) -> String) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('{') {
@@ -78,7 +97,7 @@ pub fn fill(text: &str, vars: &Vars) -> String {
             .and_then(|close| Some((vars.get(&rest[1..close])?, close + 1)));
         match value {
             Some((value, used)) => {
-                out.push_str(value);
+                out.push_str(&f(value));
                 rest = &rest[used..];
             }
             None => {
@@ -91,16 +110,74 @@ pub fn fill(text: &str, vars: &Vars) -> String {
     out
 }
 
+/// Fill in a matcher's glob `v` (a string; anything else stays), keeping
+/// its decor. False if it is to be left out (see `fill_glob`).
+fn fill_value(v: &mut Value, vars: &Vars) -> bool {
+    let Some(s) = v.as_str() else { return true };
+    match fill_glob(s, vars) {
+        Some(filled) if filled == s => true,
+        Some(filled) => {
+            let mut new = Value::from(filled);
+            *new.decor_mut() = v.decor().clone();
+            *v = new;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Fill in a `match` table's `app` and `title`. False if it is to be left
+/// out.
+fn fill_table(t: &mut dyn TableLike, vars: &Vars) -> bool {
+    ["app", "title"].into_iter().all(|k| {
+        t.get_mut(k)
+            .and_then(Item::as_value_mut)
+            .is_none_or(|v| fill_value(v, vars))
+    })
+}
+
+/// Fill in the globs of `doc`'s `apps` and `match`, leaving out the
+/// matchers that are to be. A key left empty by that goes.
+fn fill_matchers(doc: &mut DocumentMut, vars: &Vars) {
+    if let Some(apps) = doc.get_mut("apps").and_then(Item::as_array_mut) {
+        let keep: Vec<bool> = apps.iter_mut().map(|v| fill_value(v, vars)).collect();
+        if keep.contains(&false) {
+            let mut keep = keep.into_iter();
+            apps.retain(|_| keep.next().unwrap_or(true));
+            if apps.is_empty() {
+                doc.remove("apps");
+            }
+        }
+    }
+    let Some(item) = doc.get_mut("match") else {
+        return;
+    };
+    let emptied = if let Some(aot) = item.as_array_of_tables_mut() {
+        let keep: Vec<bool> = aot.iter_mut().map(|t| fill_table(t, vars)).collect();
+        let dropped = keep.contains(&false);
+        let mut keep = keep.into_iter();
+        aot.retain(|_| keep.next().unwrap_or(true));
+        dropped && aot.is_empty()
+    } else if let Some(array) = item.as_array_mut() {
+        let keep: Vec<bool> = (array.iter_mut())
+            .map(|v| v.as_inline_table_mut().is_none_or(|t| fill_table(t, vars)))
+            .collect();
+        let dropped = keep.contains(&false);
+        let mut keep = keep.into_iter();
+        array.retain(|_| keep.next().unwrap_or(true));
+        dropped && array.is_empty()
+    } else {
+        false
+    };
+    if emptied {
+        doc.remove("match");
+    }
+}
+
 /// The text of a new note made from `template`: its frontmatter copied
-/// (comments, order and unknown keys too), the title and text filled in,
-/// attached to `context` (an app ID) if the template has no matchers of
-/// its own, and with links to `files` at the end of the text.
-pub fn text(
-    template: &Note,
-    context: Option<&str>,
-    vars: &Vars,
-    files: &[PathBuf],
-) -> Result<String, String> {
+/// (comments, order and unknown keys too), the text and the matchers'
+/// globs filled in, and with links to `files` at the end of the text.
+pub fn text(template: &Note, vars: &Vars, files: &[PathBuf]) -> Result<String, String> {
     if let Some(e) = &template.error {
         return Err(format!("the template's {e}"));
     }
@@ -109,12 +186,12 @@ pub fn text(
     let source = template.text();
     let front = &source[..source.len() - template.body().len()];
     let mut note = Note::parse(format!("{front}{}", fill(template.body(), vars)));
-    if template.global()
-        && let Some(app) = context.filter(|a| !a.is_empty())
-    {
-        let mut apps = toml_edit::Array::new();
-        apps.push(matcher::escape(app));
-        note.set_value("apps", apps)?;
+    // Only a frontmatter that may hold a placeholder is written again.
+    if note.frontmatter().is_some_and(|f| f.contains('{')) {
+        note.edit(|doc| {
+            fill_matchers(doc, vars);
+            Ok(())
+        })?;
     }
     let mut text = note.text().to_owned();
     if !files.is_empty() {
@@ -194,65 +271,121 @@ mod tests {
     }
 
     #[test]
-    fn a_note_from_a_template_for_the_context() {
+    fn a_template_without_matchers_makes_a_global_note() {
         let template = parse(
             "+++\n# how meetings go\ncolor = \"blue\"\n+++\n# Meeting {date}\n\n## {app}: {window}\n\n- [ ] agenda at {time}\n",
         );
-        let t = text(&template, Some("firefox"), &vars(), &[]).unwrap();
-        // The frontmatter as it was (its comment too), plus the app.
+        let t = text(&template, &vars(), &[]).unwrap();
+        // The frontmatter as it was (its comment too), even with a window.
         assert_eq!(
             t,
-            "+++\n# how meetings go\ncolor = \"blue\"\napps = [\"firefox\"]\n+++\n# Meeting 2026-11-19\n\n## firefox: Docs - Mozilla Firefox\n\n- [ ] agenda at 13:28\n"
+            "+++\n# how meetings go\ncolor = \"blue\"\n+++\n# Meeting 2026-11-19\n\n## firefox: Docs - Mozilla Firefox\n\n- [ ] agenda at 13:28\n"
         );
         let note = Note::parse(t);
         assert!(note.error.is_none() && note.warnings.is_empty());
         assert_eq!(note.title(), Some("Meeting 2026-11-19"));
-        assert!(note.matches(Some(&Window::new("firefox", ""))));
-        assert!(!note.matches(Some(&Window::new("foot", ""))));
+        assert!(note.global());
+        // And without a window.
+        let none = Vars::at(&Fixed(60), 1_795_091_280, "", "");
+        let plain = parse("# Notes {date}\n\ntext\n");
+        let t = text(&plain, &none, &[]).unwrap();
+        assert_eq!(t, "# Notes 2026-11-19\n\ntext\n");
+        assert!(Note::parse(t).global());
     }
 
     #[test]
-    fn without_a_context_it_is_global() {
-        let template = parse("# Notes {date}\n\ntext\n");
-        for context in [None, Some("")] {
-            let t = text(&template, context, &vars(), &[]).unwrap();
-            assert_eq!(t, "# Notes 2026-11-19\n\ntext\n");
-            assert!(Note::parse(t).global());
-        }
-        // The app ID is escaped, as a new note's is.
-        let t = text(&template, Some("org.x[1]*"), &vars(), &[]).unwrap();
-        let note = Note::parse(t);
+    fn placeholders_in_matchers_are_filled_in_escaped() {
+        let mut v = vars();
+        v.app = "org.x[1]*".into();
+        v.window = "say \"hi\" \\ {date}".into();
+        let template = parse(
+            "+++\napps = [\"{app}\", \"foot\"] # mine\nextra = \"{app}\"\n[[match]]\napp = \"{app}\"\ntitle = \"*{window}*\"\n+++\n# {app}\n",
+        );
+        let t = text(&template, &v, &[]).unwrap();
+        let note = Note::parse(t.clone());
+        assert!(note.error.is_none() && note.warnings.is_empty(), "{t}");
+        // Other keys, and the comment, stay as they are.
+        assert!(
+            t.contains("extra = \"{app}\"") && t.contains("# mine"),
+            "{t}"
+        );
+        assert!(note.body().starts_with("# org.x[1]*"));
+        // The app ID matches as it is, not as a glob.
         assert!(note.matches(Some(&Window::new("org.x[1]*", ""))));
+        assert!(note.matches(Some(&Window::new("foot", ""))));
         assert!(!note.matches(Some(&Window::new("org.x1-other", ""))));
+        // The title's own globs stay globs; the window's title is as it is.
+        let only_match = parse("+++\n[[match]]\napp = \"{app}\"\ntitle = \"*{window}*\"\n+++\nx\n");
+        let note = Note::parse(text(&only_match, &v, &[]).unwrap());
+        let title = "a say \"hi\" \\ {date} b";
+        assert!(note.matches(Some(&Window::new("org.x[1]*", title))));
+        assert!(!note.matches(Some(&Window::new("org.x[1]*", "say hi"))));
+        assert!(!note.matches(Some(&Window::new("org.x1", title))));
+        // An inline table, too.
+        let inline = parse("+++\nmatch = [{ title = \"{window}\" }]\n+++\nx\n");
+        let note = Note::parse(text(&inline, &v, &[]).unwrap());
+        assert!(note.matches(Some(&Window::new("any", "say \"hi\" \\ {date}"))));
+        assert!(!note.matches(Some(&Window::new("any", "other"))));
     }
 
     #[test]
-    fn a_templates_own_matchers_win_over_the_context() {
-        let apps = parse("+++\napps = [\"thunderbird\"]\n+++\nreply\n");
-        let t = text(&apps, Some("firefox"), &vars(), &[]).unwrap();
-        assert_eq!(t, apps.text());
-        let note = Note::parse(t);
+    fn a_matcher_whose_placeholder_has_no_value_is_left_out() {
+        let none = Vars::at(&Fixed(60), 1_795_091_280, "", "");
+        // Its only matcher gone, the note is global.
+        let app = parse("+++\ncolor = \"blue\"\napps = [\"{app}\"]\n+++\nx\n");
+        let t = text(&app, &none, &[]).unwrap();
+        assert_eq!(t, "+++\ncolor = \"blue\"\n+++\nx\n");
+        let only = parse("+++\napps = [\"{app}\"]\n+++\nx\n");
+        assert_eq!(text(&only, &none, &[]).unwrap(), "x\n");
+        // The others stay.
+        let some = parse(
+            "+++\napps = [\"{app}\", \"foot\"]\n[[match]]\napp = \"{app}\"\n[[match]]\ntitle = \"*wl-shell*\"\n+++\nx\n",
+        );
+        let note = Note::parse(text(&some, &none, &[]).unwrap());
+        assert!(note.matches(Some(&Window::new("foot", ""))));
+        assert!(note.matches(Some(&Window::new("any", "~/wl-shell"))));
+        assert!(!note.matches(Some(&Window::new("", ""))));
+        assert!(!note.matches(Some(&Window::new("any", ""))));
+        // A table goes if either of its globs has no value: a window with
+        // an app ID but no title.
+        let mut untitled = vars();
+        untitled.window.clear();
+        let both = parse("+++\nmatch = [{ app = \"{app}\", title = \"*{window}*\" }]\n+++\nx\n");
+        let t = text(&both, &untitled, &[]).unwrap();
+        assert_eq!(t, "x\n");
+        // A tag keeps it from being global.
+        let tagged = parse("+++\ntags = [\"t\"]\napps = [\"{app}\"]\n+++\nx\n");
+        assert!(!Note::parse(text(&tagged, &none, &[]).unwrap()).global());
+    }
+
+    #[test]
+    fn a_templates_own_matchers_are_kept_as_they_are() {
+        for same in [
+            "+++\napps = [\"thunderbird\"]\n+++\nreply\n",
+            "+++\n[[match]]\ntitle = \"*wl-shell*\"\n+++\nx\n",
+            "+++\ntags = [\"browser\"]\n+++\nx\n",
+            "+++\napps = []\n+++\nx\n",
+            "+++\napps = [\"{unknown}\"]\n+++\nx\n",
+        ] {
+            let template = parse(same);
+            assert_eq!(text(&template, &vars(), &[]).unwrap(), same);
+        }
+        let note = Note::parse(
+            text(
+                &parse("+++\napps = [\"thunderbird\"]\n+++\nx\n"),
+                &vars(),
+                &[],
+            )
+            .unwrap(),
+        );
         assert!(note.matches(Some(&Window::new("thunderbird", ""))));
         assert!(!note.matches(Some(&Window::new("firefox", ""))));
-        // A title match and a tag are matchers of its own, too.
-        let by_title = parse("+++\n[[match]]\ntitle = \"*wl-shell*\"\n+++\nx\n");
-        let t = text(&by_title, Some("foot"), &vars(), &[]).unwrap();
-        assert_eq!(t, by_title.text());
-        assert!(!Note::parse(t).matches(Some(&Window::new("foot", ""))));
-        let tagged = parse("+++\ntags = [\"browser\"]\n+++\nx\n");
-        let t = text(&tagged, Some("foot"), &vars(), &[]).unwrap();
-        assert_eq!(t, tagged.text());
-        assert!(!Note::parse(t).global());
-        // An empty list names nothing: the context's.
-        let empty = parse("+++\napps = []\n+++\nx\n");
-        let t = text(&empty, Some("foot"), &vars(), &[]).unwrap();
-        assert!(Note::parse(t).matches(Some(&Window::new("foot", ""))));
     }
 
     #[test]
     fn title_placeholders_are_filled_in_the_body_only() {
         let template = parse("+++\ntitle = \"{date}\"\n+++\n# Standup {date}\n");
-        let t = text(&template, None, &vars(), &[]).unwrap();
+        let t = text(&template, &vars(), &[]).unwrap();
         assert!(t.contains("title = \"{date}\""));
         assert_eq!(Note::parse(t).title(), Some("Standup 2026-11-19"));
     }
@@ -260,7 +393,7 @@ mod tests {
     #[test]
     fn a_due_time_and_other_keys_are_copied() {
         let template = parse("+++\ndue = 2026-12-01T09:00\nextra = \"kept\"\n+++\nbody {date}\n");
-        let t = text(&template, Some("foot"), &vars(), &[]).unwrap();
+        let t = text(&template, &vars(), &[]).unwrap();
         let note = Note::parse(t.clone());
         assert!(note.due().is_some());
         assert!(t.contains("extra = \"kept\""));
@@ -271,27 +404,27 @@ mod tests {
     fn a_broken_template_is_an_error() {
         let broken = parse("+++\ntitle = \n+++\nx\n");
         assert!(broken.error.is_some());
-        assert!(text(&broken, None, &vars(), &[]).is_err());
+        assert!(text(&broken, &vars(), &[]).is_err());
         let unterminated = parse("+++\ntitle = \"x\"\n");
-        assert!(text(&unterminated, None, &vars(), &[]).is_err());
+        assert!(text(&unterminated, &vars(), &[]).is_err());
     }
 
     #[test]
     fn dropped_files_are_linked_at_the_end() {
         let template = parse("# Trip {date}\n\npacking\n");
         let files = [PathBuf::from("/tmp/ticket.pdf")];
-        let t = text(&template, Some("firefox"), &vars(), &files).unwrap();
+        let t = text(&template, &vars(), &files).unwrap();
         let note = Note::parse(t.clone());
         assert!(note.body().starts_with("# Trip 2026-11-19\n\npacking\n"));
         assert!(note.body().contains("ticket.pdf"));
         assert!(t.contains("file:///tmp/ticket.pdf"));
         // A template with no text at all gets only the files.
         let empty = parse("+++\ncolor = \"pink\"\n+++\n");
-        let t = text(&empty, None, &vars(), &files).unwrap();
+        let t = text(&empty, &vars(), &files).unwrap();
         assert!(Note::parse(t).body().contains("ticket.pdf"));
         // Without files, nothing is added.
         assert_eq!(
-            text(&template, None, &vars(), &[]).unwrap(),
+            text(&template, &vars(), &[]).unwrap(),
             "# Trip 2026-11-19\n\npacking\n"
         );
     }

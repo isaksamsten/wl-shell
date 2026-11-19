@@ -2236,7 +2236,10 @@ impl WlNote {
         let (hidden_here, hidden_all) = self.hidden_counts();
         let (due_all, due_overdue) = self.due_counts();
         let available = Available {
-            undo: self.undo.action().is_some(),
+            undo: self.undo.action().map(|action| match action {
+                Removal::Hide(_) => row::Removed::Hide,
+                Removal::Trash(_) => row::Removed::Trash,
+            }),
             window: self.scratch.is_some() && self.scratch_context().is_some(),
             paste: !clipboard_mimes(core).is_empty(),
             templates: self.templates.len(),
@@ -2252,9 +2255,9 @@ impl WlNote {
 
     /// Write a new note from the template `key` (relative to the
     /// templates' directory) for the context's window, with links to
-    /// `files`, and return its key. It is the way `+` makes a note, but
-    /// for what the template says: its own `apps`, `match` or `tags`
-    /// instead of the context's app.
+    /// `files`, and return its key. It is attached to what the template
+    /// names (`{app}` and `{window}` in it are the context's), global if
+    /// it names nothing.
     fn template_note(
         &mut self,
         core: &mut Core<Self>,
@@ -2273,8 +2276,7 @@ impl WlNote {
             None => ("", ""),
         };
         let vars = template::Vars::now(app, title);
-        let context = (!app.is_empty()).then_some(app);
-        let text = template::text(&template.note, context, &vars, files)?;
+        let text = template::text(&template.note, &vars, files)?;
         self.write_new_note(core, &text)
     }
 
@@ -3089,7 +3091,7 @@ mod tests {
         assert!(entries.iter().all(|e| e.here && !e.overdue));
         assert_eq!(entries[1].title, "Meeting {date}");
         assert_eq!(entries[0].app, "thunderbird");
-        assert_eq!(entries[1].app, "");
+        assert_eq!(entries[1].app, "global");
         // The color is the template's own.
         assert_ne!(entries[0].color, entries[1].color);
         // They aren't notes: not in the index, nor the hidden count.

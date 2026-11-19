@@ -25,9 +25,9 @@ impl Window {
 }
 
 /// A glob matching exactly `s` (an app ID, say), its special characters
-/// escaped.
+/// escaped (a backslash too: it escapes in a glob).
 pub fn escape(s: &str) -> String {
-    globset::escape(s)
+    globset::escape(s).replace('\\', "\\\\")
 }
 
 /// A glob as written, and compiled; None if it doesn't parse.
@@ -49,6 +49,7 @@ impl Pattern {
         let built = GlobBuilder::new(text)
             .case_insensitive(ignore_case)
             .literal_separator(false)
+            .backslash_escape(true)
             .build();
         let (glob, error) = match built {
             Ok(g) => (Some(g.compile_matcher()), None),
@@ -171,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_glob_matches_only_itself() {
+        for s in ["org.x[1]*", "a\\b", "C:\\*", "{a,b}?", "\\[x]"] {
+            let w = Window::new(s, s);
+            assert!(m(Some(&escape(s)), Some(&escape(s))).matches(&w), "{s}");
+            assert!(
+                !m(Some(&escape(s)), None).matches(&Window::new("other", "")),
+                "{s}"
+            );
+        }
+        assert!(!m(Some(&escape("a\\b")), None).matches(&Window::new("ab", "")));
+    }
+
+    #[test]
     fn broken_globs_never_match() {
         let (broken, errors) = Matcher::new(Some("fire[fox"), None);
         assert_eq!(errors.len(), 1);
@@ -184,4 +198,3 @@ mod tests {
         assert!(!broken.matches(&Window::new("foot", "{a")));
     }
 }
-

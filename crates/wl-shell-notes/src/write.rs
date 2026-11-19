@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 /// the same directory, synced, and renamed over it.
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     // A dot file, which the index leaves out.
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let result = (|| {
@@ -42,7 +45,10 @@ pub fn create_new(dir: &Path, stem: &str, text: &str) -> io::Result<PathBuf> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => continue,
             Err(e) => return Err(e),
         };
-        if let Err(e) = file.write_all(text.as_bytes()).and_then(|_| file.sync_all()) {
+        if let Err(e) = file
+            .write_all(text.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
             let _ = std::fs::remove_file(&path);
             return Err(e);
         }
@@ -72,4 +78,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
-
