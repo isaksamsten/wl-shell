@@ -39,9 +39,18 @@
 //! - **Close** (Close All Windows, with several) while it has windows,
 //!   with `close-command`.
 //!
+//! For windows (found by the launcher's `@` search), in this order:
+//!
+//! - **Activate** the window.
+//! - **Close Window** with `close-command`, hidden without it.
+//! - Its app's rows as above, if it has a desktop entry, but not
+//!   Windows… (the search lists them already) and not a second Close
+//!   when this is the app's only window.
+//!
 //! The desktop and `[app.<id>]` actions aren't in a table: they are the
 //! app's own. Windows… is the table `APP_WINDOWS`, ahead of them; the
-//! rest is `APP_ACTIONS`, after them.
+//! rest is `APP_ACTIONS`, after them. A window's own are
+//! `WINDOW_ACTIONS`, ahead of its app's.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +67,7 @@ use crate::trash::EMPTY_ICON;
 pub enum Subject {
     File(File),
     App(App),
+    Window(WindowSubject),
 }
 
 /// A file or folder.
@@ -90,6 +100,21 @@ pub struct Window {
     pub title: String,
 }
 
+/// A window found by the launcher's window search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowSubject {
+    pub id: String,
+    /// Its title; empty if it has none.
+    pub title: String,
+    /// Its app's ID as the compositor reports it.
+    pub app_id: String,
+    /// Its app's name, which an untitled window goes by.
+    pub app_name: String,
+    /// Its app, if it has a desktop entry (and so rows of its own);
+    /// `windows` are all of its windows.
+    pub app: Option<App>,
+}
+
 impl App {
     fn running(&self) -> bool {
         !self.windows.is_empty()
@@ -101,13 +126,17 @@ impl App {
 }
 
 impl Subject {
-    /// Its name: the file's, or the app's.
+    /// Its name: the file's, the app's, or the window's title.
     pub fn name(&self) -> String {
         match self {
             Subject::File(File { path, .. }) => (path.file_name())
                 .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy())
                 .into_owned(),
             Subject::App(app) => app.name.clone(),
+            Subject::Window(w) => match w.title.trim() {
+                "" => w.app_name.clone(),
+                title => title.to_string(),
+            },
         }
     }
 }
@@ -190,6 +219,9 @@ pub enum Does {
     Close(Vec<String>),
     /// Activate the app's (a desktop ID) window; closes the launcher.
     Activate { app: String, window: String },
+    /// Activate the window (its ID) of the app with this ID as the
+    /// compositor reports it; closes the launcher.
+    ActivateWindow { app_id: String, window: String },
     /// `trash-command` on the path; closes the launcher.
     Trash(PathBuf),
     /// Further choices, a level deeper.
@@ -371,6 +403,28 @@ const APP_ACTIONS: &[Action<App>] = &[
     },
 ];
 
+/// A window's actions, ahead of its app's.
+const WINDOW_ACTIONS: &[Action<WindowSubject>] = &[
+    Action {
+        id: "activate",
+        name: |_, _| "Activate".into(),
+        // The app's icon, by its desktop ID if it has one.
+        icon: |w, _| Icon::App(w.app.as_ref().map_or(&w.app_id, |a| &a.id).clone()),
+        applies: |_, _| true,
+        does: |w, _| Does::ActivateWindow {
+            app_id: w.app_id.clone(),
+            window: w.id.clone(),
+        },
+    },
+    Action {
+        id: "close-window",
+        name: |_, _| "Close Window".into(),
+        icon: |_, _| names(&["window-close", "application-exit", "process-stop"]),
+        applies: |_, cx| cx.close,
+        does: |w, _| Does::Close(vec![w.id.clone()]),
+    },
+];
+
 /// `path`'s directory, if it has one.
 fn parent(path: &Path) -> Option<&Path> {
     path.parent().filter(|p| !p.as_os_str().is_empty())
@@ -393,6 +447,20 @@ pub fn actions(subject: &Subject, cx: &Context) -> Level {
             all.extend(desktop_actions(a));
             all.extend(commands(a));
             all.extend(choices(APP_ACTIONS, a, cx));
+            all
+        }
+        Subject::Window(w) => {
+            let mut all = choices(WINDOW_ACTIONS, w, cx);
+            if let Some(a) = &w.app {
+                all.extend(desktop_actions(a));
+                all.extend(commands(a));
+                let mut own = choices(APP_ACTIONS, a, cx);
+                // Close Window does it already for the app's only window.
+                if a.windows.len() <= 1 {
+                    own.retain(|c| c.id != "close");
+                }
+                all.extend(own);
+            }
             all
         }
     };
@@ -940,5 +1008,124 @@ mod tests {
             id: id.into(),
             title: title.into(),
         }
+    }
+
+    /// A window `w1` of Firefox, which has `windows`.
+    fn found(app: Option<App>, windows: &[(&str, &str)]) -> Subject {
+        let app = app.map(|app| App {
+            windows: windows.iter().map(|(id, t)| window(id, t)).collect(),
+            ..app
+        });
+        Subject::Window(WindowSubject {
+            id: "w1".into(),
+            title: "Inbox".into(),
+            app_id: "org.mozilla.firefox".into(),
+            app_name: "Firefox".into(),
+            app,
+        })
+    }
+
+    #[test]
+    fn a_windows_actions() {
+        let apps = apps();
+        let l = level_of(
+            &found(Some(firefox()), &[("w1", "Inbox")]),
+            &apps,
+            None,
+            ALL,
+        );
+        assert_eq!(
+            (l.name.as_str(), l.placeholder.as_str()),
+            ("Inbox", "Activate")
+        );
+        // Its own first, then its app's: with one window, one Close.
+        assert_eq!(ids(&l), ["activate", "close-window", "pin", "new-window"]);
+        let (app_id, window) = ("org.mozilla.firefox".to_string(), "w1".to_string());
+        assert_eq!(
+            does(&l, "activate"),
+            &Does::ActivateWindow { app_id, window }
+        );
+        assert_eq!(l.choices[0].icon, Icon::App("firefox".into()));
+        assert_eq!(does(&l, "close-window"), &Does::Close(vec!["w1".into()]));
+        assert_eq!(l.choices[1].name, "Close Window");
+        // The app's pin is the app's.
+        let app = String::from("firefox");
+        let pinned = true;
+        assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
+    }
+
+    #[test]
+    fn a_windows_apps_rows_without_windows() {
+        let apps = apps();
+        let two = [("w1", "Inbox"), ("w2", "Docs")];
+        let l = level_of(&found(Some(firefox()), &two), &apps, None, ALL);
+        // The search lists the windows already: no Windows…. With
+        // several, closing the app's windows is another thing.
+        assert_eq!(
+            ids(&l),
+            ["activate", "close-window", "pin", "new-window", "close"]
+        );
+        let close = l.choices.iter().find(|c| c.id == "close").unwrap();
+        assert_eq!(close.name, "Close All Windows");
+        assert_eq!(close.does, Does::Close(vec!["w1".into(), "w2".into()]));
+    }
+
+    #[test]
+    fn a_windows_app_rows_follow_its_own() {
+        let apps = apps();
+        let action = DesktopAction {
+            id: "private".into(),
+            name: "New Private Window".into(),
+            icon: None,
+            exec: "firefox --private".into(),
+        };
+        let app = App {
+            desktop: vec![action],
+            commands: vec![AppAction {
+                name: "profile".into(),
+                command: "profile {app-id}".into(),
+                icon: None,
+                when: When::Always,
+            }],
+            ..firefox()
+        };
+        let l = level_of(&found(Some(app), &[("w1", "Inbox")]), &apps, None, ALL);
+        assert_eq!(
+            ids(&l),
+            [
+                "activate",
+                "close-window",
+                "desktop:private",
+                "command:0",
+                "pin",
+                "new-window"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_without_a_desktop_entry() {
+        let apps = apps();
+        let l = level_of(&found(None, &[]), &apps, None, ALL);
+        assert_eq!(ids(&l), ["activate", "close-window"]);
+        // Its icon is the app ID's.
+        assert_eq!(l.choices[0].icon, Icon::App("org.mozilla.firefox".into()));
+        // Without a `close-command`, only activating is left.
+        let no_close = Env {
+            close: false,
+            ..ALL
+        };
+        let l = level_of(&found(None, &[]), &apps, None, no_close);
+        assert_eq!(ids(&l), ["activate"]);
+        assert_eq!(l.placeholder, "Activate");
+        // An untitled window goes by its app's name.
+        let Subject::Window(w) = found(None, &[]) else {
+            unreachable!();
+        };
+        let untitled = Subject::Window(WindowSubject {
+            title: "  ".into(),
+            ..w
+        });
+        assert_eq!(untitled.name(), "Firefox");
     }
 }

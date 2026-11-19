@@ -73,6 +73,16 @@
 //! pause when they leave it or the launcher closes, and go when the
 //! search is back.
 //!
+//! Windows (the `@` trigger): every window of the toplevel list is a
+//! candidate (`set_candidates`), ranked by title and app name by app.rs
+//! (windowsearch.rs). A window's match shows its capture as an app's
+//! Windows… do, but only the windows on the ring hold a capture: one
+//! coming onto the ring starts it (live while it is there, with `previews
+//! = "live"`), one leaving it is paused and kept, and the search going
+//! away drops them all (`windowsearch::captures`). The pill has the title
+//! and, dimmed after it, the app's name (`Match::detail`); the bar
+//! completes the title inline, or shows it at the end with the app after.
+//!
 //! Texts (the query, the completion, the name) are lines from the worker;
 //! a line shows its last text until the new one arrives. Icons come from
 //! the shared cache.
@@ -114,6 +124,7 @@ use crate::drum::{self, Drum};
 use crate::filesearch;
 use crate::launcher::{Completion, Nav, Query, Scope, Selection, completion};
 use crate::view::Handover;
+use crate::windowsearch;
 
 type Qh = QueueHandle<Shell<WlDock>>;
 
@@ -122,6 +133,10 @@ const FADE_RESPONSE: f64 = 120.0;
 /// Shown while nothing was typed.
 const PLACEHOLDER: &str = "Search apps";
 const FILES_PLACEHOLDER: &str = "Search files";
+const WINDOWS_PLACEHOLDER: &str = "Search windows";
+const NO_WINDOWS: &str = "No windows";
+/// Theme icon names of window search, before a window is found.
+const WINDOWS_ICONS: &[&str] = &["preferences-system-windows", "window", "view-grid"];
 /// How far the texts slide when a level is entered or left, of the
 /// bar's width, at most `SLIDE_MAX` pixels.
 const SLIDE: f64 = 0.12;
@@ -283,6 +298,16 @@ pub struct Match {
     /// The window (its ID) whose capture it shows instead of its icon,
     /// once there is a frame (`set_previews`).
     pub window: Option<String>,
+    /// What follows the name, dimmed, in its pill.
+    pub detail: Option<Detail>,
+}
+
+/// What a pill shows after a match's name, dimmed: a window's app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Detail {
+    pub text: String,
+    /// The parts of it the query matched, as byte ranges.
+    pub matched: Vec<Range<usize>>,
 }
 
 /// A file match.
@@ -756,6 +781,9 @@ pub struct LauncherView {
     previews: Vec<Preview>,
     /// Capture them live while on the ring (else one frame each).
     live: bool,
+    /// The windows of a window search, or the subject's (their IDs and
+    /// handles): the ones to hold captures.
+    candidates: Vec<(String, ExtForeignToplevelHandleV1)>,
     /// The context pill's icons: the subject's, then the crumbs'.
     pinned_subs: Vec<Sub>,
     fly_sub: Sub,
@@ -875,6 +903,7 @@ impl LauncherView {
             ring_subs: Vec::new(),
             previews: Vec::new(),
             live: false,
+            candidates: Vec::new(),
             pinned_subs: Vec::new(),
             fly_sub,
             panel,
@@ -1061,7 +1090,7 @@ impl LauncherView {
         }
         self.caret_buffer = cache::color_buffer(&self.g, caret, &self.qh).ok();
         self.divider_buffer = cache::color_buffer(&self.g, divider, &self.qh).ok();
-        for scope in [Scope::Apps, Scope::Files] {
+        for scope in [Scope::Apps, Scope::Files, Scope::Windows] {
             self.search_key(scope)
                 .inspect(|k| self.assets.named_icon(k));
         }
@@ -1140,6 +1169,7 @@ impl LauncherView {
         let names: &[&str] = match scope {
             Scope::Apps | Scope::Actions | Scope::Web => SEARCH_ICONS,
             Scope::Files => &files::FOLDER_ICONS,
+            Scope::Windows => WINDOWS_ICONS,
             Scope::Bang => &["web-browser"],
         };
         let names = names.iter().map(|s| s.to_string()).collect();
@@ -1293,8 +1323,12 @@ impl LauncherView {
         }
         if depth == 0 {
             self.pill_in.retarget(0.0);
-            // Back in the search: the subject's windows aren't needed.
-            self.previews.clear();
+            // Back in the search: the subject's windows aren't needed
+            // (a window search keeps the captures of its windows).
+            if self.nav.query().scope() != Scope::Windows {
+                self.previews.clear();
+                self.candidates.clear();
+            }
         }
         self.slide_texts(-1.0);
         self.ring.clear();
@@ -1333,8 +1367,7 @@ impl LauncherView {
         if same {
             return;
         }
-        let kept = (self.kept().map(str::to_string))
-            .and_then(|id| matches.iter().position(|m| m.id == id));
+        let kept = front_after(self.kept(), &matches);
         match kept {
             Some(front) => self.replace(matches, front),
             None => self.set_matches(matches),
@@ -1544,6 +1577,19 @@ impl LauncherView {
                 let after = after.map(|t| line(t, style.completion));
                 (None, inline, after)
             }
+            Scope::Windows => {
+                let bar = window_bar(q, selected);
+                let end = match (bar.end, selected) {
+                    (End::NoWindows, _) => Some((NO_WINDOWS.to_string(), Vec::new())),
+                    (End::App, Some(m)) => Some(window_end(m, false, style)),
+                    (End::Title, Some(m)) => Some(window_end(m, true, style)),
+                    _ => None,
+                };
+                let after = (end.filter(|(text, _)| !text.is_empty()))
+                    .map(|(text, spans)| spanned(text, spans, style.completion));
+                let inline = bar.inline.map(|t| line(t, style.completion));
+                (None, inline, after)
+            }
             Scope::Bang => {
                 let name = selected.map(|m| m.name.as_str());
                 let engine_label = || {
@@ -1666,23 +1712,62 @@ impl LauncherView {
         self.live = live;
         self.previews
             .retain(|p| windows.iter().any(|(id, _)| *id == p.window));
-        for (id, handle) in windows {
-            if !self.previews.iter().any(|p| p.window == id) {
+        for (id, handle) in &windows {
+            if !self.previews.iter().any(|p| p.window == *id) {
                 // One frame first: it goes live once it is on the ring.
-                let p = Preview::new(id, &handle, &self.g, false, &self.qh);
+                let p = Preview::new(id.clone(), handle, &self.g, false, &self.qh);
                 self.previews.push(p);
             }
         }
+        self.candidates = windows;
         self.sync_live();
         self.kick();
     }
 
-    /// Capture the windows on the ring live (with `live`), and pause the
-    /// rest after the frame they have.
+    /// The windows of a window search (their IDs and handles), as they
+    /// are now: those on the ring hold a capture, `live` while there,
+    /// and the captures of windows that closed go.
+    pub fn set_candidates(
+        &mut self,
+        windows: Vec<(String, ExtForeignToplevelHandleV1)>,
+        live: bool,
+    ) {
+        self.live = live;
+        self.candidates = windows;
+        self.sync_live();
+        self.kick();
+    }
+
+    /// The window search is over: no window holds a capture.
+    pub fn clear_candidates(&mut self) {
+        self.candidates.clear();
+        self.previews.clear();
+    }
+
+    /// Start the captures of the windows that came onto the ring, drop
+    /// those of windows that are gone, capture the windows on the ring
+    /// live (with `live`), and pause the rest after the frame they have.
     fn sync_live(&mut self) {
-        let ring = &self.ring;
+        let plan = {
+            let candidates: Vec<&str> = (self.candidates.iter())
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let held: Vec<&str> = self.previews.iter().map(|p| p.window.as_str()).collect();
+            let ring: Vec<&str> = (self.ring.iter())
+                .filter_map(|r| r.m.window.as_deref())
+                .collect();
+            windowsearch::captures(&candidates, &held, &ring)
+        };
+        self.previews.retain(|p| !plan.drop.contains(&p.window));
+        for id in &plan.start {
+            if let Some((_, handle)) = self.candidates.iter().find(|(c, _)| c == id) {
+                // One frame first: it goes live below if it is to.
+                let p = Preview::new(id.clone(), handle, &self.g, false, &self.qh);
+                self.previews.push(p);
+            }
+        }
         for p in &mut self.previews {
-            let shown = ring.iter().any(|r| r.m.window.as_ref() == Some(&p.window));
+            let shown = plan.live.contains(&p.window);
             p.set_live(self.live && shown && !self.closing, &self.g, &self.qh);
         }
     }
@@ -2269,6 +2354,7 @@ fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32, web: bo
         spans.extend(matched);
         spans.push((at..text.len(), dimmer(style.completion)));
     }
+    push_detail(&mut text, &mut spans, m, style, true);
     PillRequest {
         text,
         spans,
@@ -2285,6 +2371,103 @@ fn label_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32, web: bo
     }
 }
 
+/// Add the dimmed `m.detail` (a window's app) to a pill's `text` after
+/// two spaces, the parts the query matched brighter.
+fn push_detail(
+    text: &mut String,
+    spans: &mut Vec<(Range<usize>, u32)>,
+    m: &Match,
+    style: &LauncherStyle,
+    highlight: bool,
+) {
+    let Some(d) = m.detail.as_ref().filter(|d| !d.text.is_empty()) else {
+        return;
+    };
+    if !text.is_empty() {
+        text.push_str("  ");
+    }
+    let at = text.len();
+    text.push_str(&d.text);
+    // The first span holding a character colors it.
+    let matched =
+        (d.matched.iter().filter(|_| highlight)).map(|r| (r.start + at..r.end + at, style.matched));
+    spans.extend(matched);
+    spans.push((at..text.len(), dimmer(style.completion)));
+}
+
+/// What shows at the bar's end for a window search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// "No windows".
+    NoWindows,
+    /// The selected window's app, dimmed (its title is inline).
+    App,
+    /// The selected window's title, then its app, dimmed.
+    Title,
+}
+
+/// The bar of a window search for the `q` typed and the `selected`
+/// window: what continues the query inline, and what stands at the end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowBar {
+    inline: Option<String>,
+    end: End,
+}
+
+/// The title completes the query inline when the query starts it, and
+/// the app follows at the end; else the title is at the end, with the
+/// app. With nothing typed, the placeholder stands inline and the title
+/// and app at the end (to tell which window is in front). Without a
+/// window, "No windows".
+fn window_bar(q: &str, selected: Option<&Match>) -> WindowBar {
+    let placeholder = || Some(WINDOWS_PLACEHOLDER.to_string());
+    let Some(m) = selected else {
+        return WindowBar {
+            inline: q.is_empty().then(placeholder).flatten(),
+            end: End::NoWindows,
+        };
+    };
+    match completion(q, Some(&m.name)) {
+        Completion::Inline(rest) if !rest.is_empty() => WindowBar {
+            inline: Some(rest),
+            end: End::App,
+        },
+        Completion::Inline(_) => WindowBar {
+            inline: None,
+            end: End::App,
+        },
+        Completion::None => WindowBar {
+            inline: placeholder(),
+            end: End::Title,
+        },
+        Completion::After(_) => WindowBar {
+            inline: None,
+            end: End::Title,
+        },
+    }
+}
+
+/// The text at the bar's end for the window `m`: its title (with
+/// `title`) and its app dimmed, the parts the query matched brighter.
+fn window_end(m: &Match, title: bool, style: &LauncherStyle) -> (String, Vec<(Range<usize>, u32)>) {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    if title {
+        text.push_str(&m.name);
+        spans.extend(m.matched.iter().map(|r| (r.clone(), style.matched)));
+    }
+    push_detail(&mut text, &mut spans, m, style, true);
+    (text, spans)
+}
+
+/// The position among `matches` of the one the user rolled to (`kept`,
+/// its ID), if it is still there: a window that was retitled is the same
+/// match, one that closed is not.
+fn front_after(kept: Option<&str>, matches: &[Match]) -> Option<usize> {
+    let kept = kept?;
+    matches.iter().position(|m| m.id == kept)
+}
+
 /// The subject's name in the context pill: bare, in the labels' size,
 /// with a file's parent directory dimmed after it.
 fn name_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillRequest {
@@ -2296,6 +2479,7 @@ fn name_request(m: &Match, style: &LauncherStyle, max: i32, scale: i32) -> PillR
         text.push_str(&f.parent);
         spans.push((at..text.len(), dimmer(style.completion)));
     }
+    push_detail(&mut text, &mut spans, m, style, false);
     PillRequest {
         text,
         spans,
@@ -2421,5 +2605,125 @@ mod tests {
         assert_eq!(*steps.last().unwrap(), w(&[1.0]));
         // Never narrower than round.
         assert!(pill_layout(&s, bar, 0.0, &[]).pill.w >= s.pill_height());
+    }
+
+    fn window(id: &str, title: &str, app: &str) -> Match {
+        Match {
+            id: id.into(),
+            name: title.into(),
+            icon: None,
+            app: Some(app.to_lowercase()),
+            named: Vec::new(),
+            matched: Vec::new(),
+            file: None,
+            window: Some(id.into()),
+            detail: Some(Detail {
+                text: app.into(),
+                matched: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_kept_window_survives_retitling_and_a_closed_one_leaves() {
+        let ids = |m: &[Match]| m.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let before = [window("1", "PLAN.md", "foot"), window("2", "Inbox", "Mail")];
+        assert_eq!(ids(&before), ["1", "2"]);
+        // The user rolled to window 2, which is retitled: it stays in front.
+        let after = [
+            window("1", "PLAN.md", "foot"),
+            window("2", "Inbox (3)", "Mail"),
+        ];
+        assert_eq!(front_after(Some("2"), &after), Some(1));
+        // It moves with the ranking.
+        let reordered = [window("3", "New", "foot"), window("2", "Inbox (3)", "Mail")];
+        assert_eq!(front_after(Some("2"), &reordered), Some(1));
+        // It closed: the best match is in front again.
+        let closed = [window("1", "PLAN.md", "foot")];
+        assert_eq!(front_after(Some("2"), &closed), None);
+        // Nothing rolled to: nothing is kept.
+        assert_eq!(front_after(None, &after), None);
+    }
+
+    #[test]
+    fn the_bar_completes_a_windows_title() {
+        let inbox = window("1", "Inbox - Mail", "Thunderbird");
+        let bar = |q: &str, m: Option<&Match>| window_bar(q, m);
+        // The query starts the title: it continues inline, the app at the end.
+        assert_eq!(
+            bar("inb", Some(&inbox)),
+            WindowBar {
+                inline: Some("ox - Mail".into()),
+                end: End::App
+            }
+        );
+        // The whole title typed: only the app.
+        assert_eq!(bar("inbox - mail", Some(&inbox)).end, End::App);
+        assert_eq!(bar("inbox - mail", Some(&inbox)).inline, None);
+        // Otherwise the title and the app are at the end.
+        assert_eq!(
+            bar("mail", Some(&inbox)),
+            WindowBar {
+                inline: None,
+                end: End::Title
+            }
+        );
+        // Nothing typed: the placeholder, and which window is in front.
+        assert_eq!(
+            bar("", Some(&inbox)),
+            WindowBar {
+                inline: Some(WINDOWS_PLACEHOLDER.into()),
+                end: End::Title
+            }
+        );
+        // No windows.
+        assert_eq!(
+            bar("", None),
+            WindowBar {
+                inline: Some(WINDOWS_PLACEHOLDER.into()),
+                end: End::NoWindows
+            }
+        );
+        assert_eq!(
+            bar("zzz", None),
+            WindowBar {
+                inline: None,
+                end: End::NoWindows
+            }
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn a_windows_pill_has_its_title_and_its_app_dimmed() {
+        let s = style();
+        let mut m = window("1", "Inbox - Mail", "Thunderbird");
+        m.matched = vec![0..3];
+        m.detail.as_mut().unwrap().matched = vec![0..4];
+        let r = label_request(&m, &s, 400, 1, false);
+        assert_eq!(r.text, "Inbox - Mail  Thunderbird");
+        // The title's match first, then the app's, then the app dimmed.
+        assert_eq!(r.spans[0], (0..3, s.matched));
+        let at = "Inbox - Mail  ".len();
+        assert_eq!(r.spans[1], (at..at + 4, s.matched));
+        assert_eq!(
+            *r.spans.last().unwrap(),
+            (at..r.text.len(), dimmer(s.completion))
+        );
+        // In the context pill, nothing is highlighted.
+        let pill = name_request(&m, &s, 400, 1);
+        assert_eq!(pill.text, r.text);
+        assert_eq!(pill.spans, [(at..r.text.len(), dimmer(s.completion))]);
+        // The bar's end: the title with its match, or only the app.
+        let (text, spans) = window_end(&m, true, &s);
+        assert_eq!(text, r.text);
+        assert_eq!(spans[0], (0..3, s.matched));
+        let (text, _) = window_end(&m, false, &s);
+        assert_eq!(text, "Thunderbird");
+        // An untitled window shows its app's name once.
+        let mut untitled = window("2", "Zathura", "Zathura");
+        untitled.detail = None;
+        assert_eq!(label_request(&untitled, &s, 400, 1, false).text, "Zathura");
+        assert_eq!(window_end(&untitled, true, &s).0, "Zathura");
     }
 }

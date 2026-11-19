@@ -209,6 +209,8 @@ pub struct LauncherConfig {
     pub web: crate::engines::Web,
     /// File search (`[launcher.files]`).
     pub files: LauncherFiles,
+    /// Window search (`[launcher.windows]`).
+    pub windows: LauncherWindows,
 }
 
 impl Default for LauncherConfig {
@@ -223,7 +225,23 @@ impl Default for LauncherConfig {
             history: true,
             web: crate::engines::Web::default(),
             files: LauncherFiles::default(),
+            windows: LauncherWindows::default(),
         }
+    }
+}
+
+/// The launcher's window search.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct LauncherWindows {
+    /// Typed first, switches to window search; None: there is none.
+    #[serde(deserialize_with = "files_trigger")]
+    pub trigger: Option<char>,
+}
+
+impl Default for LauncherWindows {
+    fn default() -> Self {
+        Self { trigger: Some('@') }
     }
 }
 
@@ -1535,6 +1553,20 @@ mod tests {
         assert!(err("[launcher.files]\nmax = 0"));
         assert!(err("[launcher.files]\nunknown = 1"));
         assert!(err("files-trigger = \"'\""));
+    }
+
+    #[test]
+    fn window_search() {
+        let d = Config::default().launcher.windows;
+        assert_eq!(d.trigger, Some('@'));
+        let c = parse("[launcher.windows]\ntrigger = \"/\"").unwrap();
+        assert_eq!(c.launcher.windows.trigger, Some('/'));
+        let off = parse("[launcher.windows]\ntrigger = \"\"").unwrap();
+        assert_eq!(off.launcher.windows.trigger, None);
+        let err = |s: &str| parse(s).is_err();
+        assert!(err("[launcher.windows]\ntrigger = \" \""));
+        assert!(err("[launcher.windows]\ntrigger = \"ab\""));
+        assert!(err("[launcher.windows]\nunknown = 1"));
     }
 
     #[test]

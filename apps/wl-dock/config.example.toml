@@ -78,6 +78,12 @@
 #gitignore = true                # Honor .gitignore, .ignore and git excludes
 #max = 1000000                   # Entries searched at most; 1–100000000
 
+# A query starting with the trigger searches every open window by title
+# (and app name). Enter activates one with activate-command; Tab offers
+# more, such as closing it with close-command.
+#[launcher.windows]
+#trigger = "@"                   # One character; "" turns window search off
+
 # Web search is opt-in: uncomment the engines you want. Type ! to filter
 # engines, then Tab to search with one. Ctrl+V can paste a whole bang.
 #[launcher.web]

@@ -30,6 +30,7 @@ mod stripview;
 mod trash;
 mod view;
 mod websuggest;
+mod windowsearch;
 mod zoom;
 
 use std::process::ExitCode;

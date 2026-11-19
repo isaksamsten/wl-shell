@@ -5,6 +5,7 @@
 //! | ------------------------- | ------------------------------------------ |
 //! | typing                    | edits the query                            |
 //! | the trigger (`'`)         | typed first: search files instead          |
+//! | `@`                       | typed first: search every window instead   |
 //! | Backspace, Ctrl+W, Ctrl+U | delete a character, a word, everything     |
 //! | Enter                     | open the selection (`launcher-enter`)      |
 //! | Ctrl+Enter                | the other of activating and launching      |
@@ -20,8 +21,10 @@
 //! space is never one. Backspace (or Ctrl+W) on an empty file query, or
 //! Shift+Tab, goes back to the apps with the query empty. A trigger typed
 //! in the file query is a plain character (nucleo's exact-match prefix).
+//! Window search's trigger (`@`) works the same way, with the same ways
+//! back.
 //!
-//! Tab on a match (a file or an app) enters its actions, a level with a
+//! Tab on a match (a file, an app or a window) enters its actions, a level with a
 //! query of its own (`Nav`), and Tab (or Enter) on an action with
 //! choices (Open with…) enters those. In a level, Escape, Shift+Tab, or
 //! Backspace on an empty query go back one level, restoring its query
@@ -103,8 +106,18 @@ pub enum Scope {
     Files,
     Bang,
     Web,
+    /// Every open window, by title (the `@` trigger).
+    Windows,
     /// A level's choices (a subject's actions, or an action's choices).
     Actions,
+}
+
+impl Scope {
+    /// Backspace on its empty query (and Shift+Tab) goes back to the
+    /// apps: the scopes a trigger switched to.
+    fn has_way_back(self) -> bool {
+        matches!(self, Scope::Files | Scope::Bang | Scope::Windows)
+    }
 }
 
 /// The query: what was typed, with the caret at its end, and what it
@@ -168,26 +181,34 @@ impl Query {
     /// Apply an editing key; `trigger` typed first in an empty app query
     /// switches to files. Returns whether the text or the scope changed.
     pub fn edit(&mut self, key: &Key, trigger: Option<char>) -> bool {
+        self.edit_in(key, trigger, None)
+    }
+
+    /// Like `edit`, with `windows` as the trigger of window search too.
+    /// The file trigger wins should they be the same character.
+    pub fn edit_in(&mut self, key: &Key, files: Option<char>, windows: Option<char>) -> bool {
         let before = (self.text.len(), self.scope);
         match key {
             Key::Text(t) => {
-                let rest = (trigger.filter(|c| !c.is_whitespace()))
-                    .filter(|_| self.scope == Scope::Apps && self.text.is_empty())
-                    .and_then(|c| t.strip_prefix(c));
-                match rest {
-                    Some(rest) => {
-                        self.scope = Scope::Files;
+                let first = self.scope == Scope::Apps && self.text.is_empty();
+                let triggered = |trigger: Option<char>, scope| {
+                    let c = trigger.filter(|c| !c.is_whitespace() && first)?;
+                    Some((scope, t.strip_prefix(c)?))
+                };
+                let found =
+                    triggered(files, Scope::Files).or_else(|| triggered(windows, Scope::Windows));
+                match found {
+                    Some((scope, rest)) => {
+                        self.scope = scope;
                         self.text.push_str(rest);
                     }
                     None => self.text.push_str(t),
                 }
             }
-            Key::Back if matches!(self.scope, Scope::Files | Scope::Bang) => {
+            Key::Back if self.scope.has_way_back() => {
                 *self = Self::default();
             }
-            Key::Backspace | Key::DeleteWord
-                if matches!(self.scope, Scope::Files | Scope::Bang) && self.is_empty() =>
-            {
+            Key::Backspace | Key::DeleteWord if self.scope.has_way_back() && self.is_empty() => {
                 *self = Self::default();
             }
             Key::Backspace => {
@@ -498,6 +519,77 @@ mod tests {
         edit(&mut q, t("'abc"));
         assert!(edit(&mut q, Key::Back));
         assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+    }
+
+    #[test]
+    fn the_windows_trigger() {
+        let t = |s: &str| Key::Text(s.into());
+        let edit = |q: &mut Query, key: Key| q.edit_in(&key, Some('\''), Some('@'));
+        // `@` alone switches; the rest is the title query.
+        let mut q = Query::default();
+        assert!(edit(&mut q, t("@")));
+        assert_eq!((q.scope(), q.text()), (Scope::Windows, ""));
+        edit(&mut q, t("plan"));
+        assert_eq!((q.scope(), q.text()), (Scope::Windows, "plan"));
+        // Pasting `@foot` is the same as typing it.
+        let mut pasted = Query::default();
+        edit(&mut pasted, t("@foot"));
+        assert_eq!((pasted.scope(), pasted.text()), (Scope::Windows, "foot"));
+        // In the window query, `@` is a plain character; so is the files trigger.
+        edit(&mut pasted, t("@'"));
+        assert_eq!((pasted.scope(), pasted.text()), (Scope::Windows, "foot@'"));
+        // Mid-query, or after anything, it is a character of the app query.
+        let mut apps = Query::default();
+        edit(&mut apps, t("a@"));
+        assert_eq!((apps.scope(), apps.text()), (Scope::Apps, "a@"));
+        let mut apps = Query::default();
+        edit(&mut apps, t(" "));
+        edit(&mut apps, t("@"));
+        assert_eq!((apps.scope(), apps.text()), (Scope::Apps, " @"));
+        // The files trigger still works beside it.
+        let mut files = Query::default();
+        edit(&mut files, t("'x"));
+        assert_eq!((files.scope(), files.text()), (Scope::Files, "x"));
+        // Without a trigger (`trigger = ""`), or with a space, there is no search.
+        let mut off = Query::default();
+        off.edit_in(&t("@x"), Some('\''), None);
+        assert_eq!((off.scope(), off.text()), (Scope::Apps, "@x"));
+        let mut space = Query::default();
+        space.edit_in(&t(" x"), None, Some(' '));
+        assert_eq!((space.scope(), space.text()), (Scope::Apps, " x"));
+        // `edit` has no window search.
+        let mut plain = Query::default();
+        plain.edit(&t("@x"), Some('\''));
+        assert_eq!((plain.scope(), plain.text()), (Scope::Apps, "@x"));
+        // The same character for both: files win.
+        let mut both = Query::default();
+        both.edit_in(&t("@x"), Some('@'), Some('@'));
+        assert_eq!(both.scope(), Scope::Files);
+    }
+
+    #[test]
+    fn the_way_back_from_windows() {
+        let t = |s: &str| Key::Text(s.into());
+        let edit = |q: &mut Query, key: Key| q.edit_in(&key, Some('\''), Some('@'));
+        // Backspace and Ctrl+W on an empty query return to the apps.
+        let mut q = Query::default();
+        edit(&mut q, t("@a"));
+        assert!(edit(&mut q, Key::Backspace) && q.scope() == Scope::Windows);
+        assert!(edit(&mut q, Key::Backspace));
+        assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+        edit(&mut q, t("@ab"));
+        assert!(edit(&mut q, Key::DeleteWord) && q.scope() == Scope::Windows);
+        assert!(edit(&mut q, Key::DeleteWord) && q.scope() == Scope::Apps);
+        // Shift+Tab at any time, emptying the query.
+        edit(&mut q, t("@abc"));
+        assert!(edit(&mut q, Key::Back));
+        assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+        // Escape clears the query, then closes (as for files).
+        edit(&mut q, t("@abc"));
+        assert_eq!(act(Key::Escape, 0, &q), Act::Clear);
+        assert_eq!(act(Key::Back, 0, &q), Act::Edit(Key::Back));
+        edit(&mut q, Key::Clear);
+        assert_eq!(act(Key::Escape, 0, &q), Act::Close);
     }
 
     #[test]

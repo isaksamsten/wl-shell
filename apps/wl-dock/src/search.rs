@@ -168,6 +168,44 @@ impl Search {
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.into_iter().map(|(_, i)| i).collect()
     }
+
+    /// The indices of `windows` (each a title and its app's name) that
+    /// match `query`, best first. The title counts most; the app's name
+    /// is worth less, as are the two together for a query of several
+    /// words (`inbox thunder`). Equal scores keep the order given (the
+    /// windows' recency), never the alphabet. An empty query keeps them
+    /// all, in order.
+    pub fn rank_windows(&mut self, windows: &[(&str, &str)], query: &str) -> Vec<usize> {
+        let folded = fold(query.trim());
+        let pattern = Pattern::new(
+            &folded,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        if pattern.atoms.is_empty() {
+            return (0..windows.len()).collect();
+        }
+        let words = pattern.atoms.len() > 1;
+        let mut scored: Vec<(f64, usize)> = Vec::new();
+        for (i, (title, app)) in windows.iter().enumerate() {
+            let by_title = self.field(&pattern, title).map(|s| {
+                let prefix = fold(title).starts_with(&folded);
+                s + if prefix { PREFIX_BONUS } else { 0.0 }
+            });
+            let by_app = self.field(&pattern, app).map(|s| s * OTHER_WEIGHT);
+            let together = words
+                .then(|| self.field(&pattern, &format!("{title} {app}")))
+                .flatten()
+                .map(|s| s * OTHER_WEIGHT);
+            let best = [by_title, by_app, together].into_iter().flatten();
+            if let Some(score) = best.reduce(f64::max) {
+                scored.push((score, i));
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +343,63 @@ mod tests {
         // Equal scores keep the order given.
         assert_eq!(s.rank_names(&names, "open"), [0, 1, 2]);
         assert!(s.rank_names(&names, "zz").is_empty());
+    }
+
+    /// (title, app) of windows, most recent first.
+    const WINDOWS: [(&str, &str); 5] = [
+        ("PLAN.md - wl-shell", "foot"),
+        ("Inbox — Mozilla Thunderbird", "Thunderbird"),
+        ("rust lifetimes - Google Search", "Firefox"),
+        ("~", "foot"),
+        ("Planning board", "Firefox"),
+    ];
+
+    #[test]
+    fn windows_by_title() {
+        let mut s = Search::default();
+        // Nothing typed keeps them all, in their order.
+        assert_eq!(s.rank_windows(&WINDOWS, ""), [0, 1, 2, 3, 4]);
+        assert_eq!(s.rank_windows(&WINDOWS, "  "), [0, 1, 2, 3, 4]);
+        assert_eq!(s.rank_windows(&WINDOWS, "inbox"), [1]);
+        assert_eq!(s.rank_windows(&WINDOWS, "lifetimes"), [2]);
+        assert!(s.rank_windows(&WINDOWS, "zzz").is_empty());
+        // The start of a title beats a match further in.
+        assert_eq!(s.rank_windows(&WINDOWS, "plan")[0], 0);
+        assert_eq!(s.rank_windows(&WINDOWS, "plan"), [0, 4]);
+        // Accents and case do not matter.
+        assert_eq!(s.rank_windows(&WINDOWS, "INBÖX"), [1]);
+    }
+
+    #[test]
+    fn windows_by_app_below_the_title() {
+        let mut s = Search::default();
+        // `foot` finds both terminals, the most recent first.
+        assert_eq!(s.rank_windows(&WINDOWS, "foot"), [0, 3]);
+        // A title that matches beats an app that matches.
+        let windows = [("Notes", "Firefox"), ("Firefox Relay", "Safari")];
+        assert_eq!(s.rank_windows(&windows, "firefox"), [1, 0]);
+        // Several words may be spread over the title and the app.
+        assert_eq!(s.rank_windows(&WINDOWS, "inbox thunder"), [1]);
+        assert_eq!(s.rank_windows(&WINDOWS, "lifetimes firefox"), [2]);
+        assert!(s.rank_windows(&WINDOWS, "lifetimes foot").is_empty());
+    }
+
+    #[test]
+    fn untitled_windows_go_by_their_app() {
+        let mut s = Search::default();
+        // An untitled window is given its app's name as its title.
+        let windows = [("Zathura", "Zathura"), ("Docs", "Zathura")];
+        assert_eq!(s.rank_windows(&windows, "zath"), [0, 1]);
+        assert_eq!(s.rank_windows(&windows, "docs"), [1]);
+    }
+
+    #[test]
+    fn windows_tie_by_recency_not_by_name() {
+        let mut s = Search::default();
+        let windows = [("Tool B", "x"), ("Tool A", "x"), ("Tool C", "x")];
+        assert_eq!(s.rank_windows(&windows, "tool"), [0, 1, 2]);
+        // Whatever the order given, equal scores stay in it.
+        let reversed = [windows[2], windows[1], windows[0]];
+        assert_eq!(s.rank_windows(&reversed, "tool"), [0, 1, 2]);
     }
 }

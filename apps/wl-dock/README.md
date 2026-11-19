@@ -60,6 +60,11 @@ the walk stays on one file system.
 
 Tab on a file or application shows what you can do with it.
 
+Start the query with `@` to search every open window by title or app name, on
+any output. The drum shows each window's capture, and `@` followed by Enter goes
+to the previous window. Enter activates the window with `activate-command`; Tab
+offers more, such as Close Window with `close-command`.
+
 To enable web search, copy the engines you want from `config.example.toml`.
 Type `!` to search engines by name or keyword, then press Tab to enter the
 selected engine.
@@ -177,6 +182,9 @@ exclude = ["node_modules", "target", "__pycache__"] # Gitignore-style globs
 hidden = false                 # Include hidden files and directories
 gitignore = true               # Skip what .gitignore, .ignore and git exclude
 max = 1000000                  # Entries searched at most; 1–100000000
+
+[launcher.windows]
+trigger = "@"                  # Typed first, searches windows; "" turns it off
 ```
 
 ### Commands and desktop integration
