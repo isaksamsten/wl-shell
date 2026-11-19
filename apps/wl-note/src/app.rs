@@ -50,7 +50,12 @@
 //!   handed over (`drawer_entries`), each saying whether it belongs to the
 //!   context, and the drawer decides what shows. It is handed them again
 //!   whenever the notes are shown again. Picking one takes it out of the
-//!   `hidden` file, which is all that is written.
+//!   `hidden` file, which is all that is written. The Due button's drawer
+//!   lists the notes with a `due` (overdue first, hidden ones dimmed);
+//!   its ✓ clears the `due`. The Templates button's drawer lists the
+//!   files of `.templates` (an `Index` of their own, watched with its
+//!   own `watch_tree`): picking one writes a new note from it
+//!   (template.rs), and so does a file drop on one.
 //! - **Fonts on the main thread**, for the open note's editable title,
 //!   are loaded on a thread of their own at the start.
 
@@ -91,7 +96,7 @@ use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
 use crate::row::{self, Available, Button};
-use crate::{bar, create, files, find, list, reorder, scratch};
+use crate::{bar, create, files, find, list, reorder, scratch, template};
 
 /// Windows whose output is remembered at most: the stream may report
 /// windows the toplevel list never announces, so not all are forgotten.
@@ -196,6 +201,11 @@ pub struct WlNote {
     notes_touched: bool,
     /// The notes directory's watch.
     tree: Option<RegistrationToken>,
+    /// The templates (`.templates` in the notes directory), as notes of
+    /// their own, and their watch.
+    templates: Index,
+    templates_touched: bool,
+    templates_tree: Option<RegistrationToken>,
     /// Renames in the notes directory not followed yet, as (from, to).
     moves: Vec<(PathBuf, PathBuf)>,
     /// Notes with a Move to Trash command in flight (absolute paths).
@@ -257,6 +267,9 @@ impl WlNote {
         let config = reloader.config().clone();
         Ok(Self {
             index: Index::new(config.notes_dir()),
+            templates: Index::new(template::dir(&config.notes_dir())),
+            templates_touched: false,
+            templates_tree: None,
             scratch: None,
             scratch_touched: false,
             scratch_closed: HashMap::new(),
@@ -523,6 +536,51 @@ impl WlNote {
         self.index = Index::new(dir);
         self.notes_touched = true;
         self.rescan(core);
+        self.open_templates(core);
+    }
+
+    /// Read the templates directory (created if missing) and watch it.
+    fn open_templates(&mut self, core: &Core<Self>) {
+        if let Some(token) = self.templates_tree.take() {
+            core.loop_handle.remove(token);
+        }
+        let dir = template::dir(self.index.dir());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("{}: {e}", dir.display());
+        }
+        let watched =
+            wl_shell_config::watch_tree(&core.loop_handle, &dir, |shell: &mut Shell<Self>, _| {
+                shell.program.templates_touched = true
+            });
+        match watched {
+            Ok(token) => self.templates_tree = Some(token),
+            Err(e) => warn!("not watching {}: {e}", dir.display()),
+        }
+        self.templates = Index::new(dir);
+        self.templates_touched = true;
+        self.scan_templates();
+    }
+
+    /// Read the templates again, if they were touched.
+    fn scan_templates(&mut self) {
+        if !std::mem::take(&mut self.templates_touched) {
+            return;
+        }
+        let changes = self.templates.scan();
+        for e in &changes.errors {
+            warn!("{e}");
+        }
+        for rel in changes.added.iter().chain(&changes.changed) {
+            if let Some(e) = self.templates.get(rel)
+                && let Some(error) = &e.note.error
+            {
+                warn!("template {}: {error}", rel.display());
+            }
+        }
+        if !changes.is_empty() {
+            // The Templates drawer, and the button.
+            self.dirty = true;
+        }
     }
 
     fn open_scratch(&mut self, core: &Core<Self>) {
@@ -804,6 +862,7 @@ impl WlNote {
         self.reload_state();
         self.rescan(core);
         self.scan_scratch();
+        self.scan_templates();
         self.serve(core);
         // A note kept open goes once it is closed, and the column may
         // follow the focus again.
@@ -1250,8 +1309,22 @@ impl WlNote {
         (hidden.iter().filter(|&&here| here).count(), hidden.len())
     }
 
+    /// How many notes have a `due`, and how many of those are overdue
+    /// (those still to be trashed aren't counted).
+    fn due_counts(&self) -> (usize, usize) {
+        let now = due::now();
+        let dues: Vec<bool> = (self.index.iter())
+            .filter_map(|(rel, e)| {
+                let due = e.note.due()?;
+                (!self.trashing(&self.index.dir().join(rel))).then(|| due.overdue(&Local, now))
+            })
+            .collect();
+        (dues.len(), dues.iter().filter(|&&over| over).count())
+    }
+
     /// What a drawer of `kind` can list: for the hidden notes, the one
-    /// hidden last first.
+    /// hidden last first; for the due ones, the overdue first, then the
+    /// soonest (hidden ones too, dimmed); for the templates, by path.
     fn drawer_entries(&self, kind: drawer::Kind) -> Vec<DrawerEntry> {
         let window = self.window();
         let now = due::now();
@@ -1270,6 +1343,41 @@ impl WlNote {
                         note.matches(window),
                         note.due().is_some_and(|d| d.overdue(&Local, now)),
                     ))
+                })
+                .collect(),
+            drawer::Kind::Due => {
+                let mut entries: Vec<DrawerEntry> = (self.index.iter())
+                    .filter_map(|(rel, e)| {
+                        let due = e.note.due()?;
+                        if self.trashing(&self.index.dir().join(rel)) {
+                            return None;
+                        }
+                        let at = due.at(&Local);
+                        Some(
+                            DrawerEntry::of(
+                                rel.to_string_lossy().into_owned(),
+                                &list::name(rel),
+                                &e.note,
+                                self.config.paper_color(e.note.meta.color.as_ref()),
+                                e.note.matches(window),
+                                at <= now,
+                            )
+                            .due(at, due.when(&Local, now))
+                            .dimmed(self.state.is_hidden(rel)),
+                        )
+                    })
+                    .collect();
+                drawer::sort_due(&mut entries);
+                entries
+            }
+            drawer::Kind::Templates => (self.templates.iter())
+                .map(|(rel, e)| {
+                    DrawerEntry::template(
+                        rel.to_string_lossy().into_owned(),
+                        &list::name(rel),
+                        &e.note,
+                        self.config.paper_color(e.note.meta.color.as_ref()),
+                    )
                 })
                 .collect(),
         }
@@ -1416,6 +1524,12 @@ impl WlNote {
             }
             Act::Row(Button::Undo) => self.undo_removal(core),
             Act::Row(Button::Hidden) => self.toggle_drawer(core, from, drawer::Kind::Hidden),
+            Act::Row(Button::Due) => self.toggle_drawer(core, from, drawer::Kind::Due),
+            Act::Row(Button::Templates) => self.toggle_drawer(core, from, drawer::Kind::Templates),
+            Act::Template(key) => match self.template_note(core, &key, &[]) {
+                Ok(key) => self.open_created(core, from, &key),
+                Err(e) => warn!("new note from a template: {e}"),
+            },
             Act::Show(key, open) => self.show_hidden(core, from, &key, open),
             Act::Row(Button::Paste) => self.paste_note(core, from),
             Act::Row(button @ (Button::Window | Button::Global)) => {
@@ -2107,16 +2221,48 @@ impl WlNote {
             self.undo.take();
         }
         let (hidden_here, hidden_all) = self.hidden_counts();
+        let (due_all, due_overdue) = self.due_counts();
         let available = Available {
             undo: self.undo.action().is_some(),
             window: self.scratch.is_some() && self.scratch_context().is_some(),
             paste: !clipboard_mimes(core).is_empty(),
+            templates: self.templates.len(),
             hidden_here,
             hidden_all,
+            due_all,
+            due_overdue,
         };
         for column in &mut self.columns {
             column.set_row_available(available);
         }
+    }
+
+    /// Write a new note from the template `key` (relative to the
+    /// templates' directory) for the context's window, with links to
+    /// `files`, and return its key. It is the way `+` makes a note, but
+    /// for what the template says: its own `apps`, `match` or `tags`
+    /// instead of the context's app.
+    fn template_note(
+        &mut self,
+        core: &mut Core<Self>,
+        key: &str,
+        files: &[PathBuf],
+    ) -> Result<String, String> {
+        // What was just written is read.
+        self.templates_touched = true;
+        self.scan_templates();
+        let template = &self
+            .templates
+            .get(Path::new(key))
+            .ok_or("the template is gone")?;
+        let (app, title) = match self.window() {
+            Some(w) => (w.app_id.as_str(), w.title.as_str()),
+            None => ("", ""),
+        };
+        let vars = template::Vars::now(app, title);
+        let context = (!app.is_empty()).then_some(app);
+        let text = template::text(&template.note, context, &vars, files)?;
+        self.write_new_note(core, &text)
     }
 
     fn paste_note(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
@@ -2272,6 +2418,10 @@ impl WlNote {
                     let text = create::text(context, None, None, Some(&body), None)?;
                     self.write_new_note(core, &text)?
                 };
+                self.open_created(core, &drop.surface, &key);
+            }
+            FileTarget::Template(key) => {
+                let key = self.template_note(core, &key, &paths)?;
                 self.open_created(core, &drop.surface, &key);
             }
             FileTarget::Note { key, editor } => {
@@ -2825,6 +2975,125 @@ mod tests {
             mtime
         );
         assert!(keys(&app).iter().all(|(k, _)| k != "web.md"));
+    }
+
+    #[test]
+    fn the_due_drawer_finds_an_overdue_note_while_it_is_hidden() {
+        let dir = TempDir::new("due-entries");
+        let notes = dir.0.join("notes");
+        for (name, text) in [
+            ("soon.md", "+++\ndue = 2998-01-01\n+++\n# Soon\nsoon\n"),
+            ("late.md", "+++\ndue = 2999-01-01\n+++\n# Late\nlate\n"),
+            (
+                "old.md",
+                "+++\ndue = 2001-01-01\napps = [\"firefox\"]\n+++\n# Old\nlong ago\n",
+            ),
+            ("older.md", "+++\ndue = 2000-01-01\n+++\n# Older\nlonger\n"),
+            ("plain.md", "no due time\n"),
+            ("bad.md", "+++\ndue = \"tomorrow\"\n+++\nnot a time\n"),
+        ] {
+            std::fs::write(notes.join(name), text).unwrap();
+        }
+        // The oldest overdue one is hidden: it is still in the drawer.
+        let mut app = app_with_hidden(&dir.0, &["older.md"]);
+        let keys = |app: &WlNote| -> Vec<(String, bool, bool, bool)> {
+            (app.drawer_entries(drawer::Kind::Due).into_iter())
+                .map(|e| (e.key, e.overdue, e.dim, e.here))
+                .collect()
+        };
+        let f = |key: &str, overdue, dim, here| (key.to_string(), overdue, dim, here);
+        // Overdue first, then the soonest; hidden ones dimmed; notes with
+        // no (or a broken) due time aren't there.
+        assert_eq!(
+            keys(&app),
+            [
+                f("older.md", true, true, true),
+                f("old.md", true, false, false),
+                f("soon.md", false, false, true),
+                f("late.md", false, false, true),
+            ]
+        );
+        assert_eq!(app.due_counts(), (4, 2));
+        // For the window the note belongs to.
+        focus(&mut app, "firefox");
+        assert!(
+            keys(&app)
+                .iter()
+                .any(|e| *e == f("old.md", true, false, true))
+        );
+        // What a row says: when, where, what.
+        let entries = app.drawer_entries(drawer::Kind::Due);
+        let old = entries.iter().find(|e| e.key == "old.md").unwrap();
+        assert_eq!(old.title, "Old");
+        assert!(
+            old.due.contains("Jan") && old.due.contains("2001"),
+            "{}",
+            old.due
+        );
+        assert!(
+            old.subtitle().ends_with("firefox · long ago"),
+            "{}",
+            old.subtitle()
+        );
+        // Clearing a due time (the ✓) takes the note out of it; its
+        // file's other keys stay.
+        let mut note = Note::parse(std::fs::read_to_string(notes.join("old.md")).unwrap());
+        note.set_due(None).unwrap();
+        assert!(note.text().contains("apps = [\"firefox\"]"));
+        std::fs::write(notes.join("old.md"), note.text()).unwrap();
+        app.index.scan();
+        assert!(keys(&app).iter().all(|e| e.0 != "old.md"));
+        assert_eq!(app.due_counts(), (3, 1));
+        // A note being trashed is gone from it and the count.
+        let trash = Trash {
+            path: notes.join("soon.md"),
+            identity: Trash::identity(&notes.join("soon.md")).unwrap(),
+            command: "true".into(),
+        };
+        app.undo.replace(
+            Instant::now() + Duration::from_secs(5),
+            Removal::Trash(trash),
+        );
+        assert!(keys(&app).iter().all(|e| e.0 != "soon.md"));
+        assert_eq!(app.due_counts(), (2, 1));
+    }
+
+    #[test]
+    fn the_templates_drawer_lists_the_templates_directory() {
+        let dir = TempDir::new("template-entries");
+        let notes = dir.0.join("notes");
+        let templates = template::dir(&notes);
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            templates.join("meeting.md"),
+            "+++\ntitle = \"Meeting {date}\"\n+++\nagenda\n",
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("mail.md"),
+            "+++\napps = [\"thunderbird\"]\ncolor = \"blue\"\n+++\n# Reply\n",
+        )
+        .unwrap();
+        std::fs::write(templates.join("notes.txt"), "not a template").unwrap();
+        std::fs::write(notes.join("note.md"), "a note\n").unwrap();
+        let mut app = app_with_hidden(&dir.0, &[]);
+        app.templates = Index::load(&templates).0;
+        let entries = app.drawer_entries(drawer::Kind::Templates);
+        assert_eq!(
+            entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["mail.md", "meeting.md"]
+        );
+        assert!(entries.iter().all(|e| e.here && !e.overdue));
+        assert_eq!(entries[1].title, "Meeting {date}");
+        assert_eq!(entries[0].app, "thunderbird");
+        assert_eq!(entries[1].app, "");
+        // The color is the template's own.
+        assert_ne!(entries[0].color, entries[1].color);
+        // They aren't notes: not in the index, nor the hidden count.
+        assert!(app.index.get(Path::new("meeting.md")).is_none());
+        assert_eq!(app.index.len(), 1);
+        assert_eq!(app.templates.len(), 2);
+        assert_eq!(app.hidden_counts(), (0, 0));
     }
 
     #[test]

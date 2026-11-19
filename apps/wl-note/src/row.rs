@@ -14,16 +14,20 @@ pub enum Button {
     Window,
     Global,
     Paste,
+    Templates,
     Hidden,
+    Due,
 }
 
 impl Button {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Undo,
         Self::Window,
         Self::Global,
         Self::Paste,
+        Self::Templates,
         Self::Hidden,
+        Self::Due,
     ];
 
     pub fn label(self) -> &'static str {
@@ -32,7 +36,9 @@ impl Button {
             Self::Window => "Window",
             Self::Global => "Global",
             Self::Paste => "Paste",
+            Self::Templates => "Templates",
             Self::Hidden => "Hidden",
+            Self::Due => "Due",
         }
     }
 
@@ -42,7 +48,9 @@ impl Button {
             Self::Window => "▭",
             Self::Global => "◯",
             Self::Paste => "⎘",
+            Self::Templates => "◫",
             Self::Hidden => "≡",
+            Self::Due => "◷",
         }
     }
 }
@@ -52,28 +60,50 @@ pub struct Available {
     pub undo: bool,
     pub window: bool,
     pub paste: bool,
+    /// How many templates there are.
+    pub templates: usize,
     /// The notes hidden from this context, and those hidden anywhere.
     pub hidden_here: usize,
     pub hidden_all: usize,
+    /// The notes with a `due`, and those of them overdue.
+    pub due_all: usize,
+    pub due_overdue: usize,
 }
 
-/// What a button shows: its glyph, with a count where it has one (`9+`
-/// past nine, so it stays within the button).
-pub fn glyph(button: Button, state: Available) -> String {
-    if button != Button::Hidden || state.hidden_here == 0 {
-        return button.glyph().into();
+/// The count a button carries: `9+` past nine, so it stays within the
+/// button. None: it has none.
+fn count(button: Button, state: Available) -> Option<String> {
+    let n = match button {
+        Button::Hidden => state.hidden_here,
+        Button::Due => state.due_overdue,
+        _ => 0,
+    };
+    match n {
+        0 => None,
+        1..=9 => Some(n.to_string()),
+        _ => Some("9+".into()),
     }
-    match state.hidden_here {
-        n @ 1..=9 => format!("{}{n}", button.glyph()),
-        _ => format!("{}9+", button.glyph()),
+}
+
+/// What a button shows: its glyph, with a count where it has one.
+pub fn glyph(button: Button, state: Available) -> String {
+    match count(button, state) {
+        Some(n) => format!("{}{n}", button.glyph()),
+        None => button.glyph().into(),
     }
 }
 
 /// What a button says it does on hover.
 pub fn label(button: Button, state: Available) -> String {
     match (button, state.hidden_here, state.hidden_all) {
-        (Button::Hidden, 0, all) => format!("Hidden notes ({all} elsewhere)"),
-        (Button::Hidden, here, _) => format!("Hidden notes ({here} here)"),
+        (Button::Hidden, 0, all) => return format!("Hidden notes ({all} elsewhere)"),
+        (Button::Hidden, here, _) => return format!("Hidden notes ({here} here)"),
+        _ => {}
+    }
+    match (button, state.due_overdue, state.due_all) {
+        (Button::Due, 0, all) => format!("Due notes ({all})"),
+        (Button::Due, over, _) => format!("Due notes ({over} overdue)"),
+        (Button::Templates, ..) => "New from a template".into(),
         _ => button.label().into(),
     }
 }
@@ -93,7 +123,9 @@ pub fn buttons(order: &[Button], state: Available, mode: Mode) -> Vec<Button> {
             Button::Window => state.window && mode != Mode::Closed,
             Button::Global => mode != Mode::Closed,
             Button::Paste => state.paste && mode == Mode::Rest,
+            Button::Templates => state.templates > 0 && mode == Mode::Rest,
             Button::Hidden => state.hidden_all > 0 && mode == Mode::Rest,
+            Button::Due => state.due_all > 0 && mode == Mode::Rest,
         };
         if show && !result.contains(&button) {
             result.push(button);
@@ -267,6 +299,61 @@ mod tests {
         // Other buttons never carry it.
         assert_eq!(glyph(Paste, with(3)), "⎘");
         assert_eq!(label(Paste, with(3)), "Paste");
+    }
+
+    #[test]
+    fn templates_and_due_show_at_rest_when_there_is_something() {
+        let order = [Templates, Due];
+        let none = Available::default();
+        for mode in [Mode::Closed, Mode::Drag, Mode::Rest] {
+            assert!(buttons(&order, none, mode).is_empty());
+        }
+        let some = Available {
+            templates: 2,
+            due_all: 1,
+            ..none
+        };
+        for mode in [Mode::Closed, Mode::Drag] {
+            assert!(buttons(&order, some, mode).is_empty());
+        }
+        assert_eq!(buttons(&order, some, Mode::Rest), [Templates, Due]);
+        assert_eq!(
+            buttons(&[Due, Templates], some, Mode::Rest),
+            [Due, Templates]
+        );
+        // Each on its own.
+        let templates = Available { due_all: 0, ..some };
+        assert_eq!(buttons(&order, templates, Mode::Rest), [Templates]);
+        let due = Available {
+            templates: 0,
+            ..some
+        };
+        assert_eq!(buttons(&order, due, Mode::Rest), [Due]);
+    }
+
+    #[test]
+    fn the_due_count_is_of_the_overdue_and_stays_in_the_button() {
+        let with = |all, overdue| Available {
+            due_all: all,
+            due_overdue: overdue,
+            ..Available::default()
+        };
+        // Nothing overdue: no count.
+        assert_eq!(glyph(Due, with(4, 0)), "◷");
+        assert_eq!(label(Due, with(4, 0)), "Due notes (4)");
+        assert_eq!(glyph(Due, with(4, 2)), "◷2");
+        assert_eq!(glyph(Due, with(40, 9)), "◷9");
+        assert_eq!(glyph(Due, with(40, 10)), "◷9+");
+        assert_eq!(label(Due, with(4, 2)), "Due notes (2 overdue)");
+        // The hidden count isn't the due one, and the templates have none.
+        let state = Available {
+            hidden_here: 3,
+            templates: 5,
+            ..with(4, 2)
+        };
+        assert_eq!(glyph(Hidden, state), "≡3");
+        assert_eq!(glyph(Templates, state), "◫");
+        assert_eq!(label(Templates, state), "New from a template");
     }
 
     #[test]

@@ -393,6 +393,8 @@ pub enum Act {
     Hide(String),
     /// Show this hidden note again, and open it (or not).
     Show(String, bool),
+    /// Make a new note from this template (a path in `.templates`).
+    Template(String),
     Color(String, Color),
     /// Set this note's due time (a TOML date or datetime), or with None
     /// clear it.
@@ -521,6 +523,9 @@ pub enum FileTarget {
     New,
     NewScratch,
     NewGlobal,
+    /// A template of the open Templates drawer: a new note from it, with
+    /// the files linked.
+    Template(String),
     Note {
         key: String,
         editor: Option<(usize, String)>,
@@ -558,8 +563,8 @@ enum DrawerHit {
     Scope,
     /// The n-th row in view.
     Row(usize),
-    /// The trash icon on the n-th row in view.
-    Trash(usize),
+    /// The button (the trash icon, or the ✓) on the n-th row in view.
+    Action(usize),
 }
 
 /// The open drawer.
@@ -572,6 +577,18 @@ struct DrawerState {
     hover: Option<DrawerHit>,
     /// Wheel movement not yet a row.
     wheel: f64,
+}
+
+/// What picking the row of the note `key` in a drawer of `kind` asks for
+/// (`ctrl` held): a hidden note is shown again, and opened unless Ctrl
+/// leaves the drawer to bring back several; a due note is opened (shown
+/// again if it is hidden); a template makes a new note.
+fn pick(kind: drawer::Kind, key: String, ctrl: bool) -> Act {
+    match kind {
+        drawer::Kind::Hidden => Act::Show(key, !ctrl),
+        drawer::Kind::Due => Act::Show(key, true),
+        drawer::Kind::Templates => Act::Template(key),
+    }
 }
 
 pub struct Column {
@@ -1669,8 +1686,8 @@ impl Column {
             return None;
         }
         let key = match self.on_at(x, y) {
-            // Nothing is dropped on a drawer.
-            On::Sheet(key) if key == drawer::KEY => return None,
+            // Only a template takes a drop (the drawer's other rows are notes).
+            On::Sheet(key) if key == drawer::KEY => return self.drawer_file_target(x, y),
             On::Margin(key) if self.notes.get(&key).is_some_and(|n| n.scratch) => {
                 return Some(FileTarget::NewScratch);
             }
@@ -2916,20 +2933,39 @@ impl Column {
         )
     }
 
-    /// The drawer's body and what is where on it (from its corner), and
-    /// how many rows that has room for.
-    fn drawer_geometry(&mut self) -> Option<(Rect, drawer::Layout)> {
-        self.drawer.as_ref()?;
+    /// The drawer's body and what is where on it (from its corner).
+    fn drawer_layout(&self) -> Option<(Rect, drawer::Layout)> {
+        let st = self.drawer.as_ref()?;
         let face = self.face(drawer::KEY)?;
         let area = self.drawer_area(face);
         let size = self.style.font_size;
         let (row, foot) = (drawerview::row_height(size), drawerview::foot_height(size));
-        let st = self.drawer.as_mut()?;
         let layout = drawer::layout(area.w, area.h, row, foot, st.drawer.len());
+        Some((area, layout))
+    }
+
+    /// The same, and the drawer is told how many rows that has room for.
+    fn drawer_geometry(&mut self) -> Option<(Rect, drawer::Layout)> {
+        let (area, layout) = self.drawer_layout()?;
+        let st = self.drawer.as_mut()?;
         if st.drawer.set_capacity(layout.capacity()) {
             self.drawer_dirty = true;
         }
         Some((area, layout))
+    }
+
+    /// What a file dropped at (`x`, `y`) on the open drawer makes: a
+    /// note from the template there, on the Templates drawer.
+    fn drawer_file_target(&self, x: f64, y: f64) -> Option<FileTarget> {
+        let st = self.drawer.as_ref()?;
+        if st.drawer.kind() != drawer::Kind::Templates {
+            return None;
+        }
+        let (area, layout) = self.drawer_layout()?;
+        let (x, y) = (x - area.x, y - area.y);
+        let shown = st.drawer.window().len();
+        let n = (layout.rows.iter().take(shown)).position(|r| r.contains(x, y))?;
+        Some(FileTarget::Template(st.drawer.row(n)?.key.clone()))
     }
 
     /// What of the drawer is at (`x`, `y`).
@@ -2945,15 +2981,17 @@ impl Column {
         if layout.filter.contains(x, y) {
             return Some(DrawerHit::Filter);
         }
-        let shown = self.drawer.as_ref()?.drawer.window().len();
+        let st = self.drawer.as_ref()?;
+        let shown = st.drawer.window().len();
+        let has_action = st.drawer.kind().row_action().is_some();
         for (n, row) in layout.rows.iter().enumerate().take(shown) {
             if row.contains(x, y) {
-                return Some(
-                    match drawer::trash_rect(*row, drawerview::ICON).contains(x, y) {
-                        true => DrawerHit::Trash(n),
-                        false => DrawerHit::Row(n),
-                    },
-                );
+                let on_action =
+                    has_action && drawer::trash_rect(*row, drawerview::ICON).contains(x, y);
+                return Some(match on_action {
+                    true => DrawerHit::Action(n),
+                    false => DrawerHit::Row(n),
+                });
             }
         }
         None
@@ -3005,26 +3043,38 @@ impl Column {
                     st.drawer.select(n);
                     row_key(st, n)
                 });
+                let kind = self.drawer_kind();
                 self.drawer_changed();
-                // Ctrl: show it again and leave the drawer, to bring back
-                // several.
-                key.map(|k| Act::Show(k, !mods.ctrl)).into_iter().collect()
+                // Ctrl, on a hidden note: show it again and leave the
+                // drawer, to bring back several.
+                (kind.zip(key))
+                    .map(|(kind, k)| pick(kind, k, mods.ctrl))
+                    .into_iter()
+                    .collect()
             }
-            DrawerHit::Trash(n) => {
+            DrawerHit::Action(n) => {
                 let Some(key) = self.drawer.as_ref().and_then(|st| row_key(st, n)) else {
                     return Vec::new();
                 };
-                let confirmed = self.trash.click(Instant::now());
-                if !confirmed {
-                    let surface = self.surface().clone();
-                    if let Err(e) = core.timer(bar::TRASH_TIMEOUT, move |app: &mut WlNote, core| {
-                        app.column_timer(core, &surface, Timer::Trash);
-                    }) {
-                        warn!("trash confirmation: {e}");
+                match self.drawer_kind().and_then(drawer::Kind::row_action) {
+                    Some(drawer::RowAction::Clear) => vec![Act::Due(key, None)],
+                    Some(drawer::RowAction::Trash) => {
+                        let confirmed = self.trash.click(Instant::now());
+                        if !confirmed {
+                            let surface = self.surface().clone();
+                            if let Err(e) =
+                                core.timer(bar::TRASH_TIMEOUT, move |app: &mut WlNote, core| {
+                                    app.column_timer(core, &surface, Timer::Trash);
+                                })
+                            {
+                                warn!("trash confirmation: {e}");
+                            }
+                        }
+                        self.drawer_changed();
+                        confirmed.then_some(Act::Trash(key)).into_iter().collect()
                     }
+                    None => Vec::new(),
                 }
-                self.drawer_changed();
-                confirmed.then_some(Act::Trash(key)).into_iter().collect()
             }
         }
     }
@@ -3071,8 +3121,9 @@ impl Column {
         match sym {
             Keysym::Escape => return vec![Act::Close],
             Keysym::Return | Keysym::KP_Enter => {
+                let kind = st.drawer.kind();
                 return (st.drawer.selected())
-                    .map(|e| Act::Show(e.key.clone(), !ctrl))
+                    .map(|e| pick(kind, e.key.clone(), ctrl))
                     .into_iter()
                     .collect();
             }
@@ -3213,34 +3264,39 @@ impl Column {
         let rows: Vec<drawerview::Row> = (0..d.window().len())
             .filter_map(|n| {
                 let e = d.row(n)?;
-                let sub = match e.line.is_empty() {
-                    true => e.app.clone(),
-                    false => format!("{} · {}", e.app, e.line),
-                };
                 Some(drawerview::Row {
                     title: e.title.clone(),
-                    sub,
+                    sub: e.subtitle(),
                     color: e.color,
                     overdue: e.overdue,
+                    dim: e.dim,
                     selected: d.is_selected(n),
                     hovered: matches!(
                         hover,
-                        Some(DrawerHit::Row(i) | DrawerHit::Trash(i)) if i == n
+                        Some(DrawerHit::Row(i) | DrawerHit::Action(i)) if i == n
                     ),
                 })
             })
             .collect();
-        let trash = match hover {
-            Some(DrawerHit::Row(n) | DrawerHit::Trash(n)) if n < rows.len() => {
-                let lit = matches!(hover, Some(DrawerHit::Trash(_)));
-                let tint = match (lit, armed) {
-                    (true, true) => TRASH_RED,
-                    (true, false) => ink,
-                    _ => (ink & !0xff) | 0xa0,
-                };
-                (self.icons.get(&self.trash_icon()))
-                    .and_then(|i| i.as_ref())
-                    .map(|image| (n, tinted(image, tint)))
+        let action = match (hover, d.kind().row_action()) {
+            (Some(DrawerHit::Row(n) | DrawerHit::Action(n)), Some(kind)) if n < rows.len() => {
+                let lit = matches!(hover, Some(DrawerHit::Action(_)));
+                match kind {
+                    drawer::RowAction::Trash => {
+                        let tint = match (lit, armed) {
+                            (true, true) => TRASH_RED,
+                            (true, false) => ink,
+                            _ => (ink & !0xff) | 0xa0,
+                        };
+                        (self.icons.get(&self.trash_icon()))
+                            .and_then(|i| i.as_ref())
+                            .map(|image| (n, drawerview::Action::Icon(tinted(image, tint))))
+                    }
+                    drawer::RowAction::Clear => {
+                        let color = if lit { ink } else { (ink & !0xff) | 0xa0 };
+                        Some((n, drawerview::Action::Glyph("✓", color)))
+                    }
+                }
             }
             _ => None,
         };
@@ -3263,10 +3319,13 @@ impl Column {
             overdue: self.style.overdue,
             filter: field,
             placeholder: "Filter",
-            scope: d.scope().label().to_owned(),
+            scope: match d.kind().scoped() {
+                true => d.scope().label().to_owned(),
+                false => String::new(),
+            },
             scope_lit: hover == Some(DrawerHit::Scope),
             rows,
-            trash,
+            action,
             empty,
             above: d.above(),
             more: d.below(),

@@ -49,7 +49,7 @@ evening = "18:00"                  # Tonight's time
 everywhere = false                 # Also show overdue notes in the global group, everywhere
 
 [row]
-buttons = ["undo", "window", "global", "paste", "hidden"] # Nearest + first; omit unwanted buttons
+buttons = ["undo", "window", "global", "paste", "templates", "hidden", "due"] # Nearest + first; omit unwanted buttons
 undo-time = 5000                   # Milliseconds; 0 disables undo
 # Paste without keyboard focus needs compositor support for ext-data-control.
 

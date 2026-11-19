@@ -23,6 +23,7 @@ mod papers;
 mod reorder;
 mod row;
 mod scratch;
+mod template;
 mod title;
 
 use std::io::Read;

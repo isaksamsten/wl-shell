@@ -47,8 +47,18 @@ pub struct Row {
     /// Its note's paper, 0xRRGGBBAA.
     pub color: u32,
     pub overdue: bool,
+    /// Drawn faint: a note that is hidden, among those due.
+    pub dim: bool,
     pub selected: bool,
     pub hovered: bool,
+}
+
+/// What a hovered row's button looks like.
+pub enum Action {
+    /// An icon, in its color.
+    Icon(Image),
+    /// A glyph, in a color (0xRRGGBBAA).
+    Glyph(&'static str, u32),
 }
 
 /// Everything a drawing depends on.
@@ -69,8 +79,8 @@ pub struct View<'a> {
     pub scope: String,
     pub scope_lit: bool,
     pub rows: Vec<Row>,
-    /// The trash icon (in its color), and the row it is on.
-    pub trash: Option<(usize, Image)>,
+    /// The button on a row (in view), and the row it is on.
+    pub action: Option<(usize, Action)>,
     /// What an empty list says.
     pub empty: Option<String>,
     /// How many rows are above the first one, and below the last.
@@ -121,6 +131,12 @@ fn faint(rgba: u32, alpha: u32) -> u32 {
     (rgba & !0xff) | alpha
 }
 
+/// `rgba` with its alpha scaled by `by` (0 to 1).
+fn fade(rgba: u32, by: f64) -> u32 {
+    let alpha = ((rgba & 0xff) as f64 * by.clamp(0.0, 1.0)).round() as u32;
+    faint(rgba, alpha)
+}
+
 /// Draw `view`: the image, and how far the filter is scrolled sideways.
 pub fn compose(fonts: &mut Text, lines: &mut Lines, view: &View) -> (Image, f64) {
     let s = view.scale.max(1);
@@ -142,6 +158,15 @@ pub fn compose(fonts: &mut Text, lines: &mut Lines, view: &View) -> (Image, f64)
         size: title_size(view.size),
         color: view.ink,
         background: 0,
+    };
+    // What is dimmed: a hidden note among those due.
+    let dim_title = text::Style {
+        color: faint(view.ink, 0x90),
+        ..title.clone()
+    };
+    let dim_small = text::Style {
+        color: faint(view.ink, 0x55),
+        ..small.clone()
     };
     let fill = |canvas: &mut Image, r: wl_shell_ui::Rect, radius: f64, color: u32| {
         let image = text::rounded_rect(px(r.w), px(r.h), radius * s as f64, color);
@@ -167,26 +192,29 @@ pub fn compose(fonts: &mut Text, lines: &mut Lines, view: &View) -> (Image, f64)
         put(&mut canvas, &hint, l.filter.x + inset, fy + 1.0);
     }
     blit(&mut canvas, &drawn.image, px(l.filter.x + inset), px(fy));
-    if view.scope_lit {
-        fill(&mut canvas, l.scope, 4.0, faint(view.ink, 0x16));
+    // The templates have no scope.
+    if !view.scope.is_empty() {
+        if view.scope_lit {
+            fill(&mut canvas, l.scope, 4.0, faint(view.ink, 0x16));
+        }
+        let scope_style = text::Style {
+            color: faint(view.ink, 0xc0),
+            ..small.clone()
+        };
+        let scope = lines.get(
+            fonts,
+            s,
+            &format!("{} ▾", view.scope),
+            &scope_style,
+            l.scope.w as i32,
+        );
+        put(
+            &mut canvas,
+            &scope,
+            l.scope.x + (l.scope.w - scope.width as f64) / 2.0,
+            l.scope.y + (l.scope.h - scope.height as f64) / 2.0,
+        );
     }
-    let scope_style = text::Style {
-        color: faint(view.ink, 0xc0),
-        ..small.clone()
-    };
-    let scope = lines.get(
-        fonts,
-        s,
-        &format!("{} ▾", view.scope),
-        &scope_style,
-        l.scope.w as i32,
-    );
-    put(
-        &mut canvas,
-        &scope,
-        l.scope.x + (l.scope.w - scope.width as f64) / 2.0,
-        l.scope.y + (l.scope.h - scope.height as f64) / 2.0,
-    );
 
     // The rows.
     let title_h = text::line_height(title.size) as f64;
@@ -199,30 +227,51 @@ pub fn compose(fonts: &mut Text, lines: &mut Lines, view: &View) -> (Image, f64)
         }
         let tab = wl_shell_ui::Rect::new(r.x + 4.0, r.y + 4.0, TAB_W, (r.h - 8.0).max(2.0));
         let outline = wl_shell_ui::Rect::new(tab.x - 1.0, tab.y - 1.0, tab.w + 2.0, tab.h + 2.0);
+        let tab_alpha = if row.dim { 0.5 } else { 1.0 };
         fill(&mut canvas, outline, 3.0, faint(view.ink, 0x50));
-        fill(&mut canvas, tab, 2.5, row.color);
-        let on_trash = view.trash.as_ref().is_some_and(|(i, _)| *i == n);
-        let end = match on_trash {
+        fill(&mut canvas, tab, 2.5, fade(row.color, tab_alpha));
+        let on_action = view.action.as_ref().is_some_and(|(i, _)| *i == n);
+        let end = match on_action {
             true => drawer::trash_rect(r, ICON).x - 4.0,
             false => r.right() - 4.0,
         };
         let room = (end - (r.x + TEXT_X)).max(8.0) as i32;
-        let line = lines.get(fonts, s, &row.title, &title, room);
+        let (title, small) = match row.dim {
+            true => (&dim_title, &dim_small),
+            false => (&title, &small),
+        };
+        let line = lines.get(fonts, s, &row.title, title, room);
         put(&mut canvas, &line, r.x + TEXT_X, r.y);
         if !row.sub.is_empty() {
-            let line = lines.get(fonts, s, &row.sub, &small, room);
+            let line = lines.get(fonts, s, &row.sub, small, room);
             put(&mut canvas, &line, r.x + TEXT_X, r.y + title_h - 3.0);
         }
-        if row.overdue && !on_trash {
+        if row.overdue && !on_action {
             let d = 6.0;
             let dot = wl_shell_ui::Rect::new(r.right() - 4.0 - d, r.y + (r.h - d) / 2.0, d, d);
             fill(&mut canvas, dot, d / 2.0, view.overdue);
         }
-        if let Some((i, icon)) = &view.trash
+        if let Some((i, action)) = &view.action
             && *i == n
         {
             let at = drawer::trash_rect(r, ICON);
-            blit(&mut canvas, icon, px(at.x), px(at.y));
+            match action {
+                Action::Icon(icon) => blit(&mut canvas, icon, px(at.x), px(at.y)),
+                Action::Glyph(glyph, color) => {
+                    let style = text::Style {
+                        size: title_size(view.size) * 1.1,
+                        color: *color,
+                        ..title.clone()
+                    };
+                    let line = lines.get(fonts, s, glyph, &style, at.w as i32);
+                    put(
+                        &mut canvas,
+                        &line,
+                        at.x + (at.w - line.width as f64) / 2.0,
+                        at.y + (at.h - line.height as f64) / 2.0,
+                    );
+                }
+            }
         }
     }
     if let Some(message) = &view.empty {
@@ -341,6 +390,7 @@ mod tests {
             sub: "firefox · a first line that is much too long to fit in the row at all".into(),
             color: 0xfff2a8ff,
             overdue: false,
+            dim: false,
             selected,
             hovered,
         }
@@ -364,7 +414,11 @@ mod tests {
         };
         let trash = Some((
             1,
-            solid(16 * scale as u32, 16 * scale as u32, [30, 30, 30, 255]),
+            Action::Icon(solid(
+                16 * scale as u32,
+                16 * scale as u32,
+                [30, 30, 30, 255],
+            )),
         ));
         View {
             scale,
@@ -380,7 +434,7 @@ mod tests {
             scope: "here".into(),
             scope_lit: false,
             rows,
-            trash,
+            action: trash,
             empty: None,
             above: 2,
             more: 3,
@@ -446,13 +500,67 @@ mod tests {
         }
     }
 
+    /// The total alpha in a part of the image.
+    fn ink(img: &Image, x: f64, y: f64, w: f64, h: f64, scale: i32) -> u64 {
+        let s = scale as f64;
+        let mut n = 0;
+        for py in (y * s) as u32..((y + h) * s) as u32 {
+            for px in (x * s) as u32..((x + w) * s) as u32 {
+                n += u64::from(pixel(img, px, py)[3]);
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn a_glyph_button_dim_rows_and_no_scope() {
+        let mut fonts = Text::new();
+        let mut lines = Lines::default();
+        for scale in [1, 2] {
+            let layout = drawer::layout(248.0, 200.0, row_height(13.0), foot_height(13.0), 2);
+            let rows = |dim| {
+                let mut rows = vec![row("A note", false, false), row("Another", false, true)];
+                rows[0].dim = dim;
+                rows
+            };
+            let mut v = view(&layout, rows(false), scale);
+            v.above = 0;
+            v.more = 0;
+            v.action = Some((1, Action::Glyph("✓", 0x2b2b2bff)));
+            let (image, _) = compose(&mut fonts, &mut lines, &v);
+            // The check is on the hovered row's end.
+            let at = drawer::trash_rect(layout.rows[1], ICON);
+            let marked = ink(&image, at.x, at.y, at.w, at.h, scale);
+            assert!(marked > 100, "{marked}");
+            v.action = None;
+            let (plain, _) = compose(&mut fonts, &mut lines, &v);
+            assert!(ink(&plain, at.x, at.y, at.w, at.h, scale) < marked);
+            // A dim row has the same shape in fainter ink.
+            let r0 = layout.rows[0];
+            let normal = ink(&plain, r0.x, r0.y, r0.w, r0.h, scale);
+            let mut v = view(&layout, rows(true), scale);
+            v.action = None;
+            let (dimmed, _) = compose(&mut fonts, &mut lines, &v);
+            let faded = ink(&dimmed, r0.x, r0.y, r0.w, r0.h, scale);
+            assert!(faded > 0 && faded < normal, "{faded} {normal}");
+            // Without a scope, nothing is drawn where it would be.
+            let s = layout.scope;
+            assert!(ink(&plain, s.x, s.y, s.w, s.h, scale) > 0);
+            let mut v = view(&layout, rows(false), scale);
+            v.scope = String::new();
+            v.action = None;
+            let (bare, _) = compose(&mut fonts, &mut lines, &v);
+            assert_eq!(ink(&bare, s.x, s.y, s.w, s.h, scale), 0);
+        }
+    }
+
     #[test]
     fn drawing_an_empty_drawer() {
         let mut fonts = Text::new();
         let mut lines = Lines::default();
         let layout = drawer::layout(248.0, 200.0, row_height(13.0), foot_height(13.0), 0);
         let mut v = view(&layout, Vec::new(), 1);
-        v.trash = None;
+        v.action = None;
         v.above = 0;
         v.more = 0;
         v.empty = Some("No hidden notes here (Tab: all)".into());

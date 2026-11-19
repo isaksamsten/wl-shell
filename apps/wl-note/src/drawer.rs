@@ -1,14 +1,16 @@
 //! The drawer: a sheet holding a list of notes rather than a note, such as
-//! the hidden ones. Pure, unit tested.
+//! the hidden ones, those with a due time, or the templates. Pure, unit
+//! tested.
 //!
 //! The program hands over every note the drawer could list (`Entry`),
 //! each saying whether it belongs to the context (`here`). The drawer
-//! decides what shows: the **scope** (`here` or `all`), the **filter**
-//! (typed; titles and bodies, fuzzy, best match first, with
-//! `nucleo-matcher`), the **selection** (arrows, Enter) and the **scroll**
-//! (a window of `capacity` rows onto the list). Without a filter the rows
-//! stay in the order they were handed over (for the hidden notes: the one
-//! hidden last first).
+//! decides what shows: the **scope** (`here` or `all`; not for the
+//! templates, which are all there is), the **filter** (typed; titles and
+//! bodies, fuzzy, best match first, with `nucleo-matcher`), the
+//! **selection** (arrows, Enter) and the **scroll** (a window of
+//! `capacity` rows onto the list). Without a filter the rows stay in the
+//! order they were handed over (for the hidden notes: the one hidden last
+//! first; for the due ones: `sort_due`).
 //!
 //! `layout` says where the parts are on the drawer's body, which the
 //! column draws (drawerview.rs) and finds the pointer on.
@@ -31,6 +33,19 @@ const EXCERPT: usize = 160;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Hidden,
+    /// The notes with a `due`, hidden or not.
+    Due,
+    /// The files of the `.templates` directory.
+    Templates,
+}
+
+/// What the button on a hovered row does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowAction {
+    /// Move the note to the Trash (two clicks).
+    Trash,
+    /// Clear the note's `due`.
+    Clear,
 }
 
 impl Kind {
@@ -38,6 +53,8 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Hidden => "Hidden",
+            Self::Due => "Due",
+            Self::Templates => "Templates",
         }
     }
 
@@ -47,7 +64,24 @@ impl Kind {
         match (self, elsewhere) {
             (Self::Hidden, false) => "No hidden notes",
             (Self::Hidden, true) => "No hidden notes here (Tab: all)",
+            (Self::Due, false) => "No notes with a due time",
+            (Self::Due, true) => "No due notes here (Tab: all)",
+            (Self::Templates, _) => "No templates in .templates",
         }
+    }
+
+    /// What the button on a hovered row does, if there is one.
+    pub fn row_action(self) -> Option<RowAction> {
+        match self {
+            Self::Hidden => Some(RowAction::Trash),
+            Self::Due => Some(RowAction::Clear),
+            Self::Templates => None,
+        }
+    }
+
+    /// Whether the notes are for `here` or `all`: a template isn't.
+    pub fn scoped(self) -> bool {
+        self != Self::Templates
     }
 }
 
@@ -90,6 +124,12 @@ pub struct Entry {
     /// It belongs to the context.
     pub here: bool,
     pub overdue: bool,
+    /// When it is due, in Unix seconds, and as it is said ("Thu 20 Nov
+    /// 09:00").
+    pub due_at: Option<i64>,
+    pub due: String,
+    /// Shown dimmed: a note that is hidden, in a drawer of those due.
+    pub dim: bool,
     /// What the filter looks in: title, app and text.
     search: String,
 }
@@ -98,9 +138,27 @@ impl Entry {
     /// The entry of `note`, at `key`; `name` is its file's name, which
     /// the title falls back to.
     pub fn of(key: String, name: &str, note: &Note, color: u32, here: bool, overdue: bool) -> Self {
+        Self::build(key, name, note, color, here, overdue, "global")
+    }
+
+    /// The entry of a template: it says where it shows only if it names
+    /// an app of its own.
+    pub fn template(key: String, name: &str, note: &Note, color: u32) -> Self {
+        Self::build(key, name, note, color, true, false, "")
+    }
+
+    fn build(
+        key: String,
+        name: &str,
+        note: &Note,
+        color: u32,
+        here: bool,
+        overdue: bool,
+        global: &str,
+    ) -> Self {
         let title = note.title_or(name).trim().to_owned();
         let app = if note.global() {
-            "global".to_owned()
+            global.to_owned()
         } else {
             crate::list::shows(note)
         };
@@ -115,9 +173,39 @@ impl Entry {
             color,
             here,
             overdue,
+            due_at: None,
+            due: String::new(),
+            dim: false,
             search,
         }
     }
+
+    /// Due at `at` (Unix seconds), said `when`.
+    pub fn due(mut self, at: i64, when: String) -> Self {
+        self.due_at = Some(at);
+        self.due = when;
+        self
+    }
+
+    pub fn dimmed(mut self, dim: bool) -> Self {
+        self.dim = dim;
+        self
+    }
+
+    /// The second line of its row: when it is due, where it shows, and
+    /// its first line, whichever there are.
+    pub fn subtitle(&self) -> String {
+        let parts = [self.due.as_str(), self.app.as_str(), self.line.as_str()];
+        let parts: Vec<&str> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+        parts.join(" · ")
+    }
+}
+
+/// Put the entries with a due time in the order of the Due drawer: those
+/// overdue first, then the soonest; those due at the same time stay as
+/// they were.
+pub fn sort_due(entries: &mut [Entry]) {
+    entries.sort_by_key(|e| (!e.overdue, e.due_at.unwrap_or(i64::MAX)));
 }
 
 /// The first line of `body` worth showing: not blank, and not the heading
@@ -254,7 +342,9 @@ impl Drawer {
     /// Whether the other scope has rows the filter lets through, so an
     /// empty drawer can say where to look.
     pub fn elsewhere(&self) -> bool {
-        self.scope == Scope::Here && !rank(&self.entries, Scope::All, &self.filter).is_empty()
+        self.kind.scoped()
+            && self.scope == Scope::Here
+            && !rank(&self.entries, Scope::All, &self.filter).is_empty()
     }
 
     /// Show `entries` instead: the selection stays on its note if it is
@@ -282,6 +372,9 @@ impl Drawer {
     }
 
     pub fn toggle_scope(&mut self) {
+        if !self.kind.scoped() {
+            return;
+        }
         self.scope = self.scope.toggled();
         self.selected = 0;
         self.top = 0;
@@ -736,5 +829,87 @@ mod tests {
         let e = Entry::of("f.md".into(), "f", &app, 0, false, true);
         assert_eq!((e.title.as_str(), e.app.as_str()), ("f", "firefox"));
         assert!(e.overdue && !e.here);
+    }
+
+    fn due_entry(key: &str, at: i64, overdue: bool, hidden: bool) -> Entry {
+        let mut e = entry(key, key, true).due(at, format!("at {at}"));
+        e.overdue = overdue;
+        e.dimmed(hidden)
+    }
+
+    #[test]
+    fn the_due_drawer_puts_the_overdue_first_then_the_soonest() {
+        let mut entries = vec![
+            due_entry("later", 900, false, false),
+            due_entry("soon", 300, false, true),
+            due_entry("old", 100, true, false),
+            due_entry("older", 50, true, true),
+            due_entry("same-a", 500, false, false),
+            due_entry("same-b", 500, false, false),
+        ];
+        sort_due(&mut entries);
+        let order: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(order, ["older", "old", "soon", "same-a", "same-b", "later"]);
+        // Hidden ones are in it, dimmed.
+        assert!(entries[0].dim && !entries[1].dim);
+        // Overdue wins even over an earlier time that hasn't passed (a
+        // clock that was set back).
+        let mut odd = vec![
+            due_entry("future", 10, false, false),
+            due_entry("past", 20, true, false),
+        ];
+        sort_due(&mut odd);
+        assert_eq!(odd[0].key, "past");
+        // The same drawer, in a drawer: that is the order shown.
+        let d = Drawer::new(Kind::Due, entries);
+        assert_eq!(keys(&d)[0], "older");
+        assert_eq!(
+            d.row(0).unwrap().subtitle(),
+            "at 50 · global · body of older"
+        );
+    }
+
+    #[test]
+    fn a_row_says_when_where_and_what() {
+        let note = Note::parse("+++\napps = [\"firefox\"]\n+++\nlinks\n");
+        let e = Entry::of("f.md".into(), "f", &note, 0, true, false);
+        assert_eq!(e.subtitle(), "firefox · links");
+        let e = e.due(1, "Thu 20 Nov 09:00".into());
+        assert_eq!(e.subtitle(), "Thu 20 Nov 09:00 · firefox · links");
+        let blank = Note::parse("+++\ntitle = \"T\"\n+++\n");
+        let e = Entry::template("t.md".into(), "t", &blank, 0);
+        assert_eq!(e.subtitle(), "");
+    }
+
+    #[test]
+    fn a_template_says_where_it_shows_only_if_it_names_an_app() {
+        let any = Note::parse("# Meeting {date}\nagenda\n");
+        let own = Note::parse("+++\napps = [\"thunderbird\"]\n+++\nreply\n");
+        let e = Entry::template("any.md".into(), "any", &any, 0);
+        assert_eq!((e.app.as_str(), e.here), ("", true));
+        assert_eq!(e.subtitle(), "agenda");
+        let e = Entry::template("own.md".into(), "own", &own, 0);
+        assert_eq!((e.app.as_str(), e.here), ("thunderbird", true));
+    }
+
+    #[test]
+    fn the_templates_have_no_scope_and_the_kinds_their_buttons() {
+        let mut d = Drawer::new(
+            Kind::Templates,
+            vec![entry("a", "A", true), entry("b", "B", true)],
+        );
+        assert_eq!(d.scope(), Scope::Here);
+        d.toggle_scope();
+        assert_eq!(d.scope(), Scope::Here);
+        assert!(!d.elsewhere());
+        assert_eq!(d.len(), 2);
+        assert!(Kind::Hidden.scoped() && Kind::Due.scoped() && !Kind::Templates.scoped());
+        assert_eq!(Kind::Hidden.row_action(), Some(RowAction::Trash));
+        assert_eq!(Kind::Due.row_action(), Some(RowAction::Clear));
+        assert_eq!(Kind::Templates.row_action(), None);
+        for kind in [Kind::Hidden, Kind::Due, Kind::Templates] {
+            assert!(!kind.label().is_empty());
+            assert!(!kind.empty(false).is_empty() && !kind.empty(true).is_empty());
+        }
     }
 }
