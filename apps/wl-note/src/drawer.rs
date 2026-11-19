@@ -115,7 +115,7 @@ pub struct Entry {
     /// The note's key: its path in the notes directory.
     pub key: String,
     pub title: String,
-    /// Where it shows: "global", or its apps.
+    /// Where it shows: `ALL_APPS`, or its apps.
     pub app: String,
     /// The first line of its text, without markdown's marks.
     pub line: String,
@@ -134,37 +134,34 @@ pub struct Entry {
     search: String,
 }
 
+/// Where a note shown for every app says it shows.
+pub const ALL_APPS: &str = "all apps";
+
 impl Entry {
     /// The entry of `note`, at `key`; `name` is its file's name, which
     /// the title falls back to.
     pub fn of(key: String, name: &str, note: &Note, color: u32, here: bool, overdue: bool) -> Self {
-        Self::build(key, name, note, color, here, overdue, "global")
+        Self::build(key, name, note, color, here, overdue)
     }
 
-    /// The entry of a template: it says where its notes show (global if
-    /// it names nothing, its placeholders as they are).
+    /// The entry of a template: it says where its notes show (all apps
+    /// if it names nothing, its placeholders as they are).
     pub fn template(key: String, name: &str, note: &Note, color: u32) -> Self {
-        Self::build(key, name, note, color, true, false, "global")
+        Self::build(key, name, note, color, true, false)
     }
 
-    fn build(
-        key: String,
-        name: &str,
-        note: &Note,
-        color: u32,
-        here: bool,
-        overdue: bool,
-        global: &str,
-    ) -> Self {
+    fn build(key: String, name: &str, note: &Note, color: u32, here: bool, overdue: bool) -> Self {
         let title = note.title_or(name).trim().to_owned();
         let app = if note.global() {
-            global.to_owned()
+            ALL_APPS.to_owned()
         } else {
             crate::list::shows(note)
         };
         let body: String = note.body().chars().take(SEARCHED).collect();
         let line = first_line(&body, &title);
-        let search = format!("{title}\n{app}\n{body}");
+        // The CLI and config call them global: that finds them too.
+        let also = if note.global() { " global" } else { "" };
+        let search = format!("{title}\n{app}{also}\n{body}");
         Self {
             key,
             title,
@@ -823,12 +820,21 @@ mod tests {
         let e = Entry::of("g.md".into(), "g", &global, 0, true, false);
         assert_eq!(
             (e.title.as_str(), e.app.as_str(), e.line.as_str()),
-            ("Groceries", "global", "milk")
+            ("Groceries", "all apps", "milk")
         );
         let app = Note::parse("+++\napps = [\"firefox\"]\n+++\nlinks\n");
         let e = Entry::of("f.md".into(), "f", &app, 0, false, true);
         assert_eq!((e.title.as_str(), e.app.as_str()), ("f", "firefox"));
         assert!(e.overdue && !e.here);
+        // Found by what the row says, and by what the CLI calls it.
+        for filter in ["all apps", "global"] {
+            let mut d = Drawer::new(
+                Kind::Hidden,
+                vec![Entry::of("g.md".into(), "g", &global, 0, true, false), e.clone()],
+            );
+            d.set_filter(filter);
+            assert_eq!(keys(&d), ["g.md"], "{filter}");
+        }
     }
 
     fn due_entry(key: &str, at: i64, overdue: bool, hidden: bool) -> Entry {
@@ -865,7 +871,7 @@ mod tests {
         assert_eq!(keys(&d)[0], "older");
         assert_eq!(
             d.row(0).unwrap().subtitle(),
-            "at 50 · global · body of older"
+            "at 50 · all apps · body of older"
         );
     }
 
@@ -878,7 +884,7 @@ mod tests {
         assert_eq!(e.subtitle(), "Thu 20 Nov 09:00 · firefox · links");
         let blank = Note::parse("+++\ntitle = \"T\"\n+++\n");
         let e = Entry::template("t.md".into(), "t", &blank, 0);
-        assert_eq!(e.subtitle(), "global");
+        assert_eq!(e.subtitle(), "all apps");
     }
 
     #[test]
@@ -886,8 +892,8 @@ mod tests {
         let any = Note::parse("# Meeting {date}\nagenda\n");
         let own = Note::parse("+++\napps = [\"thunderbird\"]\n+++\nreply\n");
         let e = Entry::template("any.md".into(), "any", &any, 0);
-        assert_eq!((e.app.as_str(), e.here), ("global", true));
-        assert_eq!(e.subtitle(), "global · agenda");
+        assert_eq!((e.app.as_str(), e.here), ("all apps", true));
+        assert_eq!(e.subtitle(), "all apps · agenda");
         let e = Entry::template("own.md".into(), "own", &own, 0);
         assert_eq!((e.app.as_str(), e.here), ("thunderbird", true));
         let focused = Note::parse("+++\napps = [\"{app}\"]\n+++\nx\n");

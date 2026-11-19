@@ -2959,7 +2959,7 @@ mod tests {
             ),
             ("Shell tips", "use fzf")
         );
-        assert_eq!(find("any.md").app, "global");
+        assert_eq!(find("any.md").app, "all apps");
         assert!(find("old.md").overdue && !find("any.md").overdue);
         // A note being trashed is gone from the drawer and the count.
         let trash = Trash {
@@ -3091,7 +3091,7 @@ mod tests {
         assert!(entries.iter().all(|e| e.here && !e.overdue));
         assert_eq!(entries[1].title, "Meeting {date}");
         assert_eq!(entries[0].app, "thunderbird");
-        assert_eq!(entries[1].app, "global");
+        assert_eq!(entries[1].app, "all apps");
         // The color is the template's own.
         assert_ne!(entries[0].color, entries[1].color);
         // They aren't notes: not in the index, nor the hidden count.
