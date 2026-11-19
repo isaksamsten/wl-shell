@@ -32,13 +32,11 @@ use crate::editor;
 /// A note, ready to render.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Content {
-    /// The title: the frontmatter's, else the first heading's, else the
-    /// file's name.
+    /// The title: the heading the body opens with, else the file's name.
     pub title: String,
-    /// The body (after the frontmatter's error, if it is broken).
+    /// The body (after the frontmatter's error, if it is broken), its
+    /// heading included.
     pub blocks: Vec<Block>,
-    /// The block of `blocks` that is the title, if it came from there.
-    pub heading: Option<usize>,
     /// The byte range in the file of each task's `[ ]` or `[x]`, in order:
     /// `Target::Task(n)` is `tasks[n]`.
     pub tasks: Vec<Range<usize>>,
@@ -54,11 +52,6 @@ impl Content {
         let offset = note.text().len() - body.len();
         let mut content = parse(body, offset);
         content.title = note.title_or(name).to_string();
-        let own = (note.meta.title.as_deref()).is_some_and(|t| !t.trim().is_empty());
-        if !own && note.title().is_some() {
-            content.heading =
-                (content.blocks.iter()).position(|b| matches!(b.kind, Kind::Heading(_)));
-        }
         if let Some(e) = &note.error {
             let run = Run {
                 dim: true,
@@ -68,23 +61,8 @@ impl Content {
             content
                 .blocks
                 .insert(0, Block::new(Kind::Paragraph, vec![run]));
-            content.heading = content.heading.map(|h| h + 1);
         }
         content
-    }
-
-    /// The body without the heading that is the title.
-    pub fn body(&self) -> Vec<Block> {
-        (self.blocks.iter().enumerate())
-            .filter(|(i, _)| Some(*i) != self.heading)
-            .map(|(_, b)| b.clone())
-            .collect()
-    }
-
-    /// What a sheet shows: the title as a heading, then the body.
-    pub fn sheet(&self) -> Vec<Block> {
-        let title = Block::new(Kind::Heading(2), vec![Run::plain(self.title.clone())]);
-        std::iter::once(title).chain(self.body()).collect()
     }
 }
 
@@ -124,33 +102,9 @@ pub fn toggle(text: &str, range: Range<usize>) -> Option<String> {
     Some(format!("{}{new}{}", &text[..at + 1], &text[at + 2..]))
 }
 
-/// Where a note's editable text starts: after its frontmatter (the first
-/// offset), and after the heading its title comes from, if the body opens
-/// with it (the second), so the title isn't shown twice.
-pub fn editable(note: &Note) -> (usize, usize) {
-    let front = note.text().len() - note.body().len();
-    if (note.meta.title.as_deref()).is_some_and(|t| !t.trim().is_empty()) {
-        return (front, front);
-    }
-    let body = note.body();
-    let mut at = 0;
-    let mut heading = false;
-    for line in body.split_inclusive('\n') {
-        let t = line.trim_end_matches(['\n', '\r']);
-        if t.trim().is_empty() {
-            at += line.len();
-            continue;
-        }
-        if heading || heading_level(t).is_none_or(|(_, text)| text.is_empty()) {
-            break;
-        }
-        heading = true;
-        at += line.len();
-    }
-    match heading {
-        true => (front, front + at),
-        false => (front, front),
-    }
+/// Where a note's editable text starts: after its frontmatter.
+pub fn editable(note: &Note) -> usize {
+    note.text().len() - note.body().len()
 }
 
 /// An ATX heading's level, and its text.
@@ -738,30 +692,22 @@ mod tests {
 
     #[test]
     fn titles() {
-        let n = Note::parse("+++\ntitle = \"Release\"\n+++\n# Heading\n- [ ] a\n");
+        // The heading the body opens with is the title, and stays in it.
+        let n = Note::parse("+++\ntitle = \"Old\"\n+++\n\n# Heading\n- [ ] a\n");
         let c = Content::of_note(&n, "file");
-        assert_eq!((c.title.as_str(), c.heading), ("Release", None));
-        assert_eq!(c.body().len(), 2);
-        let sheet = c.sheet();
-        assert_eq!(texts(&sheet[0]), "Release");
-        assert_eq!(sheet[0].kind, Kind::Heading(2));
-        assert_eq!(texts(&sheet[1]), "Heading");
-        assert_eq!(sheet[2].marker, Marker::Task(false));
-        // The first heading is the title: not shown twice.
-        let n = Note::parse("intro\n# Groceries\nmilk\n");
-        let c = Content::of_note(&n, "file");
-        assert_eq!((c.title.as_str(), c.heading), ("Groceries", Some(1)));
-        let body: Vec<String> = c.body().iter().map(texts).collect();
-        assert_eq!(body, ["intro", "milk"]);
-        assert_eq!(c.sheet().len(), 3);
-        // Else the file's name.
-        let c = Content::of_note(&Note::parse("milk"), "2026-11-17-2059");
+        assert_eq!(c.title, "Heading");
+        assert_eq!(c.blocks.len(), 2);
+        assert_eq!(texts(&c.blocks[0]), "Heading");
+        assert_eq!(c.blocks[0].kind, Kind::Heading(1));
+        assert_eq!(c.blocks[1].marker, Marker::Task(false));
+        // A heading further down isn't; the file's name is.
+        let c = Content::of_note(&Note::parse("intro\n# Groceries\n"), "2026-11-17-2059");
         assert_eq!(c.title, "2026-11-17-2059");
-        assert_eq!(texts(&c.sheet()[0]), "2026-11-17-2059");
+        assert_eq!(c.blocks.len(), 2);
         // A broken frontmatter says so.
         let c = Content::of_note(&Note::parse("+++\nx =\n+++\n# H\nbody"), "f");
         assert!(texts(&c.blocks[0]).starts_with("⚠ frontmatter"));
-        assert_eq!((c.title.as_str(), c.heading), ("H", Some(1)));
+        assert_eq!(c.title, "H");
     }
 
     #[test]

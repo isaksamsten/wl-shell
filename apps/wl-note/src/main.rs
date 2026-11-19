@@ -15,6 +15,7 @@ mod drawerview;
 mod editor;
 mod files;
 mod find;
+mod input;
 mod ipc;
 mod list;
 mod markdown;
@@ -25,7 +26,6 @@ mod reorder;
 mod row;
 mod scratch;
 mod template;
-mod title;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

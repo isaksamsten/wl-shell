@@ -803,12 +803,10 @@ impl WlNote {
                 };
                 if self.index.get(&open).is_none() && self.index.get(&new).is_some() {
                     let key = new.to_string_lossy().into_owned();
-                    let acts = self.columns[i].open(core, &key);
+                    self.columns[i].open(core, &key);
                     if let Some(draft) = &mut self.columns[i].draft {
                         draft.key = key;
                     }
-                    let surface = self.columns[i].surface().clone();
-                    self.acts(core, &surface, acts);
                     self.dirty = true;
                 }
             }
@@ -1091,7 +1089,6 @@ impl WlNote {
         self.remove_columns(core, |c| {
             target_of(c).is_some_and(|i| c.style().needs_new_surface(&styles[i]))
         });
-        let mut acts = Vec::new();
         for column in &mut self.columns {
             match target_of(&*column) {
                 Some(i) => {
@@ -1110,7 +1107,7 @@ impl WlNote {
                     if column.dragged_file_note().is_some() {
                         continue;
                     }
-                    acts.push((column.surface().clone(), column.close()));
+                    column.close();
                     column.retiring = true;
                     column.cancel_row_timer(core);
                     column.set_notes(Vec::new());
@@ -1144,9 +1141,6 @@ impl WlNote {
                 }
                 Err(e) => warn!("failed to create a column: {e}"),
             }
-        }
-        for (surface, acts) in acts {
-            self.acts(core, &surface, acts);
         }
     }
 
@@ -1421,33 +1415,30 @@ impl WlNote {
     /// The Hidden button (or another's): open its drawer in the column
     /// `from`, or close it if it is open. A note or drawer open anywhere
     /// goes first: one at a time.
-    fn toggle_drawer(&mut self, core: &mut Core<Self>, from: &WlSurface, kind: drawer::Kind) {
+    fn toggle_drawer(&mut self, _: &mut Core<Self>, from: &WlSurface, kind: drawer::Kind) {
         let Some(i) = self.column_at(from) else {
             return;
         };
         if self.columns[i].drawer_kind() == Some(kind) {
-            let acts = self.columns[i].close();
-            return self.acts(core, from, acts);
+            self.columns[i].close();
+            return;
         }
         for j in 0..self.columns.len() {
             if !self.save_draft(j, false) {
                 return;
             }
         }
-        self.close_elsewhere(core, i);
+        self.close_elsewhere(i);
         let entries = self.drawer_entries(kind);
-        let acts = self.columns[i].open_drawer(kind, entries);
-        self.acts(core, from, acts);
+        self.columns[i].open_drawer(kind, entries);
     }
 
     /// Close the notes and drawers open in the columns but `i`.
-    fn close_elsewhere(&mut self, core: &mut Core<Self>, i: usize) {
+    fn close_elsewhere(&mut self, i: usize) {
         for j in 0..self.columns.len() {
             let open = self.columns[j].open_key().is_some();
             if j != i && (open || self.columns[j].drawer_kind().is_some()) {
-                let more = self.columns[j].close();
-                let surface = self.columns[j].surface().clone();
-                self.acts(core, &surface, more);
+                self.columns[j].close();
             }
         }
     }
@@ -1497,8 +1488,7 @@ impl WlNote {
                 if !self.save_draft(i, false) {
                     return;
                 }
-                let more = self.columns[i].close();
-                self.acts(core, from, more);
+                self.columns[i].close();
             }
             Act::Task(key, n) => self.toggle_task(&key, n as usize),
             Act::Link(key, n) => self.open_link(core, &key, n as usize),
@@ -1589,10 +1579,6 @@ impl WlNote {
                     Err(e) => warn!("{e}"),
                 }
             }
-            Act::Title(key, title) => self.edit_note(&key, |note| match title.trim() {
-                "" => note.set("title", None),
-                t => note.set_value("title", t),
-            }),
             Act::Pin(key, exact) => {
                 let Some(window) = self.window().cloned() else {
                     return;
@@ -1654,17 +1640,15 @@ impl WlNote {
                 .flatten()
                 .map(|source| Draft::new(key.to_owned(), Note::parse(source)))
         });
-        self.close_elsewhere(core, i);
+        self.close_elsewhere(i);
         let Some(column) = self.columns.get_mut(i) else {
             return;
         };
-        let more = column.open(core, key);
+        column.open(core, key);
         if column.draft.as_ref().is_none_or(|d| d.key != key) {
             column.draft = draft;
             column.draft_changed();
         }
-        let surface = column.surface().clone();
-        self.acts(core, &surface, more);
     }
 
     /// Hide `key`: it crumples into the edge (closing first, if open),
@@ -1675,9 +1659,7 @@ impl WlNote {
                 if !self.save_draft(i, false) {
                     return;
                 }
-                let more = self.columns[i].close();
-                let surface = self.columns[i].surface().clone();
-                self.acts(core, &surface, more);
+                self.columns[i].close();
             }
             self.columns[i].crumple(key);
         }
@@ -1703,9 +1685,7 @@ impl WlNote {
         };
         for i in 0..self.columns.len() {
             if self.columns[i].open_key() == Some(key) {
-                let more = self.columns[i].close();
-                let surface = self.columns[i].surface().clone();
-                self.acts(core, &surface, more);
+                self.columns[i].close();
             }
             self.columns[i].crumple(key);
         }
@@ -1975,9 +1955,7 @@ impl WlNote {
                 );
                 self.detached_drafts.insert(path, draft);
             }
-            let surface = self.columns[i].surface().clone();
-            let acts = self.columns[i].close();
-            self.acts(core, &surface, acts);
+            self.columns[i].close();
             self.columns[i].cancel_row_timer(core);
             self.columns.remove(i);
         }
@@ -2574,9 +2552,7 @@ impl WlNote {
                                 "resolve the open note's unsaved changes before closing it".into(),
                             );
                         }
-                        let acts = self.columns[i].close();
-                        let surface = self.columns[i].surface().clone();
-                        self.acts(core, &surface, acts);
+                        self.columns[i].close();
                     }
                 }
                 return Ok(());
@@ -2840,10 +2816,9 @@ impl Program for WlNote {
         }
     }
 
-    fn keyboard_leave(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
+    fn keyboard_leave(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
         if let Some(i) = self.column_at(surface) {
-            let acts = self.columns[i].keyboard_leave();
-            self.acts(core, surface, acts);
+            self.columns[i].keyboard_leave();
         }
     }
 
@@ -2921,10 +2896,7 @@ mod tests {
         let dir = TempDir::new("drawer-entries");
         let notes = dir.0.join("notes");
         for (name, text) in [
-            (
-                "web.md",
-                "+++\napps = [\"firefox\"]\ntitle = \"Web\"\n+++\nlinks\n",
-            ),
+            ("web.md", "+++\napps = [\"firefox\"]\n+++\n# Web\n\nlinks\n"),
             (
                 "term.md",
                 "+++\napps = [\"foot\"]\n+++\n# Shell tips\nuse fzf\n",
@@ -3099,11 +3071,7 @@ mod tests {
         let notes = dir.0.join("notes");
         let templates = template::dir(&notes);
         std::fs::create_dir_all(&templates).unwrap();
-        std::fs::write(
-            templates.join("meeting.md"),
-            "+++\ntitle = \"Meeting {date}\"\n+++\nagenda\n",
-        )
-        .unwrap();
+        std::fs::write(templates.join("meeting.md"), "# Meeting {date}\n\nagenda\n").unwrap();
         std::fs::write(
             templates.join("mail.md"),
             "+++\napps = [\"thunderbird\"]\ncolor = \"blue\"\n+++\n# Reply\n",

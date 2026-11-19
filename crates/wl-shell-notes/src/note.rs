@@ -3,12 +3,14 @@
 //!
 //! ```markdown
 //! +++
-//! title = "Release checklist"
 //! apps  = ["firefox"]
 //! color = "yellow"
 //! +++
+//! # Release checklist
 //! - [ ] bump the version
 //! ```
+//!
+//! The title is the body's: a heading on its first line that isn't blank.
 //!
 //! Every key is optional, and a file without a frontmatter is a note too:
 //! a global one, in the default color. Unknown keys are kept. A
@@ -63,7 +65,6 @@ impl Color {
 /// What the frontmatter says.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Meta {
-    pub title: Option<String>,
     /// `apps` and `match`, in that order.
     pub matchers: Vec<Matcher>,
     pub tags: Vec<String>,
@@ -213,12 +214,10 @@ impl Note {
         self.global() || window.is_some_and(|w| self.meta.matchers.iter().any(|m| m.matches(w)))
     }
 
-    /// The title: the frontmatter's, else the first heading's.
+    /// The title: the text of the heading on the body's first line that
+    /// isn't blank, if it is one.
     pub fn title(&self) -> Option<&str> {
-        (self.meta.title.as_deref())
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .or_else(|| heading(self.body()))
+        heading(self.body())
     }
 
     /// When the note is due, if its `due` is a date or datetime.
@@ -407,37 +406,27 @@ impl Note {
     }
 }
 
-/// The text of the first ATX heading (`# Title`) outside code blocks.
+/// The text of the ATX heading (`# Title`) on `body`'s first line that
+/// isn't blank, if it is one.
 fn heading(body: &str) -> Option<&str> {
-    let mut fenced: Option<&str> = None;
-    for line in body.lines() {
-        let t = line.trim_start();
-        if line.len() - t.len() > 3 {
-            continue;
-        }
-        let marker = ["```", "~~~"].into_iter().find(|m| t.starts_with(m));
-        match (fenced, marker) {
-            (None, Some(m)) => {
-                fenced = Some(m);
-                continue;
-            }
-            (Some(open), Some(m)) if open == m => {
-                fenced = None;
-                continue;
-            }
-            (Some(_), _) => continue,
-            (None, None) => {}
-        }
-        let hashes = t.bytes().take_while(|b| *b == b'#').count();
-        let rest = &t[hashes..];
-        if (1..=6).contains(&hashes) && (rest.is_empty() || rest.starts_with([' ', '\t'])) {
-            let text = rest.trim().trim_end_matches('#').trim_end();
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
+    let line = body.lines().find(|l| !l.trim().is_empty())?;
+    let t = line.trim_start();
+    if line.len() - t.len() > 3 {
+        return None;
     }
-    None
+    let hashes = t.bytes().take_while(|b| *b == b'#').count();
+    let rest = &t[hashes..];
+    if !(1..=6).contains(&hashes) || !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let text = rest.trim_end();
+    let before_hashes = text.trim_end_matches('#');
+    let text = if before_hashes.ends_with([' ', '\t']) {
+        before_hashes
+    } else {
+        text
+    };
+    Some(text.trim()).filter(|t| !t.is_empty())
 }
 
 /// The frontmatter's keys, and the warnings about parts left out.
@@ -455,9 +444,6 @@ fn parse_meta(toml: &str) -> Result<(Meta, Vec<String>), String> {
     })?;
     let mut meta = Meta::default();
     let mut warnings = Vec::new();
-    if let Some(item) = doc.get("title") {
-        meta.title = Some(string(item, "title")?);
-    }
     if let Some(item) = doc.get("apps") {
         for app in strings(item, "apps")? {
             let (m, errors) = Matcher::new(Some(&app), None);
@@ -563,13 +549,11 @@ mod tests {
 
     #[test]
     fn with_frontmatter() {
-        let n = Note::parse(
-            "+++\ntitle = \"Release\"\napps = [\"firefox\"]\ncolor = \"pink\"\n+++\nbody\n",
-        );
+        let n = Note::parse("+++\napps = [\"firefox\"]\ncolor = \"pink\"\n+++\n# Release\nbody\n");
         assert!(n.error.is_none(), "{:?}", n.error);
         assert_eq!(n.title(), Some("Release"));
         assert_eq!(n.meta.color, Some(Color::Preset("pink")));
-        assert_eq!(n.body(), "body\n");
+        assert_eq!(n.body(), "# Release\nbody\n");
         assert!(!n.global());
         assert!(n.matches(Some(&w("firefox", "x"))));
         assert!(!n.matches(Some(&w("foot", "x"))));
@@ -601,7 +585,7 @@ mod tests {
         // Wrong types and unknown matcher keys break it too.
         for bad in [
             "apps = \"firefox\"",
-            "title = 3",
+            "color = 3",
             "[[match]]\napps = \"x\"",
             "[[match]]",
             "match = 1",
@@ -641,15 +625,15 @@ mod tests {
 
     #[test]
     fn crlf() {
-        let n = Note::parse("+++\r\ntitle = \"Win\"\r\napps = [\"a\"]\r\n+++\r\nbody\r\n");
+        let n = Note::parse("+++\r\ntitle = \"Win\"\r\napps = [\"a\"]\r\n+++\r\n# Win\r\nbody\r\n");
         assert!(n.error.is_none(), "{:?}", n.error);
         assert_eq!(n.title(), Some("Win"));
-        assert_eq!(n.body(), "body\r\n");
+        assert_eq!(n.body(), "# Win\r\nbody\r\n");
         let mut n = n;
         n.set_value("color", "blue").unwrap();
         assert_eq!(
             n.text(),
-            "+++\r\ntitle = \"Win\"\r\napps = [\"a\"]\r\ncolor = \"blue\"\r\n+++\r\nbody\r\n"
+            "+++\r\ntitle = \"Win\"\r\napps = [\"a\"]\r\ncolor = \"blue\"\r\n+++\r\n# Win\r\nbody\r\n"
         );
     }
 
@@ -664,7 +648,8 @@ mod tests {
         assert_eq!(n.title(), None);
         // A fence with trailing blanks still is one.
         let n = Note::parse("+++  \ntitle = \"a\"\n+++\t\nb");
-        assert_eq!((n.title(), n.body()), (Some("a"), "b"));
+        assert!(n.frontmatter().is_some());
+        assert_eq!(n.body(), "b");
     }
 
     #[test]
@@ -713,9 +698,8 @@ mod tests {
         n.set("color", None).unwrap();
         assert_eq!(n.text(), "just text\n");
         let mut n = Note::parse("\u{feff}text");
-        n.set_value("title", "x").unwrap();
-        assert_eq!(n.text(), "\u{feff}+++\ntitle = \"x\"\n+++\ntext");
-        assert_eq!(n.title(), Some("x"));
+        n.set_value("color", "blue").unwrap();
+        assert_eq!(n.text(), "\u{feff}+++\ncolor = \"blue\"\n+++\ntext");
     }
 
     #[test]
@@ -728,12 +712,19 @@ mod tests {
 
     #[test]
     fn headings() {
-        assert_eq!(heading("intro\n## Second #\n# First"), Some("Second"));
-        assert_eq!(heading("```\n# not\n```\n# yes"), Some("yes"));
-        assert_eq!(heading("#hashtag\n#\n    # code"), None);
-        assert_eq!(heading("~~~\n# a\n```\n# b\n~~~\n# c"), Some("c"));
-        let n = Note::parse("+++\ntitle = \"  \"\n+++\n# Heading");
-        assert_eq!(n.title(), Some("Heading"));
+        assert_eq!(heading("## Second #\n# First"), Some("Second"));
+        assert_eq!(heading("\n  \n# After blanks\ntext"), Some("After blanks"));
+        // Only the first line that isn't blank.
+        assert_eq!(heading("intro\n# Later"), None);
+        assert_eq!(heading("```\n# not\n```"), None);
+        assert_eq!(heading("#hashtag\n# x"), None);
+        assert_eq!(heading("#\n# x"), None);
+        assert_eq!(heading("    # code"), None);
+        assert_eq!(heading("   ###### Six ##"), Some("Six"));
+        // A frontmatter `title` is just an unknown key.
+        let n = Note::parse("+++\ntitle = \"Old\"\n+++\ntext");
+        assert!(n.error.is_none() && n.warnings.is_empty());
+        assert_eq!(n.title(), None);
     }
 
     #[test]

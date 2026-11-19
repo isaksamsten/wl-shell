@@ -207,9 +207,8 @@ mod tests {
 
     #[test]
     fn as_json() {
-        let a = note(
-            "+++\ntitle = \"Say \\\"hi\\\"\"\ncolor = \"#0a0b0c\"\napps = [\"ff\"]\ntags = [\"t\"]\n+++\n",
-        );
+        let a =
+            note("+++\ncolor = \"#0a0b0c\"\napps = [\"ff\"]\ntags = [\"t\"]\n+++\n# Say \"hi\"\n");
         let b = note("+++\nbroken =\n+++\n");
         let notes = [
             (Path::new("a.md"), &a, false),

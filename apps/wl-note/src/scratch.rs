@@ -109,8 +109,9 @@ pub fn keep(path: &Path, dest: &Path, window: Option<(&Window, bool)>) -> Result
 }
 
 pub fn disposition(policy: OnClose, note: &Note) -> OnClose {
-    // A title alone is still user content, as is unreadable frontmatter.
-    if note.error.is_none() && note.body().trim().is_empty() && note.title().is_none() {
+    // A heading alone is still body content, and unreadable frontmatter
+    // should not be discarded as an empty scratch note.
+    if note.error.is_none() && note.body().trim().is_empty() {
         OnClose::Delete
     } else {
         policy
@@ -299,11 +300,7 @@ mod tests {
         for policy in [OnClose::Trash, OnClose::Delete, OnClose::Keep] {
             let empty = create::text(None, Some("white"), None, Some(" \n"), None).unwrap();
             assert_eq!(disposition(policy, &Note::parse(empty)), OnClose::Delete);
-            for txt in [
-                "some text\n",
-                "+++\ntitle = 'remember'\n+++\n",
-                "+++\nbroken\n+++\n",
-            ] {
+            for txt in ["some text\n", "# remember\n", "+++\nbroken\n+++\n"] {
                 assert_eq!(disposition(policy, &Note::parse(txt)), policy);
             }
         }

@@ -553,7 +553,7 @@ mod tests {
         Entry::of(
             key.into(),
             key,
-            &Note::parse(format!("+++\ntitle = {title:?}\n+++\nbody of {title}\n")),
+            &Note::parse(format!("# {title}\n\nbody of {title}\n")),
             0xfff2a8ff,
             here,
             false,
@@ -564,7 +564,7 @@ mod tests {
         Entry::of(
             key.into(),
             key,
-            &Note::parse(format!("+++\ntitle = {title:?}\n+++\n{body}\n")),
+            &Note::parse(format!("# {title}\n\n{body}\n")),
             0xfff2a8ff,
             here,
             false,

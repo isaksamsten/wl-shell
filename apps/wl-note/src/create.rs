@@ -7,8 +7,8 @@
 
 use wl_shell_notes::{Color, Due, Note, matcher, toml_edit};
 
-/// A new note's text: the frontmatter for `app`, `color`, `title` and
-/// `due` (a TOML date or datetime; each if given), then `body`.
+/// A new note's frontmatter (`app`, `color`, `due`), then its Markdown
+/// body with a leading heading if `title` is given.
 pub fn text(
     app: Option<&str>,
     color: Option<&str>,
@@ -20,14 +20,25 @@ pub fn text(
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
+    let title = title
+        .unwrap_or("")
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !title.is_empty() {
+        let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+        // Protect literal trailing hashes from being read as a closing sequence.
+        let close = if title.ends_with('#') { " #" } else { "" };
+        let gap = if body.is_empty() { "" } else { newline };
+        body = format!("# {title}{close}{newline}{gap}{body}");
+    }
     // Not taken for a frontmatter of its own.
     if body.starts_with("+++") {
         body.insert(0, '\n');
     }
     let mut note = Note::parse(body);
-    if let Some(title) = title.map(str::trim).filter(|t| !t.is_empty()) {
-        note.set_value("title", title)?;
-    }
     if let Some(app) = app.filter(|a| !a.is_empty()) {
         let mut apps = toml_edit::Array::new();
         apps.push(matcher::escape(app));
@@ -93,10 +104,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             t,
-            "+++\ntitle = \"Release\"\napps = [\"firefox\"]\ncolor = \"pink\"\n+++\n- [ ] tag\n"
+            "+++\napps = [\"firefox\"]\ncolor = \"pink\"\n+++\n# Release\n\n- [ ] tag\n"
         );
         let n = Note::parse(t);
         assert!(n.error.is_none() && n.warnings.is_empty());
+        assert_eq!(n.title(), Some("Release"));
         assert!(n.matches(Some(&Window::new("firefox", ""))));
         assert!(!n.matches(Some(&Window::new("foot", ""))));
         // App IDs are matched as they are.
@@ -108,6 +120,8 @@ mod tests {
         let n = Note::parse(text(Some("a"), None, None, Some("+++\nx\n+++\n"), None).unwrap());
         assert!(n.error.is_none());
         assert_eq!(n.body(), "\n+++\nx\n+++\n");
+        let n = Note::parse(text(None, None, Some("First\r\nSecond #"), None, None).unwrap());
+        assert_eq!(n.title(), Some("First Second #"));
     }
 
     #[test]

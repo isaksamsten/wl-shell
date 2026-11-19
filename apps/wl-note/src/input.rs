@@ -1,36 +1,26 @@
-//! The open note's title, edited in place: one line of text and a caret.
-//! Pure, unit tested.
+//! Single-line text input for the drawer filter.
 //!
 //! The usual keys: characters insert, Backspace and Delete remove (a word
 //! with Ctrl), the arrows move (by words with Ctrl), Home and End go to
-//! the ends. The column maps keys to these; Enter keeps the edit (if it
-//! `changed`), Escape drops it.
+//! the ends.
 
-/// A title being edited.
+/// A single-line input field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Title {
+pub struct Field {
     pub text: String,
     /// A byte index of `text`, on a char boundary.
     pub caret: usize,
     anchor: usize,
-    /// As it was.
-    original: String,
 }
 
-impl Title {
+impl Field {
     /// Edit `text`, the caret at its end.
     pub fn new(text: &str) -> Self {
         Self {
             text: text.to_string(),
             caret: text.len(),
             anchor: text.len(),
-            original: text.to_string(),
         }
-    }
-
-    /// Whether it differs from what it was.
-    pub fn changed(&self) -> bool {
-        self.text.trim() != self.original.trim()
     }
 
     /// Put the caret at byte `at` (or the char boundary before it).
@@ -183,9 +173,8 @@ mod tests {
 
     #[test]
     fn typing_and_moving() {
-        let mut t = Title::new("Groceries");
+        let mut t = Field::new("Groceries");
         assert_eq!(t.caret, 9);
-        assert!(!t.changed());
         t.insert(" list\n");
         assert_eq!(t.text, "Groceries list");
         t.home();
@@ -206,16 +195,11 @@ mod tests {
         assert_eq!(t.caret, 17);
         t.right(false);
         assert_eq!(t.caret, 17);
-        assert!(t.changed());
-        // Only blanks around it: no change.
-        let mut t = Title::new("Groceries");
-        t.insert("  ");
-        assert!(!t.changed());
     }
 
     #[test]
     fn removing() {
-        let mut t = Title::new("one two  three");
+        let mut t = Field::new("one two  three");
         t.backspace(false);
         assert_eq!(t.text, "one two  thre");
         t.backspace(true);
@@ -233,7 +217,7 @@ mod tests {
 
     #[test]
     fn multibyte_chars() {
-        let mut t = Title::new("Grüße 日本");
+        let mut t = Field::new("Grüße 日本");
         t.left(false);
         assert_eq!(&t.text[t.caret..], "本");
         t.backspace(false);

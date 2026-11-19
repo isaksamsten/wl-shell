@@ -18,7 +18,7 @@ pub struct Draft {
 
 impl Draft {
     pub fn new(key: String, note: Note) -> Self {
-        let body_start = markdown::editable(&note).1;
+        let body_start = markdown::editable(&note);
         let editor = Editor::new(&note.text()[body_start..]);
         let clean = editor.text().into();
         Self {
@@ -71,7 +71,7 @@ impl Draft {
     }
 
     pub fn reload(&mut self, note: Note) {
-        self.body_start = markdown::editable(&note).1;
+        self.body_start = markdown::editable(&note);
         let text = &note.text()[self.body_start..];
         if Editor::new(text).text() != self.editor.text() {
             self.editor.reload(text);
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(d.conflict, Some(Some(theirs.clone())));
         assert_eq!(d.source(), format!("{base}!"));
         d.reload(Note::parse(theirs));
-        assert_eq!(d.editor.line_col(d.editor.caret()), (1, 6));
+        assert_eq!(d.editor.line_col(d.editor.caret()), (3, 6));
         assert!(!d.dirty());
     }
 
@@ -153,7 +153,8 @@ mod tests {
             "note.md".into(),
             Note::parse("+++\r\n# c\r\n+++\r\n# Title"),
         );
-        d.editor.insert("a\nb");
+        d.editor.doc_end(false);
+        d.editor.insert("\na\nb");
         let source = d.source();
         assert_eq!(source, "+++\r\n# c\r\n+++\r\n# Title\r\na\r\nb");
         d.saved(source.clone());

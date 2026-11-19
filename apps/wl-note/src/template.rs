@@ -109,12 +109,6 @@ pub fn text(
     let source = template.text();
     let front = &source[..source.len() - template.body().len()];
     let mut note = Note::parse(format!("{front}{}", fill(template.body(), vars)));
-    if let Some(title) = template.meta.title.as_deref() {
-        match fill(title, vars).trim() {
-            "" => note.set("title", None)?,
-            title => note.set_value("title", title)?,
-        }
-    }
     if template.global()
         && let Some(app) = context.filter(|a| !a.is_empty())
     {
@@ -202,13 +196,13 @@ mod tests {
     #[test]
     fn a_note_from_a_template_for_the_context() {
         let template = parse(
-            "+++\n# how meetings go\ntitle = \"Meeting {date}\"\ncolor = \"blue\"\n+++\n## {app}: {window}\n\n- [ ] agenda at {time}\n",
+            "+++\n# how meetings go\ncolor = \"blue\"\n+++\n# Meeting {date}\n\n## {app}: {window}\n\n- [ ] agenda at {time}\n",
         );
         let t = text(&template, Some("firefox"), &vars(), &[]).unwrap();
         // The frontmatter as it was (its comment too), plus the app.
         assert_eq!(
             t,
-            "+++\n# how meetings go\ntitle = \"Meeting 2026-11-19\"\ncolor = \"blue\"\napps = [\"firefox\"]\n+++\n## firefox: Docs - Mozilla Firefox\n\n- [ ] agenda at 13:28\n"
+            "+++\n# how meetings go\ncolor = \"blue\"\napps = [\"firefox\"]\n+++\n# Meeting 2026-11-19\n\n## firefox: Docs - Mozilla Firefox\n\n- [ ] agenda at 13:28\n"
         );
         let note = Note::parse(t);
         assert!(note.error.is_none() && note.warnings.is_empty());
@@ -256,24 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn the_title_is_filled_in_alone() {
-        // A heading title is part of the text.
-        let heading = parse("+++\ncolor = \"pink\"\n+++\n# Standup {date}\n");
-        let t = text(&heading, None, &vars(), &[]).unwrap();
+    fn title_placeholders_are_filled_in_the_body_only() {
+        let template = parse("+++\ntitle = \"{date}\"\n+++\n# Standup {date}\n");
+        let t = text(&template, None, &vars(), &[]).unwrap();
+        assert!(t.contains("title = \"{date}\""));
         assert_eq!(Note::parse(t).title(), Some("Standup 2026-11-19"));
-        // A title that is nothing once filled in goes.
-        let blank = parse("+++\ntitle = \"{window}\"\n+++\nx\n");
-        let mut v = vars();
-        v.window = String::new();
-        let t = text(&blank, None, &v, &[]).unwrap();
-        assert_eq!(t, "x\n");
-        // Quotes in a window's title stay in the TOML.
-        let quoted = parse("+++\ntitle = \"{window}\"\n+++\nx\n");
-        let mut v = vars();
-        v.window = "say \"hi\" \\ there".into();
-        let note = Note::parse(text(&quoted, None, &v, &[]).unwrap());
-        assert!(note.error.is_none());
-        assert_eq!(note.title(), Some("say \"hi\" \\ there"));
     }
 
     #[test]
@@ -305,7 +286,7 @@ mod tests {
         assert!(note.body().contains("ticket.pdf"));
         assert!(t.contains("file:///tmp/ticket.pdf"));
         // A template with no text at all gets only the files.
-        let empty = parse("+++\ntitle = \"T\"\n+++\n");
+        let empty = parse("+++\ncolor = \"pink\"\n+++\n");
         let t = text(&empty, None, &vars(), &files).unwrap();
         assert!(Note::parse(t).body().contains("ticket.pdf"));
         // Without files, nothing is added.
