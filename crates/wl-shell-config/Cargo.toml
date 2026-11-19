@@ -10,6 +10,7 @@ license.workspace = true
 wl-shell-log.workspace = true
 
 calloop.workspace = true
+globset.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 serde.workspace = true
 toml.workspace = true
