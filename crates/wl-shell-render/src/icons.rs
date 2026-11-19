@@ -299,6 +299,8 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
     let bundled: Option<&[u8]> = match name {
         "builtin:pin" => Some(include_bytes!("../assets/pin.svg")),
         "builtin:unpin" => Some(include_bytes!("../assets/unpin.svg")),
+        "builtin:dock-keep" => Some(include_bytes!("../assets/dock-keep.svg")),
+        "builtin:dock-remove" => Some(include_bytes!("../assets/dock-remove.svg")),
         "builtin:archive" => Some(include_bytes!("../assets/archive.svg")),
         "builtin:trash" => Some(include_bytes!("../assets/trash.svg")),
         "builtin:close" => Some(include_bytes!("../assets/close.svg")),

@@ -274,8 +274,8 @@ fn keep_name(cx: &Context) -> String {
 /// Keep in Dock's icon, for a file or an app.
 fn keep_icon(cx: &Context) -> Icon {
     match cx.pinned {
-        true => names(&["view-unpin", "list-remove", "builtin:unpin"]),
-        false => names(&["view-pin", "pin", "builtin:pin"]),
+        true => names(&["builtin:dock-remove"]),
+        false => names(&["builtin:dock-keep"]),
     }
 }
 
@@ -867,7 +867,7 @@ mod tests {
         let app = String::from("firefox");
         let pinned = true;
         assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
-        let pin_icon = super::names(&["view-pin", "pin", "builtin:pin"]);
+        let pin_icon = super::names(&["builtin:dock-keep"]);
         assert_eq!(l.choices[0].icon, pin_icon);
         // A kept one comes off.
         let env = Env {
@@ -876,7 +876,7 @@ mod tests {
         };
         let l = level_of(&firefox, &apps, None, env);
         assert_eq!(l.choices[0].name, "Remove from Dock");
-        let unpin_icon = super::names(&["view-unpin", "list-remove", "builtin:unpin"]);
+        let unpin_icon = super::names(&["builtin:dock-remove"]);
         assert_eq!(l.choices[0].icon, unpin_icon);
         let (app, pinned) = ("firefox".into(), false);
         assert_eq!(does(&l, "pin"), &Does::PinApp { app, pinned });
