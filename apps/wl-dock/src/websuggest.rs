@@ -251,6 +251,41 @@ mod tests {
     }
 
     #[test]
+    fn app_queries_reach_the_queue_only_with_fallback_suggest() {
+        use crate::engines::{Place, Web};
+        use crate::launcher::Scope;
+        let worker = Worker(Arc::new((
+            Mutex::new(Queue {
+                next: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        )));
+        let mut web = Web {
+            fallback: Some("g".into()),
+            engines: vec![Engine {
+                keyword: "g".into(),
+                name: "Google".into(),
+                url: "https://example.org/?q={query}".into(),
+                suggest: "https://example.org/s?q={query}".into(),
+                ..Engine::default()
+            }],
+            ..Web::default()
+        };
+        let mut session = Session::new(1);
+        let mut ask = |web: &Web, text: &str| {
+            let engine = web.fallback_suggester(Scope::Apps, Place::Front);
+            session.query(&worker, engine, text);
+            worker.0.0.lock().unwrap().next.take().map(|r| r.query.text)
+        };
+        assert_eq!(ask(&web, "how tall"), None);
+        web.fallback_suggest = true;
+        assert_eq!(ask(&web, "how tall"), Some("how tall".into()));
+        // Back to nothing typed: the queue is emptied.
+        assert_eq!(ask(&web, " "), None);
+    }
+
+    #[test]
     fn stale_answers_and_cache() {
         let mut session = Session::new(5);
         let a = Query {

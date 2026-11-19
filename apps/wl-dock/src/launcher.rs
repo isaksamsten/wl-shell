@@ -8,6 +8,7 @@
 //! | Backspace, Ctrl+W, Ctrl+U | delete a character, a word, everything     |
 //! | Enter                     | open the selection (`launcher-enter`)      |
 //! | Ctrl+Enter                | the other of activating and launching      |
+//! | Alt+Enter                 | search the web for the query               |
 //! | Up, Ctrl+N                | the next match: the drum rolls toward you  |
 //! | Down, Ctrl+P              | the previous match: the drum rolls back    |
 //! | Tab                       | a match's actions; an action's choices     |
@@ -44,6 +45,9 @@ pub enum Key {
     Open {
         other: bool,
     },
+    /// Alt+Enter: search the web for the app query with the fallback
+    /// engine, whatever is in front.
+    Search,
     /// Tab: into the selection's actions or choices.
     Tab,
     /// Shift+Tab: back out of a level, or out of files to the apps.
@@ -58,6 +62,7 @@ impl Key {
         let ctrl = mods.ctrl && !mods.alt;
         Some(match sym {
             Keysym::Escape => Key::Escape,
+            Keysym::Return | Keysym::KP_Enter if mods.alt && !mods.ctrl => Key::Search,
             Keysym::Return | Keysym::KP_Enter => Key::Open { other: mods.ctrl },
             Keysym::BackSpace if ctrl => Key::DeleteWord,
             Keysym::BackSpace => Key::Backspace,
@@ -83,7 +88,10 @@ impl Key {
 
     /// Whether holding it down repeats it.
     pub fn repeats(&self) -> bool {
-        !matches!(self, Key::Open { .. } | Key::Escape | Key::Back | Key::Tab)
+        !matches!(
+            self,
+            Key::Open { .. } | Key::Search | Key::Escape | Key::Back | Key::Tab
+        )
     }
 }
 
@@ -196,7 +204,7 @@ impl Query {
                 self.text.truncate(start);
             }
             Key::Clear => self.text.clear(),
-            Key::Roll(_) | Key::Open { .. } | Key::Tab | Key::Back | Key::Escape => {}
+            Key::Roll(_) | Key::Open { .. } | Key::Search | Key::Tab | Key::Back | Key::Escape => {}
         }
         // Every edit of the text changes its length.
         (self.text.len(), self.scope) != before
@@ -217,6 +225,8 @@ pub enum Act {
     Open {
         other: bool,
     },
+    /// Search the web for the app query.
+    Search,
     /// Into the selection's actions or choices.
     Into,
     /// Back out of the level.
@@ -229,6 +239,7 @@ pub fn act(key: Key, depth: usize, query: &Query) -> Act {
     match key {
         Key::Roll(by) => Act::Roll(by),
         Key::Open { other } => Act::Open { other },
+        Key::Search => Act::Search,
         Key::Escape | Key::Back if depth > 0 => Act::Out,
         Key::Backspace | Key::DeleteWord if depth > 0 && query.is_empty() => Act::Out,
         Key::Tab => Act::Into,
@@ -401,6 +412,24 @@ mod tests {
         assert!(Key::Backspace.repeats() && Key::Roll(1).repeats());
         assert!(!Key::Open { other: false }.repeats() && !Key::Escape.repeats());
         assert!(!Key::Back.repeats() && !Key::Tab.repeats());
+        // Alt+Enter searches the web; with Ctrl too, it is an Enter.
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(Key::from(Keysym::Return, None, &alt), Some(Key::Search));
+        assert_eq!(Key::from(Keysym::KP_Enter, None, &alt), Some(Key::Search));
+        let both = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            Key::from(Keysym::Return, None, &both),
+            Some(Key::Open { other: true })
+        );
+        assert!(!Key::Search.repeats());
+        assert_eq!(act(Key::Search, 0, &Query::default()), Act::Search);
     }
 
     #[test]

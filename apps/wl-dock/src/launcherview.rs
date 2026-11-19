@@ -1469,7 +1469,10 @@ impl LauncherView {
         let scope = self.nav.query().scope();
         // The names on the drum, with what the query matched brighter.
         let labels: Vec<PillRequest> = (self.ring.iter())
-            .map(|r| label_request(&r.m, style, max, scale, scope == Scope::Web))
+            .map(|r| {
+                let web = scope == Scope::Web || r.m.id.starts_with(crate::engines::SUGGESTION);
+                label_request(&r.m, style, max, scale, web)
+            })
             .collect();
         let selected = self.selected().and_then(|i| self.ring.get(i)).map(|r| &r.m);
         let q = self.nav.query().text();
@@ -1525,12 +1528,17 @@ impl LauncherView {
                         .unwrap_or(""),
                     _ => PLACEHOLDER,
                 };
-                let (inline, after) = match completion(q, name) {
-                    Completion::None if q.is_empty() => (Some(placeholder.to_string()), None),
-                    Completion::None => (None, None),
-                    Completion::Inline(rest) if rest.is_empty() => (None, None),
-                    Completion::Inline(rest) => (Some(rest), None),
-                    Completion::After(name) => (None, Some(name)),
+                let fallback = selected.filter(|m| m.id == crate::engines::FALLBACK);
+                let (inline, after) = match (fallback, completion(q, name)) {
+                    // "Search Google" continues nothing: always at the end.
+                    (Some(m), _) => (None, Some(m.name.clone())),
+                    (None, Completion::None) if q.is_empty() => {
+                        (Some(placeholder.to_string()), None)
+                    }
+                    (None, Completion::None) => (None, None),
+                    (None, Completion::Inline(rest)) if rest.is_empty() => (None, None),
+                    (None, Completion::Inline(rest)) => (Some(rest), None),
+                    (None, Completion::After(name)) => (None, Some(name)),
                 };
                 let inline = inline.map(|t| line(t, style.completion));
                 let after = after.map(|t| line(t, style.completion));
@@ -1548,13 +1556,18 @@ impl LauncherView {
                         spanned(m.name.clone(), spans, style.completion)
                     })
                 };
-                match completion(q, name) {
-                    Completion::Inline(rest) if !rest.is_empty() => {
-                        (None, Some(line(rest, style.completion)), None)
+                if let Some(m) = selected.filter(|m| m.id == crate::engines::FALLBACK) {
+                    // An unknown bang, searched whole by the fallback.
+                    (None, None, Some(line(m.name.clone(), style.completion)))
+                } else {
+                    match completion(q, name) {
+                        Completion::Inline(rest) if !rest.is_empty() => {
+                            (None, Some(line(rest, style.completion)), None)
+                        }
+                        Completion::After(_) => (None, None, engine_label()),
+                        Completion::None if q.is_empty() => (None, None, engine_label()),
+                        _ => (None, None, None),
                     }
-                    Completion::After(_) => (None, None, engine_label()),
-                    Completion::None if q.is_empty() => (None, None, engine_label()),
-                    _ => (None, None, None),
                 }
             }
             Scope::Web => {

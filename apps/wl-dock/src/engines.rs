@@ -4,9 +4,14 @@ use serde::{Deserialize, Deserializer, de::MapAccess};
 use url::Url;
 use wl_shell_log::warn;
 
+use crate::launcher::Scope;
 use crate::search::Search;
 /// Stable ring ID for the query itself, distinct from its suggestions.
 pub const TYPED: &str = "typed";
+/// Ring ID of the web search fallback.
+pub const FALLBACK: &str = "web-fallback";
+/// What the ID of a ring match for a suggestion starts with.
+pub const SUGGESTION: &str = "suggestion:";
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -17,6 +22,7 @@ pub struct Web {
     pub bang_trigger: Option<char>,
     pub command: String,
     pub suggest: bool,
+    pub fallback_suggest: bool,
     #[serde(rename = "engine", deserialize_with = "read_engines")]
     pub engines: Vec<Engine>,
 }
@@ -29,9 +35,21 @@ impl Default for Web {
             bang_trigger: Some('!'),
             command: "xdg-open {url}".into(),
             suggest: true,
+            fallback_suggest: false,
             engines: Vec::new(),
         }
     }
+}
+
+/// Where the web search fallback sits on the drum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// Not shown.
+    Off,
+    /// In front: nothing else matched.
+    Front,
+    /// In the last slot, behind the matches (`show = "always"`).
+    Last,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -100,6 +118,55 @@ pub fn http_url(text: &str) -> Option<Url> {
 }
 
 impl Web {
+    /// Turn off a fallback that names no engine, with a warning. Run
+    /// once the config is read.
+    pub fn check(&mut self) {
+        if let Some(keyword) = &self.fallback
+            && self.engine(keyword).is_none()
+        {
+            warn!("launcher.web.fallback: there is no engine {keyword:?}; the web fallback is off");
+            self.fallback = None;
+        }
+    }
+
+    /// The engine the fallback searches with.
+    pub fn fallback_engine(&self) -> Option<&Engine> {
+        self.engine(self.fallback.as_deref()?)
+    }
+
+    /// Where the fallback goes for a `scope` query of `text` that has
+    /// `matches` matches (apps, or the engines of a bang). Only app
+    /// queries fall back, and an unknown bang: a file search or a
+    /// level's choices never do.
+    pub fn fallback_place(&self, scope: Scope, text: &str, matches: usize) -> Place {
+        if self.fallback_engine().is_none() || text.trim().is_empty() {
+            return Place::Off;
+        }
+        match scope {
+            Scope::Apps | Scope::Bang if matches == 0 => Place::Front,
+            Scope::Apps if self.show == Show::Always => Place::Last,
+            _ => Place::Off,
+        }
+    }
+
+    /// What the fallback searches for: an unknown bang is searched
+    /// whole, trigger included.
+    pub fn fallback_query(&self, scope: Scope, text: &str) -> String {
+        match (scope, self.bang_trigger) {
+            (Scope::Bang, Some(trigger)) => format!("{trigger}{text}"),
+            _ => text.to_owned(),
+        }
+    }
+
+    /// The engine to ask for suggestions of an app query, if its
+    /// fallback is in front: only with `fallback-suggest` (and not
+    /// `suggest = false`), since it sends app queries over the network.
+    pub fn fallback_suggester(&self, scope: Scope, place: Place) -> Option<&Engine> {
+        (scope == Scope::Apps && place == Place::Front && self.suggest && self.fallback_suggest)
+            .then(|| self.fallback_engine())
+            .flatten()
+    }
+
     pub fn engine(&self, keyword: &str) -> Option<&Engine> {
         self.engines.iter().find(|e| e.keyword == keyword)
     }
@@ -254,5 +321,117 @@ mod tests {
         query.edit(&Key::Clear, None);
         assert_eq!(act(Key::Escape, 0, &query), Act::Close);
         assert!(!Query::default().start_bang("!a", None));
+    }
+
+    fn web(fallback: Option<&str>, show: Show) -> Web {
+        Web {
+            fallback: fallback.map(str::to_owned),
+            show,
+            engines: [("g", "Google"), ("d", "DuckDuckGo")]
+                .into_iter()
+                .map(|(keyword, name)| Engine {
+                    keyword: keyword.into(),
+                    name: name.into(),
+                    url: "https://example.org/?q={query}".into(),
+                    suggest: "https://example.org/s?q={query}".into(),
+                    ..Engine::default()
+                })
+                .collect(),
+            ..Web::default()
+        }
+    }
+
+    #[test]
+    fn the_fallback_is_in_front_when_nothing_matches() {
+        let web = web(Some("g"), Show::Empty);
+        assert_eq!(web.fallback_engine().unwrap().name, "Google");
+        assert_eq!(web.fallback_place(Scope::Apps, "how tall", 0), Place::Front);
+        // A match is enough with the default `show`, however weak.
+        assert_eq!(web.fallback_place(Scope::Apps, "weather", 1), Place::Off);
+        // Nothing typed, nothing to search for.
+        assert_eq!(web.fallback_place(Scope::Apps, "", 0), Place::Off);
+        assert_eq!(web.fallback_place(Scope::Apps, "  ", 0), Place::Off);
+    }
+
+    #[test]
+    fn always_puts_it_last_behind_the_matches() {
+        let web = web(Some("d"), Show::Always);
+        assert_eq!(web.fallback_place(Scope::Apps, "weather", 3), Place::Last);
+        assert_eq!(web.fallback_place(Scope::Apps, "weather", 1), Place::Last);
+        // Without matches, it is the front.
+        assert_eq!(web.fallback_place(Scope::Apps, "weather", 0), Place::Front);
+        assert_eq!(web.fallback_place(Scope::Apps, "", 3), Place::Off);
+    }
+
+    #[test]
+    fn no_fallback_without_an_engine() {
+        let none = web(None, Show::Always);
+        assert_eq!(none.fallback_place(Scope::Apps, "x", 0), Place::Off);
+        assert_eq!(none.fallback_place(Scope::Bang, "x", 0), Place::Off);
+        // A keyword that names no engine turns it off.
+        let mut unknown = web(Some("nope"), Show::Empty);
+        assert_eq!(unknown.fallback_place(Scope::Apps, "x", 0), Place::Off);
+        unknown.check();
+        assert_eq!(unknown.fallback, None);
+        let mut known = web(Some("g"), Show::Empty);
+        known.check();
+        assert_eq!(known.fallback.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn only_app_queries_and_unknown_bangs_fall_back() {
+        let web = web(Some("g"), Show::Always);
+        for scope in [Scope::Files, Scope::Actions, Scope::Web] {
+            assert_eq!(web.fallback_place(scope, "x", 0), Place::Off);
+            assert_eq!(web.fallback_place(scope, "x", 4), Place::Off);
+        }
+        // An unknown bang has no engines to show; the fallback searches it whole.
+        assert_eq!(web.fallback_place(Scope::Bang, "xyz foo", 0), Place::Front);
+        assert_eq!(web.fallback_query(Scope::Bang, "xyz foo"), "!xyz foo");
+        assert_eq!(web.fallback_query(Scope::Apps, "how tall"), "how tall");
+        // Known engines on the drum: the picker, even with `show = "always"`.
+        assert_eq!(web.fallback_place(Scope::Bang, "g", 2), Place::Off);
+        assert_eq!(web.fallback_place(Scope::Bang, "", 0), Place::Off);
+    }
+
+    #[test]
+    fn suggestions_for_app_queries_only_when_asked() {
+        let mut web = web(Some("g"), Show::Empty);
+        fn front(web: &Web) -> Option<&Engine> {
+            web.fallback_suggester(Scope::Apps, Place::Front)
+        }
+        assert!(front(&web).is_none());
+        web.fallback_suggest = true;
+        assert_eq!(front(&web).unwrap().keyword, "g");
+        // Not behind a weak match, an unknown bang, or with suggest = false.
+        assert!(web.fallback_suggester(Scope::Apps, Place::Last).is_none());
+        assert!(web.fallback_suggester(Scope::Apps, Place::Off).is_none());
+        assert!(web.fallback_suggester(Scope::Bang, Place::Front).is_none());
+        web.suggest = false;
+        assert!(front(&web).is_none());
+    }
+
+    #[test]
+    fn the_fallback_options_are_read() {
+        let c = Config::parse(
+            r#"
+            [launcher.web]
+            fallback = 'g'
+            show = 'always'
+            fallback-suggest = true
+            [launcher.web.engine.g]
+            name = 'Google'
+            url = 'https://example.com/?q={query}'
+        "#,
+        )
+        .unwrap();
+        let web = c.launcher.web;
+        assert_eq!(web.fallback.as_deref(), Some("g"));
+        assert_eq!((web.show, web.fallback_suggest), (Show::Always, true));
+        let off = Config::parse("").unwrap().launcher.web;
+        assert_eq!(
+            (off.fallback, off.show, off.fallback_suggest),
+            (None, Show::Empty, false)
+        );
     }
 }

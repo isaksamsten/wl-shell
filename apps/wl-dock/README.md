@@ -64,6 +64,13 @@ To enable web search, copy the engines you want from `config.example.toml`.
 Type `!` to search engines by name or keyword, then press Tab to enter the
 selected engine.
 
+Set `fallback` in `[launcher.web]` to an engine's keyword and a query that
+matches no app becomes a web search with that engine: Enter opens it in the
+browser. Alt+Enter searches the web for the query whatever is in front, and
+`show = "always"` also puts the search last on the drum behind the matches.
+With `fallback-suggest = true` the engine's suggestions fill the drum behind
+the search, so it is off by default.
+
 ### Keyboard activation
 
 https://github.com/user-attachments/assets/538fb920-f13e-497d-9d29-795251ed81d4

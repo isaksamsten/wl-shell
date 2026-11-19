@@ -141,7 +141,7 @@ use crate::activateview::ActivateView;
 use crate::config::{Config, FolderView, LauncherEnter, Previews, Windows};
 use crate::dock::{self, Click, Item, Kind, Order, Placement};
 use crate::drag::{self, DropTarget, Payload};
-use crate::engines::{self, Engine};
+use crate::engines::{self, Engine, Place};
 use crate::filesearch::{self, FileSearch, Found};
 use crate::folder;
 use crate::history::{self, History};
@@ -548,6 +548,7 @@ impl WlDock {
         self.reloader
             .refresh(&core.loop_handle, &mut |m| warn!("{m}"));
         self.config = self.reloader.config().clone();
+        self.config.launcher.web.check();
         self.start_worker(core)?;
         self.start_web_worker(core);
         self.load_browser_preferences();
@@ -1190,7 +1191,7 @@ impl WlDock {
     /// level's choices.
     fn rank_launcher(&mut self, core: &Core<Self>) {
         match self.launcher.as_ref().map(|l| l.query().scope()) {
-            Some(Scope::Apps) => self.rank_apps(),
+            Some(Scope::Apps) => self.rank_apps(false),
             Some(Scope::Files) => self.rank_files(core),
             Some(Scope::Bang | Scope::Web) => self.rank_web(),
             Some(Scope::Actions) => self.rank_choices(),
@@ -1205,8 +1206,10 @@ impl WlDock {
     }
 
     /// Rank the apps for the launcher's query; the app it meant (picked
-    /// for it before) first.
-    fn rank_apps(&mut self) {
+    /// for it before) first. The web search fallback comes with them
+    /// (`add_fallback`). `streamed`: suggestions for it arrived, which
+    /// keep a rolled-to selection.
+    fn rank_apps(&mut self, streamed: bool) {
         let Self {
             launcher: Some(launcher),
             search,
@@ -1224,13 +1227,13 @@ impl WlDock {
             true => history.boost(&a.id, now),
             false => 0.0,
         };
-        let query = launcher.query().text();
-        let mut ranked = search.rank(apps, query, &boost);
-        if let Some(meant) = history.meant(query).filter(|_| learn) {
+        let query = launcher.query().text().to_string();
+        let mut ranked = search.rank(apps, &query, &boost);
+        if let Some(meant) = history.meant(&query).filter(|_| learn) {
             history::meant_first(&mut ranked, |i| apps[i].id == meant);
         }
         let slots = (config.launcher.matches as usize).max(1);
-        let matches = (ranked.into_iter().take(slots))
+        let mut matches: Vec<Match> = (ranked.into_iter().take(slots))
             .map(|i| &apps[i])
             .map(|a| Match {
                 id: a.id.clone(),
@@ -1238,12 +1241,24 @@ impl WlDock {
                 icon: a.entry.icon.clone(),
                 app: None,
                 named: Vec::new(),
-                matched: search.highlight(&a.name, query),
+                matched: search.highlight(&a.name, &query),
                 file: None,
                 window: None,
             })
             .collect();
-        launcher.set_matches(matches);
+        let place = config
+            .launcher
+            .web
+            .fallback_place(Scope::Apps, &query, matches.len());
+        self.suggest_fallback(place, &query);
+        self.add_fallback(Scope::Apps, &query, place, &mut matches);
+        let Some(launcher) = &mut self.launcher else {
+            return;
+        };
+        match streamed {
+            true => launcher.stream_matches(matches),
+            false => launcher.set_matches(matches),
+        }
     }
 
     /// Filter the level's choices by the launcher's query: in their own
@@ -1424,7 +1439,7 @@ impl WlDock {
                     if let channel::Event::Msg(answer) = event {
                         let app = &mut shell.program;
                         if app.web_session.as_mut().is_some_and(|s| s.accept(answer)) {
-                            app.show_web(true);
+                            app.web_answer();
                         }
                     }
                 })
@@ -1517,17 +1532,23 @@ impl WlDock {
         let query = l.query();
         let engine = query.engine().and_then(|key| web.engine(key));
         let matches = match query.scope() {
-            Scope::Bang => web
-                .ranked(&mut self.search, query.text())
-                .into_iter()
-                .take(slots)
-                .map(|e| (e, self.search.highlight(&e.name, query.text())))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(e, matched)| {
-                    self.engine_match(e, e.keyword.clone(), e.name.clone(), matched)
-                })
-                .collect(),
+            Scope::Bang => {
+                let mut matches: Vec<Match> = web
+                    .ranked(&mut self.search, query.text())
+                    .into_iter()
+                    .take(slots)
+                    .map(|e| (e, self.search.highlight(&e.name, query.text())))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|(e, matched)| {
+                        self.engine_match(e, e.keyword.clone(), e.name.clone(), matched)
+                    })
+                    .collect();
+                // No engine for the bang: the fallback searches it whole.
+                let place = web.fallback_place(Scope::Bang, query.text(), matches.len());
+                self.add_fallback(Scope::Bang, query.text(), place, &mut matches);
+                matches
+            }
             Scope::Web => {
                 if let Some(e) = engine {
                     let text = query.text();
@@ -1544,16 +1565,7 @@ impl WlDock {
                         file: None,
                         window: None,
                     }];
-                    if let Some(session) = &self.web_session {
-                        matches.extend(session.values().iter().take(slots - 1).map(|s| {
-                            let matched = s
-                                .starts_with(text.trim())
-                                .then_some(0..text.trim().len())
-                                .into_iter()
-                                .collect();
-                            self.engine_match(e, format!("suggestion:{s}"), s.clone(), matched)
-                        }));
-                    }
+                    matches.extend(self.suggestions(e, text, slots - 1));
                     matches
                 } else {
                     Vec::new()
@@ -1567,6 +1579,125 @@ impl WlDock {
         } else {
             l.set_matches(matches);
         }
+    }
+
+    /// The suggestions in the session's answer for `text` as matches of
+    /// `engine`, at most `take`.
+    fn suggestions(&self, engine: &Engine, text: &str, take: usize) -> Vec<Match> {
+        let Some(session) = &self.web_session else {
+            return Vec::new();
+        };
+        let typed = text.trim();
+        (session.values().iter().take(take))
+            .map(|s| {
+                let matched = (s.starts_with(typed).then_some(0..typed.len()))
+                    .into_iter()
+                    .collect();
+                let id = format!("{}{s}", engines::SUGGESTION);
+                self.engine_match(engine, id, s.clone(), matched)
+            })
+            .collect()
+    }
+
+    /// Add the web search fallback to the `matches` of a `scope` query
+    /// of `text`, where `place` says it goes (`Web::fallback_place`): in
+    /// front when nothing matched, with the engine's suggestions behind
+    /// it if asked for; or in the last slot, behind the matches.
+    fn add_fallback(&self, scope: Scope, text: &str, place: Place, matches: &mut Vec<Match>) {
+        let web = &self.config.launcher.web;
+        let Some(engine) = web.fallback_engine().filter(|_| place != Place::Off) else {
+            return;
+        };
+        let slots = (self.config.launcher.matches as usize).max(1);
+        let name = format!("Search {}", engine.name);
+        let fallback = self.engine_match(engine, engines::FALLBACK.into(), name, Vec::new());
+        match place {
+            Place::Off => {}
+            Place::Front => {
+                matches.push(fallback);
+                if web.fallback_suggester(scope, place).is_some() {
+                    matches.extend(self.suggestions(engine, text, slots - 1));
+                }
+            }
+            // With one slot there is room for nothing else: Alt+Enter.
+            Place::Last if slots > 1 => {
+                matches.truncate(slots - 1);
+                matches.push(fallback);
+            }
+            Place::Last => {}
+        }
+    }
+
+    /// Ask the fallback's engine for suggestions for the app query
+    /// `text` if `place` and the config want them; else forget any asked.
+    fn suggest_fallback(&mut self, place: Place, text: &str) {
+        let Self {
+            config,
+            web_worker: Some(worker),
+            web_session,
+            web_generation,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let engine = config.launcher.web.fallback_suggester(Scope::Apps, place);
+        if engine.is_none() && web_session.is_none() {
+            return;
+        }
+        let session = web_session.get_or_insert_with(|| {
+            *web_generation += 1;
+            websuggest::Session::new(*web_generation)
+        });
+        session.query(worker, engine, text);
+    }
+
+    /// Suggestions arrived for the query: show them.
+    fn web_answer(&mut self) {
+        match self.launcher.as_ref().map(|l| l.query().scope()) {
+            Some(Scope::Apps) => self.rank_apps(true),
+            _ => self.show_web(true),
+        }
+    }
+
+    /// Search the web for `query` with the engine `keyword`: once the
+    /// launcher gave up the keyboard, the browser opens it.
+    fn open_search(&mut self, core: &Core<Self>, keyword: &str, query: &str) {
+        let web = &self.config.launcher.web;
+        let Some(e) = web.engine(keyword) else {
+            return;
+        };
+        let url = engines::url(&e.url, query);
+        if engines::http_url(&url).is_none() {
+            return;
+        }
+        let command = spawn::fill(&web.command, &[("url", &spawn::quote(&url))]);
+        let output = self.launcher.as_ref().and_then(|l| l.output());
+        let browser = self
+            .browser()
+            .map(|a| self.dock_app_id(core, a))
+            .filter(|id| {
+                (self.docks.iter())
+                    .any(|dock| Some(&dock.output) == output && dock.item(id).is_some())
+            });
+        self.close_launcher(core, browser);
+        self.pending_url = Some((command, url));
+    }
+
+    /// Alt+Enter: search the web for the app query with the fallback
+    /// engine, whatever is in front.
+    fn launcher_search(&mut self, core: &Core<Self>) {
+        let Some(l) = &self.launcher else { return };
+        let text = l.query().text();
+        if l.query().scope() != Scope::Apps || text.trim().is_empty() {
+            return;
+        }
+        let web = &self.config.launcher.web;
+        let Some(keyword) = web.fallback_engine().map(|e| e.keyword.clone()) else {
+            return;
+        };
+        let text = text.to_owned();
+        self.open_search(core, &keyword, &text);
     }
 
     fn edit_launcher(&mut self, core: &Core<Self>, edit: launcher::Key, pasted: bool) {
@@ -1605,7 +1736,7 @@ impl WlDock {
         if self
             .launcher
             .as_ref()
-            .is_some_and(|l| !matches!(l.query().scope(), Scope::Web | Scope::Bang))
+            .is_some_and(|l| !matches!(l.query().scope(), Scope::Web | Scope::Bang | Scope::Apps))
             && let (Some(session), Some(worker)) = (&mut self.web_session, &self.web_worker)
         {
             session.query(worker, None, "");
@@ -1687,6 +1818,7 @@ impl WlDock {
             Act::Roll(by) => l.roll(by),
             Act::Open { .. } if l.level().is_some() => self.launcher_run(core, None),
             Act::Open { other } => self.launcher_pick(core, None, other),
+            Act::Search => self.launcher_search(core),
             Act::Into => self.launcher_into(core, None),
             Act::Out => {
                 let to = l.depth().saturating_sub(1);
@@ -1728,34 +1860,32 @@ impl WlDock {
         let Some(m) = index.or(l.selected()).and_then(|i| l.match_at(i)) else {
             return;
         };
-        if l.query().scope() == Scope::Web {
-            let query = if m.id == engines::TYPED {
-                l.query().text()
-            } else {
-                &m.name
-            };
+        let scope = l.query().scope();
+        let suggested = scope == Scope::Apps && m.id.starts_with(engines::SUGGESTION);
+        if scope == Scope::Web || m.id == engines::FALLBACK || suggested {
             let web = &self.config.launcher.web;
-            let Some(e) = l.query().engine().and_then(|key| web.engine(key)) else {
-                return;
+            let target = if scope == Scope::Web {
+                let query = if m.id == engines::TYPED {
+                    l.query().text()
+                } else {
+                    &m.name
+                };
+                (l.query().engine()).map(|key| (key.to_owned(), query.to_owned()))
+            } else {
+                // The fallback searches the query, an unknown bang whole;
+                // a suggestion of it is searched as it is.
+                let query = match m.id == engines::FALLBACK {
+                    true => web.fallback_query(scope, l.query().text()),
+                    false => m.name.clone(),
+                };
+                (web.fallback_engine()).map(|e| (e.keyword.clone(), query))
             };
-            let url = engines::url(&e.url, query);
-            if engines::http_url(&url).is_none() {
-                return;
+            if let Some((keyword, query)) = target {
+                self.open_search(core, &keyword, &query);
             }
-            let command = spawn::fill(&web.command, &[("url", &spawn::quote(&url))]);
-            let browser = self
-                .browser()
-                .map(|a| self.dock_app_id(core, a))
-                .filter(|id| {
-                    self.docks
-                        .iter()
-                        .any(|dock| Some(&dock.output) == l.output() && dock.item(id).is_some())
-                });
-            self.close_launcher(core, browser);
-            self.pending_url = Some((command, url));
             return;
         }
-        if l.query().scope() == Scope::Bang {
+        if scope == Scope::Bang {
             return;
         }
         if let Some(f) = &m.file {
@@ -1797,14 +1927,16 @@ impl WlDock {
         }
         match l.query().scope() {
             Scope::Bang => {
-                if let Some(keyword) = l
-                    .selected()
-                    .and_then(|i| l.match_at(i))
-                    .map(|m| m.id.clone())
-                {
-                    l.enter_web(keyword, "");
+                let id = (l.selected().and_then(|i| l.match_at(i))).map(|m| m.id.clone());
+                match id {
+                    // An unknown bang is no engine: Enter searches it.
+                    Some(id) if id == engines::FALLBACK => {}
+                    Some(keyword) => {
+                        l.enter_web(keyword, "");
+                        self.rank_web();
+                    }
+                    None => self.rank_web(),
                 }
-                self.rank_web();
                 return;
             }
             Scope::Web => {
@@ -1820,6 +1952,16 @@ impl WlDock {
                 return;
             }
             _ => {}
+        }
+        // Tab on a suggestion of the web fallback completes the query.
+        if l.query().scope() == Scope::Apps
+            && let Some(text) = (l.selected().and_then(|i| l.match_at(i)))
+                .filter(|m| m.id.starts_with(engines::SUGGESTION))
+                .map(|m| m.name.clone())
+        {
+            l.query_mut().complete_web(text);
+            self.rank_launcher(core);
+            return;
         }
         let Some(i) = l.selected() else {
             return;
@@ -2289,6 +2431,7 @@ impl WlDock {
     /// with the old one and restyle the docks.
     fn config_changed(&mut self, core: &mut Core<Self>) {
         self.config = self.reloader.config().clone();
+        self.config.launcher.web.check();
         self.load_browser_preferences();
         self.clear_web();
         if self
@@ -3494,7 +3637,7 @@ impl WlDock {
             Done::Apps(apps) => {
                 self.apps = apps;
                 if (self.launcher.as_ref()).is_some_and(|l| l.query().scope() == Scope::Apps) {
-                    self.rank_apps();
+                    self.rank_apps(false);
                 } else {
                     self.show_web(true);
                 }
@@ -3817,7 +3960,12 @@ impl Program for WlDock {
                 LauncherInput::Open(i) if launcher.level().is_some() => {
                     self.launcher_run(core, Some(i))
                 }
-                LauncherInput::Open(i) if launcher.query().scope() == Scope::Bang => {
+                LauncherInput::Open(i)
+                    if launcher.query().scope() == Scope::Bang
+                        && !launcher
+                            .match_at(i)
+                            .is_some_and(|m| m.id == engines::FALLBACK) =>
+                {
                     self.launcher_into(core, Some(i));
                 }
                 LauncherInput::Open(i) => self.launcher_pick(core, Some(i), false),

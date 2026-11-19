@@ -84,6 +84,9 @@
 #bang-trigger = "!"              # One character; "" disables the trigger
 #command = "xdg-open {url}"
 #suggest = true                  # Send typed web queries to the selected engine
+#fallback = "g"                  # Engine searched when no app matches; unset: none
+#show = "empty"                  # "always": also last on the drum behind app matches
+#fallback-suggest = false        # Also ask the fallback for suggestions as you type apps
 
 #[launcher.web.engine.g]
 #name = "Google"
