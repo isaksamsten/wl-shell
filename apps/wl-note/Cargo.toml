@@ -20,6 +20,8 @@ libc.workspace = true
 pulldown-cmark.workspace = true
 serde.workspace = true
 smithay-client-toolkit.workspace = true
+url.workspace = true
+calloop = { workspace = true, features = ["signals"] }
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 

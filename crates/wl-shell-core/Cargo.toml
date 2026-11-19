@@ -14,7 +14,7 @@ calloop-wayland-source.workspace = true
 drm-fourcc.workspace = true
 gbm.workspace = true
 libc.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["pipe"] }
 smithay-client-toolkit.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true

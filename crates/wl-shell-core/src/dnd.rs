@@ -28,6 +28,8 @@
 //! `Core::read_selection` reads it, without blocking, as `dnd_receive`
 //! does; the program's own selection is answered from its data.
 //! `Program::selection_changed` reports a new selection.
+//! Programs opting into background selection can also read the current
+//! clipboard without keyboard focus, when ext-data-control is available.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -41,12 +43,41 @@ use smithay_client_toolkit::data_device_manager::{
     data_source::{CopyPasteSource, DataSourceHandler, DragSource},
 };
 use wayland_client::{
-    Connection, Proxy, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
     protocol::{
         wl_buffer::WlBuffer, wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
         wl_data_source::WlDataSource, wl_seat::WlSeat, wl_surface::WlSurface,
     },
 };
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1::{self as control_device, ExtDataControlDeviceV1},
+    ext_data_control_manager_v1::ExtDataControlManagerV1,
+    ext_data_control_offer_v1::{self as control_offer, ExtDataControlOfferV1},
+};
+
+#[derive(Default)]
+struct Control {
+    manager: Option<ExtDataControlManagerV1>,
+    device: Option<ExtDataControlDeviceV1>,
+    pending: Option<ExtDataControlOfferV1>,
+    selection: Option<ExtDataControlOfferV1>,
+}
+
+impl Control {
+    fn release(&mut self) {
+        for offer in [self.pending.take(), self.selection.take()]
+            .into_iter()
+            .flatten()
+        {
+            offer.destroy();
+        }
+        if let Some(device) = self.device.take() {
+            device.destroy();
+        }
+    }
+}
+
+type OfferMimes = std::sync::Mutex<Vec<String>>;
 use wl_shell_log::warn;
 
 use crate::shell::{Core, Program, Shell};
@@ -66,6 +97,7 @@ pub struct Dnd {
     source: Option<Source>,
     /// The selection the program set, until another replaces it.
     selection: Option<Selection>,
+    control: Control,
 }
 
 /// The data the program put on the clipboard.
@@ -92,7 +124,10 @@ pub struct DragIcon<'a> {
 }
 
 impl Dnd {
-    pub(crate) fn new(manager: Option<DataDeviceManagerState>) -> Self {
+    pub(crate) fn new(
+        manager: Option<DataDeviceManagerState>,
+        control: Option<ExtDataControlManagerV1>,
+    ) -> Self {
         Self {
             manager,
             device: None,
@@ -100,6 +135,10 @@ impl Dnd {
             dropped: false,
             source: None,
             selection: None,
+            control: Control {
+                manager: control,
+                ..Control::default()
+            },
         }
     }
 
@@ -113,12 +152,16 @@ impl Dnd {
         if let (Some(manager), None) = (&self.manager, &self.device) {
             self.device = Some(manager.get_data_device(qh, seat));
         }
+        if let (Some(manager), None) = (&self.control.manager, &self.control.device) {
+            self.control.device = Some(manager.get_data_device(seat, qh, ()));
+        }
     }
 
     pub(crate) fn release(&mut self) {
         self.device = None;
         self.source = None;
         self.selection = None;
+        self.control.release();
     }
 
     /// The offer of the drag over one of the program's surfaces (or
@@ -196,6 +239,15 @@ impl<P: Program> Core<P> {
         if let Some(own) = &self.dnd.selection {
             return own.data.iter().map(|(m, _)| m.clone()).collect();
         }
+        if self.dnd.control.device.is_some() {
+            return self
+                .dnd
+                .control
+                .selection
+                .as_ref()
+                .and_then(|offer| offer.data::<OfferMimes>())
+                .map_or_else(Vec::new, |mimes| mimes.lock().unwrap().clone());
+        }
         (self.dnd.device.as_ref())
             .and_then(|d| d.data().selection_offer())
             .map_or_else(Vec::new, |o| o.with_mime_types(|m| m.to_vec()))
@@ -217,6 +269,22 @@ impl<P: Program> Core<P> {
                 f(&mut shell.program, &mut shell.core, data);
             });
             return Ok(());
+        }
+        if let Some(offer) = &self.dnd.control.selection {
+            if !offer
+                .data::<OfferMimes>()
+                .is_some_and(|mimes| mimes.lock().unwrap().iter().any(|offered| offered == mime))
+            {
+                return Err(std::io::Error::other(
+                    "clipboard format is no longer available",
+                ));
+            }
+            use std::os::fd::AsFd;
+            let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+            offer.receive(mime.to_owned(), write.as_fd());
+            drop(write);
+            let _ = self.conn.flush();
+            return self.read_pipe(read.into(), "the clipboard", f);
         }
         let offer = (self.dnd.device.as_ref())
             .and_then(|d| d.data().selection_offer())
@@ -506,6 +574,84 @@ impl<P: Program> DataSourceHandler for Shell<P> {
             && s.source.inner() == source
         {
             s.action = action;
+        }
+    }
+}
+
+impl<P: Program> Dispatch<ExtDataControlManagerV1, ()> for Shell<P> {
+    fn event(
+        _: &mut Self,
+        _: &ExtDataControlManagerV1,
+        _: control_manager_event::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1 as control_manager_event;
+
+impl<P: Program> Dispatch<ExtDataControlOfferV1, OfferMimes> for Shell<P> {
+    fn event(
+        _: &mut Self,
+        _: &ExtDataControlOfferV1,
+        event: control_offer::Event,
+        mimes: &OfferMimes,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let control_offer::Event::Offer { mime_type } = event {
+            mimes.lock().unwrap().push(mime_type);
+        }
+    }
+}
+
+impl<P: Program> Dispatch<ExtDataControlDeviceV1, ()> for Shell<P> {
+    wayland_client::event_created_child!(Shell<P>, ExtDataControlDeviceV1, [
+        control_device::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, OfferMimes::default())
+    ]);
+
+    fn event(
+        shell: &mut Self,
+        device: &ExtDataControlDeviceV1,
+        event: control_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let control = &mut shell.core.dnd.control;
+        if control.device.as_ref() != Some(device) {
+            if let control_device::Event::DataOffer { id } = event {
+                id.destroy();
+            }
+            return;
+        }
+        match event {
+            control_device::Event::DataOffer { id } => {
+                if let Some(old) = control.pending.replace(id) {
+                    old.destroy();
+                }
+            }
+            control_device::Event::Selection { id } => {
+                if let Some(old) = control.selection.take() {
+                    old.destroy();
+                }
+                if id.is_some() {
+                    control.pending.take();
+                }
+                control.selection = id;
+                shell.program.selection_changed(&mut shell.core);
+            }
+            control_device::Event::PrimarySelection { id: Some(id) } => {
+                control.pending.take();
+                id.destroy();
+            }
+            control_device::Event::Finished => {
+                control.release();
+                shell.program.selection_changed(&mut shell.core);
+            }
+            _ => {}
         }
     }
 }

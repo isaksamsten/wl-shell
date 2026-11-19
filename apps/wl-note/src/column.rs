@@ -80,6 +80,7 @@ use wl_shell_render::paper::{self, Paper};
 use wl_shell_render::shadow::IconShadow;
 use wl_shell_render::text::{self, Field, Text};
 use wl_shell_render::worker::{Assets, PillRequest};
+use wl_shell_ui::anim::Spring;
 use wl_shell_ui::cache::shm_buffer;
 use wl_shell_ui::geom::clip;
 use wl_shell_ui::{IRect, Rect, Sub, cache, lerp};
@@ -92,6 +93,7 @@ use crate::draft::Draft;
 use crate::files;
 use crate::markdown::{self, Content};
 use crate::papers::{Papers, Sheet};
+use crate::row::{self, Available, Button, Mode};
 use crate::title::Title;
 
 /// The text's distance from a sheet's body's sides, and from its top.
@@ -149,6 +151,7 @@ pub struct Style {
     pub reveal_delay: Duration,
     pub hide_delay: Duration,
     pub response: f64,
+    row_buttons: Vec<Button>,
     pub shadow: Option<IconShadow>,
     /// Lifted headers' and sheets'.
     pub lifted: Option<IconShadow>,
@@ -195,6 +198,7 @@ impl Style {
             reveal_delay: Duration::from_millis(config.column.reveal_delay as u64),
             hide_delay: Duration::from_millis(config.column.hide_delay as u64),
             response: config.column.response as f64,
+            row_buttons: config.row.buttons.clone(),
             shadow: config.shadow(),
             lifted: config.lifted_shadow(),
             font: config.sheet.font.clone(),
@@ -359,6 +363,7 @@ pub enum Act {
     Edit(String),
     /// Make a new note.
     New(bool),
+    Row(Button),
     /// Keep as an app note (optionally matching its title).
     Keep(String, bool),
     /// Keep at this gap in the app or global group.
@@ -392,6 +397,8 @@ pub enum Timer {
     /// The pointer left the column: back to markers.
     Hide,
     Trash,
+    RowRest,
+    RowHide,
 }
 
 /// A card's subsurface, and the paper it shows.
@@ -498,6 +505,7 @@ struct FilePress {
 pub enum FileTarget {
     New,
     NewScratch,
+    NewGlobal,
     Note {
         key: String,
         editor: Option<(usize, String)>,
@@ -520,6 +528,12 @@ struct TitleShown {
     buffer: WlBuffer,
     w: f64,
     h: f64,
+}
+
+struct RowSlot {
+    disc: Sub,
+    glyph: Sub,
+    out: Spring,
 }
 
 pub struct Column {
@@ -552,6 +566,17 @@ pub struct Column {
     plus_shown: Option<(i32, WlBuffer, paper::Rendered)>,
     /// Where the `+` button is, while it takes the pointer.
     plus_rect: Option<Rect>,
+    row_slots: [RowSlot; Button::ALL.len()],
+    row_label: Sub,
+    row_label_for: Option<Button>,
+    row_disc: Option<Sized>,
+    row_hits: Vec<(Button, Rect)>,
+    row_hold: Option<Rect>,
+    row_available: Available,
+    row_mode: Mode,
+    row_last: Mode,
+    row_drag: bool,
+    row_timer: Option<(Timer, RegistrationToken)>,
     /// The open note's text, title and bar; the revealed note's bar.
     text: Sub,
     title: Sub,
@@ -738,6 +763,12 @@ impl Column {
         let parent = layer.wl_surface().clone();
         let sub = || Sub::new(&g, &parent, &no_input, &qh);
         let (plus, text, title, notice) = (sub(), sub(), sub(), sub());
+        let row_slots = std::array::from_fn(|i| RowSlot {
+            disc: sub(),
+            glyph: sub(),
+            out: Spring::new(0.0, style.response + i as f64 * 35.0),
+        });
+        let row_label = sub();
         let backdrops = std::array::from_fn(|_| std::array::from_fn(|_| sub()));
         let open_bar = BarSubs::new(&g, &parent, &no_input, &qh);
         let reveal_bar = BarSubs::new(&g, &parent, &no_input, &qh);
@@ -767,6 +798,17 @@ impl Column {
             backdrop_shown: None,
             plus_shown: None,
             plus_rect: None,
+            row_slots,
+            row_label,
+            row_label_for: None,
+            row_disc: None,
+            row_hits: Vec::new(),
+            row_hold: None,
+            row_available: Available::default(),
+            row_mode: Mode::Closed,
+            row_last: Mode::Closed,
+            row_drag: false,
+            row_timer: None,
             text,
             title,
             open_bar,
@@ -899,6 +941,12 @@ impl Column {
         self.open_bar.clear();
         self.reveal_bar.clear();
         self.plus.clear();
+        self.row_label.clear();
+        for slot in &mut self.row_slots {
+            slot.disc.clear();
+            slot.glyph.clear();
+        }
+        self.stale.extend(self.row_disc.take().map(|s| s.buffer));
         for sub in self.backdrops.iter_mut().flatten() {
             sub.clear();
         }
@@ -1416,6 +1464,19 @@ impl Column {
                 }
             }
             Timer::Trash => {}
+            Timer::RowRest => {
+                self.row_timer = None;
+                if self
+                    .pointer
+                    .is_some_and(|(x, y)| self.on_at(x, y) == On::Plus)
+                {
+                    self.set_row_mode(Mode::Rest);
+                }
+            }
+            Timer::RowHide => {
+                self.row_timer = None;
+                self.set_row_mode(Mode::Closed);
+            }
         }
         self.kick();
     }
@@ -1479,6 +1540,8 @@ impl Column {
         if self.press.take().is_some() {
             self.deck.drag_cancel();
         }
+        self.row_drag = false;
+        self.update_row_hover(core);
         self.cancel_reveal(core);
         self.deck.point(On::Outside);
         self.start_hide(core);
@@ -1501,12 +1564,23 @@ impl Column {
 
     pub fn file_hover(&mut self, core: &Core<WlNote>, x: f64, y: f64) {
         if self.dragged_file_note.is_none() {
+            self.row_drag = true;
             self.hover_at(core, x, y);
         }
     }
 
     pub fn file_target(&self, x: f64, y: f64) -> Option<FileTarget> {
         if self.retiring {
+            return None;
+        }
+        if let Some(button) = self.row_at(x, y) {
+            return match button {
+                Button::Window => Some(FileTarget::NewScratch),
+                Button::Global => Some(FileTarget::NewGlobal),
+                _ => None,
+            };
+        }
+        if self.row_hold.is_some_and(|r| r.contains(x, y)) && self.on_at(x, y) != On::Plus {
             return None;
         }
         let key = match self.on_at(x, y) {
@@ -1640,6 +1714,7 @@ impl Column {
         self.pointer = Some((x, y));
         self.cancel_hide(core);
         let on = self.on_at(x, y);
+        self.update_row_hover(core);
         let mut changed = self.leave_file_views(&on);
         changed |= self.update_bar_hover(x, y);
         let before = (
@@ -1743,6 +1818,14 @@ impl Column {
     ) -> Vec<Act> {
         self.paste_serial = self.paste_serial.wrapping_add(1);
         let on = self.on_at(x, y);
+        if let Some(button) = self.row_at(x, y) {
+            let mut acts = self.commit_title();
+            acts.push(Act::Row(button));
+            return acts;
+        }
+        if on == On::Strip && self.row_hold.is_some_and(|r| r.contains(x, y)) {
+            return Vec::new();
+        }
         let left_files = self.leave_file_views(&on);
         if self.update_bar_hover(x, y) || left_files {
             self.kick();
@@ -2114,6 +2197,9 @@ impl Column {
 
     /// What the pointer at (`x`, `y`) is on, topmost first.
     fn on_at(&self, x: f64, y: f64) -> On {
+        if self.row_at(x, y).is_some() {
+            return On::Strip;
+        }
         for card in self.deck.paint_order().into_iter().rev() {
             let hit = (self.slots.iter().find(|s| s.key == card.key)).and_then(|s| s.hit);
             if card.present() && hit.is_some_and(|r| r.contains(x, y)) {
@@ -2125,6 +2211,9 @@ impl Column {
         }
         if self.plus_rect.is_some_and(|r| r.contains(x, y)) {
             return On::Plus;
+        }
+        if self.row_hold.is_some_and(|r| r.contains(x, y)) {
+            return On::Strip;
         }
         match self.band_rects().iter().any(|r| r.contains(x, y)) {
             true => On::Strip,
@@ -2646,6 +2735,10 @@ impl Column {
         let now = Instant::now();
         let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         let moving = self.deck.advance(dt);
+        for slot in &mut self.row_slots {
+            slot.out.advance(dt);
+        }
+        let moving = moving || self.row_moving();
         self.last_frame = moving.then_some(now);
         self.render();
     }
@@ -2661,7 +2754,7 @@ impl Column {
             .into_iter()
             .flatten()
             .any(|t| t.elapsed() < PALETTE_TIME);
-        if (self.deck.moving() || animating_palette) && !self.frame_pending {
+        if (self.deck.moving() || self.row_moving() || animating_palette) && !self.frame_pending {
             self.request_frame();
         }
         self.layer.commit();
@@ -3179,6 +3272,7 @@ impl Column {
         }
 
         self.place_plus();
+        self.place_row();
         self.place_backdrops();
         if self.press.is_none()
             && let Some((x, y)) = self.pointer
@@ -3201,6 +3295,7 @@ impl Column {
         let mut input: Vec<IRect> = (self.slots.iter())
             .filter_map(|s| s.hit)
             .chain(self.plus_rect)
+            .chain(self.row_hold)
             .chain(
                 self.band_rects()
                     .into_iter()
@@ -3338,6 +3433,217 @@ impl Column {
             }
             _ => self.plus.clear(),
         }
+    }
+
+    pub fn set_row_available(&mut self, available: Available) {
+        if self.row_available != available {
+            self.row_available = available;
+            self.kick();
+        }
+    }
+
+    fn row_moving(&self) -> bool {
+        self.row_slots.iter().any(|slot| !slot.out.settled())
+    }
+
+    fn row_at(&self, x: f64, y: f64) -> Option<Button> {
+        if self.plus_rect.is_some_and(|plus| plus.contains(x, y)) {
+            return None;
+        }
+        self.row_hits
+            .iter()
+            .rev()
+            .find_map(|&(button, rect)| rect.contains(x, y).then_some(button))
+    }
+
+    fn set_row_mode(&mut self, mode: Mode) {
+        if self.row_mode != mode {
+            self.row_mode = mode;
+            if mode != Mode::Closed {
+                self.row_last = mode;
+            }
+            self.kick();
+        }
+    }
+
+    pub fn update_row_hover(&mut self, core: &Core<WlNote>) {
+        let over_plus = self
+            .pointer
+            .is_some_and(|(x, y)| self.on_at(x, y) == On::Plus);
+        let in_row = self
+            .pointer
+            .is_some_and(|(x, y)| self.row_hold.is_some_and(|r| r.contains(x, y)));
+        let timer = if self.retiring {
+            None
+        } else if (over_plus || in_row) && self.row_drag {
+            self.set_row_mode(Mode::Drag);
+            None
+        } else if self.row_mode == Mode::Drag && !self.row_drag && (over_plus || in_row) {
+            self.set_row_mode(Mode::Rest);
+            None
+        } else if self.row_mode != Mode::Closed {
+            (!(over_plus || in_row)).then_some((Timer::RowHide, self.style.hide_delay))
+        } else {
+            (over_plus && !self.row_drag && self.press.is_none())
+                .then_some((Timer::RowRest, self.style.reveal_delay))
+        };
+        if self.row_timer.map(|(kind, _)| kind) != timer.map(|(kind, _)| kind) {
+            self.cancel_row_timer(core);
+            if let Some((kind, delay)) = timer {
+                let surface = self.surface().clone();
+                if delay.is_zero() {
+                    self.timer_due(kind);
+                } else {
+                    match core.timer(delay, move |app: &mut WlNote, core| {
+                        app.column_timer(core, &surface, kind);
+                    }) {
+                        Ok(token) => self.row_timer = Some((kind, token)),
+                        Err(e) => warn!("row timer: {e}"),
+                    }
+                }
+            }
+        }
+        let label = if self.row_drag || self.retiring {
+            None
+        } else {
+            self.pointer.and_then(|(x, y)| self.row_at(x, y))
+        };
+        if label != self.row_label_for {
+            self.row_label_for = label;
+            self.kick();
+        }
+    }
+
+    pub fn cancel_row_timer(&mut self, core: &Core<WlNote>) {
+        if let Some((_, token)) = self.row_timer.take() {
+            core.loop_handle.remove(token);
+        }
+    }
+
+    fn place_row(&mut self) {
+        self.row_hits.clear();
+        self.row_hold = None;
+        let m = self.style.metrics;
+        let width = self.width as f64;
+        let edge = self.style.edge;
+        let cx = if edge == Edge::Left {
+            m.header / 2.0
+        } else {
+            width - m.header / 2.0
+        };
+        let plus = Rect::new(
+            cx - m.plus / 2.0,
+            self.deck.plus_center() - m.plus / 2.0,
+            m.plus,
+            m.plus,
+        );
+        let available = self.row_available;
+        let buttons = row::buttons(&self.style.row_buttons, available, self.row_mode);
+        let previous = row::buttons(&self.style.row_buttons, available, self.row_last);
+        let layout = |buttons: &[Button]| {
+            row::places(buttons, plus, edge, width, m.sheet_width).collect::<Vec<_>>()
+        };
+        let targets = layout(&buttons);
+        let previous = layout(&previous);
+        let surface = self.surface_rect();
+        let scale = self.scale as f64;
+        let alpha = self.deck.plus.value.clamp(0.0, 1.0);
+        let mut label = None;
+        if alpha > 0.0 && !targets.is_empty() && self.row_disc.is_none() && !self.retiring {
+            let size = m.plus as i32;
+            let image = paper::rounded(size, size, m.plus / 2.0, self.style.plus_color, self.scale);
+            if let Ok(buffer) =
+                shm_buffer(&self.g, &image, &self.qh).inspect_err(|e| warn!("row button: {e}"))
+            {
+                self.row_disc = Some(Sized {
+                    buffer,
+                    w: m.plus,
+                    h: m.plus,
+                });
+            }
+        }
+        for (i, button) in Button::ALL.into_iter().enumerate() {
+            let target = targets.iter().find(|(b, _)| *b == button).map(|(_, r)| *r);
+            let active = target.is_some() && !self.retiring;
+            let immediate = active && (button == Button::Undo || self.row_mode == Mode::Drag);
+            let out = &mut self.row_slots[i].out;
+            let goal = if active { 1.0 } else { 0.0 };
+            if immediate || alpha == 0.0 || self.retiring {
+                out.snap(goal);
+            } else {
+                out.retarget(goal);
+            }
+            let p = out.value.clamp(0.0, 1.0);
+            let rect =
+                target.or_else(|| previous.iter().find(|(b, _)| *b == button).map(|(_, r)| *r));
+            let shown = rect.filter(|_| alpha * p > 0.0 && !self.retiring);
+            let mut disc = None;
+            let mut glyph = None;
+            if let Some(rect) = shown {
+                let start = self.plus_rect.map_or(plus.x, |r| r.x);
+                let area = Rect::new(lerp(start, rect.x, p), rect.y, rect.w, rect.h);
+                if let Some(image) = &self.row_disc {
+                    disc = place_image(
+                        &mut self.row_slots[i].disc,
+                        image,
+                        area,
+                        surface,
+                        scale,
+                        alpha * p,
+                    );
+                }
+                if let Some(image) = self.line(LineKey {
+                    text: button.glyph().into(),
+                    color: self.style.plus_glyph,
+                    width: m.plus as i32,
+                    strike: false,
+                }) {
+                    let x = area.x + (area.w - image.w) / 2.0;
+                    let y = area.y + (area.h - image.h) / 2.0;
+                    glyph = place_image(
+                        &mut self.row_slots[i].glyph,
+                        &image,
+                        Rect::new(x, y, image.w, image.h),
+                        surface,
+                        scale,
+                        alpha * p,
+                    );
+                }
+                if active && alpha > 0.5 && p > 0.5 && disc.is_some() && glyph.is_some() {
+                    self.row_hits.push((button, area));
+                    if self.row_label_for == Some(button) {
+                        label = Some((button, area));
+                    }
+                }
+            }
+            if disc.is_none() {
+                self.row_slots[i].disc.clear();
+            }
+            if glyph.is_none() {
+                self.row_slots[i].glyph.clear();
+            }
+            self.attached.extend(disc.into_iter().chain(glyph));
+        }
+        if let (Some(plus), Some((_, end))) = (self.plus_rect, targets.last()) {
+            let x = plus.x.min(end.x);
+            let right = plus.right().max(end.right());
+            self.row_hold = intersect(Rect::new(x, plus.y, right - x, plus.h), surface);
+        }
+        let placed = label.and_then(|(button, rect)| {
+            let image = self.line(LineKey {
+                text: button.label().into(),
+                color: self.style.plus_glyph,
+                width: 100,
+                strike: false,
+            })?;
+            let x = (rect.x + (rect.w - image.w) / 2.0).clamp(0.0, (width - image.w).max(0.0));
+            let area = Rect::new(x, rect.y - image.h - 4.0, image.w, image.h);
+            place_image(&mut self.row_label, &image, area, surface, scale, alpha)
+        });
+        if placed.is_none() {
+            self.row_label.clear();
+        }
+        self.attached.extend(placed);
     }
 
     /// How much the open note's parts on top of its paper show: once its
@@ -3729,6 +4035,10 @@ impl Column {
                 order.extend(self.reveal_bar.subs());
             }
         }
+        for slot in &self.row_slots {
+            order.extend([&slot.disc, &slot.glyph]);
+        }
+        order.push(&self.row_label);
         let surfaces: Vec<WlSurface> = order.iter().map(|s| s.surface().clone()).collect();
         if surfaces == self.stacking {
             return;

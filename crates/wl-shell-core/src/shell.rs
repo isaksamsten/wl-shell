@@ -144,6 +144,9 @@ pub trait Program: Sized + 'static {
     /// device is only made for programs that do.
     const DATA_DEVICE: bool = false;
 
+    /// Observe clipboard offers without taking keyboard focus, if supported.
+    const BACKGROUND_SELECTION: bool = false;
+
     /// A drag entered `surface` at `at`, offering `mime_types`. Until the
     /// program accepts it (`core.dnd.accept`), it isn't taken.
     fn dnd_enter(
@@ -240,10 +243,14 @@ impl<P: Program> Shell<P> {
             input: Input::default(),
             mru: Mru::default(),
             focus_stream: focus::stream(),
-            dnd: Dnd::new(match P::DATA_DEVICE {
-                true => DataDeviceManagerState::bind(&globals, &qh).ok(),
-                false => None,
-            }),
+            dnd: Dnd::new(
+                P::DATA_DEVICE
+                    .then(|| DataDeviceManagerState::bind(&globals, &qh).ok())
+                    .flatten(),
+                P::BACKGROUND_SELECTION
+                    .then(|| globals.bind(&qh, 1..=1, ()).ok())
+                    .flatten(),
+            ),
         };
         let mut shell = Shell { core, program };
         // The first roundtrip delivers the handles, the second their state.

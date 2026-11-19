@@ -48,6 +48,11 @@ morning = "09:00"                  # Tomorrow's and next week's time
 evening = "18:00"                  # Tonight's time
 everywhere = false                 # Also show overdue notes in the global group, everywhere
 
+[row]
+buttons = ["undo", "window", "global", "paste"] # Nearest + first; omit unwanted buttons
+undo-time = 5000                   # Milliseconds; 0 disables undo
+# Paste without keyboard focus needs compositor support for ext-data-control.
+
 [integration]
 settle = 120                       # Milliseconds before notes follow focus
 # mru-event-stream = "~/.config/wl-dock/focus-stream.sh"     # Example: window ID per line

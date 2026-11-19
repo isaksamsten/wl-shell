@@ -34,6 +34,7 @@ pub struct Config {
     pub files: FilesConfig,
     pub scratch: ScratchConfig,
     pub due: DueConfig,
+    pub row: RowConfig,
     pub integration: IntegrationConfig,
     pub appearance: wl_shell_config::Appearance<Theme>,
 }
@@ -51,8 +52,26 @@ impl Default for Config {
             files: FilesConfig::default(),
             scratch: ScratchConfig::default(),
             due: DueConfig::default(),
+            row: RowConfig::default(),
             integration: IntegrationConfig::default(),
             appearance: wl_shell_config::Appearance::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RowConfig {
+    pub buttons: Vec<crate::row::Button>,
+    /// Milliseconds to undo a hide or trash.
+    pub undo_time: u32,
+}
+
+impl Default for RowConfig {
+    fn default() -> Self {
+        Self {
+            buttons: crate::row::Button::ALL.to_vec(),
+            undo_time: 5000,
         }
     }
 }

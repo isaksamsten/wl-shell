@@ -19,6 +19,7 @@ mod markdown;
 mod options;
 mod papers;
 mod reorder;
+mod row;
 mod scratch;
 mod title;
 
@@ -283,17 +284,23 @@ fn save(result: std::io::Result<()>, dir: &Path) -> Result<(), String> {
     result.map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-/// wl-note is always shown: it runs its own loop until the connection
-/// fails.
+/// Run until the compositor disconnects or the session asks us to quit.
 fn run(opts: &Options) -> Result<(), Error> {
+    use calloop::signals::{Signal, Signals};
+
+    // Block these signals before starting any worker threads.
+    let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP])?;
     let note = WlNote::new(opts.config.clone())?;
     let (mut shell, mut event_loop) = Shell::connect(note)?;
+    let signal = event_loop.get_signal();
+    let quitting = signal.clone();
+    event_loop
+        .handle()
+        .insert_source(signals, move |_, _, _| quitting.stop())?;
     shell.program.started(&mut shell.core)?;
-    loop {
-        event_loop
-            .dispatch(None, &mut shell)
-            .map_err(|e| format!("wayland connection error: {e}"))?;
-        let Shell { core, program } = &mut shell;
-        program.after_dispatch(core);
-    }
+    let result = event_loop.run(None, &mut shell, |shell| {
+        shell.program.after_dispatch(&mut shell.core);
+    });
+    shell.program.shutdown();
+    result.map_err(|e| format!("wayland connection error: {e}").into())
 }

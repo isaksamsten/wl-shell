@@ -83,6 +83,7 @@ use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::ipc::{NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::papers::Papers;
+use crate::row::{self, Available, Button};
 use crate::{bar, create, files, find, list, reorder, scratch};
 
 /// Windows whose output is remembered at most: the stream may report
@@ -114,6 +115,62 @@ struct FileDrop {
     window: Option<Ctx>,
 }
 
+struct PasteNote {
+    surface: WlSurface,
+    dir: PathBuf,
+    app: Option<String>,
+    fallback: Option<String>,
+}
+
+fn clipboard_mimes(core: &Core<WlNote>) -> Vec<String> {
+    let mimes = core.selection_mime_types();
+    let find = |mime: &str| mimes.iter().find(|m| m.eq_ignore_ascii_case(mime)).cloned();
+    find(files::URI_LIST)
+        .into_iter()
+        .chain(CLIPBOARD_TEXT.into_iter().find_map(find))
+        .collect()
+}
+
+enum Removal {
+    Hide(PathBuf),
+    Trash(Trash),
+}
+
+struct Trash {
+    path: PathBuf,
+    identity: (u64, u64),
+    command: String,
+}
+
+impl Trash {
+    fn identity(path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    fn spawn(&self) -> std::io::Result<std::process::Child> {
+        if Self::identity(&self.path)? != self.identity {
+            return Err(std::io::Error::other(
+                "note was replaced while waiting to trash it",
+            ));
+        }
+        std::process::Command::new("sh")
+            .args(["-c", &self.command, "wl-note-trash"])
+            .arg(&self.path)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+    }
+}
+
+fn trash_status(status: std::process::ExitStatus) -> std::io::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(status.to_string()))
+    }
+}
+
 pub struct WlNote {
     /// The config, reloaded when its file changes.
     reloader: Reloader<Config>,
@@ -136,6 +193,8 @@ pub struct WlNote {
     moves: Vec<(PathBuf, PathBuf)>,
     /// Notes with a Move to Trash command in flight (absolute paths).
     trash_pending: HashSet<PathBuf>,
+    undo: row::Undo<Removal>,
+    undo_timer: Option<RegistrationToken>,
     /// The order and the hidden notes.
     state: State,
     /// Where they are kept; None: nowhere (no `$HOME`), so only for now.
@@ -202,6 +261,8 @@ impl WlNote {
             tree: None,
             moves: Vec::new(),
             trash_pending: HashSet::new(),
+            undo: row::Undo::new(),
+            undo_timer: None,
             state: State::default(),
             state_dir: None,
             state_touched: false,
@@ -553,6 +614,7 @@ impl WlNote {
                     .iter()
                     .any(|c| c.open_key() == Some(&key) || c.dragged_file_note() == Some(&key))
                     || self.detached_drafts.contains_key(&path)
+                    || matches!(self.undo.action(), Some(Removal::Trash(trash)) if trash.path == path)
                 {
                     deferred = true;
                     continue;
@@ -638,6 +700,15 @@ impl WlNote {
         for (from, to) in &moves {
             let (o, h) = self.state.rename(from, to);
             (order, hidden) = (order || o, hidden || h);
+            if let Some(Removal::Hide(path)) = self.undo.action_mut()
+                && let Ok(rest) = path.strip_prefix(from)
+            {
+                *path = if rest.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    to.join(rest)
+                };
+            }
             // An open note follows its file.
             for i in 0..self.columns.len() {
                 let Some(open) = self.columns[i].open_key().map(PathBuf::from) else {
@@ -746,6 +817,7 @@ impl WlNote {
         if std::mem::take(&mut self.dirty) {
             self.show_notes();
         }
+        self.update_row_availability(core);
         // Columns gone from their outputs, once their notes slid away.
         let before = self.columns.len();
         self.columns.retain(|c| !c.retired());
@@ -771,6 +843,12 @@ impl WlNote {
         let old = std::mem::replace(&mut self.config, self.reloader.config().clone());
         if let Some(papers) = &self.papers {
             papers.borrow_mut().clear();
+        }
+        if old.notes_dir() != self.config.notes_dir()
+            || self.config.row.undo_time == 0
+            || !self.config.row.buttons.contains(&Button::Undo)
+        {
+            self.flush_undo(core);
         }
         if old.notes_dir() != self.config.notes_dir() {
             self.remove_columns(core, |_| true);
@@ -931,6 +1009,7 @@ impl WlNote {
                     }
                     acts.push((column.surface().clone(), column.close()));
                     column.retiring = true;
+                    column.cancel_row_timer(core);
                     column.set_notes(Vec::new());
                 }
                 None => {}
@@ -998,6 +1077,11 @@ impl WlNote {
         fallback: Option<&Note>,
     ) -> Option<Shown> {
         let note = self.entry(path).map(|e| &e.note).or(fallback)?;
+        if self.trash_pending.contains(&self.index.dir().join(path))
+            || matches!(self.undo.action(), Some(Removal::Trash(trash)) if trash.path == self.index.dir().join(path))
+        {
+            return None;
+        }
         let key = path.to_string_lossy().into_owned();
         let scratch = self.scratch_rel(path).is_some();
         let now = due::now();
@@ -1209,6 +1293,19 @@ impl WlNote {
                     warn!("{e}");
                 }
             }
+            Act::Row(Button::Undo) => self.undo_removal(core),
+            Act::Row(Button::Paste) => self.paste_note(core, from),
+            Act::Row(button @ (Button::Window | Button::Global)) => {
+                let new = NewNote {
+                    window: button == Button::Window,
+                    global: button == Button::Global,
+                    ..NewNote::default()
+                };
+                match self.make_note(core, new) {
+                    Ok(key) => self.open_created(core, from, &key),
+                    Err(e) => warn!("{e}"),
+                }
+            }
             Act::Keep(key, exact) => {
                 if let Err(e) = self.keep_scratch(core, &key, exact, false) {
                     warn!("{e}");
@@ -1248,7 +1345,7 @@ impl WlNote {
                 };
                 self.edit_note(&key, |note| note.set_due(due));
             }
-            Act::Trash(key) => self.trash_note(core, &key),
+            Act::Trash(key) => self.queue_trash(core, &key),
             Act::RemoveFile(key, path) => {
                 if !path.exists() {
                     self.edit_note(&key, |note| {
@@ -1266,12 +1363,17 @@ impl WlNote {
     /// Open `key` in the column `i`, closing whatever is open in the
     /// others: one note is open at a time.
     fn open_in(&mut self, core: &mut Core<Self>, i: usize, key: &str) {
+        let path = self.path(key);
+        if self.trash_pending.contains(&path)
+            || matches!(self.undo.action(), Some(Removal::Trash(trash)) if trash.path == path)
+        {
+            return;
+        }
         for j in 0..self.columns.len() {
             if (j != i || self.columns[j].open_key() != Some(key)) && !self.save_draft(j, false) {
                 return;
             }
         }
-        let path = self.path(key);
         let draft = self.detached_drafts.remove(&path).or_else(|| {
             // Another column may just have saved this note; the index
             // will catch up on the next dispatch.
@@ -1315,32 +1417,67 @@ impl WlNote {
         }
         if self.state.hidden.push(Path::new(key)) {
             self.save_state(false, true);
+            self.remember_removal(core, Removal::Hide(PathBuf::from(key)));
         }
         self.dirty = true;
     }
 
-    /// Run only the configured trash command. The filesystem scan, not
-    /// the click or the command's launch, removes the note from the deck.
-    fn trash_note(&mut self, core: &Core<Self>, key: &str) {
+    fn queue_trash(&mut self, core: &mut Core<Self>, key: &str) {
+        let path = self.path(key);
+        if matches!(self.undo.action(), Some(Removal::Trash(old)) if old.path == path) {
+            return;
+        }
         if let Some(i) = self.columns.iter().position(|c| c.open_key() == Some(key))
             && !self.save_draft(i, false)
         {
             return;
         }
-        if self.entry(Path::new(key)).is_none() {
+        let Some(trash) = self.prepare_trash(key) else {
             return;
+        };
+        for i in 0..self.columns.len() {
+            if self.columns[i].open_key() == Some(key) {
+                let more = self.columns[i].close();
+                let surface = self.columns[i].surface().clone();
+                self.acts(core, &surface, more);
+            }
+            self.columns[i].crumple(key);
         }
+        self.remember_removal(core, Removal::Trash(trash));
+        self.dirty = true;
+    }
+
+    fn trash_note(&mut self, core: &Core<Self>, key: &str) {
+        if let Some(trash) = self.prepare_trash(key) {
+            self.run_trash(core, trash);
+        }
+    }
+
+    fn prepare_trash(&self, key: &str) -> Option<Trash> {
+        self.entry(Path::new(key))?;
         let path = self.path(key);
         if self.trash_pending.contains(&path) {
-            return;
+            return None;
         }
         let template = &self.config.files.trash_command;
         if !spawn::uses(template, "paths") {
-            return warn!("files.trash-command: expected {{paths}}");
+            warn!("files.trash-command: expected {{paths}}");
+            return None;
         }
+        let identity = Trash::identity(&path)
+            .inspect_err(|e| warn!("{}: {e}", path.display()))
+            .ok()?;
         // Pass the path as a standalone shell argument, including when
         // its filename is not UTF-8.
-        let command = spawn::fill(template, &[("paths", "\"$1\"")]);
+        Some(Trash {
+            path,
+            identity,
+            command: spawn::fill(template, &[("paths", "\"$1\"")]),
+        })
+    }
+
+    fn run_trash(&mut self, core: &Core<Self>, trash: Trash) {
+        let path = trash.path.clone();
         let (send, results) = channel::channel();
         let tracked = path.clone();
         let registered = core
@@ -1359,29 +1496,25 @@ impl WlNote {
                     }
                     app.rescan(&mut shell.core);
                     app.trash_pending.remove(&tracked);
+                    app.dirty = true;
                 }
             });
         let token = match registered {
             Ok(token) => token,
             Err(e) => return warn!("files.trash-command: {e}"),
         };
-        let target = path.clone();
+        // Start the process before returning, so a shutdown cannot race its launch.
+        let mut child = match trash.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                core.loop_handle.remove(token);
+                return warn!("files.trash-command: {e}");
+            }
+        };
         let started = std::thread::Builder::new()
             .name("wl-note-trash".into())
             .spawn(move || {
-                let result = std::process::Command::new("sh")
-                    .args(["-c", &command, "wl-note-trash"])
-                    .arg(&target)
-                    .stdin(std::process::Stdio::null())
-                    .status()
-                    .and_then(|s| {
-                        if s.success() {
-                            Ok(())
-                        } else {
-                            Err(std::io::Error::other(s.to_string()))
-                        }
-                    });
-                let _ = send.send(result);
+                let _ = send.send(child.wait().and_then(trash_status));
             });
         match started {
             Ok(_) => {
@@ -1391,6 +1524,71 @@ impl WlNote {
                 core.loop_handle.remove(token);
                 warn!("files.trash-command: {e}");
             }
+        }
+    }
+
+    fn cancel_undo_timer(&mut self, core: &Core<Self>) {
+        if let Some(token) = self.undo_timer.take() {
+            core.loop_handle.remove(token);
+        }
+    }
+
+    fn remember_removal(&mut self, core: &Core<Self>, action: Removal) {
+        self.cancel_undo_timer(core);
+        let delay = Duration::from_millis(self.config.row.undo_time.into());
+        if let Some(Removal::Trash(old)) = self.undo.replace(Instant::now() + delay, action) {
+            self.run_trash(core, old);
+        }
+        if delay.is_zero() || !self.config.row.buttons.contains(&Button::Undo) {
+            self.flush_undo(core);
+            return;
+        }
+        match core.timer(delay, |app: &mut Self, core| {
+            app.undo_timer = None;
+            if let Some(Removal::Trash(trash)) = app.undo.take() {
+                app.run_trash(core, trash);
+                app.dirty = true;
+            }
+        }) {
+            Ok(token) => self.undo_timer = Some(token),
+            Err(e) => {
+                warn!("undo timer: {e}");
+                self.flush_undo(core);
+            }
+        }
+    }
+
+    fn flush_undo(&mut self, core: &Core<Self>) {
+        self.cancel_undo_timer(core);
+        if let Some(Removal::Trash(trash)) = self.undo.take() {
+            self.run_trash(core, trash);
+            self.dirty = true;
+        }
+    }
+
+    fn undo_removal(&mut self, core: &Core<Self>) {
+        self.cancel_undo_timer(core);
+        if let Some(expired) = self.undo.expire(Instant::now()) {
+            if let Removal::Trash(trash) = expired {
+                self.run_trash(core, trash);
+            }
+        } else if let Some(Removal::Hide(path)) = self.undo.take()
+            && self.state.hidden.remove(&path)
+        {
+            self.save_state(false, true);
+        }
+        self.dirty = true;
+    }
+
+    pub fn shutdown(&mut self) {
+        self.save_open_drafts();
+        if let Some(Removal::Trash(trash)) = self.undo.take()
+            && let Err(e) = trash
+                .spawn()
+                .and_then(|mut child| child.wait())
+                .and_then(trash_status)
+        {
+            warn!("files.trash-command: {}: {e}", trash.path.display());
         }
     }
 
@@ -1514,6 +1712,7 @@ impl WlNote {
             let surface = self.columns[i].surface().clone();
             let acts = self.columns[i].close();
             self.acts(core, &surface, acts);
+            self.columns[i].cancel_row_timer(core);
             self.columns.remove(i);
         }
     }
@@ -1625,6 +1824,12 @@ impl WlNote {
     /// there is no context), written at once, put at the end of the
     /// order, and opened in the built-in editor.
     fn new_note(&mut self, core: &mut Core<Self>, new: NewNote) -> Result<(), String> {
+        let key = self.make_note(core, new)?;
+        self.focus_note(core, &key);
+        Ok(())
+    }
+
+    fn make_note(&mut self, core: &mut Core<Self>, new: NewNote) -> Result<String, String> {
         if new.window {
             if new.global {
                 return Err("--window conflicts with --global".into());
@@ -1633,9 +1838,7 @@ impl WlNote {
                 .scratch_context()
                 .cloned()
                 .ok_or("no window for a scratch note")?;
-            let key = self.write_scratch(&ctx, &new)?;
-            self.focus_note(core, &key);
-            return Ok(());
+            return self.write_scratch(&ctx, &new);
         }
         let app = match new.global {
             true => None,
@@ -1648,9 +1851,7 @@ impl WlNote {
             new.text.as_deref(),
             new.due.as_deref(),
         )?;
-        let key = self.write_new_note(core, &text)?;
-        self.focus_note(core, &key);
-        Ok(())
+        self.write_new_note(core, &text)
     }
 
     fn write_scratch(&mut self, ctx: &Ctx, new: &NewNote) -> Result<String, String> {
@@ -1760,6 +1961,97 @@ impl WlNote {
         self.dirty = false;
     }
 
+    fn open_created(&mut self, core: &mut Core<Self>, surface: &WlSurface, key: &str) {
+        if let Some(i) = self
+            .column_at(surface)
+            .filter(|&i| !self.columns[i].retiring)
+            .or_else(|| self.main_column())
+        {
+            self.open_in(core, i, key);
+            self.show_notes();
+        }
+    }
+
+    fn update_row_availability(&mut self, core: &Core<Self>) {
+        let clear = match self.undo.action() {
+            Some(Removal::Hide(path)) => !self.state.is_hidden(path) || self.entry(path).is_none(),
+            Some(Removal::Trash(trash)) => self
+                .entry(
+                    trash
+                        .path
+                        .strip_prefix(self.index.dir())
+                        .unwrap_or(&trash.path),
+                )
+                .is_none(),
+            None => false,
+        };
+        if clear {
+            self.cancel_undo_timer(core);
+            self.undo.take();
+        }
+        let available = Available {
+            undo: self.undo.action().is_some(),
+            window: self.scratch.is_some() && self.scratch_context().is_some(),
+            paste: !clipboard_mimes(core).is_empty(),
+        };
+        for column in &mut self.columns {
+            column.set_row_available(available);
+        }
+    }
+
+    fn paste_note(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
+        let mut mimes = clipboard_mimes(core).into_iter();
+        let Some(mime) = mimes.next() else { return };
+        let paste = PasteNote {
+            surface: surface.clone(),
+            dir: self.index.dir().to_path_buf(),
+            app: self.window().map(|w| w.app_id.clone()),
+            fallback: mimes.next(),
+        };
+        self.read_paste(core, mime, paste);
+    }
+
+    fn read_paste(&mut self, core: &mut Core<Self>, mime: String, mut paste: PasteNote) {
+        let uri_list = mime.eq_ignore_ascii_case(files::URI_LIST);
+        if let Err(e) = core.read_selection(&mime, move |app, core, data| {
+            let body = std::str::from_utf8(&data).ok().and_then(|text| {
+                if uri_list {
+                    wl_shell_render::files::parse_uri_list(text)
+                        .map(|paths| files::append("", &paths, "\n"))
+                        .or_else(|| {
+                            let mut urls = text
+                                .lines()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && !s.starts_with('#'));
+                            let first = urls.next()?;
+                            if urls.next().is_none() {
+                                row::paste_text(first)
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    row::paste_text(text)
+                }
+            });
+            if app.index.dir() != paste.dir {
+                return;
+            }
+            if let Some(body) = body {
+                let result = create::text(paste.app.as_deref(), None, None, Some(&body), None)
+                    .and_then(|text| app.write_new_note(core, &text));
+                match result {
+                    Ok(key) => app.open_created(core, &paste.surface, &key),
+                    Err(e) => warn!("pasting note: {e}"),
+                }
+            } else if let Some(mime) = paste.fallback.take() {
+                app.read_paste(core, mime, paste);
+            }
+        }) {
+            warn!("reading clipboard: {e}");
+        }
+    }
+
     // -- file drops --------------------------------------------------------
 
     fn release_file_drag(&mut self, core: &Core<Self>) {
@@ -1837,7 +2129,7 @@ impl WlNote {
             return Err("notes directory changed during drop".into());
         }
         match drop.target {
-            FileTarget::New | FileTarget::NewScratch => {
+            FileTarget::New | FileTarget::NewScratch | FileTarget::NewGlobal => {
                 let body = files::append("", &paths, "\n");
                 let key = if matches!(drop.target, FileTarget::NewScratch) {
                     let ctx = drop.window.ok_or("no window for a scratch note")?;
@@ -1852,17 +2144,15 @@ impl WlNote {
                         },
                     )?
                 } else {
-                    let text = create::text(drop.app.as_deref(), None, None, Some(&body), None)?;
+                    let context = if matches!(drop.target, FileTarget::NewGlobal) {
+                        None
+                    } else {
+                        drop.app.as_deref()
+                    };
+                    let text = create::text(context, None, None, Some(&body), None)?;
                     self.write_new_note(core, &text)?
                 };
-                if let Some(i) = self
-                    .column_at(&drop.surface)
-                    .filter(|&i| !self.columns[i].retiring)
-                    .or_else(|| self.main_column())
-                {
-                    self.open_in(core, i, &key);
-                    self.show_notes();
-                }
+                self.open_created(core, &drop.surface, &key);
             }
             FileTarget::Note { key, editor } => {
                 let path = self.path(&key);
@@ -2076,6 +2366,7 @@ fn expand(path: &str) -> String {
 
 impl Program for WlNote {
     const DATA_DEVICE: bool = true;
+    const BACKGROUND_SELECTION: bool = true;
 
     fn dnd_enter(
         &mut self,
@@ -2251,9 +2542,10 @@ impl Program for WlNote {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
         if let Some(column) = self.columns.iter_mut().find(|c| c.surface() == surface) {
             column.frame_done();
+            column.update_row_hover(core);
             self.trim = true;
         }
     }
@@ -2282,5 +2574,66 @@ mod tests {
         assert!(!is_note(Path::new("a.md~")));
         assert!(!is_note(Path::new(".a.md.swp")));
         assert!(!is_note(Path::new(".git/a.md")));
+    }
+
+    #[test]
+    fn delayed_trash_leaves_the_file_until_commit() {
+        let root = std::env::temp_dir().join(format!("wl-note-trash-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let note = |name: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, "a note").unwrap();
+            Trash {
+                identity: Trash::identity(&path).unwrap(),
+                path,
+                command: "mv -- \"$1\" \"$1.trashed\"".into(),
+            }
+        };
+        let mut slot = row::Undo::new();
+        let now = Instant::now();
+        let end = now + Duration::from_secs(5);
+        let commit = |action| {
+            if let Some(Removal::Trash(trash)) = action {
+                trash_status(trash.spawn().unwrap().wait().unwrap()).unwrap();
+            }
+        };
+
+        let undo = note("undo me.md");
+        let untouched = undo.path.clone();
+        let mtime = untouched.metadata().unwrap().modified().unwrap();
+        commit(slot.replace(end, Removal::Trash(undo)));
+        drop(slot.take());
+        assert_eq!(untouched.metadata().unwrap().modified().unwrap(), mtime);
+
+        for (i, event) in ["timeout", "new action", "shutdown"]
+            .into_iter()
+            .enumerate()
+        {
+            let trash = note(event);
+            let path = trash.path.clone();
+            commit(slot.replace(end, Removal::Trash(trash)));
+            commit(slot.expire(now));
+            assert!(path.exists(), "{event}");
+            commit(match i {
+                0 => slot.expire(end),
+                1 => slot.replace(end, Removal::Hide(untouched.clone())),
+                _ => slot.take(),
+            });
+            assert!(!path.exists(), "{event}");
+            assert!(root.join(format!("{event}.trashed")).exists());
+        }
+
+        let replaced = note("replaced.md");
+        std::fs::rename(&replaced.path, root.join("original.md")).unwrap();
+        std::fs::write(&replaced.path, "a different note").unwrap();
+        assert!(replaced.spawn().is_err());
+        assert!(replaced.path.exists());
     }
 }
