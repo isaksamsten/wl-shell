@@ -3247,14 +3247,23 @@ impl Column {
         }
     }
 
+    /// Where a card's paper starts along the edge now: at the top of its
+    /// length, so a paper growing or shrinking (a header into a sheet,
+    /// or back) keeps its top, title and all, where the card's top is,
+    /// rather than sliding past it from being centered.
+    fn top(card: &Card) -> f64 {
+        card.y.value - card.len.value / 2.0
+    }
+
     /// Where the part of a card that is out takes the pointer: as far as
     /// it is out, as long as it is (at most its paper's `ph`).
     fn hit_rect(&self, card: &Card, ph: f64) -> Option<Rect> {
         let o = self.out_now(card);
         let l = card.len.value.min(ph);
+        let top = Self::top(card);
         let r = match self.style.edge {
-            Edge::Right => Rect::new(self.width as f64 - o, card.y.value - l / 2.0, o, l),
-            Edge::Left => Rect::new(0.0, card.y.value - l / 2.0, o, l),
+            Edge::Right => Rect::new(self.width as f64 - o, top, o, l),
+            Edge::Left => Rect::new(0.0, top, o, l),
         };
         intersect(r, self.surface_rect())
     }
@@ -3265,7 +3274,7 @@ impl Column {
         let card = self.deck.cards().iter().find(|c| c.key == key)?;
         let m = &self.style.metrics;
         let h = m.sheet_height;
-        Some(self.out_rect(self.out_now(card), m.sheet_width, card.y.value - h / 2.0, h))
+        Some(self.out_rect(self.out_now(card), m.sheet_width, Self::top(card), h))
     }
 
     fn margin_rect(&self, face: Rect) -> Rect {
@@ -3706,8 +3715,8 @@ impl Column {
                 false => lerp(-reach, card.out.value, card.presence.value),
             };
             let paper = match edge {
-                Edge::Right => Rect::new(width - o, card.y.value - ph / 2.0, pw, ph),
-                Edge::Left => Rect::new(o - pw, card.y.value - ph / 2.0, pw, ph),
+                Edge::Right => Rect::new(width - o, Self::top(card), pw, ph),
+                Edge::Left => Rect::new(o - pw, Self::top(card), pw, ph),
             };
             // Cut to its length while it grows or shrinks. The cut keeps
             // the shadow's reach past the paper's ends, so the shadow
