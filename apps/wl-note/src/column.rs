@@ -3256,10 +3256,9 @@ impl Column {
     }
 
     /// Where the part of a card that is out takes the pointer: as far as
-    /// it is out, as long as it is (at most its paper's `ph`).
-    fn hit_rect(&self, card: &Card, ph: f64) -> Option<Rect> {
+    /// it is out, `l` long from its top.
+    fn hit_rect(&self, card: &Card, l: f64) -> Option<Rect> {
         let o = self.out_now(card);
-        let l = card.len.value.min(ph);
         let top = Self::top(card);
         let r = match self.style.edge {
             Edge::Right => Rect::new(self.width as f64 - o, top, o, l),
@@ -3718,12 +3717,15 @@ impl Column {
                 Edge::Right => Rect::new(width - o, Self::top(card), pw, ph),
                 Edge::Left => Rect::new(o - pw, Self::top(card), pw, ph),
             };
-            // Cut to its length while it grows or shrinks. The cut keeps
-            // the shadow's reach past the paper's ends, so the shadow
-            // grows along with the paper instead of showing once it
-            // settles.
+            // Cut to its length while it shrinks or grows into anything but
+            // a sheet. The cut keeps the shadow's reach past the paper's
+            // ends, so the shadow grows along with the paper instead of
+            // showing once it settles. A note coming out as a sheet isn't
+            // cut: it is on top, and slides out whole from its header's
+            // top rather than unrolling from it.
             let len = card.len.value;
-            let cut = match len < ph - 0.5 && !crumpling {
+            let whole = self.deck.role(&card.key) == Role::Sheet;
+            let cut = match len < ph - 0.5 && !crumpling && !whole {
                 true => {
                     let above = (-r.y as f64).max(0.0);
                     let below = (r.y as f64 + r.h as f64 - ph).max(0.0);
@@ -3732,7 +3734,8 @@ impl Column {
                 }
                 false => Some(surface),
             };
-            let hit = self.hit_rect(card, ph).filter(|_| card.present());
+            let hit_len = if whole { ph } else { len.min(ph) };
+            let hit = self.hit_rect(card, hit_len).filter(|_| card.present());
             let slot = &mut self.slots[i];
             slot.paper = paper;
             slot.hit = hit;
