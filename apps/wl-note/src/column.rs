@@ -3401,24 +3401,46 @@ impl Column {
     fn bar_layout(&self, key: &str) -> Option<BarLayout> {
         let note = self.notes.get(key)?;
         let open = self.deck.open() == Some(key);
-        if !self.deck.held(key) || (!open && note.files.is_empty() && note.due.is_none()) {
+        if !self.deck.held(key) {
             return None;
         }
         let face = self.face(key)?;
         let bar = self.bar_rect(face);
         let mid = bar.y + bar.h / 2.0;
-        let pitch = (ICON + ICON_GAP).min(bar.w / if open { 7.0 } else { 1.0 });
+        let preview_palette = !open && note.pin != Pin::Locked;
+        let has_details = !note.files.is_empty() || note.due.is_some();
+        let slots = if open {
+            7.0
+        } else if preview_palette && has_details {
+            3.0
+        } else {
+            1.0
+        };
+        let pitch = (ICON + ICON_GAP).min(bar.w / slots);
         let size = ICON.min(pitch * 0.85);
         let rect = |x| Rect::new(x, mid - size / 2.0, size, size);
         let slot = |i: usize| rect(bar.x + i as f64 * pitch);
         let control = |i: usize| open.then(|| rect(bar.right() - size - i as f64 * pitch));
         let color = control(if note.scratch { 2 } else { 3 });
-        let palette_open = self.palette_since.is_some();
+        let palette_open = open && self.palette_since.is_some();
         // The color row slides over the clock, which is out of its way.
         let clock = control(if note.scratch { 3 } else { 4 }).filter(|_| !palette_open);
-        let file_end = clock
-            .or(color)
-            .map_or(bar.right(), |r| r.x - (pitch - size));
+        // Leave room for attachments or the due label beside the preview palette.
+        let palette_left = if preview_palette && has_details {
+            bar.x + bar.w / 3.0
+        } else {
+            bar.x
+        };
+        let file_end = clock.or(color).map_or_else(
+            || {
+                if preview_palette {
+                    palette_left
+                } else {
+                    bar.right()
+                }
+            },
+            |r| r.x - (pitch - size),
+        );
         let (n, more) = bar::fit(note.files.len(), file_end - bar.x, size, pitch - size);
         let grid = self.showing_files(key);
         let swatches = match (color, self.palette_since) {
@@ -3426,6 +3448,12 @@ impl Column {
                 let p = (start.elapsed().as_secs_f64() / PALETTE_TIME.as_secs_f64()).min(1.0);
                 let colors: Vec<_> = bar::colors(note.color).collect();
                 let rects = bar::palette(bar.x, dot, colors.len(), 1.0 - (1.0 - p).powi(3));
+                colors.into_iter().zip(rects).collect()
+            }
+            _ if preview_palette => {
+                let anchor = rect(bar.right());
+                let colors: Vec<_> = bar::colors(note.color).collect();
+                let rects = bar::palette(palette_left, anchor, colors.len(), 1.0);
                 colors.into_iter().zip(rects).collect()
             }
             _ => Vec::new(),
@@ -3452,12 +3480,12 @@ impl Column {
         let picking = !due_row.is_empty();
         let used = n + usize::from(more.is_some());
         let mut layout = BarLayout {
-            icons: if grid || !swatches.is_empty() || !due_row.is_empty() {
+            icons: if grid || palette_open || !due_row.is_empty() {
                 Vec::new()
             } else {
                 (0..n).map(|i| (i, slot(i))).collect()
             },
-            more: if !swatches.is_empty() || !due_row.is_empty() {
+            more: if palette_open || !due_row.is_empty() {
                 None
             } else if grid {
                 Some((0, slot(more.map_or(0, |_| n))))
@@ -3490,6 +3518,9 @@ impl Column {
                 *r = turn(*r);
             }
             if let Some((_, r)) = &mut layout.more {
+                *r = turn(*r);
+            }
+            for (_, r) in &mut layout.swatches {
                 *r = turn(*r);
             }
             let (x, mid) = rotate((layout.name_x, layout.mid), (cx, cy), tilt);
@@ -3567,11 +3598,13 @@ impl Column {
             Role::Sheet => {
                 let note = self.notes.get(&card.key);
                 let open = self.deck.open() == Some(card.key.as_str());
-                let files = note.is_some_and(|n| !n.files.is_empty() || n.due.is_some());
+                let footer = note.is_some_and(|n| {
+                    n.pin != Pin::Locked || !n.files.is_empty() || n.due.is_some()
+                });
                 let drawer = card.key == drawer::KEY;
                 let bar = if drawer {
                     0.0
-                } else if open || files {
+                } else if open || footer {
                     self.style.file_bar
                 } else {
                     0.0
@@ -4490,7 +4523,7 @@ impl Column {
         if plan.name.is_none()
             && let Some(d) = &due
             && grid.is_none()
-            && layout.swatches.is_empty()
+            && (!open || layout.swatches.is_empty())
             && layout.due_row.is_empty()
         {
             let room = layout.name_end - layout.name_x;
