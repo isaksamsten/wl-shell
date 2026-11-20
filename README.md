@@ -1,13 +1,14 @@
-# wl-shell
-
-Wayland shell utilities that share one runtime, each built and shipped on its
-own:
+Wayland shell utilities:
 
 - [`wl-expose`](apps/wl-expose): a window overview (exposé)
-- [`wl-switcher`](apps/wl-switcher): an Alt+Tab app and window switcher
-- [`wl-dock`](apps/wl-dock): a dock
+- [`wl-switcher`](apps/wl-switcher): an application and window switcher
+- [`wl-dock`](apps/wl-dock): a dock and launcher in one
+- [`wl-note`](apps/wl-note): sticky notes along the screen edge that follow the
+  focused app
 
 ```sh
-cargo build --release -p wl-expose      # just one program
+cargo install --path apps/wl-expose
 cargo install --path apps/wl-switcher
+cargo install --path apps/wl-dock
+cargo install --path apps/wl-wl-note
 ```
