@@ -3252,14 +3252,13 @@ impl Column {
         }
     }
 
-    /// Where a card's paper `ph` long starts along the edge now: at the
-    /// top of its length while that is shorter, so a paper growing or
-    /// shrinking (a header into a sheet, or back) keeps its top, title and
-    /// all, where the card's top is, rather than sliding past it from
-    /// being centered; centered on it while it is longer (a marker's
-    /// paper, as the length settles on it).
-    fn top(card: &Card, ph: f64) -> f64 {
-        card.y.value - card.len.value.min(ph) / 2.0
+    /// Where a card's paper starts along the edge now: at the top of its
+    /// length, so a paper growing or shrinking (a header into a sheet, or
+    /// back, or into its marker) keeps its top, title and all, where the
+    /// card's top is, rather than sliding past it from being centered, and
+    /// one paper replacing another mid-way starts where it did.
+    fn top(card: &Card) -> f64 {
+        card.y.value - card.len.value / 2.0
     }
 
     /// Where the part of a card that is out takes the pointer: as far as
@@ -3279,7 +3278,7 @@ impl Column {
         let card = self.deck.cards().iter().find(|c| c.key == key)?;
         let m = &self.style.metrics;
         let h = m.sheet_height;
-        Some(self.out_rect(self.out_now(card), m.sheet_width, Self::top(card, h), h))
+        Some(self.out_rect(self.out_now(card), m.sheet_width, Self::top(card), h))
     }
 
     fn margin_rect(&self, face: Rect) -> Rect {
@@ -3740,7 +3739,7 @@ impl Column {
             let under = under.and_then(|s| {
                 let mo = lerp(-reach, mw, card.presence.value);
                 let (mpw, mph) = (marker.w as f64, marker.h as f64);
-                let top = Self::top(card, mph);
+                let top = Self::top(card);
                 let at = match edge {
                     Edge::Right => Rect::new(width - mo, top, mpw, mph),
                     Edge::Left => Rect::new(mo - mpw, top, mpw, mph),
@@ -3755,19 +3754,20 @@ impl Column {
                 true => card.out.value,
                 false => lerp(-reach, card.out.value, card.presence.value),
             };
-            let top = Self::top(card, ph);
+            let top = Self::top(card);
             let paper = match edge {
                 Edge::Right => Rect::new(width - o, top, pw, ph),
                 Edge::Left => Rect::new(o - pw, top, pw, ph),
             };
-            // Cut to its length while it shrinks or grows into anything but
-            // a sheet. The cut keeps the shadow's reach past the paper's
-            // ends, so the shadow grows along with the paper instead of
-            // showing once it settles. A note coming out as a sheet isn't
-            // cut: it is on top, and slides out whole from its header's
-            // top rather than unrolling from it.
+            // Cut to its length while it grows or shrinks between markers
+            // and headers. The cut keeps the shadow's reach past the
+            // paper's ends, so the shadow grows along with the paper
+            // instead of showing once it settles. A sheet isn't cut while
+            // it comes out or goes back in: it slides whole from and to its
+            // header's top rather than unrolling or rolling up.
             let len = card.len.value;
-            let whole = self.deck.role(&card.key) == Role::Sheet;
+            let whole = self.deck.role(&card.key) == Role::Sheet
+                || self.deck.role_now(card) == Role::Sheet;
             let cut = match len < ph - 0.5 && !crumpling && !whole {
                 true => {
                     let above = (-r.y as f64).max(0.0);
