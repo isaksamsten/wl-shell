@@ -105,7 +105,6 @@ use crate::{bar, create, files, find, list, reorder, scratch, template};
 /// Windows whose output is remembered at most: the stream may report
 /// windows the toplevel list never announces, so not all are forgotten.
 const MAX_PLACED: usize = 4096;
-const CLIPBOARD_TEXT: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 
 /// The window the notes follow.
 #[derive(Clone, Debug, PartialEq)]
@@ -126,9 +125,12 @@ struct Target {
     layout: ColumnLayout,
 }
 
+/// A drag over a column that wl-note takes.
 struct FileOffer {
     surface: WlSurface,
     at: (f64, f64),
+    /// The types to read, best first (`files::readable`).
+    mimes: Vec<String>,
 }
 
 struct FileDrop {
@@ -143,16 +145,14 @@ struct PasteNote {
     surface: WlSurface,
     dir: PathBuf,
     app: Option<String>,
-    fallback: Option<String>,
+    /// The types still to read if this one brings nothing.
+    rest: Vec<String>,
+    /// A web URL to take if no image comes (`files::read`).
+    fallback: Option<files::Dropped>,
 }
 
 fn clipboard_mimes(core: &Core<WlNote>) -> Vec<String> {
-    let mimes = core.selection_mime_types();
-    let find = |mime: &str| mimes.iter().find(|m| m.eq_ignore_ascii_case(mime)).cloned();
-    find(files::URI_LIST)
-        .into_iter()
-        .chain(CLIPBOARD_TEXT.into_iter().find_map(find))
-        .collect()
+    files::readable(&core.selection_mime_types())
 }
 
 enum Removal {
@@ -1503,7 +1503,7 @@ impl WlNote {
             Act::Reload => self.reload_draft(i),
             Act::Copy(text) => {
                 if let Err(e) = core.set_selection(
-                    CLIPBOARD_TEXT
+                    files::TEXT
                         .into_iter()
                         .map(|m| (m.into(), text.as_bytes().to_vec()))
                         .collect(),
@@ -1513,7 +1513,7 @@ impl WlNote {
             }
             Act::Paste(serial) => {
                 let mimes = core.selection_mime_types();
-                if let Some(mime) = CLIPBOARD_TEXT
+                if let Some(mime) = files::TEXT
                     .into_iter()
                     .find_map(|m| mimes.iter().find(|s| s.eq_ignore_ascii_case(m)))
                 {
@@ -1551,7 +1551,7 @@ impl WlNote {
             Act::Row(Button::Hidden) => self.toggle_drawer(core, from, drawer::Kind::Hidden),
             Act::Row(Button::Due) => self.toggle_drawer(core, from, drawer::Kind::Due),
             Act::Row(Button::Templates) => self.toggle_drawer(core, from, drawer::Kind::Templates),
-            Act::Template(key) => match self.template_note(core, &key, &[]) {
+            Act::Template(key) => match self.template_note(core, &key, None) {
                 Ok(key) => self.open_created(core, from, &key),
                 Err(e) => warn!("new note from a template: {e}"),
             },
@@ -2254,15 +2254,15 @@ impl WlNote {
     }
 
     /// Write a new note from the template `key` (relative to the
-    /// templates' directory) for the context's window, with links to
-    /// `files`, and return its key. It is attached to what the template
-    /// names (`{app}` and `{window}` in it are the context's), global if
-    /// it names nothing.
+    /// templates' directory) for the context's window, with what `add`
+    /// brings (links to files, or text), and return its key. It is
+    /// attached to what the template names (`{app}` and `{window}` in it
+    /// are the context's), global if it names nothing.
     fn template_note(
         &mut self,
         core: &mut Core<Self>,
         key: &str,
-        files: &[PathBuf],
+        add: Option<&files::Dropped>,
     ) -> Result<String, String> {
         // What was just written is read.
         self.templates_touched = true;
@@ -2276,57 +2276,62 @@ impl WlNote {
             None => ("", ""),
         };
         let vars = template::Vars::now(app, title);
-        let text = template::text(&template.note, &vars, files)?;
+        let text = template::text(&template.note, &vars, add)?;
         self.write_new_note(core, &text)
     }
 
     fn paste_note(&mut self, core: &mut Core<Self>, surface: &WlSurface) {
-        let mut mimes = clipboard_mimes(core).into_iter();
-        let Some(mime) = mimes.next() else { return };
+        let mut mimes = clipboard_mimes(core);
+        if mimes.is_empty() {
+            return;
+        }
+        let mime = mimes.remove(0);
         let paste = PasteNote {
             surface: surface.clone(),
             dir: self.index.dir().to_path_buf(),
             app: self.window().map(|w| w.app_id.clone()),
-            fallback: mimes.next(),
+            rest: mimes,
+            fallback: None,
         };
         self.read_paste(core, mime, paste);
     }
 
     fn read_paste(&mut self, core: &mut Core<Self>, mime: String, mut paste: PasteNote) {
-        let uri_list = mime.eq_ignore_ascii_case(files::URI_LIST);
-        if let Err(e) = core.read_selection(&mime, move |app, core, data| {
-            let body = std::str::from_utf8(&data).ok().and_then(|text| {
-                if uri_list {
-                    wl_shell_render::files::parse_uri_list(text)
-                        .map(|paths| files::append("", &paths, "\n"))
-                        .or_else(|| {
-                            let mut urls = text
-                                .lines()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty() && !s.starts_with('#'));
-                            let first = urls.next()?;
-                            if urls.next().is_none() {
-                                row::paste_text(first)
-                            } else {
-                                None
-                            }
-                        })
-                } else {
-                    row::paste_text(text)
-                }
-            });
+        let read = mime.clone();
+        if let Err(e) = core.read_selection(&read, move |app, core, data| {
             if app.index.dir() != paste.dir {
                 return;
             }
-            if let Some(body) = body {
-                let result = create::text(paste.app.as_deref(), None, None, Some(&body), None)
-                    .and_then(|text| app.write_new_note(core, &text));
-                match result {
-                    Ok(key) => app.open_created(core, &paste.surface, &key),
-                    Err(e) => warn!("pasting note: {e}"),
+            let read = files::read(&mime, &data, &paste.rest, &mut paste.fallback);
+            let dropped = match read {
+                files::Read::Take(dropped) => Some(dropped),
+                files::Read::Image(ext) => {
+                    files::keep_image(&paste.dir, ext, &data, paste.fallback.take())
+                        .map_err(|e| warn!("pasting an image: {e}"))
+                        .ok()
                 }
-            } else if let Some(mime) = paste.fallback.take() {
-                app.read_paste(core, mime, paste);
+                files::Read::Next => None,
+            };
+            let dropped = match dropped {
+                Some(dropped) => dropped,
+                None if !paste.rest.is_empty() => {
+                    let next = paste.rest.remove(0);
+                    return app.read_paste(core, next, paste);
+                }
+                None => match paste.fallback.take() {
+                    Some(dropped) => dropped,
+                    None => return,
+                },
+            };
+            let body = match dropped {
+                files::Dropped::Text(text) => text,
+                other => other.append("", "\n"),
+            };
+            let result = create::text(paste.app.as_deref(), None, None, Some(&body), None)
+                .and_then(|text| app.write_new_note(core, &text));
+            match result {
+                Ok(key) => app.open_created(core, &paste.surface, &key),
+                Err(e) => warn!("pasting note: {e}"),
             }
         }) {
             warn!("reading clipboard: {e}");
@@ -2370,16 +2375,60 @@ impl WlNote {
         }
     }
 
-    fn receive_files(&mut self, core: &mut Core<Self>, drop: FileDrop, data: Vec<u8>) {
-        let Some(paths) = std::str::from_utf8(&data)
-            .ok()
-            .and_then(wl_shell_render::files::parse_uri_list)
-        else {
-            return warn!("drop did not contain a local file list");
+    /// Read the drop as `mimes[0]`, the next type if that brings nothing
+    /// usable, and take it; `fallback` is what to take if nothing else
+    /// comes (`files::read`). Once another drag came, its offer isn't
+    /// this one's: it is neither read again nor finished.
+    fn read_drop(
+        &mut self,
+        core: &mut Core<Self>,
+        drop: FileDrop,
+        mut mimes: Vec<String>,
+        mut fallback: Option<files::Dropped>,
+    ) {
+        if mimes.is_empty() {
+            core.dnd.finish();
+            return self.take_drop(core, drop, fallback);
+        }
+        let mime = mimes.remove(0);
+        let serial = self.file_drop_serial;
+        let read = core.dnd_receive(&mime.clone(), move |app, core, data| {
+            let current = app.file_drop_serial == serial;
+            let read = files::read(&mime, &data, &mimes, &mut fallback);
+            let dropped = match read {
+                files::Read::Take(dropped) => Some(dropped),
+                files::Read::Image(ext) if app.index.dir() == drop.dir => {
+                    files::keep_image(&drop.dir, ext, &data, fallback.take())
+                        .map_err(|e| warn!("keeping the dropped image: {e}"))
+                        .ok()
+                }
+                files::Read::Image(_) | files::Read::Next => None,
+            };
+            if dropped.is_none() && current && !mimes.is_empty() {
+                return app.read_drop(core, drop, mimes, fallback);
+            }
+            if current {
+                core.dnd.finish();
+            }
+            app.take_drop(core, drop, dropped.or(fallback));
+        });
+        if let Err(e) = read {
+            warn!("reading the drop: {e}");
+            core.dnd.finish();
+        }
+    }
+
+    fn take_drop(
+        &mut self,
+        core: &mut Core<Self>,
+        drop: FileDrop,
+        dropped: Option<files::Dropped>,
+    ) {
+        let Some(dropped) = dropped else {
+            return warn!("the drop brought nothing to take");
         };
-        let result = self.apply_drop(core, drop, paths);
-        if let Err(e) = result {
-            warn!("attaching files: {e}");
+        if let Err(e) = self.apply_drop(core, drop, dropped) {
+            warn!("taking the drop: {e}");
         }
     }
 
@@ -2404,14 +2453,14 @@ impl WlNote {
         &mut self,
         core: &mut Core<Self>,
         drop: FileDrop,
-        mut paths: Vec<PathBuf>,
+        mut dropped: files::Dropped,
     ) -> Result<(), String> {
         if self.index.dir() != drop.dir {
             return Err("notes directory changed during drop".into());
         }
         match drop.target {
             FileTarget::New | FileTarget::NewScratch | FileTarget::NewGlobal => {
-                let body = files::append("", &paths, "\n");
+                let body = dropped.append("", "\n");
                 let key = if matches!(drop.target, FileTarget::NewScratch) {
                     let ctx = drop.window.ok_or("no window for a scratch note")?;
                     if !core.toplevels().iter().any(|(_, t)| t.identifier == ctx.id) {
@@ -2436,15 +2485,17 @@ impl WlNote {
                 self.open_created(core, &drop.surface, &key);
             }
             FileTarget::Template(key) => {
-                let key = self.template_note(core, &key, &paths)?;
+                let key = self.template_note(core, &key, Some(&dropped))?;
                 self.open_created(core, &drop.surface, &key);
             }
             FileTarget::Note { key, editor } => {
                 let path = self.path(&key);
                 let note = self.drop_note(&key)?;
-                files::keep_unlinked(&mut paths, note.body());
-                if paths.is_empty() {
-                    return Ok(());
+                if let files::Dropped::Files(paths) = &mut dropped {
+                    files::keep_unlinked(paths, note.body());
+                    if paths.is_empty() {
+                        return Ok(());
+                    }
                 }
                 if let Some(i) = self
                     .columns
@@ -2454,12 +2505,11 @@ impl WlNote {
                     let editor = (self.columns[i].surface() == &drop.surface)
                         .then_some(editor)
                         .flatten();
-                    self.columns[i].attach_files(&key, editor, &paths);
+                    self.columns[i].attach(&key, editor, &dropped);
                     self.save_draft(i, false);
                 } else if self.detached_drafts.contains_key(&path) {
                     return Err(
-                        "reopen the note to resolve its unsaved draft before attaching files"
-                            .into(),
+                        "reopen the note to resolve its unsaved draft before dropping on it".into(),
                     );
                 } else {
                     let newline = if note.text().contains("\r\n") {
@@ -2467,7 +2517,7 @@ impl WlNote {
                     } else {
                         "\n"
                     };
-                    let added = files::append(note.body(), &paths, newline);
+                    let added = dropped.append(note.body(), newline);
                     let mut text = note.text().to_owned();
                     if note.body().is_empty() && !text.is_empty() && !text.ends_with('\n') {
                         text.push_str(newline);
@@ -2660,22 +2710,25 @@ impl Program for WlNote {
     ) {
         self.leave_file_offer(core);
         self.file_drop_serial = self.file_drop_serial.wrapping_add(1);
+        let mimes = files::readable(mimes);
         let accepted = !core.dnd.dragging()
-            && mimes.iter().any(|m| m == files::URI_LIST)
+            && !mimes.is_empty()
             && self
                 .column_at(surface)
                 .is_some_and(|i| !self.columns[i].retiring);
-        let (mime, action) = if accepted {
+        if accepted {
+            core.dnd
+                .accept(Some(&mimes[0]), DndAction::Copy, DndAction::Copy);
             self.file_offer = Some(FileOffer {
                 surface: surface.clone(),
                 at,
+                mimes,
             });
             self.track_file_offer(core, at);
-            (Some(files::URI_LIST), DndAction::Copy)
         } else {
-            (None, DndAction::empty())
-        };
-        core.dnd.accept(mime, action, action);
+            core.dnd
+                .accept(None, DndAction::empty(), DndAction::empty());
+        }
     }
 
     fn dnd_motion(&mut self, core: &mut Core<Self>, at: (f64, f64)) {
@@ -2689,28 +2742,20 @@ impl Program for WlNote {
     fn dnd_drop(&mut self, core: &mut Core<Self>) {
         let drop = self.file_offer.as_ref().and_then(|o| {
             let target = self.columns[self.column_at(&o.surface)?].file_target(o.at.0, o.at.1)?;
-            Some(FileDrop {
+            let drop = FileDrop {
                 surface: o.surface.clone(),
                 dir: self.index.dir().to_path_buf(),
                 target,
                 app: self.window().map(|w| w.app_id.clone()),
                 window: self.scratch_context().cloned(),
-            })
+            };
+            Some((drop, o.mimes.clone()))
         });
         self.leave_file_offer(core);
-        if let Some(drop) = drop
+        if let Some((drop, mimes)) = drop
             && core.dnd.action() == DndAction::Copy
         {
-            let serial = self.file_drop_serial;
-            match core.dnd_receive(files::URI_LIST, move |app, core, data| {
-                if app.file_drop_serial == serial {
-                    core.dnd.finish();
-                }
-                app.receive_files(core, drop, data);
-            }) {
-                Ok(()) => return,
-                Err(e) => warn!("reading dropped files: {e}"),
-            }
+            return self.read_drop(core, drop, mimes, None);
         }
         core.dnd.finish();
     }

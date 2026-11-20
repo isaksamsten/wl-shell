@@ -16,7 +16,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 use wl_shell_notes::due::{Local, Zone};
 use wl_shell_notes::{Note, matcher, toml_edit};
 
-use crate::files;
+use crate::files::Dropped;
 
 /// The templates' directory, in the notes directory.
 pub const DIR: &str = ".templates";
@@ -176,8 +176,9 @@ fn fill_matchers(doc: &mut DocumentMut, vars: &Vars) {
 
 /// The text of a new note made from `template`: its frontmatter copied
 /// (comments, order and unknown keys too), the text and the matchers'
-/// globs filled in, and with links to `files` at the end of the text.
-pub fn text(template: &Note, vars: &Vars, files: &[PathBuf]) -> Result<String, String> {
+/// globs filled in, and with what `add` brings (links to files, or text)
+/// at the end of the text.
+pub fn text(template: &Note, vars: &Vars, add: Option<&Dropped>) -> Result<String, String> {
     if let Some(e) = &template.error {
         return Err(format!("the template's {e}"));
     }
@@ -194,12 +195,12 @@ pub fn text(template: &Note, vars: &Vars, files: &[PathBuf]) -> Result<String, S
         })?;
     }
     let mut text = note.text().to_owned();
-    if !files.is_empty() {
+    if let Some(add) = add {
         let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
         if note.body().is_empty() && !text.is_empty() && !text.ends_with('\n') {
             text.push_str(newline);
         }
-        text.push_str(&files::append(note.body(), files, newline));
+        text.push_str(&add.append(note.body(), newline));
     }
     Ok(text)
 }
@@ -275,7 +276,7 @@ mod tests {
         let template = parse(
             "+++\n# how meetings go\ncolor = \"blue\"\n+++\n# Meeting {date}\n\n## {app}: {window}\n\n- [ ] agenda at {time}\n",
         );
-        let t = text(&template, &vars(), &[]).unwrap();
+        let t = text(&template, &vars(), None).unwrap();
         // The frontmatter as it was (its comment too), even with a window.
         assert_eq!(
             t,
@@ -288,7 +289,7 @@ mod tests {
         // And without a window.
         let none = Vars::at(&Fixed(60), 1_795_091_280, "", "");
         let plain = parse("# Notes {date}\n\ntext\n");
-        let t = text(&plain, &none, &[]).unwrap();
+        let t = text(&plain, &none, None).unwrap();
         assert_eq!(t, "# Notes 2026-11-19\n\ntext\n");
         assert!(Note::parse(t).global());
     }
@@ -301,7 +302,7 @@ mod tests {
         let template = parse(
             "+++\napps = [\"{app}\", \"foot\"] # mine\nextra = \"{app}\"\n[[match]]\napp = \"{app}\"\ntitle = \"*{window}*\"\n+++\n# {app}\n",
         );
-        let t = text(&template, &v, &[]).unwrap();
+        let t = text(&template, &v, None).unwrap();
         let note = Note::parse(t.clone());
         assert!(note.error.is_none() && note.warnings.is_empty(), "{t}");
         // Other keys, and the comment, stay as they are.
@@ -316,14 +317,14 @@ mod tests {
         assert!(!note.matches(Some(&Window::new("org.x1-other", ""))));
         // The title's own globs stay globs; the window's title is as it is.
         let only_match = parse("+++\n[[match]]\napp = \"{app}\"\ntitle = \"*{window}*\"\n+++\nx\n");
-        let note = Note::parse(text(&only_match, &v, &[]).unwrap());
+        let note = Note::parse(text(&only_match, &v, None).unwrap());
         let title = "a say \"hi\" \\ {date} b";
         assert!(note.matches(Some(&Window::new("org.x[1]*", title))));
         assert!(!note.matches(Some(&Window::new("org.x[1]*", "say hi"))));
         assert!(!note.matches(Some(&Window::new("org.x1", title))));
         // An inline table, too.
         let inline = parse("+++\nmatch = [{ title = \"{window}\" }]\n+++\nx\n");
-        let note = Note::parse(text(&inline, &v, &[]).unwrap());
+        let note = Note::parse(text(&inline, &v, None).unwrap());
         assert!(note.matches(Some(&Window::new("any", "say \"hi\" \\ {date}"))));
         assert!(!note.matches(Some(&Window::new("any", "other"))));
     }
@@ -333,15 +334,15 @@ mod tests {
         let none = Vars::at(&Fixed(60), 1_795_091_280, "", "");
         // Its only matcher gone, the note is global.
         let app = parse("+++\ncolor = \"blue\"\napps = [\"{app}\"]\n+++\nx\n");
-        let t = text(&app, &none, &[]).unwrap();
+        let t = text(&app, &none, None).unwrap();
         assert_eq!(t, "+++\ncolor = \"blue\"\n+++\nx\n");
         let only = parse("+++\napps = [\"{app}\"]\n+++\nx\n");
-        assert_eq!(text(&only, &none, &[]).unwrap(), "x\n");
+        assert_eq!(text(&only, &none, None).unwrap(), "x\n");
         // The others stay.
         let some = parse(
             "+++\napps = [\"{app}\", \"foot\"]\n[[match]]\napp = \"{app}\"\n[[match]]\ntitle = \"*wl-shell*\"\n+++\nx\n",
         );
-        let note = Note::parse(text(&some, &none, &[]).unwrap());
+        let note = Note::parse(text(&some, &none, None).unwrap());
         assert!(note.matches(Some(&Window::new("foot", ""))));
         assert!(note.matches(Some(&Window::new("any", "~/wl-shell"))));
         assert!(!note.matches(Some(&Window::new("", ""))));
@@ -351,11 +352,11 @@ mod tests {
         let mut untitled = vars();
         untitled.window.clear();
         let both = parse("+++\nmatch = [{ app = \"{app}\", title = \"*{window}*\" }]\n+++\nx\n");
-        let t = text(&both, &untitled, &[]).unwrap();
+        let t = text(&both, &untitled, None).unwrap();
         assert_eq!(t, "x\n");
         // A tag keeps it from being global.
         let tagged = parse("+++\ntags = [\"t\"]\napps = [\"{app}\"]\n+++\nx\n");
-        assert!(!Note::parse(text(&tagged, &none, &[]).unwrap()).global());
+        assert!(!Note::parse(text(&tagged, &none, None).unwrap()).global());
     }
 
     #[test]
@@ -368,13 +369,13 @@ mod tests {
             "+++\napps = [\"{unknown}\"]\n+++\nx\n",
         ] {
             let template = parse(same);
-            assert_eq!(text(&template, &vars(), &[]).unwrap(), same);
+            assert_eq!(text(&template, &vars(), None).unwrap(), same);
         }
         let note = Note::parse(
             text(
                 &parse("+++\napps = [\"thunderbird\"]\n+++\nx\n"),
                 &vars(),
-                &[],
+                None,
             )
             .unwrap(),
         );
@@ -385,7 +386,7 @@ mod tests {
     #[test]
     fn title_placeholders_are_filled_in_the_body_only() {
         let template = parse("+++\ntitle = \"{date}\"\n+++\n# Standup {date}\n");
-        let t = text(&template, &vars(), &[]).unwrap();
+        let t = text(&template, &vars(), None).unwrap();
         assert!(t.contains("title = \"{date}\""));
         assert_eq!(Note::parse(t).title(), Some("Standup 2026-11-19"));
     }
@@ -393,7 +394,7 @@ mod tests {
     #[test]
     fn a_due_time_and_other_keys_are_copied() {
         let template = parse("+++\ndue = 2026-12-01T09:00\nextra = \"kept\"\n+++\nbody {date}\n");
-        let t = text(&template, &vars(), &[]).unwrap();
+        let t = text(&template, &vars(), None).unwrap();
         let note = Note::parse(t.clone());
         assert!(note.due().is_some());
         assert!(t.contains("extra = \"kept\""));
@@ -404,28 +405,34 @@ mod tests {
     fn a_broken_template_is_an_error() {
         let broken = parse("+++\ntitle = \n+++\nx\n");
         assert!(broken.error.is_some());
-        assert!(text(&broken, &vars(), &[]).is_err());
+        assert!(text(&broken, &vars(), None).is_err());
         let unterminated = parse("+++\ntitle = \"x\"\n");
-        assert!(text(&unterminated, &vars(), &[]).is_err());
+        assert!(text(&unterminated, &vars(), None).is_err());
     }
 
     #[test]
     fn dropped_files_are_linked_at_the_end() {
         let template = parse("# Trip {date}\n\npacking\n");
-        let files = [PathBuf::from("/tmp/ticket.pdf")];
-        let t = text(&template, &vars(), &files).unwrap();
+        let files = Dropped::Files(vec![PathBuf::from("/tmp/ticket.pdf")]);
+        let t = text(&template, &vars(), Some(&files)).unwrap();
         let note = Note::parse(t.clone());
         assert!(note.body().starts_with("# Trip 2026-11-19\n\npacking\n"));
         assert!(note.body().contains("ticket.pdf"));
         assert!(t.contains("file:///tmp/ticket.pdf"));
         // A template with no text at all gets only the files.
         let empty = parse("+++\ncolor = \"pink\"\n+++\n");
-        let t = text(&empty, &vars(), &files).unwrap();
+        let t = text(&empty, &vars(), Some(&files)).unwrap();
         assert!(Note::parse(t).body().contains("ticket.pdf"));
         // Without files, nothing is added.
         assert_eq!(
-            text(&template, &vars(), &[]).unwrap(),
+            text(&template, &vars(), None).unwrap(),
             "# Trip 2026-11-19\n\npacking\n"
+        );
+        // Dropped text is a block of its own at the end.
+        let dropped = Dropped::Text("\u{a0}call Anna\r\nabout SP1 \n".into());
+        assert_eq!(
+            text(&template, &vars(), Some(&dropped)).unwrap(),
+            "# Trip 2026-11-19\n\npacking\n\ncall Anna\nabout SP1\n"
         );
     }
 

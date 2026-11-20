@@ -35,7 +35,7 @@ use wl_shell_config::ConfigFile;
 use wl_shell_core::{Error, Shell};
 use wl_shell_log::warn;
 use wl_shell_notes::due::{self, Local};
-use wl_shell_notes::{Color, Index, Note, State, Window, state, toml_edit};
+use wl_shell_notes::{state, toml_edit, Color, Index, Note, State, Window};
 
 use crate::app::WlNote;
 use crate::config::Config;

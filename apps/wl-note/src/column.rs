@@ -1603,19 +1603,21 @@ impl Column {
         Some(FileTarget::Note { key, editor })
     }
 
-    pub fn attach_files(
+    /// Add what a drop brought to the draft of `key`: at `editor`'s
+    /// offset if its text is still what it was, else at the end.
+    pub fn attach(
         &mut self,
         key: &str,
         editor: Option<(usize, String)>,
-        paths: &[PathBuf],
+        dropped: &files::Dropped,
     ) -> bool {
         let Some(draft) = self.draft.as_mut().filter(|d| d.key == key) else {
             return false;
         };
         let body = draft.editor.text();
         let (at, text) = match editor {
-            Some((at, expected)) if expected == body => (at, files::insert(body, at, paths)),
-            _ => (body.len(), files::append(body, paths, "\n")),
+            Some((at, expected)) if expected == body => (at, dropped.insert(body, at)),
+            _ => (body.len(), dropped.append(body, "\n")),
         };
         draft.editor.set_caret(at, false);
         draft.editor.paste(&text);
