@@ -141,9 +141,10 @@ const LINE: f64 = 40.0;
 const DRAG_START: f64 = 6.0;
 /// What a crumpled note shrinks to.
 const CRUMPLED: f64 = 0.2;
-/// A header fades into its marker over this much of the last of its way
-/// in (and out of it over the first of its way out).
-const HEADER_FADE: f64 = 0.5;
+/// A paper fades into the next smaller one (a sheet into its header, a
+/// header into its marker) over this much of the last of its way in (and
+/// out of it over the first of its way out).
+const PAPER_FADE: f64 = 0.5;
 /// Icons for files whose own aren't known (yet).
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
 /// What the archive icon says it does.
@@ -3709,40 +3710,56 @@ impl Column {
             if let Some(sheet) = ready {
                 self.slots[i].shown = Some((want, sheet));
             }
-            let headers = [Role::Header, Role::Lifted].map(|r| self.paper(card, r));
-            let marker = self.paper(card, Role::Marker);
-            let Some((p, sheet)) = &self.slots[i].shown else {
+            let Some((p, _)) = &self.slots[i].shown else {
                 self.slots[i].sub.clear();
                 self.slots[i].under.clear();
                 self.slots[i].hit = None;
                 continue;
             };
             let (pw, ph) = (p.w as f64, p.h as f64);
-            let r = sheet.shape.rect;
-            // A header folding into its marker fades into it (drawn under
-            // it) over the last of the way, and one coming out of it fades
+            // A paper folding into the next smaller one (a sheet into its
+            // header, a header into its marker) fades into it, drawn under
+            // it, over the last of the way, and one coming out of it fades
             // in over it, so the paper doesn't change at once as the card
-            // passes a marker's size.
-            let (mw, hw) = (self.style.metrics.marker_width, self.style.metrics.header);
-            let from = mw + 0.5;
-            let header = headers.contains(p) && !crumpling;
-            let fade = match header && hw > from {
-                true => ((card.out.value - from) / ((hw - from) * HEADER_FADE)).clamp(0.0, 1.0),
+            // passes the smaller one's size. Neither is cut to the card's
+            // length: each slides whole from and to the card's top.
+            // The papers go Sheet, Lifted, Header, Marker, each fading into
+            // the next as `role_now` crosses into it: the papers given up
+            // there are the ones faded into. (A lifted header differs from
+            // a header only by its shadow.)
+            let m = &self.style.metrics;
+            let lifted = self.style.lifted != self.style.shadow && p.shadow == self.style.lifted;
+            let shown_role = match () {
+                _ if p.sliver => Role::Marker,
+                _ if p.w == (m.sheet_width + BEHIND).round() as i32 => Role::Sheet,
+                _ if lifted => Role::Lifted,
+                _ => Role::Header,
+            };
+            let (lower, from, to) = match shown_role {
+                Role::Sheet => (Role::Lifted, m.header + LIFT + 0.5, m.sheet_width),
+                Role::Lifted => (Role::Header, m.header + 0.5, m.header + LIFT),
+                _ => (Role::Marker, m.marker_width + 0.5, m.header),
+            };
+            let fading = shown_role != Role::Marker && !crumpling && to > from;
+            let fade = match fading {
+                true => ((card.out.value - from) / ((to - from) * PAPER_FADE)).clamp(0.0, 1.0),
                 false => 1.0,
             };
-            // Asked for while it is a header, so it is ready to fade into.
-            let under = match header {
-                true => self.papers.borrow_mut().get(&marker).filter(|_| fade < 1.0),
+            // Asked for all along, so it is ready to fade into.
+            let lower_paper = self.paper(card, lower);
+            let under = match fading {
+                true => (self.papers.borrow_mut().get(&lower_paper)).filter(|_| fade < 1.0),
                 false => None,
             };
             let fade = if under.is_some() { fade } else { 1.0 };
             let under = under.and_then(|s| {
-                let mo = lerp(-reach, mw, card.presence.value);
-                let (mpw, mph) = (marker.w as f64, marker.h as f64);
+                let out = card.out.value.min(self.deck.size(lower).0);
+                let uo = lerp(-reach, out, card.presence.value);
+                let (uw, uh) = (lower_paper.w as f64, lower_paper.h as f64);
                 let top = Self::top(card);
                 let at = match edge {
-                    Edge::Right => Rect::new(width - mo, top, mpw, mph),
-                    Edge::Left => Rect::new(mo - mpw, top, mpw, mph),
+                    Edge::Right => Rect::new(width - uo, top, uw, uh),
+                    Edge::Left => Rect::new(uo - uw, top, uw, uh),
                 };
                 let r = s.shape.rect;
                 let image = Rect::new(at.x + r.x as f64, at.y + r.y as f64, r.w as f64, r.h as f64);
@@ -3759,26 +3776,7 @@ impl Column {
                 Edge::Right => Rect::new(width - o, top, pw, ph),
                 Edge::Left => Rect::new(o - pw, top, pw, ph),
             };
-            // Cut to its length while it grows or shrinks between markers
-            // and headers. The cut keeps the shadow's reach past the
-            // paper's ends, so the shadow grows along with the paper
-            // instead of showing once it settles. A sheet isn't cut while
-            // it comes out or goes back in: it slides whole from and to its
-            // header's top rather than unrolling or rolling up.
-            let len = card.len.value;
-            let whole = self.deck.role(&card.key) == Role::Sheet
-                || self.deck.role_now(card) == Role::Sheet;
-            let cut = match len < ph - 0.5 && !crumpling && !whole {
-                true => {
-                    let above = (-r.y as f64).max(0.0);
-                    let below = (r.y as f64 + r.h as f64 - ph).max(0.0);
-                    let top = card.y.value - len / 2.0 - above;
-                    intersect(surface, Rect::new(0.0, top, width, len + above + below))
-                }
-                false => Some(surface),
-            };
-            let hit_len = if whole { ph } else { len.min(ph) };
-            let hit = self.hit_rect(card, top, hit_len).filter(|_| card.present());
+            let hit = self.hit_rect(card, top, ph).filter(|_| card.present());
             let slot = &mut self.slots[i];
             slot.paper = paper;
             slot.hit = hit;
@@ -3805,7 +3803,7 @@ impl Column {
                 false => fade,
             };
             let size = (r.w as f64 * scale, r.h as f64 * scale);
-            let placed = cut.and_then(|cut| clip(image, size, None, cut));
+            let placed = clip(image, size, None, surface);
             match placed {
                 Some((rect, src)) if card.presence.value > 0.0 && alpha > 0.0 => {
                     slot.sub.show(&sheet.shape.buffer);
