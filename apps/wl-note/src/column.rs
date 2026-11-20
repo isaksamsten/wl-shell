@@ -141,6 +141,9 @@ const LINE: f64 = 40.0;
 const DRAG_START: f64 = 6.0;
 /// What a crumpled note shrinks to.
 const CRUMPLED: f64 = 0.2;
+/// A header fades into its marker over this much of the last of its way
+/// in (and out of it over the first of its way out).
+const HEADER_FADE: f64 = 0.5;
 /// Icons for files whose own aren't known (yet).
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
 /// What the archive icon says it does.
@@ -406,6 +409,8 @@ pub enum Timer {
 struct Slot {
     key: String,
     sub: Sub,
+    /// Its marker, under a header as that fades into it or out of it.
+    under: Sub,
     /// The paper shown, and its sheet.
     shown: Option<(Paper, Sheet)>,
     /// Where its paper is on the surface (unclipped).
@@ -3247,19 +3252,20 @@ impl Column {
         }
     }
 
-    /// Where a card's paper starts along the edge now: at the top of its
-    /// length, so a paper growing or shrinking (a header into a sheet,
-    /// or back) keeps its top, title and all, where the card's top is,
-    /// rather than sliding past it from being centered.
-    fn top(card: &Card) -> f64 {
-        card.y.value - card.len.value / 2.0
+    /// Where a card's paper `ph` long starts along the edge now: at the
+    /// top of its length while that is shorter, so a paper growing or
+    /// shrinking (a header into a sheet, or back) keeps its top, title and
+    /// all, where the card's top is, rather than sliding past it from
+    /// being centered; centered on it while it is longer (a marker's
+    /// paper, as the length settles on it).
+    fn top(card: &Card, ph: f64) -> f64 {
+        card.y.value - card.len.value.min(ph) / 2.0
     }
 
     /// Where the part of a card that is out takes the pointer: as far as
-    /// it is out, `l` long from its top.
-    fn hit_rect(&self, card: &Card, l: f64) -> Option<Rect> {
+    /// it is out, `l` long from `top`.
+    fn hit_rect(&self, card: &Card, top: f64, l: f64) -> Option<Rect> {
         let o = self.out_now(card);
-        let top = Self::top(card);
         let r = match self.style.edge {
             Edge::Right => Rect::new(self.width as f64 - o, top, o, l),
             Edge::Left => Rect::new(0.0, top, o, l),
@@ -3273,7 +3279,7 @@ impl Column {
         let card = self.deck.cards().iter().find(|c| c.key == key)?;
         let m = &self.style.metrics;
         let h = m.sheet_height;
-        Some(self.out_rect(self.out_now(card), m.sheet_width, Self::top(card), h))
+        Some(self.out_rect(self.out_now(card), m.sheet_width, Self::top(card, h), h))
     }
 
     fn margin_rect(&self, face: Rect) -> Rect {
@@ -3665,10 +3671,13 @@ impl Column {
         self.slots.retain(|s| cards.iter().any(|c| c.key == s.key));
         for card in &cards {
             if !self.slots.iter().any(|s| s.key == card.key) {
-                let sub = Sub::new(&self.g, self.layer.wl_surface(), &self.no_input, &self.qh);
+                let (g, parent) = (&self.g, self.layer.wl_surface());
+                let under = Sub::new(g, parent, &self.no_input, &self.qh);
+                let sub = Sub::new(g, parent, &self.no_input, &self.qh);
                 self.slots.push(Slot {
                     key: card.key.clone(),
                     sub,
+                    under,
                     shown: None,
                     paper: Rect::default(),
                     hit: None,
@@ -3701,21 +3710,55 @@ impl Column {
             if let Some(sheet) = ready {
                 self.slots[i].shown = Some((want, sheet));
             }
+            let headers = [Role::Header, Role::Lifted].map(|r| self.paper(card, r));
+            let marker = self.paper(card, Role::Marker);
             let Some((p, sheet)) = &self.slots[i].shown else {
                 self.slots[i].sub.clear();
+                self.slots[i].under.clear();
                 self.slots[i].hit = None;
                 continue;
             };
             let (pw, ph) = (p.w as f64, p.h as f64);
             let r = sheet.shape.rect;
+            // A header folding into its marker fades into it (drawn under
+            // it) over the last of the way, and one coming out of it fades
+            // in over it, so the paper doesn't change at once as the card
+            // passes a marker's size.
+            let (mw, hw) = (self.style.metrics.marker_width, self.style.metrics.header);
+            let from = mw + 0.5;
+            let header = headers.contains(p) && !crumpling;
+            let fade = match header && hw > from {
+                true => ((card.out.value - from) / ((hw - from) * HEADER_FADE)).clamp(0.0, 1.0),
+                false => 1.0,
+            };
+            // Asked for while it is a header, so it is ready to fade into.
+            let under = match header {
+                true => self.papers.borrow_mut().get(&marker).filter(|_| fade < 1.0),
+                false => None,
+            };
+            let fade = if under.is_some() { fade } else { 1.0 };
+            let under = under.and_then(|s| {
+                let mo = lerp(-reach, mw, card.presence.value);
+                let (mpw, mph) = (marker.w as f64, marker.h as f64);
+                let top = Self::top(card, mph);
+                let at = match edge {
+                    Edge::Right => Rect::new(width - mo, top, mpw, mph),
+                    Edge::Left => Rect::new(mo - mpw, top, mpw, mph),
+                };
+                let r = s.shape.rect;
+                let image = Rect::new(at.x + r.x as f64, at.y + r.y as f64, r.w as f64, r.h as f64);
+                let size = (r.w as f64 * scale, r.h as f64 * scale);
+                Some((s, clip(image, size, None, surface)?))
+            });
             // Crumpling, it stays out and shrinks toward the edge instead.
             let o = match crumpling {
                 true => card.out.value,
                 false => lerp(-reach, card.out.value, card.presence.value),
             };
+            let top = Self::top(card, ph);
             let paper = match edge {
-                Edge::Right => Rect::new(width - o, Self::top(card), pw, ph),
-                Edge::Left => Rect::new(o - pw, Self::top(card), pw, ph),
+                Edge::Right => Rect::new(width - o, top, pw, ph),
+                Edge::Left => Rect::new(o - pw, top, pw, ph),
             };
             // Cut to its length while it shrinks or grows into anything but
             // a sheet. The cut keeps the shadow's reach past the paper's
@@ -3735,7 +3778,7 @@ impl Column {
                 false => Some(surface),
             };
             let hit_len = if whole { ph } else { len.min(ph) };
-            let hit = self.hit_rect(card, hit_len).filter(|_| card.present());
+            let hit = self.hit_rect(card, top, hit_len).filter(|_| card.present());
             let slot = &mut self.slots[i];
             slot.paper = paper;
             slot.hit = hit;
@@ -3759,7 +3802,7 @@ impl Column {
                     image = image.scaled(lerp(CRUMPLED, 1.0, p), edge_x, card.y.value);
                     p * p
                 }
-                false => 1.0,
+                false => fade,
             };
             let size = (r.w as f64 * scale, r.h as f64 * scale);
             let placed = cut.and_then(|cut| clip(image, size, None, cut));
@@ -3772,6 +3815,15 @@ impl Column {
                     slot.sub.commit();
                 }
                 _ => slot.sub.clear(),
+            }
+            match under {
+                Some((s, (rect, src))) if card.presence.value > 0.0 => {
+                    slot.under.show(&s.shape.buffer);
+                    slot.under.crop(src);
+                    slot.under.place(IRect::round(rect));
+                    slot.under.commit();
+                }
+                _ => slot.under.clear(),
             }
         }
 
@@ -4576,7 +4628,7 @@ impl Column {
         order.push(&self.plus);
         for card in self.deck.paint_order() {
             if let Some(slot) = self.slots.iter().find(|s| s.key == card.key) {
-                order.push(&slot.sub);
+                order.extend([&slot.under, &slot.sub]);
             }
             if self.deck.open() == Some(card.key.as_str()) {
                 order.extend([&self.text, &self.notice]);
