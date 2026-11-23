@@ -124,12 +124,9 @@ fn theme() -> Arc<Theme> {
 
 fn paint(tree: Node, bounds: ui::Bounds, scale: i32, state: State) -> ui::Rendered {
     let req = Request {
-        tree: Arc::new(tree),
-        bounds,
-        scale,
-        theme: theme(),
         app: Some("app".into()),
         state,
+        ..Request::new(Arc::new(tree), bounds, scale, theme())
     };
     ui::render(&req, &mut Text::new(), &mut Fake)
 }
@@ -696,4 +693,113 @@ fn tiles() {
     let w = tile(wide, 192.0, 96.0, 1);
     assert_eq!((w.image.width, w.image.height), (192, 96));
     golden("tile-wide", &w.image);
+}
+
+/// A popup painted `apart`: its live slider is left out of the image and
+/// listed, painted alone it looks as it does inline, and a live bar in a
+/// scroll area stays inline. The image's corners are cut round.
+#[test]
+fn live_parts_apart() {
+    let live = Some(ui::Live {
+        rate: 1.0,
+        at: 100.0,
+    });
+    let seek = with(
+        sized(
+            Node::new(Kind::Slider {
+                value: 10.0,
+                min: 0.0,
+                max: 100.0,
+                enabled: true,
+                live,
+            }),
+            200.0,
+            20.0,
+        ),
+        |n| n.key = Some("seek".into()),
+    );
+    let bar = sized(
+        Node::new(Kind::Progress {
+            value: 0.5,
+            max: 1.0,
+            live,
+        }),
+        200.0,
+        6.0,
+    );
+    let scroll = with(Node::new(Kind::Scroll).with_children(vec![bar]), |n| {
+        n.key = Some("list".into());
+        n.layout.max_height = Some(Length::Px(40.0));
+    });
+    let tree = with(
+        col(8.0, vec![block(0xff0000ff, 100.0, 20.0), seek, scroll]),
+        |n| n.look.background = Some(Color::Rgba(0x202020ff)),
+    );
+    let request = |apart, radius| Request {
+        app: Some("app".into()),
+        state: State {
+            now: 110.0,
+            ..State::default()
+        },
+        radius,
+        apart,
+        ..Request::new(
+            Arc::new(tree.clone()),
+            ui::Bounds::Content {
+                max_w: 400.0,
+                max_h: 400.0,
+            },
+            1,
+            theme(),
+        )
+    };
+    let mut text = Text::new();
+    let inline = ui::render(&request(false, 0.0), &mut text, &mut Fake);
+    let apart = ui::render(&request(true, 10.0), &mut text, &mut Fake);
+    assert!(inline.live.is_empty());
+    assert_eq!(
+        apart.live.len(),
+        1,
+        "only the slider outside the scroll area"
+    );
+    let part = &apart.live[0];
+    assert_eq!(part.node.key.as_deref(), Some("seek"));
+    let r = part.rect;
+    assert_eq!((r.x, r.y, r.w, r.h), (12.0, 40.0, 200.0, 20.0));
+    // Still a hit, for dragging it.
+    assert!(apart.hits.iter().any(|h| h.key == "seek"));
+
+    let px = |img: &Image, x: u32, y: u32| {
+        let i = ((y * img.width + x) * 4) as usize;
+        [0, 1, 2, 3].map(|k| img.data[i + k])
+    };
+    // Where the slider was, only the background (as in the padding).
+    let bg = px(&apart.image, 5, 50);
+    for (x, y) in [(12, 50), (56, 50), (200, 50)] {
+        assert_eq!(px(&apart.image, x, y), bg, "({x}, {y})");
+    }
+    assert_ne!(px(&inline.image, 56, 50), bg);
+    // Corners cut round, the inline one square.
+    assert_eq!(px(&apart.image, 0, 0)[3], 0);
+    assert_eq!(px(&inline.image, 0, 0)[3], 255);
+
+    // Alone, as big as its rect, it is what the inline image shows there
+    // (the track and knob over transparency, not the background).
+    let alone = ui::render(&request(true, 10.0).part(part), &mut text, &mut Fake);
+    assert_eq!((alone.image.width, alone.image.height), (200, 20));
+    assert!(alone.live.is_empty());
+    // Its value moved with the clock: 20 of 100 at 110 s, so the knob is
+    // at 8 + 184 * 0.2 (at 10, it would be at 26).
+    assert_eq!(px(&alone.image, 44, 10)[3], 255);
+    assert_eq!(px(&inline.image, 12 + 44, 40 + 10)[3], 255);
+    let differ = (0..200)
+        .flat_map(|x| (0..20).map(move |y| (x, y)))
+        .filter(|&(x, y)| {
+            let a = px(&alone.image, x, y);
+            let b = px(&inline.image, 12 + x, 40 + y);
+            // Where the part is opaque, it covers the background alike.
+            a[3] == 255 && a != b
+        })
+        .count();
+    assert_eq!(differ, 0);
 }

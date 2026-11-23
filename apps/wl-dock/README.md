@@ -312,13 +312,14 @@ that app's windows).
 ### Widgets
 
 A widget is a Lua 5.4 plugin behind an app's item. It can replace the app's
-label (its name on hover) and its icon, and make its tile longer along the
-dock; popups come later. Clicking the item still launches or activates the
-app.
+label (its name on hover) and its icon, make its tile longer along the dock,
+and show an interactive popup while the item is hovered. Clicking the item
+still launches or activates the app.
 
 ```toml
 [app.foot]
 widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # or just widget = "clock"
+popup-delay = 400             # ms of hover before the widget's popup (default: [widgets])
 
 [plugin.clock]                 # Optional: defaults for every placement
 # path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
@@ -326,6 +327,7 @@ format = "%H:%M"
 
 [widgets]
 enabled = true                 # Default
+popup-delay = 300              # Default
 budget = 1000000               # Lua instructions per hook call (default)
 ```
 
@@ -370,21 +372,21 @@ return P
 Trees are built from `dock.ui` constructors: props are named, children
 positional (`nil` children are skipped).
 
-| Constructor | Props |
-| --- | --- |
-| `ui.col{}`, `ui.row{}` | `gap`, `padding` (`8`, `{v, h}` or `{t, r, b, l}`), `align` (`start`, `center`, `end`, `stretch`), `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`) |
-| `ui.grid{}` | `columns` (a count, or sizes: `40`, `'1fr'`, `'auto'`), `gap`, `row_gap` |
-| `ui.stack{}` | `align` (`center`, `top-right`, `bottom`, ...); the first child is the bottom layer |
-| `ui.box{}` | `variant` (`card`, `inset`, `badge`) |
-| `ui.scroll{}` | `max_height` |
-| `ui.spacer{}`, `ui.divider{}` | `size` |
-| `ui.text{'...'}` | `style` (`title`, `body`, `muted`, `caption`), `weight`, `color`, `size`, `align`, `max_lines` |
-| `ui.icon{'name'}` | `size`, `color` (`-symbolic` icons take the text color) |
-| `ui.app_icon{}` | `app` (default: the widget's), `size` |
-| `ui.image{src = path}` | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity` |
-| `ui.canvas{draw = fn}` | `viewbox = {w, h}` (default 100 x 100) |
-| `ui.button{}` | `label`, `icon`, `variant` (`plain`, `filled`, `ghost`), `enabled`, `selected`, `on_click` |
-| `ui.slider{}`, `ui.toggle{}`, `ui.progress{}` | `value`, `min`, `max`, `enabled`, `live`, `on_change`, `on_commit` |
+| Constructor                                   | Props                                                                                                                                                                  |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ui.col{}`, `ui.row{}`                        | `gap`, `padding` (`8`, `{v, h}` or `{t, r, b, l}`), `align` (`start`, `center`, `end`, `stretch`), `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`) |
+| `ui.grid{}`                                   | `columns` (a count, or sizes: `40`, `'1fr'`, `'auto'`), `gap`, `row_gap`                                                                                               |
+| `ui.stack{}`                                  | `align` (`center`, `top-right`, `bottom`, ...); the first child is the bottom layer                                                                                    |
+| `ui.box{}`                                    | `variant` (`card`, `inset`, `badge`)                                                                                                                                   |
+| `ui.scroll{}`                                 | `max_height`                                                                                                                                                           |
+| `ui.spacer{}`, `ui.divider{}`                 | `size`                                                                                                                                                                 |
+| `ui.text{'...'}`                              | `style` (`title`, `body`, `muted`, `caption`), `weight`, `color`, `size`, `align`, `max_lines`                                                                         |
+| `ui.icon{'name'}`                             | `size`, `color` (`-symbolic` icons take the text color)                                                                                                                |
+| `ui.app_icon{}`                               | `app` (default: the widget's), `size`                                                                                                                                  |
+| `ui.image{src = path}`                        | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity`                                                                                                        |
+| `ui.canvas{draw = fn}`                        | `viewbox = {w, h}` (default 100 x 100)                                                                                                                                 |
+| `ui.button{}`                                 | `label`, `icon`, `variant` (`plain`, `filled`, `ghost`), `enabled`, `selected`, `on_click`                                                                             |
+| `ui.slider{}`, `ui.toggle{}`, `ui.progress{}` | `value`, `min`, `max`, `enabled`, `live`, `on_change`, `on_commit`                                                                                                     |
 
 Every node also takes `width`, `height`, `min_*`, `max_*` (pixels or `'50%'`),
 `grow`, `background`, `radius`, `border`, `opacity`, `hover` (props while
@@ -396,6 +398,19 @@ hovered) and `key`. Colors are CSS colors or the theme's names in
 (`from`, `to` in radians from 3 o'clock, `pie`), `path{d = 'M ...'}`, `text`,
 `save`, `restore`, `translate`, `rotate` and `scale`, each shape with `fill`,
 `stroke`, `width` and `cap`, in viewbox units.
+
+`popup()` returns a tree for the item's popup (or `nil` for none). It opens
+after the item has been hovered for its `popup-delay`, in a speech bubble
+pointing at the item like the menu, and at once when the pointer moves from
+one open popup to another widget. `on_open()` and `on_close()` are called as
+it opens and closes, and it is asked again after `dock.redraw()`. Hover,
+pressed looks, slider drags and scrolling are handled by the dock; the
+plugin hears `on_click()`, `on_change(value)` (at most 30 times a second
+while a slider is dragged), `on_commit(value)` (on release) and a toggle's
+`on_change(on)`. A slider or progress bar with `live = { rate = 1, at =
+os.time() }` moves on its own from `value` at `at` (seconds) by `rate` per
+second, so a seek bar keeps up without a redraw; it is painted on its own
+layer, as often as that moves it a pixel.
 
 ### Per-folder settings
 

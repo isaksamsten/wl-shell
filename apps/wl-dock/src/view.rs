@@ -121,6 +121,7 @@ use wl_shell_core::reexports::calloop::timer::{TimeoutAction, Timer};
 use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
 use wl_shell_core::{Core, Shell};
 use wl_shell_log::warn;
+use wl_shell_lua::channel::PopupEvent;
 use wl_shell_render::bubble::Bubble;
 use wl_shell_render::files::FileEntry;
 use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
@@ -147,6 +148,7 @@ use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
 use crate::trash;
 use crate::widgets::{TileBase, WidgetIcon};
+use crate::widgetview::WidgetView;
 use crate::zoom;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -538,6 +540,8 @@ pub struct DockView {
     // Field order is drop order: children before their parent surface.
     /// The menu, while open (or closing).
     menu: Option<MenuView>,
+    /// A widget's popup, while open (or closing).
+    widget: Option<WidgetView>,
     /// The strip, while open (or closing).
     strip: Option<StripView>,
     panel: [Sub; 3],
@@ -715,6 +719,7 @@ impl DockView {
         };
         let mut dock = Self {
             menu: None,
+            widget: None,
             strip: None,
             panel,
             slot_subs: Vec::new(),
@@ -821,6 +826,13 @@ impl DockView {
         if style.menu != self.style.menu || style.layout.position != self.style.layout.position {
             self.menu = None;
             self.frozen = self.strip_open();
+        }
+        // So was the widget's popup.
+        if style.menu != self.style.menu
+            || style.ui_theme != self.style.ui_theme
+            || style.layout.position != self.style.layout.position
+        {
+            self.widget = None;
         }
         self.style = style;
         if resized {
@@ -988,12 +1000,13 @@ impl DockView {
         let tree = &self.widget_icons.get(&key.app_id)?.tree;
         let s = key.scale.max(1) as f32;
         Some(ui::Request {
-            tree: tree.clone(),
-            bounds: ui::Bounds::Exact(tile.w as f32 / s, tile.h as f32 / s),
-            scale: key.scale,
-            theme: self.style.ui_theme.clone(),
             app: Some(key.app_id.clone()),
-            state: ui::State::default(),
+            ..ui::Request::new(
+                tree.clone(),
+                ui::Bounds::Exact(tile.w as f32 / s, tile.h as f32 / s),
+                key.scale,
+                self.style.ui_theme.clone(),
+            )
         })
     }
 
@@ -1397,7 +1410,7 @@ impl DockView {
         self.pointer_in = false;
         self.pointer_at = None;
         self.sync_autohide();
-        if self.strip_open() || self.menu_open() {
+        if self.strip_open() || self.menu_open() || self.widget_open() {
             self.set_hovered(core, None);
             return;
         }
@@ -1969,6 +1982,7 @@ impl DockView {
     fn sync_autohide(&mut self) {
         let held = self.strip_open()
             || self.menu_open()
+            || self.widget_open()
             || self.drag.is_some()
             || self.launcher.is_some()
             || self.keys;
@@ -2177,6 +2191,7 @@ impl DockView {
     fn moving(&self) -> bool {
         self.strip.as_ref().is_some_and(StripView::moving)
             || self.menu.as_ref().is_some_and(MenuView::moving)
+            || self.widget.as_ref().is_some_and(WidgetView::moving)
             || !self.pointer.settled()
             || !self.hover.settled()
             || !self.shown.settled()
@@ -2234,6 +2249,12 @@ impl DockView {
                 self.update_label();
             }
         }
+        if let Some(w) = &mut self.widget {
+            moving |= w.advance(dt);
+            if w.gone() {
+                self.widget = None;
+            }
+        }
         self.last_frame = moving.then_some(now);
         self.render();
     }
@@ -2251,6 +2272,9 @@ impl DockView {
         self.layer.commit();
         self.render_strip();
         self.render_menu();
+        if let Some(w) = &mut self.widget {
+            w.render();
+        }
     }
 
     /// An alpha as shown: without wp_alpha_modifier_v1, things are either
@@ -2673,7 +2697,7 @@ impl DockView {
     }
 
     /// Whether the strip is open (and not closing).
-    fn strip_open(&self) -> bool {
+    pub fn strip_open(&self) -> bool {
         self.strip.as_ref().is_some_and(|s| !s.closing())
     }
 
@@ -2945,6 +2969,115 @@ impl DockView {
     /// Whether `surface` is this dock's strip.
     pub fn has_strip_surface(&self, surface: &WlSurface) -> bool {
         self.strip.as_ref().is_some_and(|s| s.surface() == surface)
+    }
+
+    // -- the widget's popup ------------------------------------------------
+
+    /// Whether a widget's popup is open (and not closing).
+    pub fn widget_open(&self) -> bool {
+        self.widget.as_ref().is_some_and(|w| !w.closing())
+    }
+
+    /// Fade the widget's popup out; it goes once it's gone. Without the
+    /// pointer on the dock, the magnification it held goes too.
+    pub fn close_widget(&mut self, core: &Core<WlDock>) {
+        let Some(w) = &mut self.widget else { return };
+        if w.closing() {
+            return;
+        }
+        w.close();
+        self.sync_autohide();
+        if !self.pointer_in && !self.strip_open() && !self.menu_open() {
+            self.unhover(core);
+        }
+        self.kick();
+    }
+
+    /// Show `tree` in `app`'s widget's popup, opening it if it isn't.
+    pub fn paint_widget(&mut self, app: &str, tree: Arc<ui::Node>) {
+        if let Some(w) = self
+            .widget
+            .as_mut()
+            .filter(|w| w.app == app && !w.closing())
+        {
+            return w.set_tree(tree);
+        }
+        let Some((icon, _)) = self.icon_place(app) else {
+            return;
+        };
+        let icon =
+            wl_shell_ui::Rect::new(icon.x as f64, icon.y as f64, icon.w as f64, icon.h as f64);
+        let widget = WidgetView::new(
+            self.g.clone(),
+            self.assets.clone(),
+            &self.qh,
+            &self.layer,
+            app.to_string(),
+            tree,
+            self.style.menu.clone(),
+            self.style.ui_theme.clone(),
+            self.style.layout.position,
+            icon,
+            self.scale,
+        );
+        match widget {
+            Ok(w) => {
+                self.widget = Some(w);
+                self.sync_autohide();
+            }
+            Err(e) => warn!("cannot show the widget's popup: {e}"),
+        }
+    }
+
+    /// A painted tree from the worker; true if it was the widget's.
+    pub fn widget_ready(&mut self, tag: u64, req: &ui::Request, r: &ui::Rendered) -> bool {
+        let Some(w) = &mut self.widget else {
+            return false;
+        };
+        let ours = w.ui_ready(tag, req, r);
+        if ours {
+            w.render();
+            if w.moving() {
+                self.kick();
+            }
+        }
+        ours
+    }
+
+    /// When the widget's live layers are due again, and the popup's ID.
+    pub fn widget_tick_due(&mut self) -> Option<(u64, std::time::Duration)> {
+        self.widget.as_mut()?.tick_due()
+    }
+
+    /// They are due, if popup `id` is still there.
+    pub fn widget_tick(&mut self, id: u64) {
+        if let Some(w) = self.widget.as_mut().filter(|w| w.id == id) {
+            w.tick();
+        }
+    }
+
+    pub fn has_widget_popup(&self, popup: &Popup) -> bool {
+        self.widget.as_ref().is_some_and(|w| w.is(popup))
+    }
+
+    pub fn has_widget_surface(&self, surface: &WlSurface) -> bool {
+        self.widget.as_ref().is_some_and(|w| w.has_surface(surface))
+    }
+
+    /// The compositor placed the widget's popup.
+    pub fn widget_configure(&mut self, configure: &PopupConfigure) {
+        if let Some(w) = &mut self.widget {
+            w.configure(configure);
+        }
+        self.kick();
+    }
+
+    /// A pointer event on the widget's popup: its app, and a node's key
+    /// and what happened to it, for the plugin.
+    pub fn widget_pointer(&mut self, e: &PointerEvent) -> Option<(String, String, PopupEvent)> {
+        let w = self.widget.as_mut()?;
+        let (key, event) = w.pointer(e)?;
+        Some((w.app.clone(), key, event))
     }
 
     pub fn has_popup(&self, popup: &Popup) -> bool {
@@ -3284,9 +3417,11 @@ impl DockView {
         }
     }
 
-    /// A bubble from the worker; true if it was the menu's.
+    /// A bubble from the worker; true if it was the menu's or the
+    /// widget's popup's.
     pub fn bubble_ready(&mut self, tag: u64, bubble: &Bubble, image: &Image) -> bool {
-        let ours = (self.menu.as_mut()).is_some_and(|m| m.bubble_ready(tag, bubble, image));
+        let ours = (self.menu.as_mut()).is_some_and(|m| m.bubble_ready(tag, bubble, image))
+            || (self.widget.as_mut()).is_some_and(|w| w.bubble_ready(tag, bubble, image));
         if ours {
             self.kick();
         }

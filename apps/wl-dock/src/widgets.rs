@@ -181,6 +181,7 @@ pub struct Effect {
     /// Their spans changed: the items do.
     pub spans: bool,
     pub clipboard: Option<String>,
+    pub popup: Option<(String, Option<Arc<Node>>)>,
 }
 
 impl Effect {
@@ -212,6 +213,7 @@ pub struct Widgets {
     runtime: Option<Runtime>,
     registry: Registry,
     pending: Pending,
+    open: Option<String>,
     /// The widgets' labels, by app ID.
     labels: BTreeMap<String, String>,
     /// Their icons, by app ID.
@@ -358,6 +360,39 @@ impl Widgets {
         }
     }
 
+    pub fn supports_popup(&self, app: &str) -> bool {
+        self.registry
+            .widget(&app_instance(app))
+            .is_some_and(|w| w.popup)
+    }
+
+    pub fn notify(&self, app: &str, kind: RequestKind) {
+        if let Some(rt) = &self.runtime {
+            rt.request(&app_instance(app), kind, ICON_TIMEOUT);
+        }
+    }
+
+    pub fn select_popup(&mut self, app: Option<&str>) {
+        if let Some(old) = self.open.take() {
+            self.notify(&old, RequestKind::Visibility(false));
+        }
+        self.open = app.map(str::to_owned);
+        if let Some(app) = app {
+            self.notify(app, RequestKind::Visibility(true));
+            self.ask_popup(&app_instance(app));
+        }
+    }
+
+    fn ask_popup(&mut self, instance: &str) {
+        if instance_app(instance) == self.open.as_deref()
+            && self.open.is_some()
+            && let Some(rt) = &self.runtime
+            && let Some(ticket) = rt.request(instance, RequestKind::Popup, ICON_TIMEOUT)
+        {
+            self.pending.insert(instance, ticket);
+        }
+    }
+
     /// Set (or with None, drop) the label of `instance`'s app; true if
     /// it changed.
     fn set_label(&mut self, instance: &str, label: Option<String>) -> bool {
@@ -384,12 +419,16 @@ impl Widgets {
                 fx.spans = self.set_span(&instance, Some(widget.span));
                 self.ask_label(&instance);
                 self.ask_icon(&instance);
+                self.ask_popup(&instance);
                 // A reloaded plugin may have no label or icon anymore.
                 fx.labels = !widget.label && self.set_label(&instance, None);
                 fx.icons = !widget.icon && self.set_icon(&instance, None);
             }
             Event::Failed { instance, .. } => {
                 self.registry.remove(&instance);
+                if let Some(app) = instance_app(&instance) {
+                    fx.popup = Some((app.into(), None));
+                }
                 fx.labels = self.set_label(&instance, None);
                 fx.icons = self.set_icon(&instance, None);
                 fx.spans = self.set_span(&instance, None);
@@ -397,6 +436,7 @@ impl Widgets {
             Event::Redraw(instance) => {
                 self.ask_label(&instance);
                 self.ask_icon(&instance);
+                self.ask_popup(&instance);
             }
             Event::Span { instance, span } => {
                 fx.spans = self.set_span(&instance, Some(span));
@@ -414,6 +454,17 @@ impl Widgets {
                 match (answer.result, topic) {
                     (Ok(Reply::Label(label)), _) => fx.labels = self.set_label(instance, label),
                     (Ok(Reply::Icon(tree)), _) => fx.icons = self.set_icon(instance, tree),
+                    (result, Topic::Popup) if instance_app(instance) == self.open.as_deref() => {
+                        if let Some(app) = &self.open {
+                            fx.popup = Some((
+                                app.clone(),
+                                match result {
+                                    Ok(Reply::Popup(tree)) => tree,
+                                    _ => None,
+                                },
+                            ));
+                        }
+                    }
                     // The app's own name or icon, while it fails.
                     (Err(_), Topic::Label) => fx.labels = self.set_label(instance, None),
                     (Err(_), Topic::Icon) => fx.icons = self.set_icon(instance, None),
@@ -517,6 +568,55 @@ mod tests {
         let a = c.app("a").unwrap();
         assert_eq!(a.widget.as_ref().unwrap().plugin, "clock");
         assert_eq!((a.popup_delay, c.widgets.popup_delay), (Some(400), 0));
+    }
+
+    #[test]
+    fn kitchen_sink_popup_loads() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.send(e);
+        })
+        .unwrap();
+        // Not bundled: loaded from its file under tests/.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/plugins/kitchen-sink.lua"
+        );
+        let c = parse(&format!(
+            "[plugin.kitchen-sink]\npath = '{path}'\n[app.demo]\nwidget = 'kitchen-sink'"
+        ));
+        let specs = specs(&c, None);
+        w.configure(specs);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !w.supports_popup("demo") {
+            w.event(recv.recv_timeout(end - Instant::now()).unwrap());
+        }
+        w.select_popup(Some("demo"));
+        loop {
+            let e = recv.recv_timeout(end - Instant::now()).unwrap();
+            if let Event::Answer(a) = &e {
+                assert!(a.result.is_ok(), "{:?}", a.result);
+            }
+            if let Some((_, tree)) = w.event(e).popup {
+                let tree = tree.unwrap();
+                let nodes = tree.walk();
+                assert!(nodes.iter().any(|n| n.handlers.commit));
+                // A live seek bar and progress bar, for their own layers.
+                use wl_shell_render::ui::Kind;
+                let live = (nodes.iter())
+                    .filter(|n| {
+                        matches!(
+                            n.kind,
+                            Kind::Slider { live: Some(_), .. }
+                                | Kind::Progress { live: Some(_), .. }
+                        )
+                    })
+                    .count();
+                assert_eq!(live, 2);
+                break;
+            }
+        }
     }
 
     /// The bundled clock, through the runtime and back into the labels.
@@ -674,12 +774,13 @@ mod tests {
         }
         let tree = w.icons()["foot"].tree.clone();
         let req = wl_shell_render::ui::Request {
-            tree,
-            bounds: wl_shell_render::ui::Bounds::Exact(96.0, 96.0),
-            scale: 2,
-            theme: Arc::new(c.ui_theme()),
             app: Some("foot".into()),
-            state: Default::default(),
+            ..wl_shell_render::ui::Request::new(
+                tree,
+                wl_shell_render::ui::Bounds::Exact(96.0, 96.0),
+                2,
+                Arc::new(c.ui_theme()),
+            )
         };
         let mut text = wl_shell_render::text::Text::new();
         let r = wl_shell_render::ui::render(&req, &mut text, &mut wl_shell_render::ui::NoResources);

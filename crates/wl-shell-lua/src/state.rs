@@ -323,6 +323,55 @@ impl State {
         })
     }
 
+    pub fn popup(&self) -> Outcome<Option<Node>> {
+        let Some(popup) = self.hook("popup") else {
+            return Outcome::Ok(None);
+        };
+        self.enter("popup", || {
+            let mut builder = Builder::new(&self.lua)?;
+            let tree = builder
+                .root(popup.call::<Value>(())?)
+                .map_err(mlua::Error::runtime)?;
+            let handlers: Table = self.lua.named_registry_value(HANDLERS)?;
+            handlers.set("popup", builder.handlers())?;
+            Ok(tree)
+        })
+    }
+
+    pub fn visibility(&self, open: bool) -> Outcome<()> {
+        let name = if open { "on_open" } else { "on_close" };
+        let Some(f) = self.hook(name) else {
+            return Outcome::Ok(());
+        };
+        self.enter(name, || f.call::<()>(()))
+    }
+
+    pub fn interaction(&self, key: &str, event: crate::channel::PopupEvent) -> Outcome<()> {
+        use crate::channel::PopupEvent::*;
+        let name = match event {
+            Click => "on_click",
+            Commit(_) => "on_commit",
+            _ => "on_change",
+        };
+        self.enter(name, || {
+            let handlers: Table = self.lua.named_registry_value(HANDLERS)?;
+            let Some(popup) = handlers.get::<Option<Table>>("popup")? else {
+                return Ok(());
+            };
+            let Some(node) = popup.get::<Option<Table>>(key)? else {
+                return Ok(());
+            };
+            let Some(f) = node.get::<Option<Function>>(name)? else {
+                return Ok(());
+            };
+            match event {
+                Click => f.call::<()>(()),
+                Toggle(v) => f.call::<()>(v),
+                Change(v) | Commit(v) => f.call::<()>(v),
+            }
+        })
+    }
+
     /// Timer `id`, due at `due`, fired.
     pub fn timer(&self, id: u64, due: Instant) -> Outcome<()> {
         let found = (|| -> mlua::Result<Option<Function>> {

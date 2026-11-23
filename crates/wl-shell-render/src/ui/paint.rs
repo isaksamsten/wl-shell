@@ -84,6 +84,57 @@ pub struct Request {
     /// The widget's app, for `ui.app_icon{}`.
     pub app: Option<String>,
     pub state: State,
+    /// The image's corners are cut round to this radius (a popup's
+    /// bubble); 0: square.
+    pub radius: f32,
+    /// Live sliders and progress bars (outside scroll areas) are left
+    /// out of the image and listed in `Rendered::live`, so the host can
+    /// paint them on their own as they move (`Request::part`).
+    pub apart: bool,
+}
+
+impl Request {
+    /// A request for `tree` in `bounds`: every other field the default.
+    pub fn new(tree: Arc<Node>, bounds: Bounds, scale: i32, theme: Arc<Theme>) -> Self {
+        Request {
+            tree,
+            bounds,
+            scale,
+            theme,
+            app: None,
+            state: State::default(),
+            radius: 0.0,
+            apart: false,
+        }
+    }
+
+    /// The request painting just `part` of this one's tree, as big as
+    /// its rect, with this one's state.
+    pub fn part(&self, part: &LivePart) -> Request {
+        let mut node = part.node.clone();
+        node.layout = Default::default();
+        node.look.opacity = Some(part.alpha);
+        Request {
+            tree: Arc::new(node),
+            bounds: Bounds::Exact(part.rect.w.max(1.0), part.rect.h.max(1.0)),
+            radius: 0.0,
+            apart: false,
+            ..self.clone()
+        }
+    }
+}
+
+/// A live node left out of an image painted `apart`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LivePart {
+    /// Its index in the tree's walk.
+    pub index: usize,
+    /// Where it goes on the image, logical pixels.
+    pub rect: Rect,
+    /// Its own and its ancestors' opacity.
+    pub alpha: f32,
+    /// The node, without children (live nodes have none).
+    pub node: Node,
 }
 
 /// A node the host tracks: where it is, as painted.
@@ -108,6 +159,8 @@ pub struct Rendered {
     pub image: Image,
     /// Front to back: a later hit is on top.
     pub hits: Vec<Hit>,
+    /// The live nodes left out (`Request::apart`), in tree order.
+    pub live: Vec<LivePart>,
 }
 
 /// Lay `req.tree` out and paint it.
@@ -134,16 +187,29 @@ pub fn render(req: &Request, text: &mut Text, res: &mut dyn Resources) -> Render
         app: req.app.as_deref(),
         hits: Vec::new(),
         nodes: &nodes,
+        apart: req.apart,
+        scrolled: 0,
+        live: Vec::new(),
     };
     let mut index = 0;
     let fg = theme.get(ThemeColor::Text);
     p.node(&mut pixmap, &mut index, 0.0, fg, 1.0, true);
     let hits = std::mem::take(&mut p.hits);
+    let live = std::mem::take(&mut p.live);
+    let radius = req.radius.min(w.min(h) / 2.0);
+    if radius > 0.0
+        && let Some(mut mask) = Mask::new(pw, ph)
+        && let Some(path) = crate::doc::rounded(0.0, 0.0, w * s, h * s, radius * s)
+    {
+        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+        pixmap.apply_mask(&mask);
+    }
     Rendered {
         width: w,
         height: h,
         image: crate::doc::bgra(&pixmap),
         hits,
+        live,
     }
 }
 
@@ -468,6 +534,11 @@ struct Painter<'a> {
     app: Option<&'a str>,
     hits: Vec<Hit>,
     nodes: &'a [&'a Node],
+    /// Leave live nodes out, into `live`.
+    apart: bool,
+    /// How many scroll areas the node being painted is in.
+    scrolled: u32,
+    live: Vec<LivePart>,
 }
 
 impl Painter<'_> {
@@ -538,6 +609,23 @@ impl Painter<'_> {
                 enabled,
                 content: self.laid.content[i],
             });
+        }
+        // Painted on its own by the host, as it moves.
+        let moves = matches!(
+            n.kind,
+            Kind::Slider { live: Some(_), .. } | Kind::Progress { live: Some(_), .. }
+        );
+        if self.apart && self.scrolled == 0 && moves {
+            self.live.push(LivePart {
+                index: i,
+                rect,
+                alpha,
+                node: Node {
+                    children: Vec::new(),
+                    ..n.clone()
+                },
+            });
+            return self.skip_children(index, n);
         }
         let s = self.s;
         let theme = self.theme;
@@ -766,9 +854,11 @@ impl Painter<'_> {
             let mask = clip(pm, r);
             match (&mut layer, mask) {
                 (Some(layer), Some(mask)) => {
+                    self.scrolled += 1;
                     for _ in 0..n.children.len() {
                         self.child(layer, index, dy + offset, fg, alpha, live, rect, dy);
                     }
+                    self.scrolled -= 1;
                     pm.draw_pixmap(
                         0,
                         0,

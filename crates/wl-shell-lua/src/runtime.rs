@@ -316,6 +316,19 @@ impl Slot {
                             (self.settle(life, shared, outcome))
                                 .map(|tree| Reply::Icon(tree.map(Arc::new)))
                         }
+                        RequestKind::Popup => {
+                            let outcome = state.popup();
+                            self.settle(life, shared, outcome)
+                                .map(|tree| Reply::Popup(tree.map(Arc::new)))
+                        }
+                        RequestKind::Interaction { key, event } => {
+                            let outcome = state.interaction(&key, event);
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
+                        RequestKind::Visibility(open) => {
+                            let outcome = state.visibility(open);
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
                     },
                 };
                 shared.emit(Event::Answer(Answer {

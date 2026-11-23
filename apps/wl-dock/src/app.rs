@@ -180,6 +180,10 @@ const URI_LIST: &str = "text/uri-list";
 /// Pixels of touchpad scrolling per step of a scroll command.
 const SCROLL_STEP: f64 = 50.0;
 
+/// How long the pointer may be off both the dock and a widget's popup
+/// (on its way from one to the other) before the popup closes.
+const WIDGET_GRACE: Duration = Duration::from_millis(180);
+
 /// An app launched from the dock, until one of its windows appears.
 struct Launch {
     app_id: String,
@@ -527,6 +531,15 @@ pub struct WlDock {
     pending_keys: Vec<KeysRun>,
     /// The plugins behind widgets.
     widgets: Widgets,
+    /// The hovered item whose widget's popup opens (or is open), and on
+    /// which dock.
+    widget_target: Option<(WlOutput, String)>,
+    /// Counts changes of `widget_target`: a timer to open a popup only
+    /// opens it if there was none since.
+    widget_epoch: u64,
+    /// Counts pointer motion on the dock and the popup: a timer to close
+    /// the popup only closes it if there was none since.
+    widget_grace: u64,
     /// Watching the plugin files.
     plugin_watches: Vec<RegistrationToken>,
 }
@@ -613,6 +626,9 @@ impl WlDock {
             keys: None,
             pending_keys: Vec::new(),
             widgets: Widgets::default(),
+            widget_target: None,
+            widget_epoch: 0,
+            widget_grace: 0,
             plugin_watches: Vec::new(),
         })
     }
@@ -790,7 +806,20 @@ impl WlDock {
             icons,
             spans,
             clipboard,
+            popup,
         } = self.widgets.event(event);
+        if let Some((app, tree)) = popup
+            && let Some((output, key)) = self.widget_target.clone()
+            && key == app
+        {
+            if let Some(tree) = tree
+                && let Some(dock) = self.dock_mut(&output)
+            {
+                dock.paint_widget(&app, tree)
+            } else {
+                self.hide_widget(core)
+            }
+        }
         if labels {
             self.show_widget_names();
         }
@@ -3201,8 +3230,72 @@ impl WlDock {
         }
     }
 
-    /// Close every dock's strip and menu.
+    /// Close the widget's popup (fading out), and stop waiting to open one.
+    fn hide_widget(&mut self, core: &Core<Self>) {
+        self.widget_epoch = self.widget_epoch.wrapping_add(1);
+        self.widget_target = None;
+        self.widgets.select_popup(None);
+        for d in &mut self.docks {
+            d.close_widget(core);
+        }
+    }
+
+    /// The pointer left the dock or the widget's popup: close the popup
+    /// unless it comes back to either soon (from the icon to the popup).
+    fn leave_widget(&mut self, core: &Core<Self>) {
+        if self.widget_target.is_none() {
+            return;
+        }
+        let grace = self.widget_grace;
+        let _ = core.timer(WIDGET_GRACE, move |s: &mut Self, core| {
+            if s.widget_grace == grace {
+                s.hide_widget(core);
+            }
+        });
+    }
+
+    /// The pointer moved on the dock on `output`: open the hovered item's
+    /// widget's popup after its delay (at once if another one was open,
+    /// as the strip hands over), or close the one open.
+    fn hover_widget(&mut self, core: &Core<Self>, output: &WlOutput) {
+        self.widget_grace = self.widget_grace.wrapping_add(1);
+        let target = self
+            .hovered_item(output)
+            .filter(|i| self.widgets.supports_popup(&i.app_id))
+            .map(|i| (output.clone(), i.app_id.clone()));
+        if self.widget_target == target {
+            return;
+        }
+        let handover = self.docks.iter().any(DockView::widget_open);
+        self.hide_widget(core);
+        let Some((output, app)) = target else { return };
+        let delay = match handover {
+            true => 0,
+            false => self
+                .config
+                .app(&app)
+                .and_then(|a| a.popup_delay)
+                .unwrap_or(self.config.widgets.popup_delay),
+        };
+        self.widget_target = Some((output.clone(), app.clone()));
+        let epoch = self.widget_epoch;
+        let _ = core.timer(
+            Duration::from_millis(delay.into()),
+            move |s: &mut Self, _| {
+                if s.widget_epoch == epoch
+                    && s.pressed.is_none()
+                    && s.dock_mut(&output)
+                        .is_some_and(|d| !d.menu_open() && !d.strip_open() && !d.dragging())
+                {
+                    s.widgets.select_popup(Some(&app));
+                }
+            },
+        );
+    }
+
+    /// Close every dock's strip and menu, and the widget's popup.
     fn close_popups(&mut self, core: &Core<Self>) {
+        self.hide_widget(core);
         self.close_strips(core);
         self.close_menus(core);
     }
@@ -4023,8 +4116,29 @@ impl WlDock {
                     self.show_web(true);
                 }
             }
-            // Widgets' popups (later); their tiles come as icons.
-            Done::Paper { .. } | Done::Doc { .. } | Done::Ui { .. } => {}
+            Done::Ui {
+                tag,
+                request,
+                rendered,
+            } => {
+                // A widget's popup, or one of its live layers.
+                for d in &mut self.docks {
+                    if !d.widget_ready(tag, &request, &rendered) {
+                        continue;
+                    }
+                    // Its live layers are painted again when they are due.
+                    if let Some((id, due)) = d.widget_tick_due() {
+                        let output = d.output.clone();
+                        let _ = core.timer(due, move |s: &mut Self, _| {
+                            if let Some(d) = s.dock_mut(&output) {
+                                d.widget_tick(id);
+                            }
+                        });
+                    }
+                    break;
+                }
+            }
+            Done::Paper { .. } | Done::Doc { .. } => {}
         }
     }
 }
@@ -4263,14 +4377,20 @@ impl Program for WlDock {
     }
 
     fn popup_configure(&mut self, _: &mut Core<Self>, popup: &Popup, configure: PopupConfigure) {
+        if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_widget_popup(popup)) {
+            return dock.widget_configure(&configure);
+        }
         if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
             dock.popup_configure(popup, &configure);
         }
     }
 
-    /// The compositor dismissed a strip or menu: a click on another
-    /// client.
+    /// The compositor dismissed a strip, menu or widget's popup: a click
+    /// on another client.
     fn popup_done(&mut self, core: &mut Core<Self>, popup: &Popup) {
+        if self.docks.iter().any(|d| d.has_widget_popup(popup)) {
+            return self.hide_widget(core);
+        }
         if let Some(dock) = self.docks.iter_mut().find(|d| d.has_popup(popup)) {
             dock.popup_done(core, popup);
         }
@@ -4360,6 +4480,19 @@ impl Program for WlDock {
             }
             return;
         }
+        if let Some(d) = (self.docks.iter_mut()).find(|d| d.has_widget_surface(&event.surface)) {
+            if let Some((app, key, event)) = d.widget_pointer(event) {
+                let kind = wl_shell_lua::RequestKind::Interaction { key, event };
+                self.widgets.notify(&app, kind);
+            }
+            // On the popup, it stays; off it, it closes unless the
+            // pointer comes back (to it or the dock) soon.
+            self.widget_grace = self.widget_grace.wrapping_add(1);
+            if matches!(event.kind, PointerEventKind::Leave { .. }) {
+                self.leave_widget(core);
+            }
+            return;
+        }
         if let Some(dock) = (self.docks.iter_mut()).find(|d| d.has_strip_surface(&event.surface)) {
             if let Some(id) = dock.strip_pointer(core, event) {
                 self.activate(core, &id);
@@ -4404,8 +4537,12 @@ impl Program for WlDock {
                 if let Some(dock) = self.dock_mut(&output) {
                     dock.pointer_motion(core, x, y);
                 }
+                if !dragging {
+                    self.hover_widget(core, &output);
+                }
             }
             PointerEventKind::Leave { .. } => {
+                self.leave_widget(core);
                 if let Some(dock) = self.dock_mut(&output) {
                     // The grab broke: the icon goes back.
                     if dragging {
@@ -4417,6 +4554,7 @@ impl Program for WlDock {
                 self.pressed = None;
             }
             PointerEventKind::Press { button, serial, .. } => {
+                self.hide_widget(core);
                 self.button(core, &output, button, serial, (x, y), true);
             }
             PointerEventKind::Release { .. } if dragging => self.drop_icon(core, &output),

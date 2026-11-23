@@ -69,6 +69,20 @@ pub enum RequestKind {
     Label,
     /// The widget's `icon(tile)`.
     Icon(Tile),
+    Popup,
+    Interaction {
+        key: String,
+        event: PopupEvent,
+    },
+    Visibility(bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PopupEvent {
+    Click,
+    Toggle(bool),
+    Change(f64),
+    Commit(f64),
 }
 
 impl RequestKind {
@@ -76,6 +90,8 @@ impl RequestKind {
         match self {
             RequestKind::Label => Topic::Label,
             RequestKind::Icon(_) => Topic::Icon,
+            RequestKind::Popup => Topic::Popup,
+            RequestKind::Interaction { .. } | RequestKind::Visibility(_) => Topic::Interaction,
         }
     }
 }
@@ -87,6 +103,8 @@ impl RequestKind {
 pub enum Topic {
     Label,
     Icon,
+    Popup,
+    Interaction,
 }
 
 /// An answer's payload.
@@ -97,6 +115,8 @@ pub enum Reply {
     Label(Option<String>),
     /// None: the app's own icon.
     Icon(Option<Arc<Node>>),
+    Popup(Option<Arc<Node>>),
+    Done,
 }
 
 /// A request as the worker sees it.
