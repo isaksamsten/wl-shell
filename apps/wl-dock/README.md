@@ -311,15 +311,21 @@ that app's windows).
 
 ### Widgets
 
-A widget is a Lua 5.4 plugin behind an app's item. It can replace the app's
-label (its name on hover) and its icon, make its tile longer along the dock,
-and show an interactive popup while the item is hovered. Clicking the item
-still launches or activates the app.
+A widget is a Lua 5.4 plugin behind an app's item, or an item of its own. On
+an app, it can replace the app's label (its name on hover) and its icon, make
+its tile longer along the dock, and show an interactive popup while the item
+is hovered; clicking the item still launches or activates the app.
 
 ```toml
 [app.foot]
 widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # or just widget = "clock"
 popup-delay = 400             # ms of hover before the widget's popup (default: [widgets])
+
+[widget.clock]                 # A standalone widget, shown while `@clock` is pinned
+# plugin = "clock"             # Default: the table's name
+name = "Clock"                 # Its label (default: the table's name)
+popup-delay = 600
+# format = "%H:%M"             # Any other key is an option for the plugin
 
 [plugin.clock]                 # Optional: defaults for every placement
 # path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
@@ -330,6 +336,20 @@ enabled = true                 # Default
 popup-delay = 300              # Default
 budget = 1000000               # Lua instructions per hook call (default)
 ```
+
+A standalone widget is placed with `wl-dock pin @clock` (or an `@clock` line
+in the pins file), at the end of the pinned apps; drag it anywhere on the
+dock: among the apps, or past the separator among the folders, up to just
+before the Trash. In the pins file, a `---` line stands for the separator:
+`@name` lines after it sit among the folders. It has no windows or
+indicator. Clicking it calls the plugin's `on_click(button)`
+(`'left'` or `'middle'`), or without one opens or closes its popup. Its menu
+has Remove from Dock, as does dropping it on the Trash: that takes the
+`@clock` line out of the pins file and leaves `[widget.clock]` alone, so it
+can be pinned again. Until the plugin draws an icon (or while it fails) it
+shows a placeholder. The bundled `clock` draws an analog clock, with the
+time as its label and the date in its popup (on an app it only sets the
+label, unless `face = true`).
 
 A plugin is a file that returns a table of hooks:
 
@@ -346,6 +366,7 @@ functions: `dock.redraw()`, `dock.timer(ms, fn)` and `dock.every(ms, fn)`
 (handles with `:cancel()`), `dock.spawn(argv, { on_line = fn, on_exit = fn })`
 (a handle with `:kill()`), `dock.run(argv)` (detached), `dock.read(path)`,
 `dock.json.decode(s)` / `dock.json.encode(v)` and `dock.clipboard(text)`;
+`dock.app` is the app the widget backs (`nil` standalone);
 `argv` is a list, or a string for `sh -c`. Plugins have no `io`, `debug` or
 `os.execute`; `require` loads modules next to the plugin. A hook that runs
 past its budget, or a failing `setup`, restarts the plugin with backoff, and the

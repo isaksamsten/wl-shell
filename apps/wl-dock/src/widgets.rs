@@ -1,21 +1,23 @@
 //! Widgets: Lua plugins (wl-shell-lua) behind the dock's items.
 //!
 //! Which plugins run comes from the config (`specs`): one state per
-//! `[app.<id>]` table with a `widget`, and one per `[plugin.<name>]`
-//! table (kept only if the plugin has launcher capabilities). A plugin
-//! name is looked up as `plugins/<name>.lua` next to the config file,
-//! then among the bundled plugins (`BUNDLED`); `[plugin.<name>] path`
-//! overrides that. A placement's options are its plugin table's, with
-//! its own over them.
+//! `[app.<id>]` table with a `widget`, one per standalone widget
+//! (`[widget.<name>]`) placed in the pins file (`@name`), and one per
+//! `[plugin.<name>]` table (kept only if the plugin has launcher
+//! capabilities). A plugin name is looked up as `plugins/<name>.lua`
+//! next to the config file, then among the bundled plugins (`BUNDLED`);
+//! `[plugin.<name>] path` overrides that. A placement's options are its
+//! plugin table's, with its own over them.
 //!
 //! `Widgets` is the dock's side of the runtime: what each instance
 //! provides (the registry), its open requests, and what the widgets show
-//! now: an app widget's `label()` replaces the app's name, its
-//! `icon(tile)` tree the app's icon, and its span lengthens its tile.
+//! now, by the key of their item (an app's ID, or a standalone widget's
+//! `dock::widget_key`): a widget's `label()` replaces the item's name, its
+//! `icon(tile)` tree the item's icon, and its span lengthens its tile.
 //! Labels and icons are asked for once the plugin loads and whenever it
 //! calls `redraw()` (icons also when the tile changes); an answer after
 //! its deadline is dropped, and a plugin that fails gives the app its
-//! own name, icon and span back.
+//! own name, icon and span back (a standalone widget shows a placeholder).
 //!
 //! The tile `icon(tile)` gets is the first dock's, magnified, at the
 //! largest scale of any dock: the tree is laid out again for each dock's
@@ -34,6 +36,7 @@ use wl_shell_lua::{
 };
 
 use crate::config::{Config, plugin_name_ok};
+use crate::dock;
 
 /// Plugins built into the dock, by name.
 pub const BUNDLED: &[(&str, &str)] = &[("clock", include_str!("../plugins/clock.lua"))];
@@ -48,9 +51,27 @@ pub fn app_instance(app_id: &str) -> String {
     format!("app:{app_id}")
 }
 
-/// The app an instance is the widget of.
-pub fn instance_app(instance: &str) -> Option<&str> {
-    instance.strip_prefix("app:")
+/// The instance of the standalone widget `name`.
+fn widget_instance(name: &str) -> String {
+    format!("widget:{name}")
+}
+
+/// The key of the item an instance is the widget of: its app's ID, or
+/// the standalone widget's key. None for a plugin table's.
+pub fn instance_key(instance: &str) -> Option<String> {
+    match instance.split_once(':')? {
+        ("app", app) => Some(app.to_string()),
+        ("widget", name) => Some(dock::widget_key(name)),
+        _ => None,
+    }
+}
+
+/// The instance behind the item with key `key`.
+pub fn key_instance(key: &str) -> String {
+    match dock::widget_name(key) {
+        Some(name) => widget_instance(name),
+        None => app_instance(key),
+    }
 }
 
 fn plugin_instance(name: &str) -> String {
@@ -115,9 +136,26 @@ pub fn watched(config: &Config, dir: Option<&Path>) -> Vec<PathBuf> {
 /// The plugins the config names.
 fn names(config: &Config) -> impl Iterator<Item = &str> {
     let placed = (config.app.values()).filter_map(|a| Some(a.widget.as_ref()?.plugin.as_str()));
+    let standalone = (config.widget.iter()).map(|(name, w)| w.plugin_for(name));
     (config.plugin.keys().map(String::as_str))
         .chain(placed)
+        .chain(standalone)
         .filter(|n| plugin_name_ok(n))
+}
+
+/// Whether the standalone widget `name` is shown when it is pinned: it
+/// has a table, and widgets are on.
+pub fn standalone(config: &Config, name: &str) -> bool {
+    config.widgets.enabled && plugin_name_ok(name) && config.widget.contains_key(name)
+}
+
+/// `[plugin.<name>]`'s options for plugin `plugin`, with `own` over them.
+fn merged(config: &Config, plugin: &str, own: &toml::Table) -> serde_json::Value {
+    let mut options = (config.plugin.get(plugin))
+        .map(|p| p.options.clone())
+        .unwrap_or_default();
+    options.extend(own.clone());
+    json(&options)
 }
 
 /// `t` as JSON, for `setup(opts)`.
@@ -125,8 +163,9 @@ fn json(t: &toml::Table) -> serde_json::Value {
     serde_json::to_value(t).unwrap_or_else(|_| serde_json::Value::Object(Default::default()))
 }
 
-/// The instances the config asks for; plugins in `dir`.
-pub fn specs(config: &Config, dir: Option<&Path>) -> Vec<InstanceSpec> {
+/// The instances the config asks for, with the standalone widgets
+/// `placed` (their names, as pinned); plugins in `dir`.
+pub fn specs(config: &Config, dir: Option<&Path>, placed: &[String]) -> Vec<InstanceSpec> {
     if !config.widgets.enabled {
         return Vec::new();
     }
@@ -145,6 +184,7 @@ pub fn specs(config: &Config, dir: Option<&Path>) -> Vec<InstanceSpec> {
             plugin: name.clone(),
             source,
             role: Role::Plugin,
+            app: None,
             options: json(&plugin.options),
             budget,
         });
@@ -155,16 +195,37 @@ pub fn specs(config: &Config, dir: Option<&Path>) -> Vec<InstanceSpec> {
             warn!("[app.{app_id}]: no plugin {:?}", widget.plugin);
             continue;
         };
-        let mut options = (config.plugin.get(&widget.plugin))
-            .map(|p| p.options.clone())
-            .unwrap_or_default();
-        options.extend(widget.options.clone());
         specs.push(InstanceSpec {
             id: app_instance(app_id),
             plugin: widget.plugin.clone(),
             source,
             role: Role::Widget,
-            options: json(&options),
+            app: Some(app_id.clone()),
+            options: merged(config, &widget.plugin, &widget.options),
+            budget,
+        });
+    }
+    for name in placed {
+        let Some(widget) = config.widget.get(name) else {
+            warn!("@{name} is pinned, but there is no [widget.{name}]: not shown");
+            continue;
+        };
+        if !plugin_name_ok(name) {
+            warn!("[widget.{name}]: bad widget name (letters, digits, - and _)");
+            continue;
+        }
+        let plugin = widget.plugin_for(name);
+        let Some(source) = source(config, dir, plugin) else {
+            warn!("[widget.{name}]: no plugin {plugin:?}");
+            continue;
+        };
+        specs.push(InstanceSpec {
+            id: widget_instance(name),
+            plugin: plugin.to_string(),
+            source,
+            role: Role::Widget,
+            app: None,
+            options: merged(config, plugin, &widget.options),
             budget,
         });
     }
@@ -213,12 +274,13 @@ pub struct Widgets {
     runtime: Option<Runtime>,
     registry: Registry,
     pending: Pending,
+    /// The item whose popup is open (or opening), by key.
     open: Option<String>,
-    /// The widgets' labels, by app ID.
+    /// The widgets' labels, by their items' keys.
     labels: BTreeMap<String, String>,
-    /// Their icons, by app ID.
+    /// Their icons, by their items' keys.
     icons: BTreeMap<String, WidgetIcon>,
-    /// Their spans, by app ID (the ones that aren't 1).
+    /// Their spans, by their items' keys (the ones that aren't 1).
     spans: BTreeMap<String, Span>,
     versions: u64,
     /// The tile icons are drawn for; None until there is a dock.
@@ -236,7 +298,8 @@ impl Widgets {
         Ok(())
     }
 
-    /// Run `specs`; true if labels went (their widgets did).
+    /// Run `specs`; true if labels, icons or spans went (their widgets
+    /// did).
     pub fn configure(&mut self, specs: Vec<InstanceSpec>) -> bool {
         let Some(runtime) = &self.runtime else {
             return false;
@@ -247,9 +310,9 @@ impl Widgets {
         self.registry.retain(kept);
         self.pending.retain(kept);
         let before = (self.labels.len(), self.icons.len(), self.spans.len());
-        self.labels.retain(|app, _| kept(&app_instance(app)));
-        self.icons.retain(|app, _| kept(&app_instance(app)));
-        self.spans.retain(|app, _| kept(&app_instance(app)));
+        self.labels.retain(|key, _| kept(&key_instance(key)));
+        self.icons.retain(|key, _| kept(&key_instance(key)));
+        self.spans.retain(|key, _| kept(&key_instance(key)));
         before != (self.labels.len(), self.icons.len(), self.spans.len())
     }
 
@@ -260,19 +323,19 @@ impl Widgets {
         }
     }
 
-    /// The widgets' labels, by app ID.
+    /// The widgets' labels, by their items' keys.
     pub fn labels(&self) -> &BTreeMap<String, String> {
         &self.labels
     }
 
-    /// The widgets' icons, by app ID.
+    /// The widgets' icons, by their items' keys.
     pub fn icons(&self) -> &BTreeMap<String, WidgetIcon> {
         &self.icons
     }
 
-    /// The span of `app`'s tile on a dock along `axis`.
-    pub fn span(&self, app: &str, axis: Axis) -> f32 {
-        self.spans.get(app).map_or(1.0, |s| match axis {
+    /// The span of the tile of the item `key` on a dock along `axis`.
+    pub fn span(&self, key: &str, axis: Axis) -> f32 {
+        self.spans.get(key).map_or(1.0, |s| match axis {
             Axis::Horizontal => s.horizontal,
             Axis::Vertical => s.vertical,
         })
@@ -296,10 +359,10 @@ impl Widgets {
     /// Ask `instance` for its icon, if it has one and there is a tile.
     fn ask_icon(&mut self, instance: &str) {
         let wants = self.registry.widget(instance).is_some_and(|w| w.icon);
-        let (Some(app), Some(base), true) = (instance_app(instance), self.tile, wants) else {
+        let (Some(key), Some(base), true) = (instance_key(instance), self.tile, wants) else {
             return;
         };
-        let span = self.span(app, base.axis) as f64;
+        let span = self.span(&key, base.axis) as f64;
         let (w, h) = match base.axis {
             Axis::Horizontal => (base.size * span, base.size),
             Axis::Vertical => (base.size, base.size * span),
@@ -318,34 +381,33 @@ impl Widgets {
         }
     }
 
-    /// Set (or with None, drop) the icon of `instance`'s app; true if it
+    /// Set (or with None, drop) the icon of `instance`'s item; true if it
     /// changed.
     fn set_icon(&mut self, instance: &str, tree: Option<Arc<Node>>) -> bool {
-        let Some(app) = instance_app(instance) else {
+        let Some(key) = instance_key(instance) else {
             return false;
         };
         match tree {
-            Some(t) if self.icons.get(app).is_some_and(|i| i.tree == t) => false,
+            Some(t) if self.icons.get(&key).is_some_and(|i| i.tree == t) => false,
             Some(tree) => {
                 self.versions += 1;
                 let version = self.versions;
-                self.icons
-                    .insert(app.to_string(), WidgetIcon { version, tree });
+                self.icons.insert(key, WidgetIcon { version, tree });
                 true
             }
-            None => self.icons.remove(app).is_some(),
+            None => self.icons.remove(&key).is_some(),
         }
     }
 
-    /// Set the span of `instance`'s app; true if it changed.
+    /// Set the span of `instance`'s item; true if it changed.
     fn set_span(&mut self, instance: &str, span: Option<Span>) -> bool {
-        let Some(app) = instance_app(instance) else {
+        let Some(key) = instance_key(instance) else {
             return false;
         };
         let span = span.filter(|s| (s.horizontal, s.vertical) != (1.0, 1.0));
         let old = match span {
-            Some(s) => self.spans.insert(app.to_string(), s),
-            None => self.spans.remove(app),
+            Some(s) => self.spans.insert(key, s),
+            None => self.spans.remove(&key),
         };
         old != span
     }
@@ -353,39 +415,46 @@ impl Widgets {
     /// Ask `instance` for its label, if it has one.
     fn ask_label(&mut self, instance: &str) {
         let wants = self.registry.widget(instance).is_some_and(|w| w.label);
-        if let (true, Some(runtime)) = (wants && instance_app(instance).is_some(), &self.runtime)
+        if let (true, Some(runtime)) = (wants && instance_key(instance).is_some(), &self.runtime)
             && let Some(ticket) = runtime.request(instance, RequestKind::Label, LABEL_TIMEOUT)
         {
             self.pending.insert(instance, ticket);
         }
     }
 
-    pub fn supports_popup(&self, app: &str) -> bool {
-        self.registry
-            .widget(&app_instance(app))
-            .is_some_and(|w| w.popup)
+    /// Whether the widget behind the item `key` has a popup.
+    pub fn supports_popup(&self, key: &str) -> bool {
+        (self.registry.widget(&key_instance(key))).is_some_and(|w| w.popup)
     }
 
-    pub fn notify(&self, app: &str, kind: RequestKind) {
+    /// Whether the widget behind the item `key` takes its clicks
+    /// (`on_click`), so a click doesn't toggle its popup.
+    pub fn takes_clicks(&self, key: &str) -> bool {
+        (self.registry.widget(&key_instance(key))).is_some_and(|w| w.on_click)
+    }
+
+    /// Tell the widget behind the item `key` about `kind`.
+    pub fn notify(&self, key: &str, kind: RequestKind) {
         if let Some(rt) = &self.runtime {
-            rt.request(&app_instance(app), kind, ICON_TIMEOUT);
+            rt.request(&key_instance(key), kind, ICON_TIMEOUT);
         }
     }
 
-    pub fn select_popup(&mut self, app: Option<&str>) {
+    /// The popup of the item `key` opens (None: the open one closes).
+    pub fn select_popup(&mut self, key: Option<&str>) {
         if let Some(old) = self.open.take() {
             self.notify(&old, RequestKind::Visibility(false));
         }
-        self.open = app.map(str::to_owned);
-        if let Some(app) = app {
-            self.notify(app, RequestKind::Visibility(true));
-            self.ask_popup(&app_instance(app));
+        self.open = key.map(str::to_owned);
+        if let Some(key) = key {
+            self.notify(key, RequestKind::Visibility(true));
+            self.ask_popup(&key_instance(key));
         }
     }
 
     fn ask_popup(&mut self, instance: &str) {
-        if instance_app(instance) == self.open.as_deref()
-            && self.open.is_some()
+        if self.open.is_some()
+            && instance_key(instance) == self.open
             && let Some(rt) = &self.runtime
             && let Some(ticket) = rt.request(instance, RequestKind::Popup, ICON_TIMEOUT)
         {
@@ -393,19 +462,19 @@ impl Widgets {
         }
     }
 
-    /// Set (or with None, drop) the label of `instance`'s app; true if
+    /// Set (or with None, drop) the label of `instance`'s item; true if
     /// it changed.
     fn set_label(&mut self, instance: &str, label: Option<String>) -> bool {
-        let Some(app) = instance_app(instance) else {
+        let Some(key) = instance_key(instance) else {
             return false;
         };
         match label {
-            Some(l) if self.labels.get(app) != Some(&l) => {
-                self.labels.insert(app.to_string(), l);
+            Some(l) if self.labels.get(&key) != Some(&l) => {
+                self.labels.insert(key, l);
                 true
             }
             Some(_) => false,
-            None => self.labels.remove(app).is_some(),
+            None => self.labels.remove(&key).is_some(),
         }
     }
 
@@ -426,8 +495,8 @@ impl Widgets {
             }
             Event::Failed { instance, .. } => {
                 self.registry.remove(&instance);
-                if let Some(app) = instance_app(&instance) {
-                    fx.popup = Some((app.into(), None));
+                if let Some(key) = instance_key(&instance) {
+                    fx.popup = Some((key, None));
                 }
                 fx.labels = self.set_label(&instance, None);
                 fx.icons = self.set_icon(&instance, None);
@@ -454,7 +523,7 @@ impl Widgets {
                 match (answer.result, topic) {
                     (Ok(Reply::Label(label)), _) => fx.labels = self.set_label(instance, label),
                     (Ok(Reply::Icon(tree)), _) => fx.icons = self.set_icon(instance, tree),
-                    (result, Topic::Popup) if instance_app(instance) == self.open.as_deref() => {
+                    (result, Topic::Popup) if instance_key(instance) == self.open => {
                         if let Some(app) = &self.open {
                             fx.popup = Some((
                                 app.clone(),
@@ -504,7 +573,7 @@ mod tests {
             "#,
         );
         let dir = Path::new("/nonexistent/plugins");
-        let specs = specs(&c, Some(dir));
+        let specs = specs(&c, Some(dir), &[]);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["plugin:clock", "app:firefox", "app:foot"]);
         // The bundled clock, since there is no file.
@@ -519,7 +588,59 @@ mod tests {
         assert_eq!(watched(&c, Some(dir)), [dir.join("clock.lua")]);
         // Off: nothing runs.
         let off = parse("[widgets]\nenabled = false\n[app.foot]\nwidget = \"clock\"");
-        assert!(super::specs(&off, Some(dir)).is_empty());
+        assert!(super::specs(&off, Some(dir), &[]).is_empty());
+    }
+
+    #[test]
+    fn standalone_widgets_run_while_placed() {
+        let c = parse(
+            r#"
+            [plugin.clock]
+            format = "%H"
+
+            [widget.clock]
+            name = "Clock"
+            popup-delay = 600
+            format = "%M"
+
+            [widget.utc]
+            plugin = "clock"
+            zone = "UTC"
+            "#,
+        );
+        let dir = Path::new("/nonexistent/plugins");
+        assert_eq!(c.widget["clock"].name.as_deref(), Some("Clock"));
+        assert_eq!(c.widget["clock"].popup_delay, Some(600));
+        assert_eq!(c.widget["utc"].plugin_for("utc"), "clock");
+        // Only the placed ones, and only those with a table.
+        let placed = ["utc".to_string(), "gone".to_string(), "clock".to_string()];
+        let specs = specs(&c, Some(dir), &placed);
+        let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["plugin:clock", "widget:utc", "widget:clock"]);
+        assert_eq!(
+            (specs[1].role, specs[1].app.as_deref()),
+            (Role::Widget, None)
+        );
+        assert_eq!(specs[1].plugin, "clock");
+        assert_eq!(specs[1].options["format"], "%H");
+        assert_eq!(specs[1].options["zone"], "UTC");
+        // Its own keys but `plugin`, `name` and `popup-delay` are options.
+        assert_eq!(specs[2].options["format"], "%M");
+        assert!(specs[2].options.get("name").is_none());
+        assert!(specs[2].options.get("popup-delay").is_none());
+        assert!(standalone(&c, "clock") && !standalone(&c, "gone"));
+        // Instances and items' keys.
+        let key = dock::widget_key("utc");
+        assert_eq!(key_instance(&key), "widget:utc");
+        assert_eq!(instance_key("widget:utc"), Some(key));
+        assert_eq!(instance_key("app:a:b").as_deref(), Some("a:b"));
+        assert_eq!(key_instance("a:b"), "app:a:b");
+        assert_eq!(instance_key("plugin:clock"), None);
+        // Bad tables are config errors.
+        let err = |s: &str| <Config as ConfigFile>::parse(s).unwrap_err();
+        assert!(err("[widget.a]\nplugin = 1").contains("plugin"));
+        assert!(err("[widget.a]\nplugin = '../x'").contains("bad plugin name"));
+        assert!(err("[widget.a]\npopup-delay = 'x'").contains("popup-delay"));
     }
 
     #[test]
@@ -586,7 +707,7 @@ mod tests {
         let c = parse(&format!(
             "[plugin.kitchen-sink]\npath = '{path}'\n[app.demo]\nwidget = 'kitchen-sink'"
         ));
-        let specs = specs(&c, None);
+        let specs = specs(&c, None, &[]);
         w.configure(specs);
         let end = Instant::now() + Duration::from_secs(5);
         while !w.supports_popup("demo") {
@@ -630,7 +751,7 @@ mod tests {
         })
         .unwrap();
         let c = parse("[app.foot]\nwidget = { plugin = 'clock', format = 'at %Y' }");
-        w.configure(specs(&c, None));
+        w.configure(specs(&c, None, &[]));
         let year = std::process::Command::new("date")
             .arg("+%Y")
             .output()
@@ -641,6 +762,45 @@ mod tests {
             let e = recv.recv_timeout(end - Instant::now()).expect("no label");
             w.event(e);
         }
+    }
+
+    /// The bundled clock standalone: its face, its label and its popup,
+    /// by its item's key; on an app, neither face nor popup.
+    #[test]
+    fn the_bundled_clock_stands_alone() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        w.set_tile(Some(TileBase {
+            size: 48.0,
+            axis: Axis::Horizontal,
+            scale: 1,
+        }));
+        let c = parse("[widget.clock]\n[app.foot]\nwidget = 'clock'");
+        w.configure(specs(&c, None, &["clock".to_string()]));
+        let key = dock::widget_key("clock");
+        let end = Instant::now() + Duration::from_secs(5);
+        while !(w.icons().contains_key(&key) && w.labels().contains_key(&key)) {
+            w.event(recv.recv_timeout(end - Instant::now()).expect("no icon"));
+        }
+        assert!(w.supports_popup(&key) && !w.takes_clicks(&key));
+        // Its popup comes with a tree; the app's with none.
+        for (item, some) in [(key.as_str(), true), ("foot", false)] {
+            w.select_popup(Some(item));
+            let tree = loop {
+                let e = recv.recv_timeout(end - Instant::now()).expect("no popup");
+                if let Some((k, tree)) = w.event(e).popup {
+                    assert_eq!(k, item);
+                    break tree;
+                }
+            };
+            assert_eq!(tree.is_some(), some, "{item:?}");
+        }
+        assert!(!w.icons().contains_key("foot"));
     }
 
     #[test]
@@ -766,7 +926,7 @@ mod tests {
             scale: 2,
         }));
         let c = parse("[app.foot]\nwidget = { plugin = 'clock', face = true }");
-        w.configure(specs(&c, None));
+        w.configure(specs(&c, None, &[]));
         let end = Instant::now() + Duration::from_secs(5);
         while !w.icons().contains_key("foot") {
             let e = recv.recv_timeout(end - Instant::now()).expect("no icon");

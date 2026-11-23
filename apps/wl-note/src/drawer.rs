@@ -830,7 +830,10 @@ mod tests {
         for filter in ["all apps", "global"] {
             let mut d = Drawer::new(
                 Kind::Hidden,
-                vec![Entry::of("g.md".into(), "g", &global, 0, true, false), e.clone()],
+                vec![
+                    Entry::of("g.md".into(), "g", &global, 0, true, false),
+                    e.clone(),
+                ],
             );
             d.set_filter(filter);
             assert_eq!(keys(&d), ["g.md"], "{filter}");

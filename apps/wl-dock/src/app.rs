@@ -96,12 +96,18 @@
 //! once the surface is gone, so the window gets the keyboard.
 //!
 //! Widgets (widgets.rs): Lua plugins run on wl-shell-lua's thread pool,
-//! configured from the `widget` keys and `[plugin.<name>]` tables and
-//! restarted when their files change (watched like the config). Their
-//! events come through a channel into the loop; an app widget's label
-//! replaces the app's name in every dock, its icon tree (painted by the
-//! worker, per dock) the app's icon, and its span lengthens the app's
-//! item.
+//! configured from the `widget` keys, the `[widget.<name>]` tables
+//! pinned as `@name`, and the `[plugin.<name>]` tables, and restarted
+//! when their files change (watched like the config). Their events come
+//! through a channel into the loop; a widget's label replaces its item's
+//! name in every dock, its icon tree (painted by the worker, per dock)
+//! the item's icon, and its span lengthens the item.
+//!
+//! Standalone widgets are items of their own, among the pinned apps or
+//! among the folders: dragged anywhere from the first app to just before
+//! the Trash, removed (on the Trash, or with their menu's Remove from
+//! Dock) but never unpinned. Clicking one calls its `on_click`, or else
+//! opens or closes its popup.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -160,7 +166,7 @@ use crate::launcherview::{
     Detail, FileMatch, FilesStatus, LauncherInput, LauncherStyle, LauncherView, Match,
 };
 use crate::menu::{self, Action, MenuKey};
-use crate::pins::{self, Pin};
+use crate::pins::{self, Pin, Zone};
 use crate::search::Search;
 use crate::strip::{self, Key};
 use crate::trash;
@@ -537,6 +543,12 @@ pub struct WlDock {
     /// Counts changes of `widget_target`: a timer to open a popup only
     /// opens it if there was none since.
     widget_epoch: u64,
+    /// The item whose widget's popup was open when the button went down
+    /// on the dock: clicking it closes the popup for good.
+    widget_was_open: Option<String>,
+    /// The standalone widgets pinned when the plugins were last
+    /// configured (they run while they are pinned).
+    widget_pins: Vec<String>,
     /// Counts pointer motion on the dock and the popup: a timer to close
     /// the popup only closes it if there was none since.
     widget_grace: u64,
@@ -628,6 +640,8 @@ impl WlDock {
             widgets: Widgets::default(),
             widget_target: None,
             widget_epoch: 0,
+            widget_was_open: None,
+            widget_pins: Vec::new(),
             widget_grace: 0,
             plugin_watches: Vec::new(),
         })
@@ -763,14 +777,15 @@ impl WlDock {
         self.configure_widgets(core);
     }
 
-    /// Run the plugins the config asks for, and watch their files.
+    /// Run the plugins the config asks for (and the standalone widgets
+    /// pinned), and watch their files.
     fn configure_widgets(&mut self, core: &Core<Self>) {
         let dir = widgets::plugin_dir(self.reloader.path().as_deref());
-        if self
-            .widgets
-            .configure(widgets::specs(&self.config, dir.as_deref()))
-        {
+        self.widget_pins = pins::widgets(&self.pins);
+        let specs = widgets::specs(&self.config, dir.as_deref(), &self.widget_pins);
+        if self.widgets.configure(specs) {
             self.show_widget_names();
+            self.show_widget_icons();
         }
         let paths = match self.config.widgets.enabled {
             true => widgets::watched(&self.config, dir.as_deref()),
@@ -2972,19 +2987,35 @@ impl WlDock {
         }
         self.end_launches(core, &toplevels);
 
-        let pins = pins::apps(&self.pins);
+        // The standalone widgets pinned run while they are.
+        if pins::widgets(&self.pins) != self.widget_pins {
+            self.configure_widgets(core);
+        }
+        // The pinned apps, with the standalone widgets among them; then
+        // the folders and the widgets among those. Paths that are files
+        // aren't shown: only folders are pinned.
+        let shown = |name: &str| widgets::standalone(&self.config, name);
+        let mut pins: Vec<String> = Vec::new();
+        let mut tail: Vec<dock::Tail> = Vec::new();
+        for pin in &self.pins {
+            match pin {
+                Pin::App(app) => pins.push(app.clone()),
+                Pin::Widget(name, Zone::Apps) if shown(name) => pins.push(dock::widget_key(name)),
+                Pin::Widget(name, Zone::Folders) if shown(name) => {
+                    tail.push(dock::Tail::Widget(name.clone()))
+                }
+                Pin::Widget(..) => {}
+                Pin::Path(p) => match std::fs::metadata(pins::expand(p)) {
+                    Ok(m) if !m.is_dir() => {}
+                    Ok(_) => tail.push(dock::Tail::Folder(p.clone(), true)),
+                    Err(_) => tail.push(dock::Tail::Folder(p.clone(), false)),
+                },
+            }
+        }
         let focused = (self.config.active_indicator && core.focus_stream.running())
             .then(|| core.mru.first())
             .flatten();
         let streaming = self.output_stream.running();
-        // Paths that are files aren't shown: only folders are pinned.
-        let folders: Vec<(String, bool)> = (pins::paths(&self.pins).into_iter())
-            .filter_map(|p| match std::fs::metadata(pins::expand(&p)) {
-                Ok(m) if !m.is_dir() => None,
-                Ok(_) => Some((p, true)),
-                Err(_) => Some((p, false)),
-            })
-            .collect();
         let trash = self.config.trash.enabled.then_some(self.trash_full);
         for dock in &mut self.docks {
             // The stream names connectors: an output without one can't be
@@ -2996,12 +3027,12 @@ impl WlDock {
             let mut items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
                 self.placement.place(id, connector, by_output)
             });
+            dock::add_tail(&mut items, &tail, trash);
             // Widgets' tiles may be longer along the dock.
             let axis = dock.tile_base().axis;
-            for item in items.iter_mut().filter(|i| i.is_app()) {
+            for item in items.iter_mut().filter(|i| i.is_app() || i.is_widget()) {
                 item.span = dock::Span::of(self.widgets.span(&item.app_id, axis));
             }
-            dock::add_tail(&mut items, &folders, trash);
             dock.set_items(core, &items);
         }
         // What takes a drag from outside may have changed.
@@ -3110,6 +3141,12 @@ impl WlDock {
                 self.middle_click(core, &item);
                 self.release_keyboard(output);
             }
+            BTN_MIDDLE if item.is_widget() && self.widgets.takes_clicks(&item.app_id) => {
+                self.close_strips(core);
+                let kind = wl_shell_lua::RequestKind::Click("middle".into());
+                self.widgets.notify(&item.app_id, kind);
+                self.release_keyboard(output);
+            }
             BTN_RIGHT if !menu_was => self.open_menu(core, pressed),
             _ => self.release_keyboard(output),
         }
@@ -3209,9 +3246,27 @@ impl WlDock {
             Click::OpenFolder => {
                 return self.list_folder(item, output, Some(pressed.serial), None);
             }
+            Click::Widget => self.click_widget(output, item),
             Click::Nothing => {}
         }
         self.release_keyboard(output);
+    }
+
+    /// A left click on the standalone widget `item` on `output`: its
+    /// `on_click("left")`, else its popup opens, or stays closed if it
+    /// was open (the press closed it). Either way, hovering it doesn't
+    /// open the popup again until the pointer moves to another item.
+    fn click_widget(&mut self, output: &WlOutput, item: &Item) {
+        let key = &item.app_id;
+        let was_open = self.widget_was_open.take().as_ref() == Some(key);
+        self.widget_epoch = self.widget_epoch.wrapping_add(1);
+        self.widget_target = Some((output.clone(), key.clone()));
+        if self.widgets.takes_clicks(key) {
+            let kind = wl_shell_lua::RequestKind::Click("left".into());
+            self.widgets.notify(key, kind);
+        } else if !was_open && self.widgets.supports_popup(key) {
+            self.widgets.select_popup(Some(key));
+        }
     }
 
     /// Close every dock's strip.
@@ -3269,13 +3324,13 @@ impl WlDock {
         let handover = self.docks.iter().any(DockView::widget_open);
         self.hide_widget(core);
         let Some((output, app)) = target else { return };
+        let own = match dock::widget_name(&app) {
+            Some(name) => self.config.widget.get(name).and_then(|w| w.popup_delay),
+            None => self.config.app(&app).and_then(|a| a.popup_delay),
+        };
         let delay = match handover {
             true => 0,
-            false => self
-                .config
-                .app(&app)
-                .and_then(|a| a.popup_delay)
-                .unwrap_or(self.config.widgets.popup_delay),
+            false => own.unwrap_or(self.config.widgets.popup_delay),
         };
         self.widget_target = Some((output.clone(), app.clone()));
         let epoch = self.widget_epoch;
@@ -3315,9 +3370,9 @@ impl WlDock {
     /// pins as the drop says, and show them at once.
     fn drop_icon(&mut self, core: &Core<Self>, output: &WlOutput) {
         let dropped = self.dock_mut(output).and_then(DockView::end_drag);
-        if let Some((key, drop)) = dropped {
+        if let Some((key, drop, zone)) = dropped {
             let mut pins = self.pins.clone();
-            if drag::apply(&mut pins, Self::pin_of(&key), drop) {
+            if drag::apply(&mut pins, Self::pin_of(&key, zone), drop) {
                 self.pins = pins;
                 self.save_pins();
                 self.rebuild(core, None);
@@ -3326,8 +3381,12 @@ impl WlDock {
         self.release_keyboard(output);
     }
 
-    /// The pin of the item with key `key`: a folder's path, or an app.
-    fn pin_of(key: &str) -> Pin {
+    /// The pin of the item with key `key`: a folder's path, a standalone
+    /// widget (in `zone`), or an app.
+    fn pin_of(key: &str, zone: Zone) -> Pin {
+        if let Some(name) = dock::widget_name(key) {
+            return Pin::Widget(name.to_string(), zone);
+        }
         match dock::folder_pin(key) {
             Some(path) => Pin::Path(path.to_string()),
             None => Pin::App(key.to_string()),
@@ -3515,6 +3574,7 @@ impl WlDock {
         self.pending_menu = None;
         let groups = match item.kind {
             Kind::App => self.menu_groups(core, &item),
+            Kind::Widget { .. } => menu::widget(),
             Kind::Trash { full } => menu::trash(full),
             Kind::Folder { exists } => {
                 let pin = item.folder().unwrap_or_default();
@@ -3581,7 +3641,7 @@ impl WlDock {
     /// Keep the item `key` (an app or a folder) in the dock, or not, and
     /// write the pins file.
     fn set_pinned(&mut self, key: &str, pinned: bool) {
-        self.keep(Self::pin_of(key), pinned);
+        self.keep(Self::pin_of(key, Zone::Apps), pinned);
     }
 
     /// Keep `pin` in the dock, or not, and write the pins file.
@@ -4554,6 +4614,11 @@ impl Program for WlDock {
                 self.pressed = None;
             }
             PointerEventKind::Press { button, serial, .. } => {
+                // A click on a standalone widget whose popup this closes
+                // leaves it closed.
+                self.widget_was_open = (self.docks.iter())
+                    .find(|d| d.output == output)
+                    .and_then(|d| d.widget_item().map(str::to_string));
                 self.hide_widget(core);
                 self.button(core, &output, button, serial, (x, y), true);
             }

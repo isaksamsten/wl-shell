@@ -13,8 +13,10 @@
 //! `[app."<app-id>"]` tables (see `AppConfig`), and per-folder ones (how
 //! its popup lists it, its icon) in `[folder."<path>"]` tables (see
 //! `FolderConfig`). An app's `widget` puts a plugin behind it;
-//! `[plugin.<name>]` tables load plugins with their default options, and
-//! `[widgets]` holds what every widget shares (see widgets.rs).
+//! `[widget.<name>]` tables are standalone widgets (placed as `@name` in
+//! the pins file), `[plugin.<name>]` tables load plugins with their
+//! default options, and `[widgets]` holds what every widget shares (see
+//! widgets.rs).
 //!
 //! Colors live in `[appearance]`; `[appearance.dark]` and
 //! `[appearance.light]` override its keys in the desktop's dark or light
@@ -75,6 +77,8 @@ pub struct Config {
     pub plugin: BTreeMap<String, PluginConfig>,
     /// `[widgets]`: settings of every widget.
     pub widgets: WidgetsConfig,
+    /// `[widget.<name>]`: standalone widgets.
+    pub widget: BTreeMap<String, StandaloneConfig>,
 }
 
 impl Default for Config {
@@ -108,6 +112,7 @@ impl Default for Config {
             folder: BTreeMap::new(),
             plugin: BTreeMap::new(),
             widgets: WidgetsConfig::default(),
+            widget: BTreeMap::new(),
         }
     }
 }
@@ -590,6 +595,56 @@ pub struct PluginConfig {
     /// The rest: options for `setup(opts)`.
     #[serde(flatten)]
     pub options: toml::Table,
+}
+
+/// A `[widget.<name>]` table: a standalone widget. `plugin` (default:
+/// the table's name), `name` (its label and menu title; default: the
+/// table's name) and `popup-delay`; the rest are the plugin's options for
+/// it, over its `[plugin.<name>]` table's.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(try_from = "toml::Table")]
+pub struct StandaloneConfig {
+    pub plugin: Option<String>,
+    pub name: Option<String>,
+    /// Hover before the popup opens; default: `[widgets]`'s.
+    pub popup_delay: Option<u32>,
+    pub options: toml::Table,
+}
+
+impl TryFrom<toml::Table> for StandaloneConfig {
+    type Error = String;
+
+    fn try_from(mut t: toml::Table) -> Result<Self, String> {
+        let mut string = |key: &str| match t.remove(key) {
+            None => Ok(None),
+            Some(toml::Value::String(s)) => Ok(Some(s)),
+            Some(_) => Err(format!("{key}: expected a string")),
+        };
+        let plugin = string("plugin")?;
+        let name = string("name")?;
+        if let Some(p) = plugin.as_deref().filter(|p| !plugin_name_ok(p)) {
+            return Err(format!(
+                "plugin: bad plugin name {p:?} (letters, digits, - and _)"
+            ));
+        }
+        let popup_delay = match t.remove("popup-delay") {
+            None => None,
+            Some(v) => Some(de::duration(v).map_err(|e| format!("popup-delay: {e}"))?),
+        };
+        Ok(StandaloneConfig {
+            plugin,
+            name,
+            popup_delay,
+            options: t,
+        })
+    }
+}
+
+impl StandaloneConfig {
+    /// The plugin behind the widget `name` (this table's).
+    pub fn plugin_for<'a>(&'a self, name: &'a str) -> &'a str {
+        self.plugin.as_deref().unwrap_or(name)
+    }
 }
 
 /// `[widgets]`.

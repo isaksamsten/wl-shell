@@ -3,7 +3,9 @@
 //! output stream placed each window.
 //!
 //! - Pinned apps come first, in their pinned order, on every dock, whether
-//!   or not they're running.
+//!   or not they're running. Standalone widgets sit among them, or among
+//!   the folders, where they are pinned: they are no app, have no
+//!   windows, and only get removed from the dock, never unpinned.
 //! - Then the running apps that aren't pinned, in the order their first
 //!   window appeared (`Order`). An app keeps its place while it has
 //!   windows, so icons don't move around when windows close.
@@ -14,8 +16,8 @@
 //!   it's reported. Without a running stream, every dock shows every
 //!   window. Unpinned apps only show where they have windows.
 //! - Then the separator, the pinned folders (in their pinned order, on
-//!   every dock, faded if they don't exist), and the Trash. The separator
-//!   shows when anything follows it.
+//!   every dock, faded if they don't exist) and the widgets among them,
+//!   and the Trash. The separator shows when anything follows it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +36,11 @@ pub struct Window {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     App,
+    /// A standalone widget (`[widget.<name>]`), pinned as `@name`.
+    Widget {
+        /// Among the folders, after the separator (else among the apps).
+        tail: bool,
+    },
     /// The line between the apps and the folders and Trash.
     Separator,
     /// A pinned folder; `exists` if it is there (as a directory).
@@ -52,6 +59,18 @@ pub const SEPARATOR: &str = "\0separator";
 pub const TRASH: &str = "\0trash";
 /// What folders' keys start with; their pin follows.
 const FOLDER: &str = "\0folder\0";
+/// What standalone widgets' keys start with; their names follow.
+const WIDGET: &str = "\0widget\0";
+
+/// The key of the standalone widget `name`.
+pub fn widget_key(name: &str) -> String {
+    format!("{WIDGET}{name}")
+}
+
+/// The name of the standalone widget whose key is `key`, if it is one.
+pub fn widget_name(key: &str) -> Option<&str> {
+    key.strip_prefix(WIDGET)
+}
 
 /// The key of the folder pinned as `pin`.
 pub fn folder_key(pin: &str) -> String {
@@ -116,6 +135,8 @@ pub enum Click {
     OpenTrash,
     /// Open the folder's popup.
     OpenFolder,
+    /// A standalone widget's: its `on_click`, else its popup toggles.
+    Widget,
     Nothing,
 }
 
@@ -124,7 +145,7 @@ impl Item {
     fn other(kind: Kind) -> Self {
         let key = match kind {
             Kind::Separator => SEPARATOR,
-            Kind::Trash { .. } | Kind::App | Kind::Folder { .. } => TRASH,
+            Kind::Trash { .. } | Kind::App | Kind::Folder { .. } | Kind::Widget { .. } => TRASH,
         };
         Self::keyed(key.to_string(), kind)
     }
@@ -158,10 +179,20 @@ impl Item {
         folder_pin(&self.app_id).filter(|_| self.is_folder())
     }
 
+    pub fn is_widget(&self) -> bool {
+        matches!(self.kind, Kind::Widget { .. })
+    }
+
+    /// The standalone widget's name, if it is one.
+    #[cfg(test)]
+    pub fn widget(&self) -> Option<&str> {
+        widget_name(&self.app_id).filter(|_| self.is_widget())
+    }
+
     /// Whether it can be dragged to another place (or the Trash): apps
-    /// that can be pinned, and folders.
+    /// that can be pinned, widgets, and folders.
     pub fn draggable(&self) -> bool {
-        (self.is_app() && !self.app_id.is_empty()) || self.is_folder()
+        (self.is_app() && !self.app_id.is_empty()) || self.is_widget() || self.is_folder()
     }
 
     /// What a click does: activate the most recently focused of the
@@ -171,6 +202,7 @@ impl Item {
         match self.kind {
             Kind::App => {}
             Kind::Separator => return Click::Nothing,
+            Kind::Widget { .. } => return Click::Widget,
             Kind::Trash { .. } => return Click::OpenTrash,
             Kind::Folder { exists } => {
                 return if exists {
@@ -303,9 +335,10 @@ impl Placement {
     }
 }
 
-/// A dock's items. `pins` are app IDs in pinned order, `order` the running
-/// apps' order, `focused` the focused window's ID (None: don't mark the
-/// active app), and `place` says where each window is for this dock.
+/// A dock's items. `pins` are app IDs and standalone widgets' keys
+/// (`widget_key`) in pinned order, `order` the running apps' order,
+/// `focused` the focused window's ID (None: don't mark the active app),
+/// and `place` says where each window is for this dock.
 pub fn items(
     toplevels: &[Toplevel],
     pins: &[String],
@@ -341,8 +374,16 @@ pub fn items(
     };
     let mut out: Vec<Item> = Vec::new();
     for pin in pins {
-        if !out.iter().any(|i| i.app_id == *pin) {
-            out.push(item(pin, true));
+        if out.iter().any(|i| i.app_id == *pin) {
+            continue;
+        }
+        match widget_name(pin) {
+            Some(_) => {
+                let mut widget = Item::keyed(pin.clone(), Kind::Widget { tail: false });
+                widget.pinned = true;
+                out.push(widget);
+            }
+            None => out.push(item(pin, true)),
         }
     }
     for app_id in order.apps() {
@@ -357,18 +398,30 @@ pub fn items(
     out
 }
 
+/// A pinned item after the separator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tail {
+    /// A folder, by its pin, and whether it exists.
+    Folder(String, bool),
+    /// A standalone widget, by its name.
+    Widget(String),
+}
+
 /// After `items`: the separator if anything follows it, the pinned
-/// `folders` (each a pin and whether it exists), and the Trash if
-/// `trash` says whether it is full.
-pub fn add_tail(items: &mut Vec<Item>, folders: &[(String, bool)], trash: Option<bool>) {
-    if folders.is_empty() && trash.is_none() {
+/// items of the `tail` (folders and widgets), and the Trash if `trash`
+/// says whether it is full.
+pub fn add_tail(items: &mut Vec<Item>, tail: &[Tail], trash: Option<bool>) {
+    if tail.is_empty() && trash.is_none() {
         return;
     }
     items.push(Item::other(Kind::Separator));
-    for (pin, exists) in folders {
-        let key = folder_key(pin);
+    for t in tail {
+        let (key, kind) = match t {
+            Tail::Folder(pin, exists) => (folder_key(pin), Kind::Folder { exists: *exists }),
+            Tail::Widget(name) => (widget_key(name), Kind::Widget { tail: true }),
+        };
         if !items.iter().any(|i| i.app_id == key) {
-            let mut item = Item::keyed(key, Kind::Folder { exists: *exists });
+            let mut item = Item::keyed(key, kind);
             item.pinned = true;
             items.push(item);
         }
@@ -617,6 +670,48 @@ mod tests {
     }
 
     #[test]
+    fn widgets_among_the_pinned_apps() {
+        let clock = widget_key("clock");
+        let got = all(&[toplevel("1", "term")], &["files", &clock, "term"]);
+        let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();
+        assert_eq!(kinds, [Kind::App, Kind::Widget { tail: false }, Kind::App]);
+        let w = &got[1];
+        assert_eq!(w.widget(), Some("clock"));
+        assert!(w.pinned && w.draggable() && !w.is_app() && !w.running());
+        assert_eq!(w.click(&Mru::default()), Click::Widget);
+        // Its key is no app's, nor a folder's.
+        assert_eq!(widget_name(&w.app_id), Some("clock"));
+        assert!(folder_pin(&w.app_id).is_none() && got[0].widget().is_none());
+    }
+
+    #[test]
+    fn widgets_among_the_folders() {
+        let mut got = all(&[], &["files"]);
+        let tail = [
+            Tail::Folder("~/Downloads".into(), true),
+            Tail::Widget("clock".into()),
+        ];
+        add_tail(&mut got, &tail, Some(false));
+        let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Kind::App,
+                Kind::Separator,
+                Kind::Folder { exists: true },
+                Kind::Widget { tail: true },
+                Kind::Trash { full: false },
+            ]
+        );
+        assert_eq!(got[3].widget(), Some("clock"));
+        assert!(got[3].pinned && got[3].draggable());
+        // A widget alone after the separator shows it.
+        let mut alone = all(&[], &["files"]);
+        add_tail(&mut alone, &[Tail::Widget("clock".into())], None);
+        assert_eq!(alone[1].kind, Kind::Separator);
+    }
+
+    #[test]
     fn the_trash_comes_last() {
         let mut got = all(&[toplevel("1", "term")], &["files"]);
         add_tail(&mut got, &[], Some(true));
@@ -648,9 +743,9 @@ mod tests {
     fn folders_after_the_separator() {
         let mut got = all(&[toplevel("1", "term")], &[]);
         let folders = [
-            ("~/Downloads".to_string(), true),
-            ("/gone".to_string(), false),
-            ("~/Downloads".to_string(), true),
+            Tail::Folder("~/Downloads".into(), true),
+            Tail::Folder("/gone".into(), false),
+            Tail::Folder("~/Downloads".into(), true),
         ];
         add_tail(&mut got, &folders, None);
         let kinds: Vec<Kind> = got.iter().map(|i| i.kind).collect();

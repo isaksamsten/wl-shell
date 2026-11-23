@@ -23,10 +23,12 @@
 //!   `redraw()`, `invalidate()`, `timer(ms, fn)`, `every(ms, fn)`,
 //!   `spawn(argv, {on_line, on_exit})`, `run(argv)`, `json.decode`,
 //!   `json.encode`, `read(path)`, `clipboard(text)` and `span(n)` (see
-//!   `host.rs`), the `ui` constructors and the `theme`'s color names
-//!   (see [`ui`]).
+//!   `host.rs`), `app` (the app a widget backs, nil for a standalone
+//!   one), the `ui` constructors and the `theme`'s color names (see
+//!   [`ui`]).
 //! - Widgets answer `label()` and `icon(tile)`: an icon is a [`ui::Node`]
-//!   tree, built from what the hook returned on the plugin's thread.
+//!   tree, built from what the hook returned on the plugin's thread. A
+//!   standalone widget's item also hears its clicks (`on_click(button)`).
 
 mod caps;
 pub mod channel;

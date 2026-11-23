@@ -326,7 +326,10 @@ impl WidgetView {
             return;
         }
         let request = ui::Request {
-            app: Some(self.app.clone()),
+            // A standalone widget has no app of its own.
+            app: crate::dock::widget_name(&self.app)
+                .is_none()
+                .then(|| self.app.clone()),
             state: self.state_now(),
             radius: self.style.metrics.radius as f32,
             apart: true,

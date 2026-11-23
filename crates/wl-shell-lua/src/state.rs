@@ -187,6 +187,10 @@ impl State {
         });
         lua.set_app_data(host.clone());
         host::install(&lua, settings.namespace).map_err(LoadError::fixed)?;
+        // The app the widget backs, nil for a standalone one.
+        (lua.globals().get::<Table>(settings.namespace))
+            .and_then(|ns| ns.set("app", spec.app.clone()))
+            .map_err(LoadError::fixed)?;
 
         budget.reset(&lua).map_err(LoadError::fixed)?;
         let chunk = (lua.load(code))
@@ -344,6 +348,14 @@ impl State {
             return Outcome::Ok(());
         };
         self.enter(name, || f.call::<()>(()))
+    }
+
+    /// A standalone widget's item was clicked: `on_click(button)`.
+    pub fn click(&self, button: &str) -> Outcome<()> {
+        let Some(f) = self.hook("on_click") else {
+            return Outcome::Ok(());
+        };
+        self.enter("on_click", || f.call::<()>(button))
     }
 
     pub fn interaction(&self, key: &str, event: crate::channel::PopupEvent) -> Outcome<()> {

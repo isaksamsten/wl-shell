@@ -329,6 +329,10 @@ impl Slot {
                             let outcome = state.visibility(open);
                             self.settle(life, shared, outcome).map(|()| Reply::Done)
                         }
+                        RequestKind::Click(button) => {
+                            let outcome = state.click(&button);
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
                     },
                 };
                 shared.emit(Event::Answer(Answer {

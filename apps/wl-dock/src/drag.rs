@@ -1,17 +1,22 @@
 //! Dragging: icons within the dock, and files dropped on it from outside.
 //! Pure, unit tested; view.rs shows the drags and app.rs applies drops.
 //!
-//! Dragging an icon (an app or a folder):
+//! Dragging an icon (an app, a standalone widget or a folder):
 //!
 //! - Only pinned items have an order to change, apps among the apps and
 //!   folders among the folders. A pinned item moves the gap among the
-//!   other pinned items of its kind; past the last one, the gap stays at
+//!   other pinned items of its zone; past the last one, the gap stays at
 //!   their end.
+//! - A widget goes anywhere: among the apps before the separator, among
+//!   the folders past its middle (`zone`), so up to just before the Trash.
+//!   In the other zone it has no place of its own: the gap is always open
+//!   there.
 //! - A running app that isn't pinned, dragged among the pinned apps, gets
 //!   pinned there. Past them (half an icon after the last), it is back
 //!   among the running apps, and dropping it there changes nothing.
-//! - On the Trash, a pinned item is unpinned. A running app that isn't
-//!   pinned has nothing to remove, so the Trash doesn't take it.
+//! - On the Trash, a pinned item is unpinned (a widget removed from the
+//!   dock). A running app that isn't pinned has nothing to remove, so the
+//!   Trash doesn't take it.
 //! - Off the dock, the item goes back to its place, and a drop there
 //!   changes nothing: dragging off the dock never unpins.
 //!
@@ -33,15 +38,27 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pins::{self, Pin};
+use crate::pins::{self, Pin, Zone};
 
-/// The item being dragged, among the pinned items of its kind.
+/// The item being dragged, among the pinned items of its zone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dragged {
-    /// The `i`th pinned app or folder (from 0).
+    /// The `i`th pinned app, folder or widget of its zone (from 0).
     Pinned(usize),
     /// A running app that isn't pinned.
     Running,
+    /// A widget from the other zone.
+    Across,
+}
+
+/// The zone a widget dragged with the pointer at `u` goes to, with the
+/// separator's center at `separator` (None: there is none, so no
+/// folders' zone to go to).
+pub fn zone(u: f64, separator: Option<f64>) -> Zone {
+    match separator {
+        Some(s) if u >= s => Zone::Folders,
+        _ => Zone::Apps,
+    }
 }
 
 /// Where a drop would put the dragged item.
@@ -88,15 +105,15 @@ pub fn target(dragged: Dragged, s: &Scene, u: f64) -> Target {
         return Target::Home;
     }
     if s.on_trash {
-        return match dragged {
-            Dragged::Pinned(_) => Target::Trash,
-            Dragged::Running => Target::Home,
+        return match trash_takes(dragged) {
+            true => Target::Trash,
+            false => Target::Home,
         };
     }
     let k = s.pinned.iter().filter(|&&c| c < u).count();
     match dragged {
         Dragged::Pinned(i) if i == k => Target::Home,
-        Dragged::Pinned(_) => Target::Gap(k),
+        Dragged::Pinned(_) | Dragged::Across => Target::Gap(k),
         Dragged::Running if k < s.pinned.len() || u < s.pinned_end + s.step / 2.0 => Target::Gap(k),
         Dragged::Running => Target::Home,
     }
@@ -104,7 +121,7 @@ pub fn target(dragged: Dragged, s: &Scene, u: f64) -> Target {
 
 /// Whether the Trash takes `dragged`.
 pub fn trash_takes(dragged: Dragged) -> bool {
-    matches!(dragged, Dragged::Pinned(_))
+    matches!(dragged, Dragged::Pinned(_) | Dragged::Across)
 }
 
 /// What dropping `dragged` on `target` does.
@@ -117,7 +134,8 @@ pub fn drop(dragged: Dragged, target: Target) -> Drop {
     }
 }
 
-/// Apply `drop` of the item pinned (or to be pinned) as `pin` to `pins`.
+/// Apply `drop` of the item pinned (or to be pinned) as `pin` to `pins`
+/// (a widget's `pin` saying the zone it goes to).
 /// Returns whether they changed.
 pub fn apply(pins: &mut Vec<Pin>, pin: Pin, drop: Drop) -> bool {
     match drop {
@@ -334,6 +352,33 @@ mod tests {
         // Removing one.
         assert!(apply(&mut p, app("a"), Drop::Unpin));
         assert_eq!(pins::apps(&p), ["c", "d", "b"]);
+    }
+
+    #[test]
+    fn widgets_go_across_the_separator() {
+        // Past the separator's middle, among the folders.
+        assert_eq!(zone(99.0, Some(100.0)), Zone::Apps);
+        assert_eq!(zone(100.0, Some(100.0)), Zone::Folders);
+        assert_eq!(zone(900.0, None), Zone::Apps);
+        // From the other zone, the gap is open everywhere, even past
+        // the last one; the Trash takes it.
+        let s = scene();
+        assert_eq!(target(Dragged::Across, &s, 50.0), Target::Gap(0));
+        assert_eq!(target(Dragged::Across, &s, 900.0), Target::Gap(3));
+        let trash = Scene {
+            on_trash: true,
+            ..s
+        };
+        assert_eq!(target(Dragged::Across, &trash, 900.0), Target::Trash);
+        assert_eq!(drop(Dragged::Across, Target::Trash), Drop::Unpin);
+        // Dropped among the folders, second there.
+        let mut p = pins::parse("a\n@w\n~/x\n/y\n");
+        let folders = Pin::Widget("w".into(), Zone::Folders);
+        assert!(apply(&mut p, folders, Drop::Pin(1)));
+        assert_eq!(
+            pins::format(&p),
+            pins::format(&pins::parse("a\n---\n~/x\n@w\n/y\n"))
+        );
     }
 
     #[test]

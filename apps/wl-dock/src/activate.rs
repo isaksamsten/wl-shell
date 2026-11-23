@@ -3,8 +3,8 @@
 //!
 //! Holding Super, the compositor binds the number keys to `wl-dock
 //! --activate <n>`. The first ten dock items are numbered 1–9 and 0, in
-//! dock order (the apps, then the folders); the Trash and the separator
-//! have none. A press of n acts on item n:
+//! dock order (the apps, then the folders); standalone widgets, the
+//! Trash and the separator have none. A press of n acts on item n:
 //!
 //! | item n               | first press                | pressing n again           |
 //! | -------------------- | -------------------------- | -------------------------- |
@@ -37,7 +37,7 @@ const KEY_1: u32 = 2;
 const KEY_0: u32 = 11;
 
 /// The keys of the numbered items, in order: item n is `[n - 1]`. Apps
-/// and folders count; the separator and the Trash don't.
+/// and folders count; widgets, the separator and the Trash don't.
 pub fn numbered<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<String> {
     (items.into_iter())
         .filter(|i| matches!(i.kind, Kind::App | Kind::Folder { .. }))
@@ -118,9 +118,10 @@ impl Subject {
             Kind::App if !item.windows.is_empty() || !item.elsewhere.is_empty() => Subject::Window,
             Kind::App => Subject::NotRunning,
             Kind::Folder { exists: true } => Subject::Folder,
-            Kind::Folder { exists: false } | Kind::Separator | Kind::Trash { .. } => {
-                Subject::Nothing
-            }
+            Kind::Folder { exists: false }
+            | Kind::Separator
+            | Kind::Trash { .. }
+            | Kind::Widget { .. } => Subject::Nothing,
         }
     }
 }

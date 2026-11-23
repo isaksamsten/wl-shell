@@ -19,6 +19,9 @@
 //! Empty Trash asks first: picking it turns the row into its `confirm`
 //! text, and only picking it again runs it.
 //!
+//! A standalone widget's menu (`widget`) has Remove from Dock only: it
+//! takes its line out of the pins file and leaves its config table.
+//!
 //! A folder's menu (`folder`) has Open and Remove from Dock. Its popup
 //! (`folder_popup`) is a menu too: a row per entry, with the entry's
 //! thumbnail or type icon in a larger icon column, and Open in File
@@ -274,6 +277,14 @@ pub fn folder(path: &Path, exists: bool) -> Vec<Group> {
         entries: vec![entry("Remove from Dock", Action::Unpin)],
     });
     groups
+}
+
+/// A standalone widget's menu: Remove from Dock.
+pub fn widget() -> Vec<Group> {
+    vec![Group {
+        line: false,
+        entries: vec![entry("Remove from Dock", Action::Unpin)],
+    }]
 }
 
 /// A folder's popup: a row per entry, then Open in File Manager.
@@ -954,6 +965,14 @@ mod tests {
         let gone = folder(p, false);
         assert_eq!(labels(&gone), [vec!["Remove from Dock"]]);
         assert!(!gone[0].line);
+    }
+
+    #[test]
+    fn widget_menu() {
+        let g = widget();
+        assert_eq!(labels(&g), [vec!["Remove from Dock"]]);
+        assert_eq!(g[0].entries[0].action, Action::Unpin);
+        assert!(!g[0].line);
     }
 
     #[test]

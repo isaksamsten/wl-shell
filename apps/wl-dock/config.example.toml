@@ -256,14 +256,22 @@
 #]
 
 # --- Widgets (examples) ---------------------------------------------------
-# A widget is a Lua plugin behind an app's item: it can set the item's
-# label and draw its icon. A plugin name is looked up as plugins/<name>.lua next to this
-# file, then among the bundled plugins (clock). Plugin files are reloaded on
-# save.
+# A widget is a Lua plugin behind an app's item, or an item of its own: it
+# can set the item's label, draw its icon and show a popup. A plugin name
+# is looked up as plugins/<name>.lua next to this file, then among the
+# bundled plugins (clock). Plugin files are reloaded on save.
 
 #[app.foot]
 #widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
-#popup-delay = 400               # Hover before its popup opens (later)
+#popup-delay = 400               # Hover before its popup opens
+
+# A standalone widget: an item of its own, shown while `@clock` is pinned
+# (`wl-dock pin @clock`). Remove from Dock unpins it and keeps this table.
+#[widget.clock]
+#plugin = "clock"                # Default: the table's name
+#name = "Clock"                  # Its label; default: the table's name
+#popup-delay = 600
+#format = "%H:%M"                # Other keys are options for the plugin
 
 #[plugin.clock]                  # Defaults for every placement of the plugin
 #path = "~/src/clock.lua"        # Optional; default lookup by name

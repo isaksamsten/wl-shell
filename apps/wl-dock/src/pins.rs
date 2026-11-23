@@ -6,15 +6,32 @@
 //! ```
 //!
 //! One item per line, in dock order. Blank lines and `#` comments are
-//! ignored. A line that starts with `/` or `~/` is a folder's path,
-//! anything else an app ID. Folders are shown after the apps; a path
-//! that is a file is skipped (files are never pinned). The file is
-//! written atomically (a temp file, then a rename). The dock watches it
-//! and reloads it when it changes, so `wl-dock pin` and editing it by
-//! hand both work. A missing file means no pins.
+//! ignored. A line that starts with `/` or `~/` is a folder's path, one
+//! that starts with `@` a standalone widget (`@clock`: the widget of the
+//! config's `[widget.clock]`), anything else an app ID. A `---` line
+//! stands for the dock's separator: a widget before it sits among the
+//! apps, one after it among the folders (just before the Trash). Apps are
+//! always before the separator and folders after it, wherever they are in
+//! the file. A path that is a file is skipped (files are never pinned).
+//! The file is written atomically (a temp file, then a rename), the items
+//! before the separator first. The dock watches it and reloads it when it
+//! changes, so `wl-dock pin` and editing it by hand both work. A missing
+//! file means no pins.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The line that stands for the separator.
+const BREAK: &str = "---";
+
+/// Where in the dock a pin is: among the apps, or after the separator
+/// among the folders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zone {
+    Apps,
+    Folders,
+}
 
 /// One pinned item.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,21 +39,47 @@ pub enum Pin {
     App(String),
     /// A folder, as written (`~/` kept).
     Path(String),
+    /// A standalone widget, by its name (written `@name`), and where it
+    /// sits.
+    Widget(String, Zone),
 }
 
 impl Pin {
-    /// A line of the file, or an argument of `wl-dock pin`.
+    /// A line of the file, or an argument of `wl-dock pin` (a widget
+    /// among the apps).
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
+        if let Some(name) = s.strip_prefix('@') {
+            return Pin::Widget(name.trim().to_string(), Zone::Apps);
+        }
         match s.starts_with('/') || s.starts_with("~/") {
             true => Pin::Path(s.to_string()).normalized(),
             false => Pin::App(s.to_string()),
         }
     }
 
-    fn text(&self) -> &str {
+    /// As written in the file.
+    fn text(&self) -> Cow<'_, str> {
         match self {
-            Pin::App(s) | Pin::Path(s) => s,
+            Pin::App(s) | Pin::Path(s) => Cow::Borrowed(s),
+            Pin::Widget(name, _) => Cow::Owned(format!("@{name}")),
+        }
+    }
+
+    /// Where it sits.
+    pub fn zone(&self) -> Zone {
+        match self {
+            Pin::App(_) => Zone::Apps,
+            Pin::Path(_) => Zone::Folders,
+            Pin::Widget(_, zone) => *zone,
+        }
+    }
+
+    /// The same item, wherever it sits.
+    pub fn same(&self, other: &Pin) -> bool {
+        match (self, other) {
+            (Pin::Widget(a, _), Pin::Widget(b, _)) => a == b,
+            _ => self == other,
         }
     }
 }
@@ -54,24 +97,44 @@ pub fn path() -> Option<PathBuf> {
 /// The pins in a file's text, each once.
 pub fn parse(text: &str) -> Vec<Pin> {
     let mut pins: Vec<Pin> = Vec::new();
+    let mut zone = Zone::Apps;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let pin = Pin::parse(line);
-        if !pins.contains(&pin) {
+        if line == BREAK {
+            zone = Zone::Folders;
+            continue;
+        }
+        let pin = match Pin::parse(line) {
+            Pin::Widget(name, _) => Pin::Widget(name, zone),
+            pin => pin,
+        };
+        if !pins.iter().any(|p| p.same(&pin)) {
             pins.push(pin);
         }
     }
     pins
 }
 
-/// The file's text for `pins`.
+/// The file's text for `pins`: those among the apps, then the separator
+/// and those after it, each in their order.
 pub fn format(pins: &[Pin]) -> String {
-    let mut out = String::from("# wl-dock: pinned apps (and paths), one per line, in dock order\n");
-    for pin in pins {
-        out.push_str(pin.text());
+    let mut out = String::from(
+        "# wl-dock: pinned apps and @widgets, then --- and folders and @widgets, in dock order\n",
+    );
+    let zone = |z: Zone| pins.iter().filter(move |p| p.zone() == z);
+    for pin in zone(Zone::Apps) {
+        out.push_str(&pin.text());
+        out.push('\n');
+    }
+    if zone(Zone::Folders).next().is_some() {
+        out.push_str(BREAK);
+        out.push('\n');
+    }
+    for pin in zone(Zone::Folders) {
+        out.push_str(&pin.text());
         out.push('\n');
     }
     out
@@ -82,17 +145,28 @@ pub fn apps(pins: &[Pin]) -> Vec<String> {
     (pins.iter())
         .filter_map(|p| match p {
             Pin::App(a) => Some(a.clone()),
-            Pin::Path(_) => None,
+            Pin::Path(_) | Pin::Widget(..) => None,
         })
         .collect()
 }
 
 /// The paths among `pins`, in order.
+#[cfg(test)]
 pub fn paths(pins: &[Pin]) -> Vec<String> {
     (pins.iter())
         .filter_map(|p| match p {
             Pin::Path(p) => Some(p.clone()),
-            Pin::App(_) => None,
+            Pin::App(_) | Pin::Widget(..) => None,
+        })
+        .collect()
+}
+
+/// The widgets' names among `pins`, in order.
+pub fn widgets(pins: &[Pin]) -> Vec<String> {
+    (pins.iter())
+        .filter_map(|p| match p {
+            Pin::Widget(name, _) => Some(name.clone()),
+            Pin::App(_) | Pin::Path(_) => None,
         })
         .collect()
 }
@@ -129,12 +203,9 @@ impl Pin {
         }
     }
 
-    /// The same kind of pin: both apps or both paths.
+    /// The same kind of pin: in the same zone.
     fn same_kind(&self, other: &Pin) -> bool {
-        matches!(
-            (self, other),
-            (Pin::App(_), Pin::App(_)) | (Pin::Path(_), Pin::Path(_))
-        )
+        self.zone() == other.zone()
     }
 }
 
@@ -162,26 +233,27 @@ pub fn write(path: &Path, pins: &[Pin]) -> io::Result<()> {
 
 /// Add `pin` at the end. Returns false if it was pinned already.
 pub fn pin(pins: &mut Vec<Pin>, pin: Pin) -> bool {
-    if pins.contains(&pin) {
+    if pins.iter().any(|p| p.same(&pin)) {
         return false;
     }
     pins.push(pin);
     true
 }
 
-/// Remove `pin`. Returns false if it wasn't pinned.
+/// Remove `pin` (a widget wherever it sits). Returns false if it wasn't
+/// pinned.
 pub fn unpin(pins: &mut Vec<Pin>, pin: &Pin) -> bool {
     let before = pins.len();
-    pins.retain(|p| p != pin);
+    pins.retain(|p| !p.same(pin));
     pins.len() != before
 }
 
-/// Pin `pin` as the `k`th pin of its kind (apps or paths; from 0),
-/// moving it there if it is pinned already. The other kind keeps its
-/// places. Returns whether the pins changed.
+/// Pin `pin` as the `k`th pin of its zone (from 0), moving it there if
+/// it is pinned already (a widget may move to the other zone). The other
+/// zone keeps its places. Returns whether the pins changed.
 pub fn place(pins: &mut Vec<Pin>, pin: Pin, k: usize) -> bool {
     let before = pins.clone();
-    pins.retain(|p| *p != pin);
+    pins.retain(|p| !p.same(&pin));
     let same: Vec<usize> = (pins.iter().enumerate())
         .filter(|(_, p)| p.same_kind(&pin))
         .map(|(i, _)| i)
@@ -217,12 +289,16 @@ pub mod cli {
         write(path, pins).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// An argument: an app ID, or a path (relative ones made absolute).
+    /// An argument: an app ID, `@` and a widget's name, or a path
+    /// (relative ones made absolute).
     fn item(arg: &str) -> Pin {
         let arg = arg.trim();
         let relative = arg == "."
             || arg == ".."
-            || (arg.contains('/') && !arg.starts_with('/') && !arg.starts_with("~/"));
+            || (arg.contains('/')
+                && !arg.starts_with('/')
+                && !arg.starts_with("~/")
+                && !arg.starts_with('@'));
         let absolute = || {
             std::fs::canonicalize(arg)
                 .or_else(|_| std::path::absolute(arg))
@@ -234,12 +310,19 @@ pub mod cli {
         }
     }
 
-    /// Pin `item` (an app ID or a folder). The message for the user, if
-    /// any. Files are refused.
+    /// Pin `item` (an app ID, a widget or a folder). The message for the
+    /// user, if any. Files are refused.
     pub fn add(item: &str) -> Result<Option<String>, String> {
         let item = self::item(item);
-        if item.text().is_empty() {
+        if item.text().is_empty() || matches!(&item, Pin::Widget(n, _) if n.is_empty()) {
             return Err("nothing to pin".into());
+        }
+        if let Pin::Widget(name, _) = &item
+            && !crate::config::plugin_name_ok(name)
+        {
+            return Err(format!(
+                "bad widget name {name:?} (letters, digits, - and _)"
+            ));
         }
         let mut note = None;
         if let Pin::Path(p) = &item {
@@ -272,10 +355,12 @@ pub mod cli {
         Ok(None)
     }
 
-    /// The pins, one per line.
+    /// The pins, one per line, in dock order (as the file has them).
     pub fn list() -> Result<String, String> {
         let pins = load(&file()?)?;
-        Ok(pins.iter().map(|p| format!("{}\n", p.text())).collect())
+        Ok((format(&pins).lines().skip(1))
+            .map(|l| format!("{l}\n"))
+            .collect())
     }
 }
 
@@ -336,6 +421,64 @@ mod tests {
         let mut none = Vec::new();
         assert!(place_app(&mut none, "a", 3));
         assert_eq!(none, [Pin::App("a".into())]);
+    }
+
+    #[test]
+    fn widgets_sit_anywhere() {
+        let mut pins = parse("a\n@clock\n~/x\nb\n @ weather \n---\n@moon\n/y\n");
+        let w = |n: &str| Pin::Widget(n.into(), Zone::Apps);
+        let t = |n: &str| Pin::Widget(n.into(), Zone::Folders);
+        assert_eq!(pins[1], w("clock"));
+        assert_eq!(pins[4], w("weather"));
+        assert_eq!(pins[5], t("moon"));
+        assert_eq!(widgets(&pins), ["clock", "weather", "moon"]);
+        assert_eq!(apps(&pins), ["a", "b"]);
+        // Paths are after the separator wherever they are written.
+        assert_eq!(paths(&pins), ["~/x", "/y"]);
+        assert_eq!(pins[2].zone(), Zone::Folders);
+        // Written back in dock order, which reads back the same.
+        assert_eq!(
+            format(&pins).lines().skip(1).collect::<Vec<_>>(),
+            ["a", "@clock", "b", "@weather", "---", "~/x", "@moon", "/y"]
+        );
+        let again = parse(&format(&pins));
+        assert_eq!(format(&again), format(&pins));
+        assert_eq!(again[5].zone(), Zone::Folders);
+        // No separator line without anything after it.
+        assert!(!format(&parse("a\n@clock\n")).lines().any(|l| l == BREAK));
+        // Placed among the apps and widgets: the paths keep their places.
+        assert!(place(&mut pins, w("clock"), 0));
+        assert_eq!(apps_zone(&pins), ["@clock", "a", "b", "@weather"]);
+        // Moved after the separator: the second there.
+        assert!(place(&mut pins, t("weather"), 1));
+        assert_eq!(apps_zone(&pins), ["@clock", "a", "b"]);
+        assert_eq!(folders_zone(&pins), ["~/x", "@weather", "@moon", "/y"]);
+        // And back, the last among the apps.
+        assert!(place(&mut pins, w("moon"), 9));
+        assert_eq!(apps_zone(&pins), ["@clock", "a", "b", "@moon"]);
+        // Once each, wherever: pinning again changes nothing.
+        assert!(!pin(&mut pins, w("weather")));
+        // Removed from the dock, wherever it sits.
+        assert!(unpin(&mut pins, &w("weather")));
+        assert!(unpin(&mut pins, &t("clock")));
+        assert_eq!(widgets(&pins), ["moon"]);
+        // An app ID can't start with `@`; a path can't either.
+        assert_eq!(Pin::parse("@x/y"), w("x/y"));
+    }
+
+    fn zone_texts(pins: &[Pin], zone: Zone) -> Vec<String> {
+        (pins.iter())
+            .filter(|p| p.zone() == zone)
+            .map(|p| p.text().into_owned())
+            .collect()
+    }
+
+    fn apps_zone(pins: &[Pin]) -> Vec<String> {
+        zone_texts(pins, Zone::Apps)
+    }
+
+    fn folders_zone(pins: &[Pin]) -> Vec<String> {
+        zone_texts(pins, Zone::Folders)
     }
 
     #[test]

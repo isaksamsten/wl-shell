@@ -141,7 +141,7 @@ use crate::folder::{self, UserDirs};
 use crate::layout::{Frame, LABEL_GAP, Metrics};
 use crate::menu::{self, MenuKey};
 use crate::menuview::{Look, MenuInput, MenuStyle, MenuView};
-use crate::pins;
+use crate::pins::{self, Zone};
 use crate::row::{self, Slot};
 use crate::stack;
 use crate::strip::{self, Key};
@@ -174,6 +174,8 @@ const MISSING_ALPHA: f64 = 0.4;
 const STACK_ROOM: f64 = 32.0;
 /// How far a badge's center is in from the icon's corner, in badge sizes.
 const BADGE_INSET: f64 = 0.3;
+/// The icon a standalone widget shows until its plugin draws one.
+const WIDGET_ICON: &str = "application-x-addon";
 
 /// Tags of badge requests, unique in the process.
 fn next_tag() -> u64 {
@@ -319,8 +321,14 @@ impl Style {
             icons: (config.app.iter())
                 .filter_map(|(id, a)| Some((id.clone(), a.icon.clone()?)))
                 .collect(),
+            // Standalone widgets' names: their tables' `name`, else the
+            // tables' names.
             names: (config.app.iter())
                 .filter_map(|(id, a)| Some((id.clone(), a.name.clone()?)))
+                .chain((config.widget.iter()).map(|(name, w)| {
+                    let shown = w.name.clone().unwrap_or_else(|| name.clone());
+                    (dock::widget_key(name), shown)
+                }))
                 .collect(),
             folder_icons: (config.folder.iter())
                 .filter_map(|(path, f)| Some((pins::expand(path), f.icon.clone()?)))
@@ -403,7 +411,8 @@ struct SlotSubs {
     icon: Sub,
 }
 
-/// The pinned items that have an order among themselves.
+/// The pinned items that have an order among themselves: the zones on
+/// either side of the separator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Group {
     Apps,
@@ -413,9 +422,23 @@ enum Group {
 impl Group {
     fn of(item: &Item) -> Option<Self> {
         match item.kind {
-            Kind::App => Some(Group::Apps),
-            Kind::Folder { .. } => Some(Group::Folders),
+            Kind::App | Kind::Widget { tail: false } => Some(Group::Apps),
+            Kind::Folder { .. } | Kind::Widget { tail: true } => Some(Group::Folders),
             Kind::Separator | Kind::Trash { .. } => None,
+        }
+    }
+
+    fn zone(self) -> Zone {
+        match self {
+            Group::Apps => Zone::Apps,
+            Group::Folders => Zone::Folders,
+        }
+    }
+
+    fn from_zone(zone: Zone) -> Self {
+        match zone {
+            Zone::Apps => Group::Apps,
+            Zone::Folders => Group::Folders,
         }
     }
 }
@@ -423,7 +446,13 @@ impl Group {
 /// An icon being dragged.
 struct Drag {
     app_id: String,
+    /// The group it is headed for: its own, but a widget's may be the
+    /// other one.
     group: Group,
+    /// Its own group.
+    home: Group,
+    /// It is a widget, so it may go to the other group.
+    crosses: bool,
     /// Where the pointer is on the surface.
     at: (f64, f64),
     /// From the pointer to the icon's center, as it was picked up.
@@ -1000,7 +1029,10 @@ impl DockView {
         let tree = &self.widget_icons.get(&key.app_id)?.tree;
         let s = key.scale.max(1) as f32;
         Some(ui::Request {
-            app: Some(key.app_id.clone()),
+            // A standalone widget has no app of its own.
+            app: dock::widget_name(&key.app_id)
+                .is_none()
+                .then(|| key.app_id.clone()),
             ..ui::Request::new(
                 tree.clone(),
                 ui::Bounds::Exact(tile.w as f32 / s, tile.h as f32 / s),
@@ -1032,6 +1064,12 @@ impl DockView {
     fn icon_key(&self, item: &Item) -> Option<icons::Key> {
         match item.kind {
             Kind::App => Some(self.app_icon_key(&item.app_id).with_tile(self.tile(item))),
+            // Its tree once the plugin draws one, a placeholder before
+            // (or while it fails).
+            Kind::Widget { .. } => {
+                let key = self.app_icon_key(&item.app_id).with_tile(self.tile(item));
+                Some(key.with_icon(Some(WIDGET_ICON.into())))
+            }
             Kind::Separator => None,
             // Named after the icon, so a missing one gets a letter tile.
             Kind::Trash { full } => {
@@ -1577,9 +1615,12 @@ impl DockView {
         let (cx, cy) = icon.center();
         // A flight still on its way lands at once.
         self.fly = None;
+        let crosses = item.is_some_and(Item::is_widget);
         self.drag = Some(Drag {
             app_id: app_id.to_string(),
             group,
+            home: group,
+            crosses,
             at: (x, y),
             offset: (cx - x, cy - y),
             size: (icon.w, icon.h),
@@ -1596,11 +1637,10 @@ impl DockView {
 
     /// The pointer moved to (`x`, `y`) while dragging.
     fn drag_motion(&mut self, x: f64, y: f64) {
-        let Some((app_id, group)) = self.drag.as_ref().map(|d| (d.app_id.clone(), d.group)) else {
+        let Some((app_id, home, crosses, was)) =
+            (self.drag.as_ref()).map(|d| (d.app_id.clone(), d.home, d.crosses, d.group))
+        else {
             return;
-        };
-        let Some(dragged) = self.dragged(&app_id) else {
-            return self.cancel_drag();
         };
         let frame = self.frame();
         let m = self.style.metrics();
@@ -1609,6 +1649,18 @@ impl DockView {
         let laid = self.lay(u, self.hover.value, false);
         let step = m.icon + self.style.gap;
         let on_dock = self.on_dock(&laid, u, v);
+        // A widget goes to the side of the separator the pointer is on.
+        let group = match crosses {
+            true => Group::from_zone(drag::zone(u, self.separator_center(&laid))),
+            false => home,
+        };
+        let dragged = match group == home {
+            true => self.dragged(&app_id),
+            false => Some(drag::Dragged::Across),
+        };
+        let Some(dragged) = dragged else {
+            return self.cancel_drag();
+        };
         // The other pinned items' centers of its group, and where they
         // (and the gap among them) end.
         let mut pinned = Vec::new();
@@ -1646,8 +1698,12 @@ impl DockView {
         } else {
             self.hover.retarget(0.0);
         }
-        let changed = self.drag.as_ref().is_some_and(|d| d.target != target);
+        let changed = self
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.target != target || was != group);
         if let Some(drag) = &mut self.drag {
+            drag.group = group;
             drag.at = (x, y);
             drag.target = target;
         }
@@ -1672,6 +1728,18 @@ impl DockView {
         (self.pinned_slots(group, except))
             .nth(k)
             .map(|(_, s)| s.item.app_id.clone())
+    }
+
+    /// Where the separator's middle is, as `laid`; None if there is none.
+    fn separator_center(&self, laid: &Laid) -> Option<f64> {
+        (laid.row.cells.iter().zip(&laid.slots))
+            .find(|(_, slot)| {
+                slot.is_some_and(|i| {
+                    let s = &self.slots[i];
+                    !s.leaving && s.item.kind == Kind::Separator
+                })
+            })
+            .map(|(cell, _)| cell.center)
     }
 
     /// Make `key` the item that grows (None: none).
@@ -1757,12 +1825,16 @@ impl DockView {
         }
     }
 
-    /// The button came up: drop the icon. Returns the app and what the
-    /// drop does to the pins, which the caller applies (and rebuilds the
-    /// items) right away.
-    pub fn end_drag(&mut self) -> Option<(String, drag::Drop)> {
+    /// The button came up: drop the icon. Returns the app, what the drop
+    /// does to the pins, which the caller applies (and rebuilds the
+    /// items) right away, and the zone it goes to (a widget's may be the
+    /// other one).
+    pub fn end_drag(&mut self) -> Option<(String, drag::Drop, Zone)> {
         let drag = self.drag.take()?;
-        let dragged = self.dragged(&drag.app_id);
+        let dragged = match drag.group == drag.home {
+            true => self.dragged(&drag.app_id),
+            false => Some(drag::Dragged::Across),
+        };
         let drop = dragged.map_or(drag::Drop::Nothing, |d| drag::drop(d, drag.target));
         let from = self.drag_rect(&drag);
         // Landing in the gap: its spring becomes the slot's, which the
@@ -1795,7 +1867,7 @@ impl DockView {
         self.sync_autohide();
         self.update_label();
         self.kick();
-        Some((drag.app_id, drop))
+        Some((drag.app_id, drop, drag.group.zone()))
     }
 
     /// Where the dragged icon is drawn: under the pointer as it was picked
@@ -1896,7 +1968,8 @@ impl DockView {
             let s = &self.slots[i];
             let cell = laid.cell(i)?;
             let kind = match s.item.kind {
-                Kind::App => drag::HitKind::App,
+                // A widget takes nothing (it isn't among the takers).
+                Kind::App | Kind::Widget { .. } => drag::HitKind::App,
                 Kind::Folder { .. } => drag::HitKind::Folder,
                 Kind::Trash { .. } => drag::HitKind::Trash,
                 Kind::Separator => drag::HitKind::Separator,
@@ -1915,10 +1988,13 @@ impl DockView {
             let Some(s) = slot.map(|i| &self.slots[i]) else {
                 continue;
             };
-            match s.item.kind {
-                Kind::Folder { .. } if !s.leaving => folders.push(cell.center),
-                Kind::Separator | Kind::Trash { .. } if zone.is_none() => zone = Some(cell.start),
-                _ => {}
+            // The folders' zone holds its widgets too, for where pinned
+            // folders go.
+            if !s.leaving && s.item.pinned && Group::of(&s.item) == Some(Group::Folders) {
+                folders.push(cell.center);
+            } else if matches!(s.item.kind, Kind::Separator | Kind::Trash { .. }) && zone.is_none()
+            {
+                zone = Some(cell.start);
             }
         }
         let step = self.style.icon() + self.style.gap;
@@ -2976,6 +3052,14 @@ impl DockView {
     /// Whether a widget's popup is open (and not closing).
     pub fn widget_open(&self) -> bool {
         self.widget.as_ref().is_some_and(|w| !w.closing())
+    }
+
+    /// The key of the item whose widget's popup is open (and not
+    /// closing).
+    pub fn widget_item(&self) -> Option<&str> {
+        (self.widget.as_ref())
+            .filter(|w| !w.closing())
+            .map(|w| w.app.as_str())
     }
 
     /// Fade the widget's popup out; it goes once it's gone. Without the

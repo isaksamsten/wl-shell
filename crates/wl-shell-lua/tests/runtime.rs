@@ -34,6 +34,7 @@ fn code(id: &str, code: &str) -> InstanceSpec {
             code: Arc::from(code),
         },
         role: Role::Widget,
+        app: None,
         options: serde_json::json!({}),
         budget: 1_000_000,
     }
@@ -98,6 +99,39 @@ fn popup_handlers_run_on_the_instance() {
         Reply::Done
     );
     assert_eq!(label(&rt, &recv, "p").unwrap().as_deref(), Some("1"));
+}
+
+#[test]
+fn item_clicks_and_the_app() {
+    let (rt, recv) = runtime();
+    let source = "local got = 'none'
+        return {
+          on_click = function(button) got = button end,
+          label = function() return tostring(dock.app) .. ':' .. got end,
+        }";
+    let mut app = code("app", source);
+    app.app = Some("foot".into());
+    rt.configure(vec![code("w", source), app]);
+    // Either may load first.
+    let mut waiting = vec!["w", "app"];
+    while !waiting.is_empty() {
+        let (id, caps) = next(&recv, |e| match e {
+            Event::Loaded { instance, caps } => Some((instance, caps)),
+            _ => None,
+        });
+        assert!(caps.widget.unwrap().on_click);
+        waiting.retain(|w| *w != id);
+    }
+    let ticket = rt
+        .request("w", RequestKind::Click("middle".into()), WAIT)
+        .unwrap();
+    let done = next(&recv, |e| match e {
+        Event::Answer(a) if a.id == ticket.id => Some(a.result),
+        _ => None,
+    });
+    assert_eq!(done, Ok(Reply::Done));
+    assert_eq!(label(&rt, &recv, "w"), Ok(Some("nil:middle".into())));
+    assert_eq!(label(&rt, &recv, "app"), Ok(Some("foot:none".into())));
 }
 
 #[test]

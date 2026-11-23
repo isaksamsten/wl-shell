@@ -11,6 +11,7 @@
 //! | `read(path)`                      | A file's text (`~/` expands), or nil and the error.                   |
 //! | `clipboard(text)`                 | Copies `text`.                                                        |
 //! | `span(n)`                         | Sets the tile's length along the dock: 1, 1.5 or 2 (or `{horizontal = 2, vertical = 1}`). |
+//! | `app`                             | The app ID the widget backs; nil for a standalone widget.             |
 //! | `ui.*`, `theme.*`                 | The UI constructors and the theme's color names (`ui.rs`).            |
 //!
 //! `argv` is a list of strings, or one string run with `sh -c`.

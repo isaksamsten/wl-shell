@@ -75,6 +75,9 @@ pub enum RequestKind {
         event: PopupEvent,
     },
     Visibility(bool),
+    /// A standalone widget's item was clicked with this button
+    /// (`"left"` or `"middle"`): its `on_click(button)`.
+    Click(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -91,7 +94,9 @@ impl RequestKind {
             RequestKind::Label => Topic::Label,
             RequestKind::Icon(_) => Topic::Icon,
             RequestKind::Popup => Topic::Popup,
-            RequestKind::Interaction { .. } | RequestKind::Visibility(_) => Topic::Interaction,
+            RequestKind::Interaction { .. }
+            | RequestKind::Visibility(_)
+            | RequestKind::Click(_) => Topic::Interaction,
         }
     }
 }

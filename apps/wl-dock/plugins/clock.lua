@@ -1,21 +1,39 @@
--- The clock: shows the time as its item's label, and with `face`, an
--- analog clock as its icon.
+-- The clock: an analog clock face and the time as its label, with the
+-- date in its popup.
+--
+-- Standalone, pinned as `@clock` (`wl-dock pin @clock`):
+--
+--   [widget.clock]
+--   name = "Clock"
+--
+-- Or behind an app, as its label (and with `face = true`, its icon):
 --
 --   [app.<id>]
 --   widget = { plugin = "clock", format = "%H:%M:%S", face = true }
 --
--- `format` is an `os.date` format (default "%H:%M"); `face` (default
--- false) draws the clock instead of the app's icon.
+-- `format` is an `os.date` format for the label (default "%H:%M");
+-- `date` the popup's (default "%A %e %B"). `face` draws the clock as the
+-- icon: the default standalone, but not on an app, whose icon it would
+-- replace. `popup = false` leaves out the popup (it is off on an app
+-- unless `popup = true`).
 
 local ui, theme = dock.ui, dock.theme
 local C = {}
-local format, face = "%H:%M", false
+local format, date, face, popup = "%H:%M", "%A %e %B", dock.app == nil, dock.app == nil
 
 function C.setup(opts)
 	if type(opts.format) == "string" then
 		format = opts.format
 	end
-	face = opts.face == true
+	if type(opts.date) == "string" then
+		date = opts.date
+	end
+	if type(opts.face) == "boolean" then
+		face = opts.face
+	end
+	if type(opts.popup) == "boolean" then
+		popup = opts.popup
+	end
 	-- The dock only redraws what changed.
 	dock.every(1000, dock.redraw)
 end
@@ -65,4 +83,19 @@ function C.icon(tile)
 	return ui.canvas({ viewbox = { 100, 100 }, draw = draw })
 end
 
+function C.popup()
+	if not popup then
+		return nil
+	end
+	return ui.col({
+		padding = 16,
+		gap = 8,
+		align = "center",
+		ui.canvas({ viewbox = { 100, 100 }, width = 160, height = 160, draw = draw }),
+		ui.text({ os.date(format), style = "title" }),
+		ui.text({ (os.date(date):gsub("%s+", " ")), style = "muted" }),
+	})
+end
+
 return C
+

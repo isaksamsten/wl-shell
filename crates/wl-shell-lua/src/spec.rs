@@ -56,6 +56,9 @@ pub struct InstanceSpec {
     pub plugin: String,
     pub source: Source,
     pub role: Role,
+    /// The app a widget backs (`dock.app`); None for a standalone widget
+    /// or a plugin table.
+    pub app: Option<String>,
     /// Passed to `setup(opts)`.
     pub options: serde_json::Value,
     /// Lua instructions per hook call.

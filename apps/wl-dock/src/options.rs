@@ -38,15 +38,16 @@ pub struct Options {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum Cmd {
-    /// Pin an app (by app ID) or a folder (by path) to the end of its
+    /// Pin an app (by app ID), a standalone widget (`@name`, of the
+    /// config's `[widget.<name>]`) or a folder (by path) to the end of its
     /// part of the dock; files can't be pinned
     Pin {
-        #[arg(value_name = "APP-ID|FOLDER")]
+        #[arg(value_name = "APP-ID|@WIDGET|FOLDER")]
         item: String,
     },
-    /// Unpin an app or a folder
+    /// Unpin an app or a folder, or remove a widget
     Unpin {
-        #[arg(value_name = "APP-ID|FOLDER")]
+        #[arg(value_name = "APP-ID|@WIDGET|FOLDER")]
         item: String,
     },
     /// Print the pins, in dock order
