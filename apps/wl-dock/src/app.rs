@@ -2500,10 +2500,13 @@ impl WlDock {
             || self.pending_terminal.is_some()
             || self.pending_app.is_some()
             || self.pending_window.is_some();
-        // The compositor has given the keyboard back before the app is
-        // activated (or the file opened), so the app keeps it.
-        if pending && let Err(e) = core.conn.roundtrip() {
-            warn!("{e}");
+        if pending {
+            // Remove the launcher before starting an opener or activating
+            // an existing window. Keep the focus handoff, not the animation.
+            self.drop_launcher();
+            if let Err(e) = core.conn.roundtrip() {
+                warn!("{e}");
+            }
         }
         if let Some(open) = self.pending_open.take() {
             if self.config.launcher.history {
