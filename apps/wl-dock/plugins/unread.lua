@@ -93,30 +93,12 @@ function P.setup(opts)
 end
 
 function P.icon()
-	local label = badge()
-	if label then
-		return ui.stack({
-			align = position,
-			ui.app_icon({}),
-			ui.col({
-				-- A translucent underlay peeks out below the pill.
-				padding = { 0, 0, 2, 0 },
-				background = "#200a184d",
-				radius = 9,
-				ui.row({
-					min_width = 18,
-					height = 18,
-					padding = { 0, 5 },
-					align = "center",
-					justify = "center",
-					background = "#a51e50",
-					radius = 9,
-					border = { width = 1, color = "#ffd9e6" },
-					ui.text({ label, size = 11, weight = "bold", color = "#ffffff" }),
-				}),
-			}),
-		})
-	end
+	local unread = badge()
+	return ui.stack({
+		align = position,
+		ui.app_icon({}),
+		ui.box({ variant = "badge", ui.text({ unread, style = "caption" }) }),
+	})
 end
 
 return P
