@@ -259,7 +259,7 @@
 # A widget is a Lua plugin behind an app's item, or an item of its own: it
 # can set the item's label, draw its icon and show a popup. A plugin name
 # is looked up as plugins/<name>.lua next to this file, then among the
-# bundled plugins (clock, player). Plugin files are reloaded on save.
+# bundled plugins (clock, player, unread). Plugin files are reloaded on save.
 
 #[app.foot]
 #widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
@@ -280,6 +280,15 @@
 #widget = "player"
 #[app.firefox]
 #widget = { plugin = "player", player = "firefox" }
+
+# Show the count published by an app over Unity LauncherEntry D-Bus signals.
+#[app."co.hyprlab.Hylki"]
+#widget = "unread"
+# Badge position: top-left, top, top-right (default), left, center, right,
+# bottom-left, bottom, or bottom-right.
+# widget = { plugin = "unread", position = "bottom-left" }
+# Optional desktop ID override when the launcher uses a different ID:
+# widget = { plugin = "unread", desktop-entry = "co.hyprlab.Hylki.desktop" }
 
 # Standalone, it follows whichever player plays (`wl-dock pin @nowplaying`).
 #[widget.nowplaying]

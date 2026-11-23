@@ -314,12 +314,15 @@ that app's windows).
 A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
-Two plugins are bundled: `clock` and `player` (what an MPRIS media player is
-playing, with a cover, controls and a seek bar).
+The bundled plugins include `clock`, `player` for MPRIS playback, and
+`unread` for apps that publish a launcher count over D-Bus.
 
 ```toml
 [app.spotify]
 widget = "player"              # or { plugin = "player", player = "spotify" }
+
+[app."co.hyprlab.Hylki"]
+widget = "unread"              # Shows a badge after the app publishes its count
 
 [widget.clock]                 # Shown while `@clock` is pinned
 name = "Clock"
@@ -330,6 +333,11 @@ enabled = true
 popup-delay = 300
 budget = 1000000               # Lua instructions per hook call
 ```
+
+The unread badge appears after the first visible, positive count update.
+The plugin matches the app's desktop entry, falling back to its Wayland app
+ID. If the publisher uses a different desktop ID, override it with
+`widget = { plugin = "unread", desktop-entry = "example.desktop" }`.
 
 Your own plugins go in `~/.config/wl-dock/plugins/<name>.lua` and reload when
 you save them. See [PLUGINS.md](PLUGINS.md) for the widget settings, the

@@ -49,6 +49,7 @@ use crate::dock;
 pub const BUNDLED: &[(&str, &str)] = &[
     ("clock", include_str!("../plugins/clock.lua")),
     ("player", include_str!("../plugins/player.lua")),
+    ("unread", include_str!("../plugins/unread.lua")),
 ];
 
 /// Modules built into the dock that plugins `require`, by name.
