@@ -255,6 +255,25 @@
 #{ name = "Next", command = "playerctl next", icon = "media-skip-forward", when = "running" },
 #]
 
+# --- Widgets (examples) ---------------------------------------------------
+# A widget is a Lua plugin behind an app's item; for now it can set the
+# item's label. A plugin name is looked up as plugins/<name>.lua next to this
+# file, then among the bundled plugins (clock). Plugin files are reloaded on
+# save.
+
+#[app.foot]
+#widget = { plugin = "clock", format = "%H:%M:%S" }  # Or a name: widget = "clock"
+#popup-delay = 400               # Hover before its popup opens (later)
+
+#[plugin.clock]                  # Defaults for every placement of the plugin
+#path = "~/src/clock.lua"        # Optional; default lookup by name
+#format = "%H:%M"
+
+#[widgets]
+#enabled = true
+#popup-delay = 300
+#budget = 1000000                # Lua instructions per hook call
+
 # --- Per-folder settings (example) ----------------------------------------
 # Customizes a pinned folder (`wl-dock pin ~/Downloads`); it does not pin it.
 

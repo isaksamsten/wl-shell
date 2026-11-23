@@ -309,6 +309,45 @@ Each action requires `name` and `command`; `icon` is optional. `when` is
 commands can use `{app-id}`, `{id}` (most recent window) and `{ids}` (all of
 that app's windows).
 
+### Widgets
+
+A widget is a Lua 5.4 plugin behind an app's item. For now it can replace the
+app's label (its name on hover); icons and popups come later. Clicking the
+item still launches or activates the app.
+
+```toml
+[app.foot]
+widget = { plugin = "clock", format = "%H:%M:%S" }  # or just widget = "clock"
+
+[plugin.clock]                 # Optional: defaults for every placement
+# path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
+format = "%H:%M"
+
+[widgets]
+enabled = true                 # Default
+budget = 1000000               # Lua instructions per hook call (default)
+```
+
+A plugin is a file that returns a table of hooks:
+
+```lua
+local P, n = {}, 0
+function P.setup(opts) dock.every(1000, function() n = n + 1; dock.redraw() end) end
+function P.label() return 'Up ' .. n .. 's' end
+return P
+```
+
+`setup(opts)` gets the plugin's options; `label()` returns a string, or `nil`
+for the app's own name, and is asked again after `dock.redraw()`. Host
+functions: `dock.redraw()`, `dock.timer(ms, fn)` and `dock.every(ms, fn)`
+(handles with `:cancel()`), `dock.spawn(argv, { on_line = fn, on_exit = fn })`
+(a handle with `:kill()`), `dock.run(argv)` (detached), `dock.read(path)`,
+`dock.json.decode(s)` / `dock.json.encode(v)` and `dock.clipboard(text)`;
+`argv` is a list, or a string for `sh -c`. Plugins have no `io`, `debug` or
+`os.execute`; `require` loads modules next to the plugin. A hook that runs
+past its budget, or a failing `setup`, restarts the plugin with backoff, and the
+app shows its own name meanwhile. Plugin files reload when saved.
+
 ### Per-folder settings
 
 This customizes a pinned folder; it does not pin it. Paths accept `~/`.

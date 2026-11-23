@@ -14,6 +14,7 @@ wl-shell-config = { path = "crates/wl-shell-config", version = "0.1.0" }
 wl-shell-core = { path = "crates/wl-shell-core", version = "0.1.0" }
 wl-shell-daemon = { path = "crates/wl-shell-daemon", version = "0.1.0" }
 wl-shell-log = { path = "crates/wl-shell-log", version = "0.1.0" }
+wl-shell-lua = { path = "crates/wl-shell-lua", version = "0.1.0" }
 wl-shell-notes = { path = "crates/wl-shell-notes", version = "0.1.0" }
 wl-shell-render = { path = "crates/wl-shell-render", version = "0.1.0" }
 wl-shell-ui = { path = "crates/wl-shell-ui", version = "0.1.0" }
@@ -30,6 +31,7 @@ globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
+mlua = { version = "0.12", features = ["lua54", "vendored", "send", "serialize"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false }

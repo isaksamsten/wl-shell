@@ -11,6 +11,7 @@ wl-shell-config.workspace = true
 wl-shell-core.workspace = true
 wl-shell-daemon.workspace = true
 wl-shell-log.workspace = true
+wl-shell-lua.workspace = true
 wl-shell-render.workspace = true
 wl-shell-ui.workspace = true
 
@@ -21,6 +22,7 @@ nucleo-matcher.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smithay-client-toolkit.workspace = true
+toml.workspace = true
 ureq.workspace = true
 url.workspace = true
 wayland-client.workspace = true

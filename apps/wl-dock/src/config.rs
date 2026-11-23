@@ -12,7 +12,9 @@
 //! icon, name and launch command, and what dropping files does) live in
 //! `[app."<app-id>"]` tables (see `AppConfig`), and per-folder ones (how
 //! its popup lists it, its icon) in `[folder."<path>"]` tables (see
-//! `FolderConfig`).
+//! `FolderConfig`). An app's `widget` puts a plugin behind it;
+//! `[plugin.<name>]` tables load plugins with their default options, and
+//! `[widgets]` holds what every widget shares (see widgets.rs).
 //!
 //! Colors live in `[appearance]`; `[appearance.dark]` and
 //! `[appearance.light]` override its keys in the desktop's dark or light
@@ -69,6 +71,10 @@ pub struct Config {
     pub appearance: Appearance,
     pub app: BTreeMap<String, AppConfig>,
     pub folder: BTreeMap<String, FolderConfig>,
+    /// `[plugin.<name>]`: loads a plugin, with its default options.
+    pub plugin: BTreeMap<String, PluginConfig>,
+    /// `[widgets]`: settings of every widget.
+    pub widgets: WidgetsConfig,
 }
 
 impl Default for Config {
@@ -100,6 +106,8 @@ impl Default for Config {
             appearance: Appearance::default(),
             app: BTreeMap::new(),
             folder: BTreeMap::new(),
+            plugin: BTreeMap::new(),
+            widgets: WidgetsConfig::default(),
         }
     }
 }
@@ -536,6 +544,13 @@ pub struct AppConfig {
     pub desktop_actions: bool,
     /// Opens files dropped on the icon: `{files}`, `{app-id}`.
     pub drop: Option<String>,
+    /// A widget backs the app's item: a plugin's name, or a table with
+    /// `plugin` and the plugin's options.
+    #[serde(deserialize_with = "some_widget")]
+    pub widget: Option<WidgetConfig>,
+    /// Hover before the widget's popup opens; default: `[widgets]`'s.
+    #[serde(deserialize_with = "some_duration")]
+    pub popup_delay: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -550,8 +565,92 @@ impl Default for AppConfig {
             launch_command: None,
             desktop_actions: true,
             drop: None,
+            widget: None,
+            popup_delay: None,
         }
     }
+}
+
+/// A widget placement: `widget = "clock"`, or `widget = { plugin =
+/// "clock", ... }` with the plugin's options for this placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidgetConfig {
+    pub plugin: String,
+    /// Over the `[plugin.<name>]` table's.
+    pub options: toml::Table,
+}
+
+/// A `[plugin.<name>]` table.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct PluginConfig {
+    /// The plugin's file; default: `plugins/<name>.lua` next to the
+    /// config, else a bundled plugin of that name.
+    pub path: Option<String>,
+    /// The rest: options for `setup(opts)`.
+    #[serde(flatten)]
+    pub options: toml::Table,
+}
+
+/// `[widgets]`.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WidgetsConfig {
+    /// Off: no plugin runs.
+    pub enabled: bool,
+    /// Hover before a widget's popup opens.
+    #[serde(deserialize_with = "de::duration")]
+    pub popup_delay: u32,
+    /// Lua instructions per hook call.
+    #[serde(deserialize_with = "budget")]
+    pub budget: u32,
+}
+
+impl Default for WidgetsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            popup_delay: 300,
+            budget: 1_000_000,
+        }
+    }
+}
+
+/// Whether `name` can name a plugin (and its file).
+pub fn plugin_name_ok(name: &str) -> bool {
+    !name.is_empty() && (name.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn some_widget<'de, D: Deserializer<'de>>(d: D) -> Result<Option<WidgetConfig>, D::Error> {
+    use serde::de::Error;
+    let (plugin, options) = match toml::Value::deserialize(d)? {
+        toml::Value::String(plugin) => (plugin, toml::Table::new()),
+        toml::Value::Table(mut t) => match t.remove("plugin") {
+            Some(toml::Value::String(plugin)) => (plugin, t),
+            Some(_) => return Err(D::Error::custom("widget.plugin: expected a string")),
+            None => return Err(D::Error::custom("widget: `plugin` is missing")),
+        },
+        _ => {
+            return Err(D::Error::custom(
+                "widget: expected a plugin name or a table with `plugin`",
+            ));
+        }
+    };
+    match plugin_name_ok(&plugin) {
+        true => Ok(Some(WidgetConfig { plugin, options })),
+        false => Err(D::Error::custom(format!(
+            "widget: bad plugin name {plugin:?} (letters, digits, - and _)"
+        ))),
+    }
+}
+
+fn some_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    de::duration(d).map(Some)
+}
+
+/// Instructions per hook call, 10 thousand to 1 billion.
+fn budget<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 10_000, 1_000_000_000)
 }
 
 /// A `[folder."<path>"]` table.

@@ -29,6 +29,8 @@ use crate::shapes::{Shape, ShapeKey, strip_image};
 
 /// Shapes kept: a strip of a dozen cards has four shadow strips each.
 const MAX_SHAPES: usize = 64;
+/// Labels kept per app: a few names, at a few scales.
+const MAX_LABELS_PER_APP: usize = 8;
 
 /// A buffer and its logical size.
 #[derive(Clone, Debug)]
@@ -126,7 +128,19 @@ impl Cache {
         };
         match self.labels.iter_mut().find(|(k, _)| *k == key) {
             Some((_, old)) => self.stale.push(std::mem::replace(old, sized).buffer),
-            None => self.labels.push((key, sized)),
+            None => {
+                // Labels that change (a widget's clock) push out their
+                // app's oldest ones.
+                let app = key.app_id.clone();
+                self.labels.push((key, sized));
+                let of_app =
+                    |l: &[(LabelKey, Sized)]| l.iter().filter(|(k, _)| k.app_id == app).count();
+                while of_app(&self.labels) > MAX_LABELS_PER_APP {
+                    if let Some(i) = self.labels.iter().position(|(k, _)| k.app_id == app) {
+                        self.stale.push(self.labels.remove(i).1.buffer);
+                    }
+                }
+            }
         }
     }
 

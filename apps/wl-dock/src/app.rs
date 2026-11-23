@@ -94,6 +94,12 @@
 //! go of the modifiers held when the keyboard came activates the picked
 //! or highlighted window (or opens the entry). What it activates runs
 //! once the surface is gone, so the window gets the keyboard.
+//!
+//! Widgets (widgets.rs): Lua plugins run on wl-shell-lua's thread pool,
+//! configured from the `widget` keys and `[plugin.<name>]` tables and
+//! restarted when their files change (watched like the config). Their
+//! events come through a channel into the loop; an app widget's label
+//! replaces the app's name in every dock.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -158,6 +164,7 @@ use crate::strip::{self, Key};
 use crate::trash;
 use crate::view::{DockView, MenuEvent, Offer, Style};
 use crate::websuggest;
+use crate::widgets::{self, Effect, Widgets};
 use crate::windowsearch;
 
 /// How long the launcher (or the activate surface) waits for the
@@ -516,6 +523,10 @@ pub struct WlDock {
     keys: Option<Keys>,
     /// What it activates or opens, once its surface is gone.
     pending_keys: Vec<KeysRun>,
+    /// The plugins behind widgets.
+    widgets: Widgets,
+    /// Watching the plugin files.
+    plugin_watches: Vec<RegistrationToken>,
 }
 
 impl WlDock {
@@ -599,6 +610,8 @@ impl WlDock {
             history_path: history::path(),
             keys: None,
             pending_keys: Vec::new(),
+            widgets: Widgets::default(),
+            plugin_watches: Vec::new(),
         })
     }
 
@@ -610,6 +623,7 @@ impl WlDock {
         self.config = self.reloader.config().clone();
         self.config.launcher.web.check();
         self.start_worker(core)?;
+        self.start_widgets(core);
         self.start_web_worker(core);
         self.load_browser_preferences();
         self.watch_config(core);
@@ -706,6 +720,94 @@ impl WlDock {
         self.trash_touched = true;
     }
 
+    // -- widgets -------------------------------------------------------------
+
+    /// Start the plugin runtime; its events come through the loop.
+    fn start_widgets(&mut self, core: &Core<Self>) {
+        let (send, events) = channel::channel();
+        let send = std::sync::Mutex::new(send);
+        let started = self.widgets.start(move |e| {
+            let _ = send.lock().map(|s| s.send(e));
+        });
+        if let Err(e) = started {
+            return warn!("no widgets: {e}");
+        }
+        let watched =
+            core.loop_handle
+                .insert_source(events, |event, _, shell: &mut Shell<Self>| {
+                    if let channel::Event::Msg(event) = event {
+                        shell.program.plugin_event(&mut shell.core, event);
+                    }
+                });
+        if let Err(e) = watched {
+            warn!("no widgets: {e}");
+        }
+        self.configure_widgets(core);
+    }
+
+    /// Run the plugins the config asks for, and watch their files.
+    fn configure_widgets(&mut self, core: &Core<Self>) {
+        let dir = widgets::plugin_dir(self.reloader.path().as_deref());
+        if self
+            .widgets
+            .configure(widgets::specs(&self.config, dir.as_deref()))
+        {
+            self.show_widget_names();
+        }
+        let paths = match self.config.widgets.enabled {
+            true => widgets::watched(&self.config, dir.as_deref()),
+            false => Vec::new(),
+        };
+        if paths == self.widgets.watching {
+            return;
+        }
+        for token in self.plugin_watches.drain(..) {
+            core.loop_handle.remove(token);
+        }
+        for path in &paths {
+            let p = path.clone();
+            let watched = wl_shell_config::watch_file(
+                &core.loop_handle,
+                path,
+                move |shell: &mut Shell<Self>| shell.program.widgets.touched.push(p.clone()),
+            );
+            match watched {
+                Ok(token) => self.plugin_watches.push(token),
+                // No plugin folder: nothing to watch until it exists.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("not watching {}: {e}", path.display()),
+            }
+        }
+        self.widgets.watching = paths;
+    }
+
+    /// Something from the plugin runtime.
+    fn plugin_event(&mut self, core: &mut Core<Self>, event: wl_shell_lua::Event) {
+        match self.widgets.event(event) {
+            Some(Effect::Labels) => self.show_widget_names(),
+            Some(Effect::Clipboard(text)) => {
+                let data = ([
+                    "text/plain;charset=utf-8",
+                    "text/plain",
+                    "UTF8_STRING",
+                    "STRING",
+                ])
+                .map(|mime| (mime.to_string(), text.clone().into_bytes()));
+                if let Err(e) = core.set_selection(data.into()) {
+                    warn!("a widget's copy: {e}");
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Give the docks the widgets' labels.
+    fn show_widget_names(&mut self) {
+        for dock in &mut self.docks {
+            dock.set_widget_names(self.widgets.labels());
+        }
+    }
+
     /// Look whether anything is in the Trash.
     fn check_trash(&mut self) {
         let full = self.trash_dir.as_deref().is_some_and(trash::full);
@@ -737,6 +839,13 @@ impl WlDock {
         }
         if std::mem::take(&mut self.pins_touched) {
             self.reload_pins();
+        }
+        let plugins = std::mem::take(&mut self.widgets.touched);
+        if !plugins.is_empty() {
+            self.configure_widgets(core);
+            for path in &plugins {
+                self.widgets.reload(path);
+            }
         }
         if std::mem::take(&mut self.trash_touched) {
             self.check_trash();
@@ -2656,6 +2765,7 @@ impl WlDock {
         }
         self.use_streams(core);
         self.watch_trash(core);
+        self.configure_widgets(core);
         self.outputs_dirty = true;
         self.reload = true;
         self.trim = true;
@@ -2754,6 +2864,7 @@ impl WlDock {
                         let apps: Vec<String> =
                             self.launching.iter().map(|l| l.app_id.clone()).collect();
                         dock.set_launching(&apps);
+                        dock.set_widget_names(self.widgets.labels());
                         self.docks.push(dock);
                     }
                     Err(e) => warn!("failed to create a dock: {e}"),

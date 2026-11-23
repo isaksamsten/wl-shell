@@ -600,6 +600,8 @@ pub struct DockView {
     /// Where the label goes: along the dock, and its start across it.
     label_at: (f64, f64),
     label_timer: Option<RegistrationToken>,
+    /// The labels widgets give their apps, by app ID (over the names).
+    widget_names: BTreeMap<String, String>,
 
     frame_pending: bool,
     last_frame: Option<Instant>,
@@ -745,6 +747,7 @@ impl DockView {
             label_alpha: Spring::new(0.0, LABEL_RESPONSE),
             label_at: (0.0, 0.0),
             label_timer: None,
+            widget_names: BTreeMap::new(),
             frame_pending: false,
             last_frame: None,
             output_size: None,
@@ -969,13 +972,46 @@ impl DockView {
         }
     }
 
+    /// The labels widgets give their apps now.
+    pub fn set_widget_names(&mut self, names: &BTreeMap<String, String>) {
+        if *names == self.widget_names {
+            return;
+        }
+        let changed: Vec<String> = (names.iter())
+            .filter(|(app, name)| self.widget_names.get(*app) != Some(name))
+            .map(|(app, _)| app.clone())
+            .chain(
+                (self.widget_names.keys())
+                    .filter(|app| !names.contains_key(*app))
+                    .cloned(),
+            )
+            .collect();
+        self.widget_names = names.clone();
+        // Have the new labels ready for a hover.
+        let cache = self.cache.borrow();
+        for app in &changed {
+            let shown = (self.slots.iter()).any(|s| !s.leaving && s.item.app_id == *app);
+            if let Some(key) = self.label_key(app).filter(|_| shown)
+                && cache.label(&key).is_none()
+            {
+                self.assets.label(&key);
+            }
+        }
+        drop(cache);
+        if (self.hovered.as_ref()).is_some_and(|h| changed.contains(h)) {
+            self.update_label();
+        }
+    }
+
     fn label_key(&self, app_id: &str) -> Option<LabelKey> {
         let name = match app_id {
             dock::SEPARATOR => return None,
             dock::TRASH => Some("Trash".to_string()),
             _ => match dock::folder_pin(app_id) {
                 Some(pin) => Some(folder::name(pin, &pins::expand(pin))),
-                None => self.style.names.get(app_id).cloned(),
+                None => (self.widget_names.get(app_id))
+                    .or_else(|| self.style.names.get(app_id))
+                    .cloned(),
             },
         };
         Some(LabelKey {

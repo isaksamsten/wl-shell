@@ -31,6 +31,7 @@ mod stripview;
 mod trash;
 mod view;
 mod websuggest;
+mod widgets;
 mod windowsearch;
 mod zoom;
 

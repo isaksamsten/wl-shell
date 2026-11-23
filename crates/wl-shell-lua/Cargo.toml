@@ -1,0 +1,14 @@
+[package]
+name = "wl-shell-lua"
+description = "Lua plugins for wl-shell programs: states on a thread pool, host functions, capabilities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wl-shell-log.workspace = true
+
+mlua.workspace = true
+serde.workspace = true
+serde_json.workspace = true
