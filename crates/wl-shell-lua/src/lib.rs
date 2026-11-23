@@ -43,7 +43,8 @@ mod state;
 pub mod ui;
 
 pub use caps::{
-    API, ActionDecl, Capabilities, Registry, SPANS, SourceDecl, Span, WidgetCaps, span_step,
+    API, ActionDecl, Capabilities, PopupOn, Registry, SPANS, SourceDecl, Span, WidgetCaps,
+    span_step,
 };
 pub use channel::{
     Answer, Axis, InstanceId, Pending, Reply, Request, RequestId, RequestKind, Ticket, Tile, Topic,

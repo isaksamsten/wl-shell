@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use wl_shell_log::warn;
 use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
-    AppInfo, Axis, Event, InstanceSpec, Pending, Registry, Reply, RequestKind, Role, Runtime,
-    Settings, Source, Span, Tile, Topic,
+    AppInfo, Axis, Event, InstanceSpec, Pending, PopupOn, Registry, Reply, RequestKind, Role,
+    Runtime, Settings, Source, Span, Tile, Topic,
 };
 use wl_shell_render::icons::AppEntry;
 
@@ -484,9 +484,27 @@ impl Widgets {
         (self.registry.widget(&key_instance(key))).is_some_and(|w| w.popup)
     }
 
-    /// Whether the widget behind the item `key` takes its clicks
-    /// (`on_click`), so a click doesn't toggle its popup.
+    /// What opens the popup of the item `key`, if it has one: an app's
+    /// always opens on hover (a click is the app's), a standalone
+    /// widget's as its plugin says (`popup_on`).
+    pub fn popup_on(&self, key: &str) -> Option<PopupOn> {
+        let w = self.registry.widget(&key_instance(key)).filter(|w| w.popup)?;
+        match dock::widget_name(key) {
+            Some(_) => Some(w.popup_on),
+            None => Some(PopupOn::Hover),
+        }
+    }
+
+    /// Whether the widget behind the item `key` takes its left clicks
+    /// (`on_click`): it has the hook, and its popup doesn't open on
+    /// click.
     pub fn takes_clicks(&self, key: &str) -> bool {
+        self.takes_middle_clicks(key) && self.popup_on(key) != Some(PopupOn::Click)
+    }
+
+    /// Whether the widget behind the item `key` has `on_click`, which
+    /// hears middle clicks whatever opens the popup.
+    pub fn takes_middle_clicks(&self, key: &str) -> bool {
         (self.registry.widget(&key_instance(key))).is_some_and(|w| w.on_click)
     }
 
@@ -990,6 +1008,45 @@ mod tests {
         };
         assert!(w.event(failed).labels);
         assert!(w.labels().is_empty());
+    }
+
+    #[test]
+    fn popups_open_on_hover_except_clicked_standalone_ones() {
+        use wl_shell_lua::{Capabilities, WidgetCaps};
+        let mut w = Widgets::default();
+        let load = |w: &mut Widgets, instance: &str, popup, on_click, popup_on| {
+            let widget = WidgetCaps {
+                popup,
+                on_click,
+                popup_on,
+                ..Default::default()
+            };
+            w.event(Event::Loaded {
+                instance: instance.into(),
+                caps: Capabilities {
+                    widget: Some(widget),
+                    ..Default::default()
+                },
+            });
+        };
+        load(&mut w, "app:a", true, false, PopupOn::Click);
+        load(&mut w, "widget:cal", true, true, PopupOn::Click);
+        load(&mut w, "widget:clock", true, true, PopupOn::Hover);
+        load(&mut w, "widget:btn", false, true, PopupOn::Click);
+        let cal = dock::widget_key("cal");
+        let clock = dock::widget_key("clock");
+        let btn = dock::widget_key("btn");
+        // A click on an app is the app's: its popup opens on hover.
+        assert_eq!(w.popup_on("a"), Some(PopupOn::Hover));
+        // Opening on click takes left clicks from `on_click`, not middle.
+        assert_eq!(w.popup_on(&cal), Some(PopupOn::Click));
+        assert!(!w.takes_clicks(&cal) && w.takes_middle_clicks(&cal));
+        assert_eq!(w.popup_on(&clock), Some(PopupOn::Hover));
+        assert!(w.takes_clicks(&clock));
+        // No popup: nothing opens, and `on_click` hears every click.
+        assert_eq!(w.popup_on(&btn), None);
+        assert!(w.takes_clicks(&btn));
+        assert_eq!(w.popup_on("unknown"), None);
     }
 
     #[test]

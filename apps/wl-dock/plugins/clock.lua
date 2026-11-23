@@ -21,6 +21,8 @@ local ui, theme = dock.ui, dock.theme
 local C = {}
 local format, date, face, popup = "%H:%M", "%A %e %B", dock.app == nil, dock.app == nil
 
+C.popup_on = "click"
+
 function C.setup(opts)
 	if type(opts.format) == "string" then
 		format = opts.format
@@ -98,4 +100,3 @@ function C.popup()
 end
 
 return C
-

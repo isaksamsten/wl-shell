@@ -3,7 +3,8 @@
 //!
 //! A plugin file returns one table. Widget hooks (`icon`, `label`,
 //! `popup`, `on_open`, `on_close`, `on_click`) sit at its top level or
-//! under `widget`; `setup` at the top level (or under `widget`).
+//! under `widget`, next to `span` and `popup_on`; `setup` at the top
+//! level (or under `widget`).
 //! `actions` and `sources` are lists of tables for the launcher: their
 //! keys are reserved by `api = 1` and only their ids and names are read
 //! for now. `api`, if given, must be 1.
@@ -28,6 +29,19 @@ pub struct WidgetCaps {
     pub on_click: bool,
     /// The tile's length along the dock, per axis.
     pub span: Span,
+    /// What opens the popup of a standalone widget (an app's always
+    /// opens on hover, since a click is the app's).
+    pub popup_on: PopupOn,
+}
+
+/// What opens a widget's popup: `popup_on = 'hover' | 'click'`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PopupOn {
+    /// Hovering the item for its popup delay; the label doesn't show.
+    #[default]
+    Hover,
+    /// A left click; hovering shows the label.
+    Click,
 }
 
 /// A tile's length along the dock, in icons: 1, 1.5 or 2.
@@ -115,6 +129,7 @@ impl Capabilities {
             on_close: is_fn(&widget, "on_close"),
             on_click: is_fn(&widget, "on_click"),
             span: span(&widget.get::<Value>("span").map_err(e)?)?,
+            popup_on: popup_on(&widget.get::<Value>("popup_on").map_err(e)?)?,
         };
         let any = caps.icon || caps.label || caps.popup || caps.on_click;
         Ok(Capabilities {
@@ -147,6 +162,19 @@ pub(crate) fn widget_table(plugin: &Table) -> mlua::Result<Table> {
         Value::Table(t) => t,
         _ => plugin.clone(),
     })
+}
+
+/// `popup_on = 'hover'` (the default) or `'click'`.
+pub(crate) fn popup_on(v: &Value) -> Result<PopupOn, String> {
+    match v {
+        Value::Nil => Ok(PopupOn::Hover),
+        Value::String(s) if s.as_bytes() == b"hover" => Ok(PopupOn::Hover),
+        Value::String(s) if s.as_bytes() == b"click" => Ok(PopupOn::Click),
+        v => Err(format!(
+            "popup_on: expected 'hover' or 'click', got {}",
+            show(v)
+        )),
+    }
 }
 
 /// `span = 2`, or `span = { horizontal = 2, vertical = 1 }`.
@@ -312,6 +340,16 @@ mod tests {
         let s = c.widget.unwrap().span;
         assert_eq!((s.horizontal, s.vertical), (2.0, 1.0));
         assert!(caps("return { label = function() end, span = 'wide' }").is_err());
+    }
+
+    #[test]
+    fn popup_on() {
+        let c = caps("return { popup = function() end }").unwrap();
+        assert_eq!(c.widget.unwrap().popup_on, PopupOn::Hover);
+        let c = caps("return { widget = { popup = function() end, popup_on = 'click' } }").unwrap();
+        assert_eq!(c.widget.unwrap().popup_on, PopupOn::Click);
+        let e = caps("return { popup = function() end, popup_on = 'press' }").unwrap_err();
+        assert!(e.contains("popup_on"), "{e}");
     }
 
     #[test]

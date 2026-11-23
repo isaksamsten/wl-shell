@@ -633,6 +633,9 @@ pub struct DockView {
     hovered: Option<String>,
     /// The hover delay passed: the hovered app's label shows.
     label_on: bool,
+    /// The item whose label is held back, since its widget's popup
+    /// opens on hover (and is about to, or is open).
+    label_held: Option<String>,
     /// The label shown (or fading out). Looked up in the cache when
     /// drawn, since the cache may replace it.
     label: Option<LabelKey>,
@@ -787,6 +790,7 @@ impl DockView {
             hover: Spring::new(0.0, response),
             hovered: None,
             label_on: false,
+            label_held: None,
             label: None,
             label_alpha: Spring::new(0.0, LABEL_RESPONSE),
             label_at: (0.0, 0.0),
@@ -2195,7 +2199,8 @@ impl DockView {
     }
 
     /// The label that should show: the hovered app's once the delay
-    /// passed, or while dragging, what a drop does.
+    /// passed (unless its popup opens on hover, or one is open), or
+    /// while dragging, what a drop does.
     fn wanted_label(&self) -> Option<LabelKey> {
         if self.launcher.is_some() {
             return None;
@@ -2210,10 +2215,14 @@ impl DockView {
         if let Some(incoming) = &self.incoming {
             return self.incoming_label(incoming);
         }
-        // The strip replaces its app's label; no label shows over a menu.
+        // The strip replaces its app's label, and a widget's popup that
+        // opens on hover its item's; no label shows over a menu or a
+        // popup.
         let stripped = |a: &str| (self.strip.as_ref()).is_some_and(|s| s.app_id == a);
+        let held = |a: &str| self.label_held.as_deref() == Some(a);
+        let covered = self.menu.is_some() || self.widget_open();
         (self.hovered.as_deref())
-            .filter(|a| self.label_on && !stripped(a) && self.menu.is_none())
+            .filter(|a| self.label_on && !stripped(a) && !held(a) && !covered)
             .and_then(|a| self.label_key(a))
     }
 
@@ -2242,6 +2251,14 @@ impl DockView {
             }
         }
         self.kick();
+    }
+
+    /// Hold back the label of the item `key` (None: of none).
+    pub fn hold_label(&mut self, key: Option<&str>) {
+        if self.label_held.as_deref() != key {
+            self.label_held = key.map(str::to_owned);
+            self.update_label();
+        }
     }
 
     // -- frames ------------------------------------------------------------
@@ -3074,7 +3091,8 @@ impl DockView {
         if !self.pointer_in && !self.strip_open() && !self.menu_open() {
             self.unhover(core);
         }
-        self.kick();
+        // The label it covered comes back.
+        self.update_label();
     }
 
     /// The remote image `src` arrived: the popup is painted again if it
@@ -3116,6 +3134,8 @@ impl DockView {
             Ok(w) => {
                 self.widget = Some(w);
                 self.sync_autohide();
+                // No label over the popup.
+                self.update_label();
             }
             Err(e) => warn!("cannot show the widget's popup: {e}"),
         }

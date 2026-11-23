@@ -39,8 +39,9 @@ popup-delay = 400              # ms of hover before the popup; default: [widgets
 ```
 
 Clicking the item still launches or activates the app, and its menu, windows
-and indicator stay the same. If the plugin fails, the app gets its own name,
-icon and size back.
+and indicator stay the same. So on an app, a plugin's popup always opens on
+hover, even if the plugin asks for `popup_on = 'click'`. If the plugin fails,
+the app gets its own name, icon and size back.
 
 ### Standalone
 
@@ -64,13 +65,14 @@ the Trash. The pins file (`$XDG_STATE_HOME/wl-dock/pinned`) holds it as an
 `@clock` line. A `---` line in that file stands for the separator, and
 `@name` lines after it sit among the folders.
 
-Standalone widgets have no windows and no indicator. A left or middle click
-calls the plugin's `on_click(button)`. If the plugin has no `on_click`, the
-click opens or closes the popup. The right-click menu has **Remove from
-Dock**, and dropping the widget on the Trash does the same. Removing it
-deletes the `@clock` line but keeps `[widget.clock]`, so you can pin it
-again later. Until the plugin draws an icon, or while it is failing, the
-item shows a placeholder.
+Standalone widgets have no windows and no indicator. A left click opens or
+closes the popup if the plugin has `popup_on = 'click'`. Otherwise the click
+calls the plugin's `on_click('left')`, or opens or closes the popup if the
+plugin has no `on_click`. A middle click calls `on_click('middle')`. The
+right-click menu has **Remove from Dock**, and dropping the widget on the
+Trash does the same. Removing it deletes the `@clock` line but keeps
+`[widget.clock]`, so you can pin it again later. Until the plugin draws an
+icon, or while it is failing, the item shows a placeholder.
 
 ### Plugin tables and global settings
 
@@ -323,15 +325,16 @@ All hooks are optional. A plugin needs at least one of `icon`, `label`,
 | `popup()`       | When the popup opens and after `dock.redraw()` while it is open | A UI tree, or `nil` for no popup                                        |
 | `on_open()`     | When the popup opens                                            |                                                                         |
 | `on_close()`    | When the popup closes                                           |                                                                         |
-| `on_click(btn)` | A standalone widget's item is clicked                           | `btn`: `'left'` or `'middle'`                                           |
+| `on_click(btn)` | A standalone widget's item is clicked (left: see `popup_on`)    | `btn`: `'left'` or `'middle'`                                           |
 | `on_app()`      | `dock.app` gained names (see above)                             |                                                                         |
 
 The plugin table also takes these keys:
 
-| Key    | Meaning                                                                                                                                                                                     |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `span` | The tile's length along the dock in icons: `1`, `1.5` or `2` (other values round down), or per dock direction `{ horizontal = 2, vertical = 1 }`. Change it at run time with `dock.span()`. |
-| `api`  | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
+| Key        | Meaning                                                                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `span`     | The tile's length along the dock in icons: `1`, `1.5` or `2` (other values round down), or per dock direction `{ horizontal = 2, vertical = 1 }`. Change it at run time with `dock.span()`. |
+| `popup_on` | What opens the popup: `'hover'` (default) or `'click'`. See [`popup()`](#popup). On an app's item the popup always opens on hover.                                                          |
+| `api`      | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
 
 `actions` and `sources` are reserved for future launcher integration.
 
@@ -354,12 +357,23 @@ icon tree are never called.
 
 #### `popup()`
 
-The popup opens after the item has been hovered for its `popup-delay`. It is
-shown in a speech bubble pointing at the item, like the menu. When the
-pointer moves from one open popup to another widget, the next popup opens at
-once. The dock handles hover and pressed looks, slider drags and scrolling
-itself. It calls the plugin's handlers as described in
-[Interaction](#interaction).
+By default the popup opens after the item has been hovered for its
+`popup-delay`, and the item's label doesn't show: hovering shows the popup
+or the label, never both. If `popup()` returns `nil`, the label shows
+instead, until the pointer moves to another item and back.
+
+With `popup_on = 'click'`, a standalone widget shows its label on hover, and
+a left click opens or closes the popup instead of calling `on_click`. The
+popup stays open while the pointer moves over items without a hover popup,
+and closes when the pointer leaves the dock and the popup, on another click,
+or when it hands over to another widget's hover popup. On an app's item,
+clicks belong to the app, so its popup opens on hover anyway.
+
+No label shows while a popup is open. The popup is shown in a speech bubble
+pointing at the item, like the menu. When the pointer moves from one open
+popup to another widget, the next popup opens at once. The dock handles
+hover and pressed looks, slider drags and scrolling itself. It calls the
+plugin's handlers as described in [Interaction](#interaction).
 
 ### The `dock` API
 

@@ -106,8 +106,14 @@
 //! Standalone widgets are items of their own, among the pinned apps or
 //! among the folders: dragged anywhere from the first app to just before
 //! the Trash, removed (on the Trash, or with their menu's Remove from
-//! Dock) but never unpinned. Clicking one calls its `on_click`, or else
-//! opens or closes its popup.
+//! Dock) but never unpinned.
+//!
+//! A widget's popup opens on hover (an app's always, a standalone
+//! widget's unless its plugin says `popup_on = 'click'`), and then the
+//! item's label doesn't show unless `popup()` has nothing to show. A
+//! click on a standalone widget opens or closes its popup if it opens
+//! on click, else calls its `on_click`, else opens or closes its popup.
+//! While a popup is open, no label shows.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -144,6 +150,7 @@ use wl_shell_core::toplevel::Toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Client, Incoming as SocketEvent, Listener, Reply};
 use wl_shell_log::warn;
+use wl_shell_lua::PopupOn;
 use wl_shell_render::files::{self, FileEntry, FolderRequest};
 use wl_shell_render::icons::{AppEntry, DesktopAction, IndexedApp};
 use wl_shell_render::worker::{Assets, Done};
@@ -546,6 +553,10 @@ pub struct WlDock {
     /// The item whose widget's popup was open when the button went down
     /// on the dock: clicking it closes the popup for good.
     widget_was_open: Option<String>,
+    /// The hovered item whose widget had no popup to show (`popup()`
+    /// was nil): it shows its label, and isn't asked again until the
+    /// pointer moves to another item.
+    widget_declined: Option<String>,
     /// The standalone widgets pinned when the plugins were last
     /// configured (they run while they are pinned).
     widget_pins: Vec<String>,
@@ -641,6 +652,7 @@ impl WlDock {
             widget_target: None,
             widget_epoch: 0,
             widget_was_open: None,
+            widget_declined: None,
             widget_pins: Vec::new(),
             widget_grace: 0,
             plugin_watches: Vec::new(),
@@ -859,7 +871,10 @@ impl WlDock {
             {
                 dock.paint_widget(&app, tree)
             } else {
-                self.hide_widget(core)
+                // Nothing to show: the label shows instead, and hovering
+                // on doesn't ask again.
+                self.hide_widget(core);
+                self.widget_declined = Some(app);
             }
         }
         if labels {
@@ -3176,7 +3191,7 @@ impl WlDock {
                 self.middle_click(core, &item);
                 self.release_keyboard(output);
             }
-            BTN_MIDDLE if item.is_widget() && self.widgets.takes_clicks(&item.app_id) => {
+            BTN_MIDDLE if item.is_widget() && self.widgets.takes_middle_clicks(&item.app_id) => {
                 self.close_strips(core);
                 let kind = wl_shell_lua::RequestKind::Click("middle".into());
                 self.widgets.notify(&item.app_id, kind);
@@ -3288,20 +3303,23 @@ impl WlDock {
     }
 
     /// A left click on the standalone widget `item` on `output`: its
-    /// `on_click("left")`, else its popup opens, or stays closed if it
-    /// was open (the press closed it). Either way, hovering it doesn't
+    /// popup opens, or stays closed if it was open (the press closed
+    /// it), unless the plugin takes the click (`on_click("left")`, when
+    /// its popup doesn't open on click). Either way, hovering it doesn't
     /// open the popup again until the pointer moves to another item.
     fn click_widget(&mut self, output: &WlOutput, item: &Item) {
         let key = &item.app_id;
         let was_open = self.widget_was_open.take().as_ref() == Some(key);
         self.widget_epoch = self.widget_epoch.wrapping_add(1);
         self.widget_target = Some((output.clone(), key.clone()));
+        self.widget_declined = None;
         if self.widgets.takes_clicks(key) {
             let kind = wl_shell_lua::RequestKind::Click("left".into());
             self.widgets.notify(key, kind);
         } else if !was_open && self.widgets.supports_popup(key) {
             self.widgets.select_popup(Some(key));
         }
+        self.sync_label_hold();
     }
 
     /// Close every dock's strip.
@@ -3328,11 +3346,27 @@ impl WlDock {
         for d in &mut self.docks {
             d.close_widget(core);
         }
+        self.sync_label_hold();
+    }
+
+    /// Hold back the label of the item whose popup opens on hover (and
+    /// is about to, or is open), so the two never show together.
+    fn sync_label_hold(&mut self) {
+        let held = (self.widget_target.as_ref())
+            .filter(|(_, key)| self.widgets.popup_on(key) == Some(PopupOn::Hover))
+            .cloned();
+        for dock in &mut self.docks {
+            let key = (held.as_ref())
+                .filter(|(output, _)| *output == dock.output)
+                .map(|(_, key)| key.as_str());
+            dock.hold_label(key);
+        }
     }
 
     /// The pointer left the dock or the widget's popup: close the popup
     /// unless it comes back to either soon (from the icon to the popup).
     fn leave_widget(&mut self, core: &Core<Self>) {
+        self.widget_declined = None;
         if self.widget_target.is_none() {
             return;
         }
@@ -3346,14 +3380,24 @@ impl WlDock {
 
     /// The pointer moved on the dock on `output`: open the hovered item's
     /// widget's popup after its delay (at once if another one was open,
-    /// as the strip hands over), or close the one open.
+    /// as the strip hands over), or close the one open. A popup opened by
+    /// a click stays open over items without a hover popup.
     fn hover_widget(&mut self, core: &Core<Self>, output: &WlOutput) {
         self.widget_grace = self.widget_grace.wrapping_add(1);
-        let target = self
-            .hovered_item(output)
-            .filter(|i| self.widgets.supports_popup(&i.app_id))
-            .map(|i| (output.clone(), i.app_id.clone()));
+        let hovered = self.hovered_item(output).map(|i| i.app_id);
+        if self.widget_declined != hovered {
+            self.widget_declined = None;
+        }
+        let target = hovered
+            .filter(|key| self.widgets.popup_on(key) == Some(PopupOn::Hover))
+            .filter(|key| self.widget_declined.as_ref() != Some(key))
+            .map(|key| (output.clone(), key));
         if self.widget_target == target {
+            return;
+        }
+        let clicked = (self.widget_target.as_ref())
+            .is_some_and(|(_, key)| self.widgets.popup_on(key) == Some(PopupOn::Click));
+        if clicked && target.is_none() {
             return;
         }
         let handover = self.docks.iter().any(DockView::widget_open);
@@ -3368,6 +3412,7 @@ impl WlDock {
             false => own.unwrap_or(self.config.widgets.popup_delay),
         };
         self.widget_target = Some((output.clone(), app.clone()));
+        self.sync_label_hold();
         let epoch = self.widget_epoch;
         let _ = core.timer(
             Duration::from_millis(delay.into()),
