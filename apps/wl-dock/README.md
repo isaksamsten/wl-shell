@@ -311,193 +311,29 @@ that app's windows).
 
 ### Widgets
 
-A widget is a Lua 5.4 plugin behind an app's item, or an item of its own. On
-an app, it can replace the app's label (its name on hover) and its icon, make
-its tile longer along the dock, and show an interactive popup while the item
-is hovered; clicking the item still launches or activates the app.
-
-```toml
-[app.foot]
-widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # or just widget = "clock"
-popup-delay = 400             # ms of hover before the widget's popup (default: [widgets])
-
-[widget.clock]                 # A standalone widget, shown while `@clock` is pinned
-# plugin = "clock"             # Default: the table's name
-name = "Clock"                 # Its label (default: the table's name)
-popup-delay = 600
-# format = "%H:%M"             # Any other key is an option for the plugin
-
-[plugin.clock]                 # Optional: defaults for every placement
-# path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
-format = "%H:%M"
-
-[widgets]
-enabled = true                 # Default
-popup-delay = 300              # Default
-budget = 1000000               # Lua instructions per hook call (default)
-```
-
-A standalone widget is placed with `wl-dock pin @clock` (or an `@clock` line
-in the pins file), at the end of the pinned apps; drag it anywhere on the
-dock: among the apps, or past the separator among the folders, up to just
-before the Trash. In the pins file, a `---` line stands for the separator:
-`@name` lines after it sit among the folders. It has no windows or
-indicator. Clicking it calls the plugin's `on_click(button)`
-(`'left'` or `'middle'`), or without one opens or closes its popup. Its menu
-has Remove from Dock, as does dropping it on the Trash: that takes the
-`@clock` line out of the pins file and leaves `[widget.clock]` alone, so it
-can be pinned again. Until the plugin draws an icon (or while it fails) it
-shows a placeholder. The bundled `clock` draws an analog clock, with the
-time as its label and the date in its popup (on an app it only sets the
-label, unless `face = true`).
-
-The bundled `player` shows what an MPRIS media player plays: the cover as
-the icon, `title – artist` as the label, and a popup that plays, pauses,
-skips and seeks. On an app it follows that app's own player, matched by the
-player's `DesktopEntry` or bus name (`org.mpris.MediaPlayer2.spotify` is
-`spotify`, without an `.instanceN`) against the app's ID, desktop entry and
-`StartupWMClass`; `player` names one by its bus name instead. Standalone,
-it follows whichever player plays (else the one that changed last), and its
-popup's title raises that player's app.
+A widget is a Lua plugin that sits behind an app's item, where it can replace
+the app's label and icon, make its tile longer and add a popup shown on hover.
+It can also be an item of its own that you pin with `wl-dock pin @<name>`.
+Two plugins are bundled: `clock` and `player` (what an MPRIS media player is
+playing, with a cover, controls and a seek bar).
 
 ```toml
 [app.spotify]
-widget = "player"
+widget = "player"              # or { plugin = "player", player = "spotify" }
 
-[app.firefox]
-widget = { plugin = "player", player = "firefox" }  # by bus name; `*` at the end matches any rest
+[widget.clock]                 # Shown while `@clock` is pinned
+name = "Clock"
+format = "%H:%M"               # Other keys are options for the plugin
 
-[widget.nowplaying]
-plugin = "player"
-name = "Now Playing"
-# cover = false                # Keep the icon as it is
-# label = false                # Keep the item's name
+[widgets]
+enabled = true
+popup-delay = 300
+budget = 1000000               # Lua instructions per hook call
 ```
 
-A plugin is a file that returns a table of hooks:
-
-```lua
-local P, n = {}, 0
-function P.setup(opts) dock.every(1000, function() n = n + 1; dock.redraw() end) end
-function P.label() return 'Up ' .. n .. 's' end
-return P
-```
-
-`setup(opts)` gets the plugin's options; `label()` returns a string, or `nil`
-for the app's own name, and is asked again after `dock.redraw()`. Host
-functions: `dock.redraw()`, `dock.timer(ms, fn)` and `dock.every(ms, fn)`
-(handles with `:cancel()`), `dock.spawn(argv, { on_line = fn, on_exit = fn })`
-(a handle with `:kill()`), `dock.run(argv)` (detached), `dock.read(path)`,
-`dock.json.decode(s)` / `dock.json.encode(v)`, `dock.clipboard(text)` and
-`dock.now()` (Unix time in seconds, with a fraction: the clock of `live.at`);
-`argv` is a list, or a string for `sh -c`. `dock.app` is the app the widget
-backs (`nil` standalone), by every name the dock knows it by: `id` (the
-dock's app ID), `desktop` (the desktop entry it matched, without
-`.desktop`), `wm_class` (that entry's `StartupWMClass`) and `name`. The
-entry's names arrive once the dock has looked it up: the same table changes,
-the plugin's `on_app()` is called, and it redraws. Plugins have no `io`,
-`debug` or `os.execute`; `require` loads modules next to the plugin, then
-the bundled ones (`mpris`). A hook that runs past its budget, or a failing
-`setup`, restarts the plugin with backoff, and the app shows its own name
-meanwhile. Plugin files reload when saved.
-
-`dock.dbus.session()` and `dock.dbus.system()` are D-Bus clients. Every call
-is asynchronous; replies and signals come back as callbacks on the plugin's
-thread:
-
-```lua
-local bus = dock.dbus.session()
-bus:call{dest = 'org.mpris.MediaPlayer2.spotify', path = '/org/mpris/MediaPlayer2',
-  iface = 'org.mpris.MediaPlayer2.Player', method = 'SetPosition',
-  signature = 'ox', args = {track, us}, timeout = 5000,
-  on_reply = function(ret, err) end}           -- ret: the reply's arguments, as a list
-bus:get(dest, path, iface, name, function(value, err) end)
-bus:get_all(dest, path, iface, function(props, err) end)
-bus:set(dest, path, iface, name, signature, value, function(err) end)
-local sub = bus:watch{sender = dest, path = path, iface = iface, member = 'Seeked',
-  arg0 = nil, on_signal = function(args, msg) end}  -- msg: sender, path, iface, member
-bus:watch_props(dest, path, iface, function(changed, invalidated) end)
-bus:watch_names('org.mpris.MediaPlayer2.', function(name, owner) end)  -- owner nil: gone
-sub:cancel()
-```
-
-From D-Bus, variants unwrap, integers (`x` and `t` too) are integers,
-doubles numbers, `a{..}` tables keyed by the key, other arrays and structs
-lists, object paths and signatures strings, and `ay` a string. To D-Bus,
-`signature` says what the arguments are; a value that doesn't fit is an
-error on the call. A `v` is inferred (`b`, `x`, `d`, `s`, a list `as`, `ax`,
-`ad`, `ab` or `av`, another table `a{sv}`); file descriptors aren't
-supported. A call answers `on_reply(nil, err)` when it fails or times out
-(5 s); watches and calls go with the plugin when it reloads or stops.
-
-The bundled `mpris` module does the MPRIS part in Lua: `mpris.watch({app =
-dock.app, player = opts.player}, fn)` calls `fn(player)` with the player
-that app's widget shows (or `nil`) whenever the choice or the player
-changes. A player has `title`, `artist`, `album`, `art`, `length`,
-`position` (as of `at`), `rate`, `playing`, `status`, `can_*` flags,
-`:now()`, and `:play_pause()`, `:next()`, `:previous()`,
-`:set_position(seconds)`, `:raise()` and more; see `plugins/mpris.lua`.
-
-`icon(tile)` returns a UI tree drawn as the app's icon (or `nil` for the
-app's own). `tile` has `w` and `h` (the magnified size in logical pixels),
-`span`, `axis` (`'horizontal'` or `'vertical'`) and `scale`. A plugin makes its
-tile longer with `span = 2` in its table, or `dock.span(1.5)` at run time
-(1, 1.5 or 2 icons; `{ horizontal = 2, vertical = 1 }` per dock direction).
-
-```lua
-local ui = dock.ui
-local P, unread = {}, 3
-function P.icon(tile)
-  return ui.stack{ align = 'top-right',
-    ui.app_icon{},                      -- the app's own icon, underneath
-    ui.box{ variant = 'badge', ui.text{tostring(unread), style = 'caption'} },
-  }
-end
-return P
-```
-
-Trees are built from `dock.ui` constructors: props are named, children
-positional (`nil` children are skipped).
-
-| Constructor                                   | Props                                                                                                                                                                  |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ui.col{}`, `ui.row{}`                        | `gap`, `padding` (`8`, `{v, h}` or `{t, r, b, l}`), `align` (`start`, `center`, `end`, `stretch`), `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`) |
-| `ui.grid{}`                                   | `columns` (a count, or sizes: `40`, `'1fr'`, `'auto'`), `gap`, `row_gap`                                                                                               |
-| `ui.stack{}`                                  | `align` (`center`, `top-right`, `bottom`, ...); the first child is the bottom layer                                                                                    |
-| `ui.box{}`                                    | `variant` (`card`, `inset`, `badge`)                                                                                                                                   |
-| `ui.scroll{}`                                 | `max_height`                                                                                                                                                           |
-| `ui.spacer{}`, `ui.divider{}`                 | `size`                                                                                                                                                                 |
-| `ui.text{'...'}`                              | `style` (`title`, `body`, `muted`, `caption`), `weight`, `color`, `size`, `align`, `max_lines`                                                                         |
-| `ui.icon{'name'}`                             | `size`, `color` (`-symbolic` icons take the text color)                                                                                                                |
-| `ui.app_icon{}`                               | `app` (default: the widget's), `size`                                                                                                                                  |
-| `ui.image{src = path}`                        | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity`; `src` is a file, a `file://` or an `http(s)://` URL (fetched once, cached on disk)                  |
-| `ui.canvas{draw = fn}`                        | `viewbox = {w, h}` (default 100 x 100)                                                                                                                                 |
-| `ui.button{}`                                 | `label`, `icon`, `variant` (`plain`, `filled`, `ghost`), `enabled`, `selected`, `on_click`                                                                             |
-| `ui.slider{}`, `ui.toggle{}`, `ui.progress{}` | `value`, `min`, `max`, `enabled`, `live`, `on_change`, `on_commit`                                                                                                     |
-
-Every node also takes `width`, `height`, `min_*`, `max_*` (pixels or `'50%'`),
-`grow`, `background`, `radius`, `border`, `opacity`, `hover` (props while
-hovered) and `key`. Colors are CSS colors or the theme's names in
-`dock.theme` (`text`, `muted`, `accent`, `accent_text`, `surface`, `border`,
-`hover`, `pressed`, `track`, `divider`, `card`, `inset`, `badge`,
-`badge_text`), which follow the dock's appearance, light and dark. A canvas's
-`draw(c)` runs when the tree is built; `c` has `line`, `rect`, `circle`, `arc`
-(`from`, `to` in radians from 3 o'clock, `pie`), `path{d = 'M ...'}`, `text`,
-`save`, `restore`, `translate`, `rotate` and `scale`, each shape with `fill`,
-`stroke`, `width` and `cap`, in viewbox units.
-
-`popup()` returns a tree for the item's popup (or `nil` for none). It opens
-after the item has been hovered for its `popup-delay`, in a speech bubble
-pointing at the item like the menu, and at once when the pointer moves from
-one open popup to another widget. `on_open()` and `on_close()` are called as
-it opens and closes, and it is asked again after `dock.redraw()`. Hover,
-pressed looks, slider drags and scrolling are handled by the dock; the
-plugin hears `on_click()`, `on_change(value)` (at most 30 times a second
-while a slider is dragged), `on_commit(value)` (on release) and a toggle's
-`on_change(on)`. A slider or progress bar with `live = { rate = 1, at =
-dock.now() }` moves on its own from `value` at `at` (seconds) by `rate` per
-second, so a seek bar keeps up without a redraw; it is painted on its own
-layer, as often as that moves it a pixel.
+Your own plugins go in `~/.config/wl-dock/plugins/<name>.lua` and reload when
+you save them. See [PLUGINS.md](PLUGINS.md) for the widget settings, the
+bundled plugins' options, and a guide and reference for writing plugins.
 
 ### Per-folder settings
 

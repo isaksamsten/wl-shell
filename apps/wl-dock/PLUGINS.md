@@ -1,0 +1,965 @@
+# wl-dock widgets and plugins
+
+A **widget** is a Lua 5.4 plugin that draws part of the dock. It can sit
+behind an app's item, where it can replace the app's label (the name shown on
+hover) and icon, make the tile longer and add a popup. It can also be an item
+of its own (a _standalone_ widget) that you pin, drag and remove like an app.
+
+This document covers [using widgets](#using-widgets), the
+[bundled plugins](#bundled-plugins), and
+[writing your own](#writing-a-plugin), followed by a
+[reference](#reference) for the hooks, the `dock` API, UI trees and D-Bus.
+
+- [Using widgets](#using-widgets)
+- [Bundled plugins](#bundled-plugins)
+- [Writing a plugin](#writing-a-plugin)
+- [How a plugin runs](#how-a-plugin-runs)
+- [Reference](#reference)
+  - [Hooks](#hooks)
+  - [The `dock` API](#the-dock-api)
+  - [UI trees](#ui-trees)
+  - [Canvas](#canvas)
+  - [D-Bus](#d-bus)
+  - [The `mpris` module](#the-mpris-module)
+- [Examples](#examples)
+- [Tips and troubleshooting](#tips-and-troubleshooting)
+
+## Using widgets
+
+### On an app
+
+Give an `[app.<id>]` table a `widget`, either a plugin name or a table with
+`plugin` and that placement's options:
+
+```toml
+[app.foot]
+widget = "clock"
+# or: widget = { plugin = "clock", format = "%H:%M:%S", face = true }
+popup-delay = 400              # ms of hover before the popup; default: [widgets]
+```
+
+Clicking the item still launches or activates the app, and its menu, windows
+and indicator stay the same. If the plugin fails, the app gets its own name,
+icon and size back.
+
+### Standalone
+
+Create a `[widget.<name>]` table and pin `@<name>`:
+
+```toml
+[widget.clock]
+# plugin = "clock"             # Default: the table's name
+name = "Clock"                 # Label and menu title; default: the table's name
+popup-delay = 600
+# format = "%H:%M"             # Every other key is an option for the plugin
+```
+
+```sh
+wl-dock pin @clock
+```
+
+The widget goes at the end of the pinned apps. You can drag it anywhere
+among the apps, or past the separator among the folders, up to just before
+the Trash. The pins file (`$XDG_STATE_HOME/wl-dock/pinned`) holds it as an
+`@clock` line. A `---` line in that file stands for the separator, and
+`@name` lines after it sit among the folders.
+
+Standalone widgets have no windows and no indicator. A left or middle click
+calls the plugin's `on_click(button)`. If the plugin has no `on_click`, the
+click opens or closes the popup. The right-click menu has **Remove from
+Dock**, and dropping the widget on the Trash does the same. Removing it
+deletes the `@clock` line but keeps `[widget.clock]`, so you can pin it
+again later. Until the plugin draws an icon, or while it is failing, the
+item shows a placeholder.
+
+### Plugin tables and global settings
+
+```toml
+[plugin.clock]                 # Defaults for every placement of this plugin
+# path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
+format = "%H:%M"
+
+[widgets]
+enabled = true                 # false: no plugin runs
+popup-delay = 300              # ms
+budget = 1000000               # Lua instructions per hook call; 10000–1000000000
+```
+
+wl-dock looks up a plugin called `name` in this order:
+
+1. `[plugin.<name>] path`, with `~/` expanded and relative paths taken from
+   the config's folder
+2. `plugins/<name>.lua` next to the config file, usually
+   `~/.config/wl-dock/plugins/`
+3. the bundled plugin of that name
+
+A file in `plugins/` with the same name as a bundled plugin replaces it,
+even if you create the file while the dock is running. Plugin names use
+letters, digits, `-` and `_`.
+
+A placement gets the options of its plugin table, with its own options
+applied key by key on top.
+
+## Bundled plugins
+
+### `clock`
+
+Shows an analog clock face as the icon, the time as the label and the date
+in the popup. On an app it only sets the label by default, so the app keeps
+its icon.
+
+| Option   | Default                  | Meaning                                   |
+| -------- | ------------------------ | ----------------------------------------- |
+| `format` | `"%H:%M"`                | `os.date` format of the label             |
+| `date`   | `"%A %e %B"`             | `os.date` format of the date in the popup |
+| `face`   | standalone: on; app: off | Draw the clock face as the icon           |
+| `popup`  | standalone: on; app: off | Show the popup                            |
+
+### `player`
+
+Shows what an MPRIS media player is playing: the cover art as the icon,
+`title – artist` as the label, and a popup that can play, pause, skip and
+seek.
+
+On an app, it follows that app's own player. A player matches when its
+`DesktopEntry`, or its bus name without the prefix and any `.instanceN`
+suffix (`org.mpris.MediaPlayer2.spotify` becomes `spotify`), is one of the
+app's ID, desktop entry or `StartupWMClass`, ignoring case. As a standalone
+widget it follows whichever player is playing, or else the one that changed
+last. Clicking the title in its popup raises that player's app.
+
+```toml
+[app.spotify]
+widget = "player"
+
+[app.firefox]
+widget = { plugin = "player", player = "firefox" }
+
+[widget.nowplaying]
+plugin = "player"
+name = "Now Playing"
+```
+
+| Option   | Default | Meaning                                                                                                             |
+| -------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `player` | —       | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`) |
+| `cover`  | `true`  | `false` keeps the item's icon                                                                                       |
+| `label`  | `true`  | `false` keeps the item's name                                                                                       |
+
+The sources in [`plugins/`](plugins) are good starting points for your own
+plugins.
+
+## Writing a plugin
+
+### A first plugin
+
+Create `~/.config/wl-dock/plugins/hello.lua`:
+
+```lua
+local P = {}
+local started = os.time()
+
+function P.setup(opts)
+  -- Update once a minute.
+  dock.every(60 * 1000, dock.redraw)
+end
+
+function P.label()
+  local minutes = (os.time() - started) // 60
+  return 'Up for ' .. minutes .. ' min'
+end
+
+return P
+```
+
+Then put it behind an app:
+
+```toml
+[app.foot]
+widget = "hello"
+```
+
+Hover over the item to see the label. The dock watches plugin files, so
+saving `hello.lua` reloads the plugin right away. Errors and `print` output
+go to the dock's stderr, prefixed with `wl-dock: plugin hello:`. Run
+`wl-dock` from a terminal while you develop.
+
+### Adding an icon and a popup
+
+```lua
+local ui, theme = dock.ui, dock.theme
+local P = {}
+local count = 0
+
+function P.icon(tile)
+  -- The app's icon with a badge in its corner.
+  return ui.stack{ align = 'top-right',
+    ui.app_icon{},
+    count > 0 and ui.box{ variant = 'badge',
+      ui.text{ tostring(count), style = 'caption' } } or nil,
+  }
+end
+
+function P.popup()
+  return ui.col{ padding = 16, gap = 8, width = 220,
+    ui.text{ 'Counter', style = 'title' },
+    ui.text{ count .. ' clicks', style = 'muted' },
+    ui.row{ gap = 8,
+      ui.button{ key = 'add', label = 'Add', variant = 'filled',
+        on_click = function() count = count + 1; dock.redraw() end },
+      ui.button{ key = 'reset', label = 'Reset', enabled = count > 0,
+        on_click = function() count = 0; dock.redraw() end },
+    },
+  }
+end
+
+return P
+```
+
+The idea is the same for every widget: the plugin keeps its own state, and
+`icon`, `label` and `popup` describe what that state looks like now. When the
+state changes, call `dock.redraw()` and the dock asks the hooks again. The
+dock only repaints what changed.
+
+### Options
+
+`setup(opts)` receives the placement's options as a Lua table, converted
+from TOML: strings, numbers, booleans, arrays as lists and tables as tables.
+Check the types yourself, because the user can write anything:
+
+```lua
+local interval = 5000
+
+function P.setup(opts)
+  if type(opts.interval) == 'number' and opts.interval >= 1000 then
+    interval = opts.interval
+  end
+  dock.every(interval, refresh)
+end
+```
+
+Document the options in a comment at the top of the plugin, as the bundled
+plugins do.
+
+### Standalone or on an app
+
+`dock.app` is `nil` for a standalone widget. On an app, it is a table with
+the names the dock knows the app by:
+
+| Field      | Meaning                                            |
+| ---------- | -------------------------------------------------- |
+| `id`       | The dock's app ID: the `[app.<id>]` key            |
+| `desktop`  | The desktop entry it matched, without `.desktop`   |
+| `wm_class` | That entry's `StartupWMClass`                      |
+| `name`     | The configured name, else the entry's, else the ID |
+
+The desktop entry is looked up after the plugin starts. When the lookup
+finishes, the dock updates the same `dock.app` table in place, calls the
+plugin's `on_app()` hook and asks the hooks again. If the plugin matches
+something by app name, as `player` does, it should check again in `on_app`.
+
+A plugin that works in both places usually picks different defaults. The
+clock, for example, only draws its face when it is standalone:
+
+```lua
+local face = dock.app == nil
+```
+
+When a hook returns `nil`, the item keeps its own label, icon or popup. On
+an app that means the app's own; on a standalone widget it means the
+`name` from the config, a placeholder icon, and no popup.
+
+## How a plugin runs
+
+- **One state per placement.** Each `[app.*]` widget and each pinned
+  `[widget.*]` gets its own Lua state. Two placements of the same plugin
+  share nothing, not even globals.
+- **Threads.** States run on a small thread pool. A state never runs on two
+  threads at once, so a plugin needs no locking. Nothing in the API blocks:
+  processes, timers and D-Bus calls all report back through callbacks on the
+  plugin's thread.
+- **Loading.** The file runs once and must return a table. If `setup(opts)`
+  exists, it is called next. Hooks can be at the top level of the table or
+  under a `widget` subtable.
+- **Budget.** Each call into the plugin (a hook, a timer, a callback) may run
+  `[widgets] budget` Lua instructions, 1,000,000 by default. A state may use
+  64 MiB of memory. Going over either limit stops the state, and `pcall`
+  can't catch it.
+- **Errors.**
+  - A hook that raises an error is logged (a repeated error only once), its
+    answer is dropped, and the plugin keeps running.
+  - A syntax error, or a file that doesn't return a table, leaves the
+    plugin stopped until you save the file again.
+  - A failing `setup`, an exceeded budget or running out of memory restarts
+    the plugin after a backoff: 1 s, doubling to at most 60 s, and back to
+    1 s once it has run for a minute.
+  - While a plugin is down, its app shows its own name and icon, and a
+    standalone widget shows a placeholder.
+- **Deadlines.** `label()` must answer within 0.5 s and `icon()` or `popup()`
+  within 1 s, or the answer is thrown away. Do slow work, such as running
+  commands or reading the network, ahead of time in timers or callbacks, and
+  have the hooks only return what is already known.
+- **Reloading.** Saving the plugin file starts a fresh state: timers stop,
+  processes are killed and D-Bus watches are cancelled. Modules loaded with
+  `require` are not watched, so save the plugin file to pick up changes to
+  them. Changes to the config apply too.
+- **When hooks run.** The dock calls `label()` and `icon()` when the plugin
+  loads and after each `dock.redraw()`. It also calls `icon()` when the tile
+  changes size. `popup()` runs when the popup opens and after each
+  `dock.redraw()` while it is open.
+
+## Reference
+
+### Hooks
+
+All hooks are optional. A plugin needs at least one of `icon`, `label`,
+`popup` or `on_click` to be a widget.
+
+| Hook            | Called                                                          | Returns / gets                                                          |
+| --------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `setup(opts)`   | Once, after the file loads                                      | `opts`: the placement's options                                         |
+| `label()`       | On load and after `dock.redraw()`                               | A string (trimmed, at most 200 characters), or `nil` for the item's own |
+| `icon(tile)`    | On load, after `dock.redraw()`, on tile changes                 | A [UI tree](#ui-trees), or `nil` for the item's own                     |
+| `popup()`       | When the popup opens and after `dock.redraw()` while it is open | A UI tree, or `nil` for no popup                                        |
+| `on_open()`     | When the popup opens                                            |                                                                         |
+| `on_close()`    | When the popup closes                                           |                                                                         |
+| `on_click(btn)` | A standalone widget's item is clicked                           | `btn`: `'left'` or `'middle'`                                           |
+| `on_app()`      | `dock.app` gained names (see above)                             |                                                                         |
+
+The plugin table also takes these keys:
+
+| Key    | Meaning                                                                                                                                                                                     |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `span` | The tile's length along the dock in icons: `1`, `1.5` or `2` (other values round down), or per dock direction `{ horizontal = 2, vertical = 1 }`. Change it at run time with `dock.span()`. |
+| `api`  | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
+
+`actions` and `sources` are reserved for future launcher integration.
+
+#### `icon(tile)`
+
+`tile` describes the space the icon gets:
+
+| Field   | Meaning                                                           |
+| ------- | ----------------------------------------------------------------- |
+| `w`,`h` | The magnified size, in logical pixels (`w` is longer with a span) |
+| `span`  | The tile's span                                                   |
+| `axis`  | `'horizontal'` (bottom dock) or `'vertical'` (side dock)          |
+| `scale` | The output's scale factor                                         |
+
+The dock lays the tree out again for each dock's size when it paints, so one
+tree works on every output. Use `tile` for proportions, such as a corner
+radius of `math.min(tile.w, tile.h) * 0.2`, not for absolute sizes. Icon
+trees are only drawn: clicks on an item go to the item, so handlers in an
+icon tree are never called.
+
+#### `popup()`
+
+The popup opens after the item has been hovered for its `popup-delay`. It is
+shown in a speech bubble pointing at the item, like the menu. When the
+pointer moves from one open popup to another widget, the next popup opens at
+once. The dock handles hover and pressed looks, slider drags and scrolling
+itself. It calls the plugin's handlers as described in
+[Interaction](#interaction).
+
+### The `dock` API
+
+| Function                           | Does                                                                                                                                                                |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dock.redraw()`                    | Ask the hooks again (once the current call returns)                                                                                                                 |
+| `dock.timer(ms, fn)`               | Call `fn()` once after `ms`. Returns a handle with `:cancel()`                                                                                                      |
+| `dock.every(ms, fn)`               | Call `fn()` every `ms` (at least 10). Returns a handle with `:cancel()`                                                                                             |
+| `dock.spawn(argv, opts)`           | Run a process. `opts.on_line(line)` gets each line of its stdout, `opts.on_exit(code)` its exit code (`nil` if killed by a signal). Returns a handle with `:kill()` |
+| `dock.run(argv)`                   | Start a detached process. Returns `true`, or `nil, err`                                                                                                             |
+| `dock.read(path)`                  | A file's text (`~/` expands, at most 16 MiB). Returns `text`, or `nil, err`                                                                                         |
+| `dock.json.decode(s)`              | JSON to Lua (`null` becomes `nil`). Raises an error on bad JSON                                                                                                     |
+| `dock.json.encode(v)`              | Lua to JSON                                                                                                                                                         |
+| `dock.clipboard(text)`             | Copy `text` to the clipboard                                                                                                                                        |
+| `dock.span(n)`                     | Set the tile's span: `1`, `1.5`, `2` or `{ horizontal =, vertical = }`                                                                                              |
+| `dock.now()`                       | Unix time in seconds, with a fraction. This is the clock `live.at` uses                                                                                             |
+| `dock.app`                         | The app behind the widget, or `nil` (see [above](#standalone-or-on-an-app))                                                                                         |
+| `dock.ui.*`                        | [UI constructors](#ui-trees)                                                                                                                                        |
+| `dock.theme.*`                     | [Theme color names](#colors)                                                                                                                                        |
+| `dock.dbus.session()`, `.system()` | [D-Bus clients](#d-bus)                                                                                                                                             |
+
+`argv` is either a list of arguments (`{'notmuch', 'count', 'tag:unread'}`),
+which is safe for arbitrary values, or a single string run with `sh -c`.
+`dock.spawn` connects stdin to `/dev/null` and sends stderr to the dock's
+stderr. Processes started with `spawn` are killed when the plugin stops;
+`dock.run` processes are not.
+
+#### The sandbox
+
+Plugins have Lua's `string`, `table`, `math`, `utf8` and `coroutine`
+libraries, plus `os.time`, `os.date`, `os.clock`, `os.difftime` and
+`os.getenv`. They don't have `io`, `debug`, `package`, `os.execute`,
+`dofile`, `loadfile` or `string.dump`, and `load` only accepts source text.
+Read files with `dock.read` and run commands with `dock.spawn` or `dock.run`.
+
+`print(...)` writes to the dock's log.
+
+`require('name')` loads `name.lua` from the plugin's folder, where dots in
+the name are subfolders (`require('lib.util')` loads `lib/util.lua`). If
+there is no such file, it loads the bundled module of that name, currently
+only [`mpris`](#the-mpris-module).
+
+### UI trees
+
+Build trees with the `dock.ui` constructors. Each one takes a single table:
+named keys are props, and positional values are children. `nil` and `false`
+children are skipped, so `cond and ui.x{} or nil` works:
+
+```lua
+local ui = dock.ui
+ui.col{ gap = 8, padding = 12,
+  ui.text{ 'Title', style = 'title' },
+  show_more and ui.text{ 'More' } or nil,
+}
+```
+
+The dock checks the tree when the hook returns. An error names the node and
+prop at fault, as in `col[1].text.color: "nope" is not a color or a theme
+color`. A tree may have at most 5000 nodes and be at most 64 levels deep.
+
+#### Constructors
+
+| Constructor            | Props                                                                                                                                                                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ui.col{}`             | Children top to bottom. `gap`, `padding`, `align`, `justify`                                                                                                                                                                                      |
+| `ui.row{}`             | Children left to right. Same props as `col`                                                                                                                                                                                                       |
+| `ui.grid{}`            | `columns`: a count (1–64) or a list of widths: pixels, `'1fr'`, `'auto'`. `gap`, `row_gap`                                                                                                                                                        |
+| `ui.stack{}`           | Layers its children; the first is at the bottom. `align`: `center` (default), `stretch`, `top`, `bottom`, `left`, `right`, `top-left`, `top-right`, `bottom-left`, `bottom-right`                                                                 |
+| `ui.box{}`             | A container. `variant`: `card`, `inset`, `badge`                                                                                                                                                                                                  |
+| `ui.scroll{}`          | Scrolls its content vertically when it is taller than the box. Limit it with `height` or `max_height`                                                                                                                                             |
+| `ui.spacer{}`          | Fixed space with `size`, or without `size` it takes up the free space in a row or column                                                                                                                                                          |
+| `ui.divider{}`         | A thin line                                                                                                                                                                                                                                       |
+| `ui.text{'…'}`         | `style`: `body` (default), `title`, `muted`, `caption`. `weight`: `normal`, `light`, `medium`, `bold` or 100–900. `color`, `size`, `align` (`start`/`left`, `center`, `end`/`right`), `max_lines`. Numbers become text. At most 10,000 characters |
+| `ui.icon{'name'}`      | An icon from the icon theme (also `name =`). `size`, `color`. `-symbolic` icons take the text color by default                                                                                                                                    |
+| `ui.app_icon{}`        | An app's icon. `app`: an app ID (default: the widget's app). `size`                                                                                                                                                                               |
+| `ui.image{src = …}`    | A file path (`~/` expands), a `file://` URL or an `http(s)://` URL. `fit`: `cover`, `contain`, `fill`. `radius`, `blur` (0–100), `opacity`. Supports PNG, JPEG, WebP and SVG                                                                      |
+| `ui.canvas{draw = fn}` | Vector drawing, see [Canvas](#canvas). `viewbox = {w, h}` (default `{100, 100}`)                                                                                                                                                                  |
+| `ui.button{}`          | `label`, `icon`, `variant` (`plain` (default), `filled`, `ghost`), `enabled`, `selected`, `tooltip`, `on_click`. Children go after the icon and label                                                                                             |
+| `ui.slider{}`          | `value`, `min` (0), `max` (1), `enabled`, `live`, `on_change`, `on_commit`                                                                                                                                                                        |
+| `ui.toggle{}`          | `value` (boolean), `enabled`, `on_change`                                                                                                                                                                                                         |
+| `ui.progress{}`        | `value`, `max` (1), `live`                                                                                                                                                                                                                        |
+
+Values for the layout props:
+
+- `padding`: `8`, `{v, h}`, `{t, r, b, l}` or `{ top =, right =, bottom =, left = }`
+- `align` (col, row): how children sit across the axis: `start`, `center`,
+  `end`, `stretch`
+- `justify`: how children spread along the axis: `start`, `center`, `end`,
+  `between`, `around`, `evenly`
+
+#### Props every node takes
+
+| Prop                                                 | Meaning                                                                                       |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `width`, `height`                                    | Pixels, or a share of the parent as `'50%'`                                                   |
+| `min_width`, `min_height`, `max_width`, `max_height` | Same units                                                                                    |
+| `grow`                                               | Share of the free space in a row or column (`true` is `1`)                                    |
+| `background`                                         | A [color](#colors)                                                                            |
+| `radius`                                             | Corner radius                                                                                 |
+| `border`                                             | A width (`1`), a color (`'accent'`), or `{ width =, color = }`. The default color is `border` |
+| `opacity`                                            | 0–1                                                                                           |
+| `hover`                                              | `background`, `radius`, `border` and `opacity` to use while hovered                           |
+| `key`                                                | A stable name for the node (see below)                                                        |
+
+Sizes are logical pixels. Images and icons are rendered at the output's
+scale.
+
+#### Colors
+
+A color is either one of the theme's names or a CSS color: `'#rrggbb'`,
+`'#rrggbbaa'`, `'rgb(…)'`, `'red'`, `'transparent'`. The theme's names are
+also available as `dock.theme.<name>`, which catches typos as Lua errors:
+
+`text`, `muted`, `accent`, `accent_text`, `surface`, `border`, `hover`,
+`pressed`, `track`, `divider`, `card`, `inset`, `badge`, `badge_text`.
+
+Theme colors follow the dock's appearance in both light and dark mode, and
+they are resolved when the tree is painted. Use them unless you need a
+specific color, and a theme change won't need a new tree.
+
+#### Interaction
+
+Interactive nodes only respond in popups.
+
+| Node     | Handler            | Called                                    |
+| -------- | ------------------ | ----------------------------------------- |
+| `button` | `on_click()`       | On click, if `enabled`                    |
+| `slider` | `on_change(value)` | While dragging, at most 30 times a second |
+| `slider` | `on_commit(value)` | On release                                |
+| `toggle` | `on_change(on)`    | When flipped                              |
+
+Any node can have an `on_click`, which makes it clickable.
+
+Handlers run on the plugin's thread like other callbacks. Update your state
+in them and call `dock.redraw()`. The dock shows hover, pressed and drag
+feedback without waiting for the plugin.
+
+**Keys.** The dock tells nodes apart across rebuilds by key, which is how it
+finds a node's handlers and keeps its state, such as a slider being dragged
+or a scroll position. A node without a `key` gets one from its position in
+the tree. Give interactive and scrolling nodes an explicit `key` whenever
+the tree's shape can change, for example when nodes before them appear and
+disappear. Keys must be unique within a tree.
+
+**Live sliders and progress bars.** A seek bar for a playing track would
+otherwise need a redraw every frame. Instead, give it
+`live = { rate = 1, at = t }`: it moves on its own from `value` at time `at`
+(a `dock.now()` time) at `rate` units per second. The dock paints it on its
+own layer, only as often as it moves by a pixel. Set `live = nil` (or
+`false`) when it should stop. The `player` plugin uses this:
+
+```lua
+ui.slider{ key = 'seek', value = p.position, max = p.length,
+  live = p.playing and { rate = p.rate, at = p.at } or nil,
+  on_commit = function(v) p:set_position(v) end }
+```
+
+### Canvas
+
+`ui.canvas{ viewbox = {w, h}, draw = fn }` calls `draw(c)` while the tree is
+built and records the drawing commands. The drawing is then scaled from the
+viewbox to the node's size. As an icon, a canvas fills the tile; in a popup,
+give it a `width` and `height`. Coordinates are in viewbox units with y
+pointing down. Angles are in radians, clockwise. A canvas can hold at most
+20,000 commands.
+
+| Method                                                | Draws                                                                                                                                                      |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `c:line{x1, y1, x2, y2}`                              | A line                                                                                                                                                     |
+| `c:rect{x, y, w, h, radius}`                          | A rectangle, optionally rounded                                                                                                                            |
+| `c:circle{x, y, r}`                                   | A circle                                                                                                                                                   |
+| `c:arc{x, y, r, from, to, pie}`                       | An arc from `from` to `to` (radians from 3 o'clock); with `pie = true`, closed through the center                                                          |
+| `c:path{d = 'M 0 0 L 10 10 Z'}`                       | SVG path data (relative commands and arcs too)                                                                                                             |
+| `c:text{'12', x, y, size, color, bold, align}`        | One line of text. Its `align` edge and vertical middle are at (`x`, `y`). `size` defaults to 12. It moves and scales with the transform but doesn't rotate |
+| `c:save()`, `c:restore()`                             | Push and pop the transform                                                                                                                                 |
+| `c:translate(x, y)`, `c:rotate(a)`, `c:scale(x[, y])` | Transform what comes next                                                                                                                                  |
+
+Shapes take `fill` and `stroke` colors, a stroke `width` (default 1, in
+viewbox units so it scales with the canvas) and a `cap` (`butt`, `round`,
+`square`). Note that these are named fields, so call `c:line{ x1 = 0, … }`
+rather than passing positional numbers.
+
+`rotate` turns around the current origin, so translate to the center first.
+A line drawn along −y (12 o'clock) and then rotated by `a` turns clockwise,
+like a clock hand:
+
+```lua
+c:save()
+c:translate(50, 50)
+c:rotate(minutes * math.pi / 30)
+c:line{ x1 = 0, y1 = 0, x2 = 0, y2 = -40, stroke = dock.theme.text, width = 3, cap = 'round' }
+c:restore()
+```
+
+### D-Bus
+
+`dock.dbus.session()` and `dock.dbus.system()` return clients for the
+session and system bus. Every call is asynchronous, and replies and signals
+arrive as callbacks on the plugin's thread.
+
+```lua
+local bus = dock.dbus.session()
+
+bus:call{ dest = 'org.mpris.MediaPlayer2.spotify', path = '/org/mpris/MediaPlayer2',
+  iface = 'org.mpris.MediaPlayer2.Player', method = 'SetPosition',
+  signature = 'ox', args = { track, us }, timeout = 5000,
+  on_reply = function(ret, err) end }        -- ret: the reply's arguments, as a list
+
+bus:get(dest, path, iface, name, function(value, err) end)
+bus:get_all(dest, path, iface, function(props, err) end)
+bus:set(dest, path, iface, name, signature, value, function(err) end)
+
+local sub = bus:watch{ sender = dest, path = path, iface = iface, member = 'Seeked',
+  arg0 = nil, on_signal = function(args, msg) end }   -- msg: sender, path, iface, member
+bus:watch_props(dest, path, iface, function(changed, invalidated) end)
+bus:watch_names('org.mpris.MediaPlayer2.', function(name, owner) end)  -- owner nil: gone
+sub:cancel()
+```
+
+- **From D-Bus:** variants are unwrapped. Integers (including `x` and `t`)
+  become Lua integers and doubles become numbers. `a{..}` becomes a table
+  keyed by the dict key, and other arrays and structs become lists. Object
+  paths and signatures become strings, and so does `ay`.
+- **To D-Bus:** `signature` gives the arguments' types, and a value that
+  doesn't fit is an error on the call. For `v`, the type is guessed:
+  booleans are `b`, integers `x`, numbers `d` and strings `s`; lists are
+  `as`, `ax`, `ad`, `ab` or `av`; other tables are `a{sv}`. File descriptors
+  (`h`) aren't supported.
+- **Failures:** a call that fails or times out (after 5 s by default, at
+  most 120 s) answers `on_reply(nil, err)`. If the bus can't be reached, the
+  client keeps trying to connect again.
+- **Watches** with a well-known `sender` only receive signals from that
+  name's current owner. `watch_names(prefix, fn)` reports the names that
+  already exist and each later change. All watches end when the plugin
+  reloads or stops.
+
+### The `mpris` module
+
+`require('mpris')` provides the MPRIS logic that `player` uses, for plugins
+that want to show a player their own way:
+
+```lua
+local mpris = require('mpris')
+local w = mpris.watch({ app = dock.app, player = opts.player }, function(p)
+  -- p: the chosen player, or nil. Called again when the choice or the player changes.
+end)
+w:refresh()   -- choose again (call it in on_app)
+w:sync()      -- ask the player for its position now
+w:cancel()
+mpris.players()  -- every player, by bus name
+```
+
+Players are chosen as described for [`player`](#player). A player has:
+
+- **Fields:** `name` (the bus name), `id` (the suffix), `identity`,
+  `desktop`, `status` (`'Playing'`, `'Paused'` or `'Stopped'`), `playing`,
+  `title`, `artist`, `album`, `art` (a URL), `length` and `position` (in
+  seconds, with `position` measured at `at`, a `dock.now()` time), `rate`,
+  `track`, `volume`, and the flags `can_play`, `can_pause`, `can_seek`,
+  `can_next`, `can_previous`, `can_control` and `can_raise`.
+- **Methods:** `p:now()` returns the current position. `play_pause`,
+  `play`, `pause`, `stop`, `next`, `previous`, `set_position(seconds)`,
+  `seek(seconds)` and `raise` control the player.
+
+## Examples
+
+### Unread count from a command
+
+This plugin puts a badge with the number of unread mails on a mail app. It
+runs the command in the background, and `icon()` only reads the result.
+
+```lua
+-- [app.thunderbird]
+-- widget = { plugin = "unread", command = "notmuch count tag:unread", interval = 60000 }
+local ui = dock.ui
+local P = {}
+local command, interval, unread = 'notmuch count tag:unread', 60000, 0
+local running
+
+local function refresh()
+  if running then return end
+  running = dock.spawn(command, {
+    on_line = function(line) unread = tonumber(line) or unread end,
+    on_exit = function() running = nil; dock.redraw() end,
+  })
+end
+
+function P.setup(opts)
+  if type(opts.command) == 'string' then command = opts.command end
+  if type(opts.interval) == 'number' then interval = math.max(opts.interval, 1000) end
+  refresh()
+  dock.every(interval, refresh)
+end
+
+function P.icon()
+  if unread == 0 then return nil end           -- the app's own icon
+  return ui.stack{ align = 'top-right',
+    ui.app_icon{},
+    ui.box{ variant = 'badge', ui.text{ unread > 99 and '99+' or unread, style = 'caption' } },
+  }
+end
+
+function P.label()
+  return unread > 0 and (dock.app.name .. ' — ' .. unread .. ' unread') or nil
+end
+
+return P
+```
+
+### CPU meter
+
+This standalone widget reads `/proc/stat` and draws a ring as its icon, with
+a progress bar in its popup.
+
+```lua
+-- [widget.cpu]
+-- name = "CPU"
+local ui, theme = dock.ui, dock.theme
+local P = {}
+local last, usage = nil, 0
+
+local function sample()
+  local text = dock.read('/proc/stat')
+  if not text then return end
+  local nums = {}
+  for n in text:match('^cpu%s+([^\n]+)'):gmatch('%d+') do nums[#nums + 1] = tonumber(n) end
+  local idle = nums[4] + (nums[5] or 0)
+  local total = 0
+  for _, n in ipairs(nums) do total = total + n end
+  if last and total > last.total then
+    usage = 1 - (idle - last.idle) / (total - last.total)
+  end
+  last = { idle = idle, total = total }
+  dock.redraw()
+end
+
+function P.setup()
+  sample()
+  dock.every(2000, sample)
+end
+
+function P.label()
+  return string.format('CPU %d%%', math.floor(usage * 100 + 0.5))
+end
+
+function P.icon()
+  return ui.canvas{ draw = function(c)
+    c:circle{ x = 50, y = 50, r = 46, fill = theme.surface }
+    c:arc{ x = 50, y = 50, r = 34, from = 0, to = 2 * math.pi, stroke = theme.track, width = 10 }
+    c:arc{ x = 50, y = 50, r = 34, from = -math.pi / 2,
+      to = -math.pi / 2 + usage * 2 * math.pi, stroke = theme.accent, width = 10, cap = 'round' }
+    c:text{ math.floor(usage * 100 + 0.5), x = 50, y = 50, size = 24, bold = true,
+      align = 'center', color = theme.text }
+  end }
+end
+
+function P.popup()
+  return ui.col{ padding = 16, gap = 8, width = 200,
+    ui.text{ 'Processor', style = 'title' },
+    ui.progress{ value = usage, max = 1 },
+    ui.text{ string.format('%.1f%% busy', usage * 100), style = 'muted' },
+  }
+end
+
+return P
+```
+
+### Volume slider
+
+This popup controls PipeWire's default sink with `wpctl`. The slider keeps
+its own value while you drag it, and the plugin only sets the volume when
+you release it.
+
+```lua
+-- [app.pavucontrol]
+-- widget = "volume"
+local ui = dock.ui
+local P = {}
+local volume, muted = 0, false
+
+local function read()
+  dock.spawn({ 'wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@' }, {
+    on_line = function(line)              -- "Volume: 0.45 [MUTED]"
+      volume = tonumber(line:match('[%d.]+')) or volume
+      muted = line:find('MUTED') ~= nil
+    end,
+    on_exit = function() dock.redraw() end,
+  })
+end
+
+P.on_open = read
+
+function P.label()
+  return string.format('Volume %d%%%s', math.floor(volume * 100 + 0.5), muted and ' (muted)' or '')
+end
+
+function P.popup()
+  return ui.col{ padding = 16, gap = 10, width = 240,
+    ui.row{ align = 'center', justify = 'between',
+      ui.text{ 'Output', style = 'title' },
+      ui.toggle{ key = 'mute', value = not muted, on_change = function(on)
+        muted = not on
+        dock.run({ 'wpctl', 'set-mute', '@DEFAULT_AUDIO_SINK@', muted and '1' or '0' })
+        dock.redraw()
+      end },
+    },
+    ui.slider{ key = 'volume', value = volume, max = 1.5, enabled = not muted,
+      on_commit = function(v)
+        volume = v
+        dock.run({ 'wpctl', 'set-volume', '@DEFAULT_AUDIO_SINK@', string.format('%.2f', v) })
+        dock.redraw()
+      end },
+  }
+end
+
+function P.setup() read() end
+
+return P
+```
+
+### Battery over D-Bus
+
+This standalone widget watches UPower's display device on the system bus, so
+it updates only when the battery changes instead of polling. Its icon is a
+ring drawn on a canvas, with the charge in the middle and the remaining time
+below it. The ring is green while charging, orange when the battery is low
+and red when it is critical. The label shows the remaining time, and the
+popup adds the status, power draw and energy.
+
+The `span` option makes the tile wider on a bottom dock: 1.5 or 2 icons.
+A wider tile shows the remaining time in large text next to the ring. Side
+docks always use the normal size. The icon has one canvas whose viewbox is
+as wide as the tile, so it scales to every dock's icon size.
+
+```lua
+-- [widget.battery]
+-- name = "Battery"
+-- low = 20          # % below which the ring turns orange
+-- critical = 10     # % below which it turns red
+-- span = 2          # Tile width on a bottom dock: 1, 1.5 or 2 icons
+local ui, theme = dock.ui, dock.theme
+local P = {}
+local DEST = 'org.freedesktop.UPower'
+local PATH = '/org/freedesktop/UPower/devices/DisplayDevice'
+local IFACE = 'org.freedesktop.UPower.Device'
+-- UPower's State values.
+local CHARGING, DISCHARGING, FULL = 1, 2, 4
+local STATES = { 'Charging', 'Discharging', 'Empty', 'Fully charged', 'Not charging', 'Discharging' }
+local low, critical = 20, 10
+local b = {}   -- the device's properties, by their UPower names
+
+local function apply(props)
+  for k, v in pairs(props) do b[k] = v end
+  dock.redraw()
+end
+
+function P.setup(opts)
+  if type(opts.low) == 'number' then low = opts.low end
+  if type(opts.critical) == 'number' then critical = opts.critical end
+  -- Wider along a bottom dock only; a side dock keeps square tiles.
+  local span = (opts.span == 1.5 or opts.span == 2) and opts.span or 1
+  dock.span({ horizontal = span, vertical = 1 })
+  local bus = dock.dbus.system()
+  bus:get_all(DEST, PATH, IFACE, function(props, err)
+    if props then apply(props) else print(err) end
+  end)
+  bus:watch_props(DEST, PATH, IFACE, apply)
+end
+
+local function color()
+  local pct = b.Percentage or 0
+  if b.State == CHARGING then return '#30d158' end
+  if pct <= critical then return '#ff453a' end
+  if pct <= low then return '#ff9f0a' end
+  return theme.accent
+end
+
+-- Seconds until full or empty, if UPower knows (0 means it doesn't).
+local function remaining()
+  if b.State == CHARGING and (b.TimeToFull or 0) > 0 then return b.TimeToFull end
+  if b.State == DISCHARGING and (b.TimeToEmpty or 0) > 0 then return b.TimeToEmpty end
+end
+
+local function short(s)   -- "2:05"
+  local m = s // 60
+  return string.format('%d:%02d', m // 60, m % 60)
+end
+
+local function long(s)    -- "2 h 5 min"
+  local m = (s + 30) // 60
+  if m < 60 then return m .. ' min' end
+  return string.format('%d h %d min', m // 60, m % 60)
+end
+
+-- The ring, in the 100 x 100 square at the viewbox's left. `time`: show the
+-- remaining time inside it.
+local function ring(c, time)
+  local pct = math.max(0, math.min(100, b.Percentage or 0))
+  c:circle{ x = 50, y = 50, r = 48, fill = theme.surface }
+  c:circle{ x = 50, y = 50, r = 38, stroke = theme.track, width = 10 }
+  if pct > 0 then
+    c:arc{ x = 50, y = 50, r = 38, from = -math.pi / 2,
+      to = -math.pi / 2 + pct / 100 * 2 * math.pi,
+      stroke = color(), width = 10, cap = 'round' }
+  end
+  if b.State == CHARGING then   -- a bolt above the number
+    c:path{ d = 'M 52 22 L 45 31 L 50 31 L 48 37 L 55 28 L 50 28 Z', fill = color() }
+  end
+  c:text{ math.floor(pct + 0.5) .. '%', x = 50, y = 50, size = 20, bold = true,
+    align = 'center', color = theme.text }
+  local s = remaining()
+  if time and s then
+    c:text{ short(s), x = 50, y = 68, size = 11, align = 'center', color = theme.muted }
+  end
+end
+
+-- The ring with the time inside: the square icon, and the popup's.
+local function draw(c) ring(c, true) end
+
+function P.icon(tile)
+  if not b.Percentage or b.IsPresent == false then return nil end   -- the placeholder
+  if tile.span <= 1 then
+    return ui.canvas{ draw = draw }
+  end
+  -- Wide: the ring, and the time beside it, in a viewbox as wide as the tile.
+  local extra = 100 * (tile.span - 1)
+  return ui.canvas{ viewbox = { 100 + extra, 100 }, draw = function(c)
+    ring(c, false)
+    local s = remaining()
+    local x, size = 100 + extra / 2, math.min(30, extra * 0.4)
+    local main = s and short(s) or (b.State == FULL and 'Full' or '–')
+    local sub = s and (b.State == CHARGING and 'to full' or 'left')
+    c:text{ main, x = x, y = sub and 42 or 50, size = size, bold = true,
+      align = 'center', color = b.State == CHARGING and color() or theme.text }
+    if sub then
+      c:text{ sub, x = x, y = 42 + size, size = size * 0.6, align = 'center', color = theme.muted }
+    end
+  end }
+end
+
+function P.label()
+  if not b.Percentage then return nil end
+  local text = math.floor(b.Percentage + 0.5) .. '%'
+  local s = remaining()
+  if s then
+    return text .. ' · ' .. long(s) .. (b.State == CHARGING and ' until full' or ' left')
+  end
+  if b.State == FULL then return text .. ' · Fully charged' end
+  return text
+end
+
+-- Shown on hover, after the widget's popup-delay.
+function P.popup()
+  if not b.Percentage or b.IsPresent == false then
+    return ui.col{ padding = 16, ui.text{ 'No battery found', style = 'muted' } }
+  end
+  local rows = { columns = { 'auto', '1fr' }, gap = 16, row_gap = 6, width = '100%' }
+  local function add(name, value)
+    rows[#rows + 1] = ui.text{ name, style = 'muted' }
+    rows[#rows + 1] = ui.text{ value, align = 'end' }
+  end
+  add('Status', STATES[b.State] or 'Unknown')
+  local s = remaining()
+  if s then add(b.State == CHARGING and 'Full in' or 'Remaining', long(s)) end
+  if (b.EnergyRate or 0) > 0 then
+    add(b.State == CHARGING and 'Charging at' or 'Using', string.format('%.1f W', b.EnergyRate))
+  end
+  if (b.EnergyFull or 0) > 0 then
+    add('Energy', string.format('%.1f / %.1f Wh', b.Energy or 0, b.EnergyFull))
+  end
+  return ui.col{ padding = 16, gap = 12, width = 260, align = 'center',
+    ui.text{ 'Battery', style = 'title' },
+    ui.canvas{ width = 120, height = 120, draw = draw },
+    ui.grid(rows),
+  }
+end
+
+return P
+```
+
+## Tips and troubleshooting
+
+- **Watch the log.** Run `wl-dock` in a terminal. Load errors, hook errors,
+  budget overruns, restarts and `print` output all appear there.
+- **Start from a bundled plugin.** Copy one from [`plugins/`](plugins) to
+  `~/.config/wl-dock/plugins/` under the same name to replace it, or under a
+  new name to start your own. [`tests/plugins/kitchen-sink.lua`](tests/plugins/kitchen-sink.lua)
+  uses every UI component.
+- **Keep hooks cheap and pure.** They should describe the current state, not
+  fetch it. Start commands and requests in `setup`, timers or `on_open`, and
+  store the results.
+- **Call `dock.redraw()` after changing state.** Calling it several times in
+  one callback costs no more than calling it once, and the dock repaints
+  only what changed.
+- **Stop work nobody sees.** For example, only tick a popup's clock between
+  `on_open` and `on_close`, as `player` does.
+- **Use theme colors** so the widget looks right in light and dark mode.
+- **Prefer argv lists to shell strings** when the command includes values
+  from options or data.
+- **Nothing on screen?** Check that `[widgets] enabled` isn't `false`, that
+  the plugin name only uses letters, digits, `-` and `_`, that a standalone
+  widget has both its `[widget.<name>]` table and its `@name` pin, and that
+  the hook returned a node from `dock.ui` rather than a plain table.
