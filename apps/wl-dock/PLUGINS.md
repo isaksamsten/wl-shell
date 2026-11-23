@@ -140,13 +140,15 @@ widget = { plugin = "player", player = "firefox" }
 [widget.nowplaying]
 plugin = "player"
 name = "Now Playing"
+span = 2               # Wide on a bottom dock: the title and artist beside the cover
 ```
 
-| Option   | Default | Meaning                                                                                                             |
-| -------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `player` | —       | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`) |
-| `cover`  | `true`  | `false` keeps the item's icon                                                                                       |
-| `label`  | `true`  | `false` keeps the item's name                                                                                       |
+| Option   | Default | Meaning                                                                                                                                                                           |
+| -------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `player` | —       | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`)                                                               |
+| `cover`  | `true`  | `false` keeps the item's icon                                                                                                                                                     |
+| `label`  | `true`  | `false` keeps the item's name                                                                                                                                                     |
+| `span`   | `1`     | `1.5` or `2`: while there is a player, the tile is that many icons wide on a bottom dock, with the title (at `2`, also the artist) beside the cover. Side docks keep square tiles |
 
 The sources in [`plugins/`](plugins) are good starting points for your own
 plugins.

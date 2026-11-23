@@ -19,7 +19,9 @@
 -- Options: `player`, a bus name suffix (`org.mpris.MediaPlayer2.<suffix>`,
 -- `*` at the end matching any rest) instead of matching the app by its
 -- names; `cover = false` keeps the icon as it is; `label = false` keeps
--- the item's name instead of the title.
+-- the item's name instead of the title; `span = 1.5` or `2` widens the
+-- tile on a bottom dock while there is a player, to show the title (and
+-- at 2, the artist) next to the cover.
 
 local ui, theme = dock.ui, dock.theme
 local mpris = require("mpris")
@@ -27,7 +29,14 @@ local mpris = require("mpris")
 local P = {}
 local p, watcher, ticking
 local cover, show_label = true, true
+local span = 1
 local standalone = dock.app == nil
+
+-- Wide only with something to show beside the cover, and only along a
+-- bottom dock.
+local function respan()
+	dock.span({ horizontal = p and span or 1, vertical = 1 })
+end
 
 local function clock(s)
 	s = math.max(0, math.floor(s or 0))
@@ -45,8 +54,12 @@ function P.setup(opts)
 	if opts.label == false then
 		show_label = false
 	end
+	if opts.span == 1.5 or opts.span == 2 then
+		span = opts.span
+	end
 	watcher = mpris.watch({ app = dock.app, player = opts.player }, function(player)
 		p = player
+		respan()
 		dock.redraw()
 	end)
 end
@@ -56,19 +69,74 @@ function P.on_app()
 	watcher:refresh()
 end
 
-function P.icon(tile)
+-- The cover over what shows until it arrives, in a stack with `props`.
+-- The stack must be sized itself: a stack in a stack has no size.
+local function cover_stack(tile, props)
+	local under = standalone and ui.icon({ "audio-x-generic" }) or ui.app_icon({})
+	props[1] = under
+	props[2] = ui.image({ src = p.art, fit = "cover", radius = math.min(tile.h, tile.w / tile.span) * 0.2 })
+	return ui.stack(props)
+end
+
+-- The square icon: the cover, else the item's own.
+local function square(tile)
 	if not cover or not (p and p.art) then
 		if standalone then
 			return ui.icon({ "audio-x-generic" })
 		end
 		return nil
 	end
-	-- Under the cover until it arrives.
-	local under = standalone and ui.icon({ "audio-x-generic" }) or ui.app_icon({})
-	return ui.stack({
-		under,
-		ui.image({ src = p.art, fit = "cover", radius = math.min(tile.w, tile.h) * 0.2 }),
+	return cover_stack(tile, {})
+end
+
+-- A wide tile: the square at the start, the title (and with room, the
+-- artist) beside it.
+local function wide(tile)
+	local h = tile.h
+	local roomy = tile.span >= 2
+	local name = (p.title and p.title ~= "") and p.title or p.identity or p.id
+	local artist = roomy and p.artist and p.artist ~= "" and p.artist or nil
+	-- As wide as the tile is tall, whatever dock it is laid out for.
+	local side = string.format("%.3f%%", 100 / tile.span)
+	local sq
+	if cover and p.art then
+		sq = cover_stack(tile, { width = side, min_width = side, height = "100%" })
+	else
+		-- The item's own icon (standalone, the placeholder).
+		sq = ui.stack({
+			width = side,
+			min_width = side,
+			height = "100%",
+			standalone and ui.icon({ "audio-x-generic", size = h * 0.9 }) or ui.app_icon({}),
+		})
+	end
+	return ui.row({
+		width = "100%",
+		height = "100%",
+		gap = h * (roomy and 0.08 or 0.06),
+		ui.stack({ width = side, min_width = side, height = "100%", sq }),
+		ui.col({
+			grow = 1,
+			min_width = 0,
+			gap = h * 0.02,
+			padding = { right = h * (roomy and 0.04 or 0.02) },
+			ui.text({
+				name,
+				size = h * (roomy and 0.17 or 0.13),
+				weight = "bold",
+				color = theme.text,
+				max_lines = (roomy and artist) and 2 or 3,
+			}),
+			artist and ui.text({ artist, size = h * 0.14, color = theme.muted, max_lines = 1 }) or nil,
+		}),
 	})
+end
+
+function P.icon(tile)
+	if p and tile.span > 1 then
+		return wide(tile)
+	end
+	return square(tile)
 end
 
 function P.label()

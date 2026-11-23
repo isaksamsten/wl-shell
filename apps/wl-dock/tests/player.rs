@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use wl_shell_lua::channel::PopupEvent;
 use wl_shell_lua::ui::{Kind, Node};
 use wl_shell_lua::{
-    AppInfo, Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source,
+    AppInfo, Axis, Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source, Tile,
 };
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -281,6 +281,8 @@ fn spec(id: &str, app: Option<AppInfo>, options: serde_json::Value) -> InstanceS
 struct Plugins {
     rt: Runtime,
     recv: Receiver<Event>,
+    /// The spans asked for, by instance, the latest last.
+    spans: std::cell::RefCell<Vec<(String, f32)>>,
 }
 
 impl Plugins {
@@ -295,8 +297,32 @@ impl Plugins {
             {
                 Event::Answer(a) if a.id == ticket.id => return a.result,
                 Event::Failed { instance, error } => panic!("{instance}: {error}"),
+                Event::Span { instance, span } => {
+                    self.spans.borrow_mut().push((instance, span.horizontal));
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// `id`'s latest span along a bottom dock (1 if it never asked).
+    fn span(&self, id: &str) -> f32 {
+        (self.spans.borrow().iter().rev())
+            .find(|(i, _)| i == id)
+            .map_or(1.0, |&(_, s)| s)
+    }
+
+    fn icon(&self, id: &str, span: f32) -> Option<Arc<Node>> {
+        let tile = Tile {
+            w: 96.0 * span as f64,
+            h: 96.0,
+            span,
+            axis: Axis::Horizontal,
+            scale: 1,
+        };
+        match self.request(id, RequestKind::Icon(tile)) {
+            Ok(Reply::Icon(tree)) => tree,
+            r => panic!("{r:?}"),
         }
     }
 
@@ -343,6 +369,49 @@ fn texts(tree: &Node) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Resources with every image an opaque cover.
+struct Covers;
+
+impl wl_shell_render::ui::Resources for Covers {
+    fn app_icon(&mut self, _: &str, _: u32) -> Option<Arc<wl_shell_render::Image>> {
+        None
+    }
+    fn icon(&mut self, _: &str, _: u32) -> Option<Arc<wl_shell_render::Image>> {
+        None
+    }
+    fn image(&mut self, _: &str) -> Option<Arc<wl_shell_render::Image>> {
+        Some(Arc::new(wl_shell_render::Image {
+            width: 8,
+            height: 8,
+            data: [0x40, 0x80, 0xc0, 0xff].repeat(64),
+        }))
+    }
+}
+
+/// `tree`, painted as a tile `span` icons wide (64 pixels per icon, not
+/// the size it was built for), has the cover filling the square at its
+/// start and the text beside it.
+fn assert_wide(tree: &Arc<Node>, span: f32) {
+    use wl_shell_render::ui;
+    let (w, h) = (64.0 * span, 64.0);
+    let req = ui::Request::new(
+        tree.clone(),
+        ui::Bounds::Exact(w, h),
+        1,
+        Arc::new(ui::Theme::default()),
+    );
+    let mut text = wl_shell_render::text::Text::new();
+    let r = ui::render(&req, &mut text, &mut Covers);
+    assert_eq!((r.image.width, r.image.height), (w as u32, h as u32));
+    let alpha = |x: u32, y: u32| r.image.data[((y * r.image.width + x) * 4 + 3) as usize];
+    for (x, y) in [(32, 32), (32, 1), (32, 62), (1, 32), (62, 32)] {
+        assert_eq!(alpha(x, y), 255, "the cover fills the square at ({x}, {y})");
+    }
+    let inked = |x0: u32, x1: u32| (0..h as u32).any(|y| (x0..x1).any(|x| alpha(x, y) > 0));
+    assert!(!inked(64, 67), "the cover ends at the square");
+    assert!(inked(67, w as u32), "the text is beside it");
 }
 
 /// Until `log` has `want`.
@@ -408,8 +477,23 @@ fn players_are_matched_followed_and_controlled() {
         ),
         spec("nowplaying", None, none.clone()),
         spec("other", Some(AppInfo::new("other")), none),
+        // Wide tiles.
+        spec(
+            "wide",
+            Some(AppInfo::new("foot")),
+            serde_json::json!({ "player": "chrom*", "span": 2 }),
+        ),
+        spec(
+            "half",
+            Some(AppInfo::new("Spotify")),
+            serde_json::json!({ "span": 1.5 }),
+        ),
     ]);
-    let p = Plugins { rt, recv };
+    let p = Plugins {
+        rt,
+        recv,
+        spans: Default::default(),
+    };
 
     // By the bus name, ignoring case.
     p.wait_label("spotify", Some("Song – Artist, Band"));
@@ -471,11 +555,31 @@ fn players_are_matched_followed_and_controlled() {
     });
     assert_eq!(live, Some(None));
 
+    // Wide: the cover, with the title (and with room, the artist) beside it.
+    p.wait_label("wide", Some("Video – Artist, Band"));
+    p.wait_label("half", Some("Song (next) – Artist, Band"));
+    assert_eq!(p.span("wide"), 2.0);
+    assert_eq!(p.span("half"), 1.5);
+    assert_eq!(p.span("spotify"), 1.0);
+    let tree = p.icon("wide", 2.0).unwrap();
+    assert!(tree.shows_image("https://example.com/art.png"));
+    assert_eq!(texts(&tree), ["Video", "Artist, Band"]);
+    assert_wide(&tree, 2.0);
+    let tree = p.icon("half", 1.5).unwrap();
+    assert_eq!(texts(&tree), ["Song (next)"]);
+    assert_wide(&tree, 1.5);
+    // A square tile (a side dock) is just the cover.
+    assert!(texts(&p.icon("wide", 1.0).unwrap()).is_empty());
+
     // Gone: the widgets it backed are the plain apps again; back, and
     // they show it again.
     drop(chromium);
     p.wait_label("option", None);
     p.wait_label("flatpak", None);
+    // Nothing to show beside the cover: square again.
+    p.wait_label("wide", None);
+    assert_eq!(p.span("wide"), 1.0);
+    assert!(p.icon("wide", 1.0).is_none());
     let _chromium = fake(
         &address,
         "chromium.instance7",
