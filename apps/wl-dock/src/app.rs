@@ -99,7 +99,9 @@
 //! configured from the `widget` keys and `[plugin.<name>]` tables and
 //! restarted when their files change (watched like the config). Their
 //! events come through a channel into the loop; an app widget's label
-//! replaces the app's name in every dock.
+//! replaces the app's name in every dock, its icon tree (painted by the
+//! worker, per dock) the app's icon, and its span lengthens the app's
+//! item.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -783,22 +785,54 @@ impl WlDock {
 
     /// Something from the plugin runtime.
     fn plugin_event(&mut self, core: &mut Core<Self>, event: wl_shell_lua::Event) {
-        match self.widgets.event(event) {
-            Some(Effect::Labels) => self.show_widget_names(),
-            Some(Effect::Clipboard(text)) => {
-                let data = ([
-                    "text/plain;charset=utf-8",
-                    "text/plain",
-                    "UTF8_STRING",
-                    "STRING",
-                ])
-                .map(|mime| (mime.to_string(), text.clone().into_bytes()));
-                if let Err(e) = core.set_selection(data.into()) {
-                    warn!("a widget's copy: {e}");
-                }
-            }
-            None => {}
+        let Effect {
+            labels,
+            icons,
+            spans,
+            clipboard,
+        } = self.widgets.event(event);
+        if labels {
+            self.show_widget_names();
         }
+        if icons {
+            self.show_widget_icons();
+        }
+        if spans {
+            self.rebuild(core, None);
+        }
+        if let Some(text) = clipboard {
+            let data = ([
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "STRING",
+            ])
+            .map(|mime| (mime.to_string(), text.clone().into_bytes()));
+            if let Err(e) = core.set_selection(data.into()) {
+                warn!("a widget's copy: {e}");
+            }
+        }
+    }
+
+    /// Give the docks the widgets' icons.
+    fn show_widget_icons(&mut self) {
+        for dock in &mut self.docks {
+            dock.set_widget_icons(self.widgets.icons());
+        }
+    }
+
+    /// The tile widgets draw their icons for: the first dock's, at the
+    /// largest scale of any.
+    fn sync_widget_tile(&mut self) {
+        let base = self.docks.first().map(|d| {
+            let mut base = d.tile_base();
+            base.scale = (self.docks.iter())
+                .map(|d| d.tile_base().scale)
+                .max()
+                .unwrap_or(1);
+            base
+        });
+        self.widgets.set_tile(base);
     }
 
     /// Give the docks the widgets' labels.
@@ -2865,12 +2899,14 @@ impl WlDock {
                             self.launching.iter().map(|l| l.app_id.clone()).collect();
                         dock.set_launching(&apps);
                         dock.set_widget_names(self.widgets.labels());
+                        dock.set_widget_icons(self.widgets.icons());
                         self.docks.push(dock);
                     }
                     Err(e) => warn!("failed to create a dock: {e}"),
                 },
             }
         }
+        self.sync_widget_tile();
     }
 
     /// `output`'s logical size, if known.
@@ -2931,6 +2967,11 @@ impl WlDock {
             let mut items = dock::items(&toplevels, &pins, &self.order, focused, |id| {
                 self.placement.place(id, connector, by_output)
             });
+            // Widgets' tiles may be longer along the dock.
+            let axis = dock.tile_base().axis;
+            for item in items.iter_mut().filter(|i| i.is_app()) {
+                item.span = dock::Span::of(self.widgets.span(&item.app_id, axis));
+            }
             dock::add_tail(&mut items, &folders, trash);
             dock.set_items(core, &items);
         }
@@ -3982,7 +4023,8 @@ impl WlDock {
                     self.show_web(true);
                 }
             }
-            Done::Paper { .. } | Done::Doc { .. } => {}
+            // Widgets' popups (later); their tiles come as icons.
+            Done::Paper { .. } | Done::Doc { .. } | Done::Ui { .. } => {}
         }
     }
 }
@@ -4186,6 +4228,7 @@ impl Program for WlDock {
         if let Some(dock) = self.dock_on(surface) {
             dock.set_scale(factor);
         }
+        self.sync_widget_tile();
     }
 
     /// The launcher's (or the activate) surface is on an output: the dock

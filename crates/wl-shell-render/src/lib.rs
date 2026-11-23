@@ -14,6 +14,7 @@ pub mod mimeapps;
 pub mod paper;
 pub mod shadow;
 pub mod text;
+pub mod ui;
 pub mod worker;
 
 pub use image::Image;

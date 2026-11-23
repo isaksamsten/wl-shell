@@ -5,6 +5,10 @@
 //! their springs carry on), adds new ones growing in from nothing, and
 //! keeps the removed ones in place, shrinking away, until they are gone.
 //!
+//! Each slot also has a spring for its span (a widget's tile's length
+//! along the dock), so a span change slides its neighbors instead of
+//! jumping.
+//!
 //! A slot whose app is launching bounces (`Bounce`): hop after hop until
 //! the launch ends, then it finishes the hop it's in and lands.
 
@@ -20,6 +24,8 @@ pub struct Slot {
     /// No longer an item: it shrinks away and then goes.
     pub leaving: bool,
     pub bounce: Option<Bounce>,
+    /// Its span (1 to 2 icons), headed for the item's.
+    pub span: Spring,
 }
 
 /// One hop, seconds.
@@ -95,6 +101,10 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
                     s.item = item.clone();
                     s.leaving = false;
                     s.presence.retarget(1.0);
+                    match animate {
+                        true => s.span.retarget(item.span.get()),
+                        false => s.span.snap(item.span.get()),
+                    }
                     s
                 }
                 None => {
@@ -108,6 +118,7 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
                         presence,
                         leaving: false,
                         bounce: None,
+                        span: Spring::new(item.span.get(), response),
                     }
                 }
             },
@@ -148,6 +159,7 @@ pub fn advance(slots: &mut Vec<Slot>, dt: f64) -> bool {
     let mut moving = false;
     for s in slots.iter_mut() {
         moving |= s.presence.advance(dt);
+        moving |= s.span.advance(dt);
         if let Some(b) = &mut s.bounce {
             match b.advance(dt) {
                 true => moving = true,
@@ -162,7 +174,7 @@ pub fn advance(slots: &mut Vec<Slot>, dt: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::{Kind, Window};
+    use crate::dock::{Kind, Span, Window};
 
     fn item(app_id: &str) -> Item {
         Item {
@@ -175,6 +187,7 @@ mod tests {
             }],
             elsewhere: Vec::new(),
             active: false,
+            span: Span::ONE,
         }
     }
 
@@ -259,6 +272,34 @@ mod tests {
         merge(&mut slots, &[a], 100.0, true);
         assert_eq!(slots[0].item.windows.len(), 2);
         assert!(slots[0].presence.settled());
+    }
+
+    #[test]
+    fn spans_slide() {
+        let mut slots = Vec::new();
+        merge(&mut slots, &[item("a")], 100.0, false);
+        assert_eq!(slots[0].span.value, 1.0);
+        let mut wide = item("a");
+        wide.span = Span::of(2.0);
+        merge(&mut slots, &[wide.clone()], 100.0, true);
+        assert_eq!((slots[0].span.value, slots[0].span.target), (1.0, 2.0));
+        assert!(advance(&mut slots, 0.05));
+        let mid = slots[0].span.value;
+        assert!(mid > 1.0 && mid < 2.0);
+        assert!(!advance(&mut slots, 1.0));
+        assert_eq!(slots[0].span.value, 2.0);
+        // New wide items come in at their span.
+        merge(
+            &mut slots,
+            &[wide, {
+                let mut b = item("b");
+                b.span = Span::of(1.5);
+                b
+            }],
+            100.0,
+            true,
+        );
+        assert_eq!(slots[1].span.value, 1.5);
     }
 
     #[test]

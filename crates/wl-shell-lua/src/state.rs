@@ -11,10 +11,11 @@ use mlua::chunk::ChunkMode;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 
 use crate::caps::{self, Capabilities};
-use crate::channel::InstanceId;
+use crate::channel::{InstanceId, Tile};
 use crate::host;
 use crate::runtime::{Job, Link, Settings, lock};
 use crate::spec::{InstanceSpec, Role};
+use crate::ui::{Builder, Node};
 
 /// The budget is counted in steps of this many instructions.
 const STEP: u32 = 1000;
@@ -26,6 +27,8 @@ const MAX_LABEL: usize = 200;
 pub(crate) const TIMERS: &str = "wl_shell_timers";
 pub(crate) const PROCS: &str = "wl_shell_procs";
 pub(crate) const LOADED: &str = "wl_shell_loaded";
+/// Handlers of the trees shown, by topic (`icon`), then by node key.
+pub(crate) const HANDLERS: &str = "wl_shell_handlers";
 
 /// What a call into a state came to.
 pub(crate) enum Outcome<T> {
@@ -107,6 +110,10 @@ pub(crate) struct Host {
     pub procs: Mutex<HashMap<u64, Arc<Mutex<Child>>>>,
     /// The plugin's folder, for `require`.
     pub dir: Option<std::path::PathBuf>,
+    /// What `span(n)` set.
+    pub span: Mutex<Option<crate::caps::Span>>,
+    /// Loaded and set up: `span(n)` is news now.
+    pub loaded: AtomicBool,
 }
 
 impl Host {
@@ -175,6 +182,8 @@ impl State {
             next: AtomicU64::new(1),
             procs: Mutex::default(),
             dir: spec.source.dir(),
+            span: Mutex::default(),
+            loaded: AtomicBool::new(false),
         });
         lua.set_app_data(host.clone());
         host::install(&lua, settings.namespace).map_err(LoadError::fixed)?;
@@ -216,6 +225,7 @@ impl State {
                 }
             }
         }
+        state.host.loaded.store(true, Ordering::Relaxed);
         Ok((state, caps))
     }
 
@@ -283,6 +293,33 @@ impl State {
             };
             let text = text.trim();
             Ok((!text.is_empty()).then(|| text.chars().take(MAX_LABEL).collect()))
+        })
+    }
+
+    /// What `span(n)` set, if it was called.
+    pub fn span(&self) -> Option<crate::caps::Span> {
+        *lock(&self.host.span)
+    }
+
+    /// `icon(tile)`: the tree, or None for the app's own icon. Its
+    /// handlers replace the last icon's.
+    pub fn icon(&self, tile: &Tile) -> Outcome<Option<Node>> {
+        let Some(icon) = self.hook("icon") else {
+            return Outcome::Ok(None);
+        };
+        self.enter("icon", || {
+            let t = self.lua.create_table()?;
+            t.set("w", tile.w)?;
+            t.set("h", tile.h)?;
+            t.set("span", tile.span)?;
+            t.set("axis", tile.axis.name())?;
+            t.set("scale", tile.scale)?;
+            let v = icon.call::<Value>(t)?;
+            let mut builder = Builder::new(&self.lua)?;
+            let tree = builder.root(v).map_err(mlua::Error::runtime)?;
+            let handlers: Table = self.lua.named_registry_value(HANDLERS)?;
+            handlers.set("icon", builder.handlers())?;
+            Ok(tree)
         })
     }
 

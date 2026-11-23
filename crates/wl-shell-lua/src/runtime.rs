@@ -58,6 +58,12 @@ pub enum Event {
         instance: InstanceId,
         text: String,
     },
+    /// `span(n)` changed the widget's span (after it loaded; before, it
+    /// is in the capabilities).
+    Span {
+        instance: InstanceId,
+        span: crate::caps::Span,
+    },
 }
 
 /// How the runtime runs.
@@ -305,6 +311,11 @@ impl Slot {
                             let outcome = state.label();
                             self.settle(life, shared, outcome).map(Reply::Label)
                         }
+                        RequestKind::Icon(tile) => {
+                            let outcome = state.icon(&tile);
+                            (self.settle(life, shared, outcome))
+                                .map(|tree| Reply::Icon(tree.map(Arc::new)))
+                        }
                     },
                 };
                 shared.emit(Event::Answer(Answer {
@@ -346,8 +357,12 @@ impl Slot {
         }
         let spec = lock(&self.spec).clone();
         match State::load(&spec, life.epoch, self.link(shared), &shared.settings) {
-            Ok((state, caps)) => {
+            Ok((state, mut caps)) => {
                 life.started = Some(Instant::now());
+                // `span(n)` during setup is the widget's span.
+                if let (Some(w), Some(span)) = (caps.widget.as_mut(), state.span()) {
+                    w.span = span;
+                }
                 // A plugin table's state is only for the launcher.
                 if spec.role == Role::Widget || caps.launcher() {
                     life.state = Some(state);

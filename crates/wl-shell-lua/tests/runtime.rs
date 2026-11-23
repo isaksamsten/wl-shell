@@ -321,3 +321,95 @@ fn plugin_tables_only_keep_launcher_states() {
     assert!(loaded(&recv, "l").launcher());
     assert!(label(&rt, &recv, "w").unwrap_err().contains("not running"));
 }
+
+fn icon(
+    rt: &Runtime,
+    recv: &Receiver<Event>,
+    id: &str,
+) -> Result<Option<wl_shell_lua::ui::Node>, String> {
+    let tile = wl_shell_lua::Tile {
+        w: 96.0,
+        h: 96.0,
+        span: 1.0,
+        axis: wl_shell_lua::Axis::Horizontal,
+        scale: 2,
+    };
+    let ticket = rt.request(id, RequestKind::Icon(tile), WAIT).unwrap();
+    next(recv, |e| match e {
+        Event::Answer(a) if a.id == ticket.id => Some(a.result.map(|r| match r {
+            Reply::Icon(tree) => tree.map(|t| (*t).clone()),
+            _ => unreachable!(),
+        })),
+        _ => None,
+    })
+}
+
+#[test]
+fn icons_are_trees() {
+    use wl_shell_lua::ui::Kind;
+    let (rt, recv) = runtime();
+    rt.configure(vec![code(
+        "a",
+        "local ui, n = dock.ui, 0
+         return {
+           icon = function(tile)
+             n = n + 1
+             if n == 2 then return nil end
+             if n == 3 then return { 'not a node' } end
+             assert(tile.w == 96 and tile.axis == 'horizontal' and tile.scale == 2)
+             return ui.stack{ align = 'top-right',
+               ui.app_icon{},
+               ui.canvas{ draw = function(c) c:circle{x = 50, y = 50, r = 40, fill = dock.theme.accent} end },
+             }
+           end,
+         }",
+    )]);
+    assert!(loaded(&recv, "a").widget.unwrap().icon);
+    let tree = icon(&rt, &recv, "a").unwrap().unwrap();
+    assert!(matches!(tree.kind, Kind::Stack { .. }));
+    assert!(matches!(&tree.children[1].kind, Kind::Canvas { commands, .. } if commands.len() == 1));
+    // nil: the app's own icon.
+    assert_eq!(icon(&rt, &recv, "a"), Ok(None));
+    // A bad tree is the hook's error; the state goes on.
+    assert!(
+        icon(&rt, &recv, "a")
+            .unwrap_err()
+            .contains("expected a node")
+    );
+    assert!(icon(&rt, &recv, "a").unwrap().is_some());
+}
+
+#[test]
+fn spans() {
+    let (rt, recv) = runtime();
+    rt.configure(vec![code(
+        "a",
+        "return {
+           span = 2,
+           setup = function() dock.span({ horizontal = 1.5, vertical = 1 }) end,
+           label = function() dock.span(1); return 'x' end,
+         }",
+    )]);
+    // `span(n)` in setup wins over `span`.
+    let span = loaded(&recv, "a").widget.unwrap().span;
+    assert_eq!((span.horizontal, span.vertical), (1.5, 1.0));
+    rt.request("a", RequestKind::Label, WAIT).unwrap();
+    let span = next(&recv, |e| match e {
+        Event::Span { instance, span } if instance == "a" => Some(span),
+        _ => None,
+    });
+    assert_eq!((span.horizontal, span.vertical), (1.0, 1.0));
+}
+
+#[test]
+fn a_canvas_that_never_ends_hits_the_budget() {
+    let (rt, recv) = runtime();
+    let mut spec = code(
+        "a",
+        "return { icon = function() return dock.ui.canvas{ draw = function(c) while true do end end } end }",
+    );
+    spec.budget = 100_000;
+    rt.configure(vec![spec]);
+    loaded(&recv, "a");
+    assert!(icon(&rt, &recv, "a").unwrap_err().contains("budget"));
+}

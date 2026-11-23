@@ -90,6 +90,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -123,7 +124,7 @@ use wl_shell_log::warn;
 use wl_shell_render::bubble::Bubble;
 use wl_shell_render::files::FileEntry;
 use wl_shell_render::worker::{Assets, LabelKey, PillRequest};
-use wl_shell_render::{Image, icons, shadow, text};
+use wl_shell_render::{Image, icons, shadow, text, ui};
 use wl_shell_ui::cache::{self, Cache};
 use wl_shell_ui::card::{self, Preview};
 use wl_shell_ui::shapes::{self, Shape, ShapeKey};
@@ -145,6 +146,7 @@ use crate::stack;
 use crate::strip::{self, Key};
 use crate::stripview::{Place, StripInput, StripStyle, StripView};
 use crate::trash;
+use crate::widgets::{TileBase, WidgetIcon};
 use crate::zoom;
 
 type Qh = QueueHandle<Shell<WlDock>>;
@@ -241,6 +243,8 @@ pub struct Style {
     user_dirs: UserDirs,
     /// None: no badges during keyboard activation.
     badge: Option<BadgeStyle>,
+    /// How widgets' trees look.
+    pub ui_theme: Arc<ui::Theme>,
 }
 
 impl Style {
@@ -325,6 +329,7 @@ impl Style {
                 background: theme.badge_background,
                 text,
             }),
+            ui_theme: Arc::new(config.ui_theme()),
         }
     }
 
@@ -421,8 +426,8 @@ struct Drag {
     at: (f64, f64),
     /// From the pointer to the icon's center, as it was picked up.
     offset: (f64, f64),
-    /// The icon's size as it was picked up.
-    size: f64,
+    /// The icon's size on the surface as it was picked up.
+    size: (f64, f64),
     target: Target,
 }
 
@@ -433,6 +438,8 @@ struct Gap {
     /// Before the slot of this item; None: after the last pinned one.
     before: Option<String>,
     presence: Spring,
+    /// The span of what lands there (a widget's tile may be longer).
+    span: f64,
 }
 
 /// A dropped (or cancelled) icon flying to its slot.
@@ -602,6 +609,9 @@ pub struct DockView {
     label_timer: Option<RegistrationToken>,
     /// The labels widgets give their apps, by app ID (over the names).
     widget_names: BTreeMap<String, String>,
+    /// The trees widgets draw as their apps' icons, by app ID, with
+    /// their versions.
+    widget_icons: BTreeMap<String, WidgetIcon>,
 
     frame_pending: bool,
     last_frame: Option<Instant>,
@@ -748,6 +758,7 @@ impl DockView {
             label_at: (0.0, 0.0),
             label_timer: None,
             widget_names: BTreeMap::new(),
+            widget_icons: BTreeMap::new(),
             frame_pending: false,
             last_frame: None,
             output_size: None,
@@ -946,10 +957,68 @@ impl DockView {
         .with_icon(self.style.icons.get(app_id).cloned())
     }
 
+    /// A widget's tile for `item`, `span` long: its tree's version and
+    /// its size in buffer pixels, upright on the surface.
+    fn tile(&self, item: &Item) -> Option<icons::Tile> {
+        let version = self.widget_icons.get(&item.app_id)?.version;
+        let thick = self.style.icon_key_size() * self.scale.max(1) as u32;
+        let long = (thick as f64 * item.span.get()).round() as u32;
+        let (w, h) = match self.frame().axis() {
+            shapes::Axis::Horizontal => (long, thick),
+            shapes::Axis::Vertical => (thick, long),
+        };
+        Some(icons::Tile { version, w, h })
+    }
+
+    /// What widgets' icons are drawn for on this dock, but their spans.
+    pub fn tile_base(&self) -> TileBase {
+        TileBase {
+            size: self.style.icon_key_size() as f64,
+            axis: match self.frame().axis() {
+                shapes::Axis::Horizontal => wl_shell_lua::Axis::Horizontal,
+                shapes::Axis::Vertical => wl_shell_lua::Axis::Vertical,
+            },
+            scale: self.scale,
+        }
+    }
+
+    /// What paints `key`'s tile, if it is one.
+    fn tile_request(&self, key: &icons::Key) -> Option<ui::Request> {
+        let tile = key.tile?;
+        let tree = &self.widget_icons.get(&key.app_id)?.tree;
+        let s = key.scale.max(1) as f32;
+        Some(ui::Request {
+            tree: tree.clone(),
+            bounds: ui::Bounds::Exact(tile.w as f32 / s, tile.h as f32 / s),
+            scale: key.scale,
+            theme: self.style.ui_theme.clone(),
+            app: Some(key.app_id.clone()),
+            state: ui::State::default(),
+        })
+    }
+
+    /// Ask the worker for `key`'s image: a widget's tile, or an icon.
+    fn request_icon(&self, key: &icons::Key) {
+        match self.tile_request(key) {
+            Some(request) => self.assets.ui_icon(key, &request),
+            None => self.assets.icon(key, &self.style.font),
+        }
+    }
+
+    /// The trees widgets draw for their apps now (with their versions).
+    pub fn set_widget_icons(&mut self, icons: &BTreeMap<String, WidgetIcon>) {
+        if *icons == self.widget_icons {
+            return;
+        }
+        self.widget_icons = icons.clone();
+        self.request_assets(false);
+        self.kick();
+    }
+
     /// The icon of `item`; None for the separator.
     fn icon_key(&self, item: &Item) -> Option<icons::Key> {
         match item.kind {
-            Kind::App => Some(self.app_icon_key(&item.app_id)),
+            Kind::App => Some(self.app_icon_key(&item.app_id).with_tile(self.tile(item))),
             Kind::Separator => None,
             // Named after the icon, so a missing one gets a letter tile.
             Kind::Trash { full } => {
@@ -1031,7 +1100,7 @@ impl DockView {
             if let Some(key) = self.icon_key(&slot.item)
                 && (all || cache.icon(&key).is_none())
             {
-                self.assets.icon(&key, &self.style.font);
+                self.request_icon(&key);
             }
             if let Some(key) = self.label_key(&slot.item.app_id)
                 && (all || cache.label(&key).is_none())
@@ -1411,11 +1480,12 @@ impl DockView {
             true => s.target,
             false => s.value,
         };
-        let gaps: Vec<(usize, f64)> = (self.gaps.iter())
+        let gaps: Vec<(usize, f64, f64)> = (self.gaps.iter())
             .map(|g| {
                 (
                     self.gap_index(g.group, g.before.as_deref()),
                     weight(&g.presence),
+                    g.span,
                 )
             })
             .collect();
@@ -1425,9 +1495,9 @@ impl DockView {
         let mut cells = Vec::with_capacity(n + gaps.len());
         let mut gap_cells = Vec::with_capacity(n + gaps.len());
         for i in 0..=n {
-            for (k, &(at, w)) in gaps.iter().enumerate() {
+            for (k, &(at, w, span)) in gaps.iter().enumerate() {
                 if at.min(n) == i {
-                    slots.push(zoom::Slot::from(w.clamp(0.0, 1.0)));
+                    slots.push(zoom::Slot::wide(span, w.clamp(0.0, 1.0)));
                     cells.push(None);
                     gap_cells.push(Some(k));
                 }
@@ -1436,7 +1506,7 @@ impl DockView {
                 let w = weight(&s.presence).clamp(0.0, 1.0);
                 slots.push(match s.item.kind {
                     Kind::Separator => zoom::Slot::fixed(separator, w),
-                    _ => zoom::Slot::from(w),
+                    _ => zoom::Slot::wide(weight(&s.span), w),
                 });
                 cells.push(Some(i));
                 gap_cells.push(None);
@@ -1487,9 +1557,10 @@ impl DockView {
         };
         let m = self.style.metrics();
         let size = cell.size.max(m.icon);
+        let len = cell.len.max(size);
         let icon = self
             .frame()
-            .rect(cell.center - size / 2.0, m.icon_v(), size, size);
+            .rect(cell.center - len / 2.0, m.icon_v(), len, size);
         let (cx, cy) = icon.center();
         // A flight still on its way lands at once.
         self.fly = None;
@@ -1498,7 +1569,7 @@ impl DockView {
             group,
             at: (x, y),
             offset: (cx - x, cy - y),
-            size,
+            size: (icon.w, icon.h),
             target: Target::Home,
         });
         // No label during a drag (but the Trash's).
@@ -1618,10 +1689,15 @@ impl DockView {
         {
             let mut presence = Spring::new(0.0, self.style.response);
             presence.retarget(1.0);
+            // As long as the dragged item.
+            let span = (self.drag.as_ref())
+                .and_then(|d| self.slots.iter().find(|s| s.item.app_id == d.app_id))
+                .map_or(1.0, |s| s.item.span.get());
             self.gaps.push(Gap {
                 group,
                 before,
                 presence,
+                span,
             });
         }
     }
@@ -1712,11 +1788,11 @@ impl DockView {
     /// Where the dragged icon is drawn: under the pointer as it was picked
     /// up, kept on the surface.
     fn drag_rect(&self, drag: &Drag) -> Rect {
-        let half = drag.size / 2.0;
-        let keep = |c: f64, len: f64| c.min(len - half).max(half);
-        let cx = keep(drag.at.0 + drag.offset.0, self.width as f64);
-        let cy = keep(drag.at.1 + drag.offset.1, self.height as f64);
-        Rect::new(cx - half, cy - half, drag.size, drag.size)
+        let (w, h) = drag.size;
+        let keep = |c: f64, len: f64, half: f64| c.min(len - half).max(half);
+        let cx = keep(drag.at.0 + drag.offset.0, self.width as f64, w / 2.0);
+        let cy = keep(drag.at.1 + drag.offset.1, self.height as f64, h / 2.0);
+        Rect::new(cx - w / 2.0, cy - h / 2.0, w, h)
     }
 
     // -- drops from outside ----------------------------------------------------
@@ -2270,10 +2346,17 @@ impl DockView {
                 false => 1.0,
             };
             let d = cell.size * grow * (1.0 - morph);
+            // A widget's tile may be longer along the dock.
+            let len = cell.len * grow * (1.0 - morph);
             // A bounce never takes the icon off the surface.
             let room = (frame.across() - m.icon_v() - d).max(0.0);
             let hop = (slot.bounce).map_or(0.0, |b| (b.height() * BOUNCE * m.icon).min(room));
-            let r = frame.rect(into(cell.center) - d / 2.0, m.icon_v() + hop - slide, d, d);
+            let r = frame.rect(
+                into(cell.center) - len / 2.0,
+                m.icon_v() + hop - slide,
+                len,
+                d,
+            );
             if let Some(at) = icons.get_mut(i) {
                 *at = Some(r);
             }
@@ -2298,7 +2381,8 @@ impl DockView {
                     } else {
                         0.0
                     };
-                    subs.icon.present(cache.icon(&key).as_ref(), padded, alpha);
+                    subs.icon
+                        .present(cache.icon_or_older(&key).as_ref(), padded, alpha);
                 }
                 _ => subs.icon.clear(),
             }
@@ -2351,7 +2435,7 @@ impl DockView {
         match (lifted_rect, lifted_key) {
             (Some(r), Some(key)) => {
                 let padded = r.outset(key.pad() as f64 * r.w / key_size);
-                (self.drag_sub).present(cache.icon(&key).as_ref(), padded, seen);
+                (self.drag_sub).present(cache.icon_or_older(&key).as_ref(), padded, seen);
             }
             _ => self.drag_sub.clear(),
         }
@@ -2609,7 +2693,8 @@ impl DockView {
         let laid = self.lay(self.pointer.target, self.hover.target, true);
         let cell = laid.cell(i)?;
         let d = cell.size.max(1.0);
-        let r = frame.rect(cell.center - d / 2.0, m.icon_v(), d, d);
+        let len = cell.len.max(d);
+        let r = frame.rect(cell.center - len / 2.0, m.icon_v(), len, d);
         Some((IRect::round(r), m.icon_v() + d))
     }
 

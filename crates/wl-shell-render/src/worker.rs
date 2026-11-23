@@ -23,6 +23,7 @@ use crate::image::Image;
 use crate::mime::MimeDb;
 use crate::paper;
 use crate::text::{self, Text};
+use crate::ui;
 
 enum Job {
     /// The icon for `key`; a letter tile in `font` if there is none.
@@ -53,6 +54,13 @@ enum Job {
     Paper(paper::Paper),
     /// A document (wl-note).
     Doc { tag: u64, doc: Doc },
+    /// A UI tree (a widget's popup).
+    Ui { tag: u64, request: ui::Request },
+    /// A widget's tile: a UI tree as the icon of `key`.
+    UiIcon {
+        key: icons::Key,
+        request: ui::Request,
+    },
     /// Forget decoded icons, e.g. because the config changed.
     ClearIcons,
 }
@@ -148,12 +156,21 @@ pub enum Done {
         doc: Doc,
         rendered: doc::Rendered,
     },
+    /// A UI tree (`Assets::ui`). Widget tiles (`Assets::ui_icon`) come
+    /// as `Icon`s.
+    Ui {
+        tag: u64,
+        request: ui::Request,
+        rendered: ui::Rendered,
+    },
 }
 
 /// The worker, and what was requested from it and not received yet.
 pub struct Assets {
     jobs: mpsc::Sender<Job>,
     icons: RefCell<Vec<icons::Key>>,
+    /// Tiles on their way, with what they were asked for.
+    tiles: RefCell<Vec<(icons::Key, ui::Request)>>,
     named: RefCell<Vec<icons::NamedIcon>>,
     labels: RefCell<Vec<LabelKey>>,
     entries: RefCell<Vec<String>>,
@@ -172,6 +189,7 @@ impl Assets {
         let assets = Self {
             jobs,
             icons: RefCell::new(Vec::new()),
+            tiles: RefCell::new(Vec::new()),
             named: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
             entries: RefCell::new(Vec::new()),
@@ -195,6 +213,24 @@ impl Assets {
                 font: font.to_string(),
             });
         }
+    }
+
+    /// Paint `request` as the icon of `key` (a widget's tile), unless it
+    /// is on its way already. It arrives as `Done::Icon`.
+    pub fn ui_icon(&self, key: &icons::Key, request: &ui::Request) {
+        let mut pending = self.tiles.borrow_mut();
+        if !pending.iter().any(|(k, r)| k == key && r == request) {
+            pending.push((key.clone(), request.clone()));
+            self.send(Job::UiIcon {
+                key: key.clone(),
+                request: request.clone(),
+            });
+        }
+    }
+
+    /// Paint a UI tree; arrives as `Done::Ui`.
+    pub fn ui(&self, tag: u64, request: ui::Request) {
+        self.send(Job::Ui { tag, request });
     }
 
     /// Request the icon named `key.name`, unless it is on its way already.
@@ -293,7 +329,10 @@ impl Assets {
     /// Book-keeping for a result from the worker.
     pub fn received(&self, done: &Done) {
         match done {
-            Done::Icon { key, .. } => self.icons.borrow_mut().retain(|k| k != key),
+            Done::Icon { key, .. } => {
+                self.icons.borrow_mut().retain(|k| k != key);
+                self.tiles.borrow_mut().retain(|(k, _)| k != key);
+            }
             Done::Named { key, .. } => self.named.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
             Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
@@ -305,8 +344,39 @@ impl Assets {
             | Done::FileType { .. }
             | Done::Apps(_)
             | Done::Paper { .. }
-            | Done::Doc { .. } => {}
+            | Done::Doc { .. }
+            | Done::Ui { .. } => {}
         }
+    }
+}
+
+/// What a UI tree takes from the worker's caches.
+struct UiResources<'a> {
+    icons: &'a mut Icons,
+    images: &'a mut ui::images::Images,
+    theme: Option<String>,
+}
+
+impl ui::Resources for UiResources<'_> {
+    fn app_icon(&mut self, app: &str, px: u32) -> Option<Arc<Image>> {
+        self.icons.load_entries();
+        self.icons
+            .get(&icons::Key::new(app, px, self.theme.clone(), None, 1))
+    }
+
+    fn icon(&mut self, name: &str, px: u32) -> Option<Arc<Image>> {
+        self.icons.named(&icons::NamedIcon {
+            name: name.to_string(),
+            fallbacks: Vec::new(),
+            size: px,
+            theme: self.theme.clone(),
+            shadow: None,
+            scale: 1,
+        })
+    }
+
+    fn image(&mut self, src: &str) -> Option<Arc<Image>> {
+        self.images.get(src)
     }
 }
 
@@ -319,6 +389,8 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
     let mut letters: HashMap<(icons::Key, String), Arc<Image>> = HashMap::new();
     // File types, loaded with the first folder.
     let mut mime: Option<MimeDb> = None;
+    // `ui.image`s.
+    let mut images = ui::images::Images::default();
     loop {
         let job = match inbox.try_recv() {
             Ok(job) => job,
@@ -451,9 +523,41 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                 let rendered = text.get_or_insert_with(Text::new).doc(&doc);
                 Done::Doc { tag, doc, rendered }
             }
+            Job::Ui { tag, request } => {
+                let mut res = UiResources {
+                    icons: &mut icons,
+                    images: &mut images,
+                    theme: request.theme.icon_theme.clone(),
+                };
+                let text = text.get_or_insert_with(Text::new);
+                let rendered = ui::render(&request, text, &mut res);
+                Done::Ui {
+                    tag,
+                    request,
+                    rendered,
+                }
+            }
+            Job::UiIcon { key, request } => {
+                let mut res = UiResources {
+                    icons: &mut icons,
+                    images: &mut images,
+                    theme: request.theme.icon_theme.clone(),
+                };
+                let text = text.get_or_insert_with(Text::new);
+                let image = ui::render(&request, text, &mut res).image;
+                let image = match &key.shadow {
+                    Some(s) => crate::shadow::icon(&image, s, key.scale),
+                    None => image,
+                };
+                Done::Icon {
+                    key,
+                    image: Arc::new(image),
+                }
+            }
             Job::ClearIcons => {
                 icons.clear();
                 letters.clear();
+                images.clear();
                 continue;
             }
         };

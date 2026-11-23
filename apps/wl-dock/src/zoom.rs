@@ -15,6 +15,13 @@
 //! cell and icon, so items appearing or disappearing grow in or shrink
 //! away while their neighbors slide.
 //!
+//! A widget's tile can be longer along the dock than an icon: `span`
+//! icons (1, 1.5 or 2), as thick as an icon. Its cell is `size · span`
+//! plus the gap, and its distance to the pointer is measured from the
+//! nearer end of its middle stretch (where a square icon would have its
+//! center): the whole tile is fully grown while the pointer is on that
+//! stretch, and its neighbors grow as they would beside an icon.
+//!
 //! The magnified row is shifted so the point under the pointer stays under
 //! the pointer: `p` falls in a resting cell at some fraction of its length,
 //! and the same fraction of the magnified cell is put at `p`. Outside the
@@ -44,6 +51,8 @@ pub struct Slot {
     /// The cell's length along the dock, instead of an icon's: it
     /// doesn't magnify, and has no icon.
     pub fixed: Option<f64>,
+    /// The tile's length in icons (1 for an icon).
+    pub span: f64,
 }
 
 impl Slot {
@@ -52,6 +61,16 @@ impl Slot {
         Self {
             weight,
             fixed: Some(len),
+            span: 1.0,
+        }
+    }
+
+    /// A tile of `span` icons, of `weight`.
+    pub fn wide(span: f64, weight: f64) -> Self {
+        Self {
+            weight,
+            fixed: None,
+            span: span.max(1.0),
         }
     }
 }
@@ -59,21 +78,20 @@ impl Slot {
 impl From<f64> for Slot {
     /// An icon's slot of `weight`.
     fn from(weight: f64) -> Self {
-        Self {
-            weight,
-            fixed: None,
-        }
+        Self::wide(1.0, weight)
     }
 }
 
 /// One slot as laid out.
-/// One item as laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     /// The icon's center.
     pub center: f64,
-    /// The icon's size, weight included; 0 for a fixed slot.
+    /// The icon's size (across the dock, and along it for a square
+    /// icon), weight included; 0 for a fixed slot.
     pub size: f64,
+    /// Its length along the dock: `size` times the span.
+    pub len: f64,
     /// The cell: the icon and half a gap on either side.
     pub start: f64,
     pub end: f64,
@@ -93,7 +111,7 @@ impl Row {
         (self.cells.iter()).position(|c| c.end > c.start && u >= c.start && u < c.end)
     }
 
-    /// The largest icon.
+    /// The largest icon (across the dock).
     pub fn largest(&self) -> f64 {
         self.cells.iter().map(|c| c.size).fold(0.0, f64::max)
     }
@@ -117,14 +135,18 @@ pub fn rest<S: Into<Slot> + Copy>(slots: &[S], center: f64, p: &Params) -> Row {
 /// at rest, with the pointer at `pointer`.
 pub fn layout<S: Into<Slot> + Copy>(slots: &[S], center: f64, pointer: f64, p: &Params) -> Row {
     let slots: Vec<Slot> = slots.iter().map(|&s| s.into()).collect();
-    let step = p.icon + p.gap;
     let rest: Vec<f64> = (slots.iter())
-        .map(|s| s.weight.max(0.0) * s.fixed.unwrap_or(step).max(0.0))
+        .map(|s| {
+            let len = s.fixed.unwrap_or(p.icon * s.span.max(1.0) + p.gap);
+            s.weight.max(0.0) * len.max(0.0)
+        })
         .collect();
     let total: f64 = rest.iter().sum();
     let start = center - total / 2.0;
-    // Each slot's icon size (0 for fixed ones) and magnified cell.
+    // Each slot's icon size (0 for fixed ones), tile length and
+    // magnified cell.
     let mut sizes = Vec::with_capacity(slots.len());
+    let mut lens = Vec::with_capacity(slots.len());
     let mut cells = Vec::with_capacity(slots.len());
     let mut at = start;
     for (&len, s) in rest.iter().zip(&slots) {
@@ -133,14 +155,19 @@ pub fn layout<S: Into<Slot> + Copy>(slots: &[S], center: f64, pointer: f64, p: &
         let w = s.weight.max(0.0);
         if s.fixed.is_some() {
             sizes.push(0.0);
+            lens.push(0.0);
             cells.push(len);
             continue;
         }
-        let d = (c - pointer).abs() / p.icon;
+        let span = s.span.max(1.0);
+        // From the nearer end of the tile's middle stretch.
+        let stretch = (span - 1.0) * p.icon / 2.0;
+        let d = ((c - pointer).abs() - stretch * w).max(0.0) / p.icon;
         let grow = (p.magnification - 1.0) * falloff(d, p.range) * p.hover;
         let size = p.icon * (1.0 + grow);
         sizes.push(size * w);
-        cells.push(w * (size + p.gap));
+        lens.push(size * span * w);
+        cells.push(w * (size * span + p.gap));
     }
     let magnified: f64 = cells.iter().sum();
 
@@ -167,11 +194,12 @@ pub fn layout<S: Into<Slot> + Copy>(slots: &[S], center: f64, pointer: f64, p: &
     let start = pointer - mapped;
 
     let mut at = start;
-    let cells = (sizes.iter().zip(&cells))
-        .map(|(&size, &len)| {
+    let cells = (sizes.iter().zip(&lens).zip(&cells))
+        .map(|((&size, &tile), &len)| {
             let cell = Cell {
                 center: at + len / 2.0,
                 size,
+                len: tile,
                 start: at,
                 end: at + len,
             };
@@ -370,5 +398,79 @@ mod tests {
             }
             last = row;
         }
+    }
+
+    /// Icons, a 2x tile and a 1.5x tile.
+    fn wide() -> Vec<Slot> {
+        vec![
+            Slot::from(1.0),
+            Slot::wide(2.0, 1.0),
+            Slot::from(1.0),
+            Slot::wide(1.5, 1.0),
+            Slot::from(1.0),
+        ]
+    }
+
+    #[test]
+    fn wide_tiles_are_longer() {
+        let rest = rest(&wide(), 500.0, &P);
+        assert!(close(rest.end - rest.start, 5.0 * 54.0 + 48.0 + 24.0));
+        let tile = rest.cells[1];
+        assert!(close(tile.len, 96.0) && close(tile.size, 48.0));
+        assert!(close(tile.end - tile.start, 102.0));
+        assert!(close(rest.cells[3].len, 72.0));
+        // Square icons are as long as they are thick.
+        assert!(close(rest.cells[0].len, rest.cells[0].size));
+    }
+
+    #[test]
+    fn wide_tiles_grow_whole_along_their_middle() {
+        let rest = rest(&wide(), 500.0, &P);
+        let tile = rest.cells[1];
+        // Anywhere on its middle stretch, it is fully magnified and stays
+        // under the pointer.
+        for f in [-0.5, -0.25, 0.0, 0.25, 0.5] {
+            let p = tile.center + f * 48.0;
+            let row = layout(&wide(), 500.0, p, &P);
+            assert!(close(row.cells[1].size, 96.0), "{f}");
+            assert!(close(row.cells[1].len, 192.0), "{f}");
+            assert_eq!(row.hit(p), Some(1));
+        }
+        // Its neighbor next to its end grows as it would beside an icon
+        // whose center is there.
+        let at_end = tile.center + 24.0;
+        let row = layout(&wide(), 500.0, at_end, &P);
+        let icons = layout(&[1.0; 5], 500.0, 500.0, &P);
+        assert!(close(row.cells[2].size, icons.cells[3].size));
+    }
+
+    #[test]
+    fn continuous_and_apart_with_wide_tiles() {
+        let s = wide();
+        let mut last = layout(&s, 500.0, 0.0, &P);
+        let mut p = 0.0;
+        while p < 1000.0 {
+            p += 0.25;
+            let row = layout(&s, 500.0, p, &P);
+            for (a, b) in row.cells.iter().zip(&last.cells) {
+                assert!((a.center - b.center).abs() < 1.0, "p = {p}");
+                assert!((a.len - b.len).abs() < 1.0, "p = {p}");
+            }
+            for pair in row.cells.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                assert!(a.center + a.len / 2.0 <= b.center - b.len / 2.0 + 1e-9);
+                assert!(close(a.end, b.start));
+            }
+            last = row;
+        }
+    }
+
+    #[test]
+    fn spans_change_smoothly_with_their_weight() {
+        // A span spring halfway from 1 to 2: in between.
+        let row = |span| rest(&[Slot::from(1.0), Slot::wide(span, 1.0)], 0.0, &P);
+        let (a, b, c) = (row(1.0), row(1.5), row(2.0));
+        assert!(a.cells[1].len < b.cells[1].len && b.cells[1].len < c.cells[1].len);
+        assert!(close(b.end - b.start, 2.0 * 54.0 + 24.0));
     }
 }

@@ -311,13 +311,14 @@ that app's windows).
 
 ### Widgets
 
-A widget is a Lua 5.4 plugin behind an app's item. For now it can replace the
-app's label (its name on hover); icons and popups come later. Clicking the
-item still launches or activates the app.
+A widget is a Lua 5.4 plugin behind an app's item. It can replace the app's
+label (its name on hover) and its icon, and make its tile longer along the
+dock; popups come later. Clicking the item still launches or activates the
+app.
 
 ```toml
 [app.foot]
-widget = { plugin = "clock", format = "%H:%M:%S" }  # or just widget = "clock"
+widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # or just widget = "clock"
 
 [plugin.clock]                 # Optional: defaults for every placement
 # path = "~/src/clock.lua"     # Default: plugins/clock.lua next to the config, else bundled
@@ -347,6 +348,54 @@ functions: `dock.redraw()`, `dock.timer(ms, fn)` and `dock.every(ms, fn)`
 `os.execute`; `require` loads modules next to the plugin. A hook that runs
 past its budget, or a failing `setup`, restarts the plugin with backoff, and the
 app shows its own name meanwhile. Plugin files reload when saved.
+
+`icon(tile)` returns a UI tree drawn as the app's icon (or `nil` for the
+app's own). `tile` has `w` and `h` (the magnified size in logical pixels),
+`span`, `axis` (`'horizontal'` or `'vertical'`) and `scale`. A plugin makes its
+tile longer with `span = 2` in its table, or `dock.span(1.5)` at run time
+(1, 1.5 or 2 icons; `{ horizontal = 2, vertical = 1 }` per dock direction).
+
+```lua
+local ui = dock.ui
+local P, unread = {}, 3
+function P.icon(tile)
+  return ui.stack{ align = 'top-right',
+    ui.app_icon{},                      -- the app's own icon, underneath
+    ui.box{ variant = 'badge', ui.text{tostring(unread), style = 'caption'} },
+  }
+end
+return P
+```
+
+Trees are built from `dock.ui` constructors: props are named, children
+positional (`nil` children are skipped).
+
+| Constructor | Props |
+| --- | --- |
+| `ui.col{}`, `ui.row{}` | `gap`, `padding` (`8`, `{v, h}` or `{t, r, b, l}`), `align` (`start`, `center`, `end`, `stretch`), `justify` (`start`, `center`, `end`, `between`, `around`, `evenly`) |
+| `ui.grid{}` | `columns` (a count, or sizes: `40`, `'1fr'`, `'auto'`), `gap`, `row_gap` |
+| `ui.stack{}` | `align` (`center`, `top-right`, `bottom`, ...); the first child is the bottom layer |
+| `ui.box{}` | `variant` (`card`, `inset`, `badge`) |
+| `ui.scroll{}` | `max_height` |
+| `ui.spacer{}`, `ui.divider{}` | `size` |
+| `ui.text{'...'}` | `style` (`title`, `body`, `muted`, `caption`), `weight`, `color`, `size`, `align`, `max_lines` |
+| `ui.icon{'name'}` | `size`, `color` (`-symbolic` icons take the text color) |
+| `ui.app_icon{}` | `app` (default: the widget's), `size` |
+| `ui.image{src = path}` | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity` |
+| `ui.canvas{draw = fn}` | `viewbox = {w, h}` (default 100 x 100) |
+| `ui.button{}` | `label`, `icon`, `variant` (`plain`, `filled`, `ghost`), `enabled`, `selected`, `on_click` |
+| `ui.slider{}`, `ui.toggle{}`, `ui.progress{}` | `value`, `min`, `max`, `enabled`, `live`, `on_change`, `on_commit` |
+
+Every node also takes `width`, `height`, `min_*`, `max_*` (pixels or `'50%'`),
+`grow`, `background`, `radius`, `border`, `opacity`, `hover` (props while
+hovered) and `key`. Colors are CSS colors or the theme's names in
+`dock.theme` (`text`, `muted`, `accent`, `accent_text`, `surface`, `border`,
+`hover`, `pressed`, `track`, `divider`, `card`, `inset`, `badge`,
+`badge_text`), which follow the dock's appearance, light and dark. A canvas's
+`draw(c)` runs when the tree is built; `c` has `line`, `rect`, `circle`, `arc`
+(`from`, `to` in radians from 3 o'clock, `pie`), `path{d = 'M ...'}`, `text`,
+`save`, `restore`, `translate`, `rotate` and `scale`, each shape with `fill`,
+`stroke`, `width` and `cap`, in viewbox units.
 
 ### Per-folder settings
 

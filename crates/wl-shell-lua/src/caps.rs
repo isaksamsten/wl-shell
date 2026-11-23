@@ -150,7 +150,7 @@ pub(crate) fn widget_table(plugin: &Table) -> mlua::Result<Table> {
 }
 
 /// `span = 2`, or `span = { horizontal = 2, vertical = 1 }`.
-fn span(v: &Value) -> Result<Span, String> {
+pub(crate) fn span(v: &Value) -> Result<Span, String> {
     let num = |v: &Value| match v {
         Value::Integer(i) => Some(*i as f64),
         Value::Number(n) => Some(*n),

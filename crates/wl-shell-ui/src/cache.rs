@@ -1,7 +1,9 @@
 //! A cache of ready `WlBuffer`s, so drawing a frame renders nothing:
 //!
 //! - Icons and app name labels, by key (one per app and output scale),
-//!   and icons by name (menu rows). They are rendered by the worker; the
+//!   and icons by name (menu rows). A widget's tiles are icons too: a new
+//!   tile replaces the app's older ones of its size, and until it is
+//!   there, the older one (or the app's icon) stands in. They are rendered by the worker; the
 //!   program turns the results into buffers as they arrive.
 //! - Shapes (shapes.rs), rendered here on first use for a size, color and
 //!   scale. The most recently used few dozen are kept.
@@ -57,6 +59,28 @@ impl Cache {
         self.icons.get(key).cloned()
     }
 
+    /// The icon of `key`; for a tile that isn't there yet, the app's
+    /// last tile (of its size if there is one), else the app's icon.
+    pub fn icon_or_older(&self, key: &icons::Key) -> Option<WlBuffer> {
+        if let Some(b) = self.icons.get(key) {
+            return Some(b.clone());
+        }
+        let tile = key.tile?;
+        let same = |k: &icons::Key| {
+            k.app_id == key.app_id && k.scale == key.scale && k.shadow == key.shadow
+        };
+        let older = (self.icons.iter())
+            .filter(|(k, _)| same(k) && k.tile.is_some())
+            .max_by_key(|(k, _)| {
+                let t = k.tile.unwrap_or(tile);
+                ((t.w, t.h) == (tile.w, tile.h), t.version)
+            });
+        match older {
+            Some((_, b)) => Some(b.clone()),
+            None => self.icons.get(&key.clone().with_tile(None)).cloned(),
+        }
+    }
+
     pub fn insert_icon<P: Program>(
         &mut self,
         g: &Globals,
@@ -66,6 +90,23 @@ impl Cache {
     ) {
         match shm_buffer(g, img, qh) {
             Ok(buffer) => {
+                // A tile replaces its app's older ones of its size.
+                if let Some(tile) = key.tile {
+                    let older: Vec<icons::Key> = (self.icons.keys())
+                        .filter(|k| {
+                            k.app_id == key.app_id
+                                && k.scale == key.scale
+                                && k.shadow == key.shadow
+                                && k.tile.is_some_and(|t| {
+                                    (t.w, t.h) == (tile.w, tile.h) && t.version != tile.version
+                                })
+                        })
+                        .cloned()
+                        .collect();
+                    for k in older {
+                        self.stale.extend(self.icons.remove(&k));
+                    }
+                }
                 if let Some(old) = self.icons.insert(key, buffer) {
                     self.stale.push(old);
                 }

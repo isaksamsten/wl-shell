@@ -10,6 +10,8 @@
 //! | `json.decode(s)` / `json.encode(v)` | JSON; `null` is `nil`.                                              |
 //! | `read(path)`                      | A file's text (`~/` expands), or nil and the error.                   |
 //! | `clipboard(text)`                 | Copies `text`.                                                        |
+//! | `span(n)`                         | Sets the tile's length along the dock: 1, 1.5 or 2 (or `{horizontal = 2, vertical = 1}`). |
+//! | `ui.*`, `theme.*`                 | The UI constructors and the theme's color names (`ui.rs`).            |
 //!
 //! `argv` is a list of strings, or one string run with `sh -c`.
 
@@ -26,7 +28,7 @@ use mlua::{Function, Lua, LuaSerdeExt, MultiValue, Table, UserData, UserDataMeth
 use wl_shell_log::warn;
 
 use crate::runtime::{Event, Job, lock};
-use crate::state::{LOADED, PROCS, TIMERS, host};
+use crate::state::{HANDLERS, LOADED, PROCS, TIMERS, host};
 
 /// The largest file `read` reads.
 const MAX_READ: u64 = 16 << 20;
@@ -51,7 +53,7 @@ pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
         safe.set(name, os.get::<Value>(name)?)?;
     }
     g.set("os", safe)?;
-    for name in [TIMERS, PROCS, LOADED] {
+    for name in [TIMERS, PROCS, LOADED, HANDLERS] {
         lua.set_named_registry_value(name, lua.create_table()?)?;
     }
     // `load` takes text only; `print` goes to the log.
@@ -140,6 +142,21 @@ pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
         })?,
     )?;
     ns.set("json", json)?;
+    ns.set(
+        "span",
+        lua.create_function(|lua, v: Value| {
+            let span = crate::caps::span(&v).map_err(mlua::Error::runtime)?;
+            let host = host(lua)?;
+            let changed = lock(&host.span).replace(span) != Some(span);
+            // While loading, it goes with the capabilities.
+            if changed && host.loaded.load(std::sync::atomic::Ordering::Relaxed) {
+                let instance = host.instance.clone();
+                host.link.emit(Event::Span { instance, span });
+            }
+            Ok(())
+        })?,
+    )?;
+    crate::ui::install(lua, &ns)?;
     g.set(namespace, ns)?;
     Ok(())
 }

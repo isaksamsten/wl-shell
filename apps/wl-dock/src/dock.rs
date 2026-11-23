@@ -63,6 +63,31 @@ pub fn folder_pin(key: &str) -> Option<&str> {
     key.strip_prefix(FOLDER)
 }
 
+/// A tile's length along the dock, in half icons: 2 (an icon), 3 or 4.
+/// Halves, so items can be compared exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Span(u8);
+
+impl Span {
+    pub const ONE: Span = Span(2);
+
+    /// The step `icons` rounds down to (1, 1.5 or 2).
+    pub fn of(icons: f32) -> Span {
+        Span((wl_shell_lua::span_step(icons as f64) * 2.0).round() as u8)
+    }
+
+    /// In icons.
+    pub fn get(self) -> f64 {
+        self.0 as f64 / 2.0
+    }
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Span::ONE
+    }
+}
+
 /// One icon in the dock: every window with the same app ID shares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -77,6 +102,8 @@ pub struct Item {
     pub elsewhere: Vec<Window>,
     /// The focused window is one of `windows`.
     pub active: bool,
+    /// Its length along the dock (a widget's tile may be longer).
+    pub span: Span,
 }
 
 /// What clicking an item does.
@@ -110,6 +137,7 @@ impl Item {
             windows: Vec::new(),
             elsewhere: Vec::new(),
             active: false,
+            span: Span::ONE,
         }
     }
 
@@ -293,6 +321,7 @@ pub fn items(
             windows: Vec::new(),
             elsewhere: Vec::new(),
             active: false,
+            span: Span::ONE,
         };
         for t in toplevels.iter().filter(|t| t.app_id == app_id) {
             let window = Window {
@@ -469,6 +498,14 @@ mod tests {
         mru.focus("2");
         mru.focus("3");
         assert_eq!(got[1].click(&mru), Click::Activate("2".into()));
+    }
+
+    #[test]
+    fn spans() {
+        assert_eq!(Span::of(1.0), Span::ONE);
+        assert_eq!(Span::of(1.7).get(), 1.5);
+        assert_eq!(Span::of(2.0).get(), 2.0);
+        assert_eq!(Span::of(0.2), Span::ONE);
     }
 
     #[test]

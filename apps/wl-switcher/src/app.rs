@@ -22,6 +22,7 @@ use wl_shell_config::Reloader;
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::Globals;
 use wl_shell_core::reexports::calloop::{RegistrationToken, channel};
+use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Daemon, Outcome, Reply};
@@ -145,7 +146,8 @@ impl WlSwitcher {
             | Done::FileType { .. }
             | Done::Apps(_)
             | Done::Paper { .. }
-            | Done::Doc { .. } => {}
+            | Done::Doc { .. }
+            | Done::Ui { .. } => {}
         }
     }
 
@@ -250,6 +252,28 @@ impl WlSwitcher {
     /// The first outcome wins.
     fn finish(&mut self, outcome: Outcome) {
         self.outcome.get_or_insert(outcome);
+    }
+
+    /// Close the selected window, or all of the selected app's windows,
+    /// with `close-command`. The switcher stays open; the windows leave it
+    /// as the compositor reports them closed.
+    fn close(&mut self, core: &Core<Self>) {
+        let Some(overlay) = self.overlay.as_ref().filter(|o| !o.closing()) else {
+            return;
+        };
+        if self.outcome.is_some() {
+            return;
+        }
+        let Some(template) = self.config.close_command.as_deref() else {
+            return warn!("Alt+Q needs a close-command");
+        };
+        for id in overlay.switcher.to_close() {
+            let command = spawn::fill(template, &[("id", &spawn::quote(id))]);
+            let output = Output::Prefixed("close-command".into());
+            if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+                warn!("close-command: {e}");
+            }
+        }
     }
 
     /// Pick the selection: close at once. Not once a cancel is fading out
@@ -376,6 +400,7 @@ impl Program for WlSwitcher {
         match action {
             Action::Cancel => self.cancel(core),
             Action::Pick => self.pick(),
+            Action::Close => self.close(core),
             Action::Step(step) => {
                 if let Some(overlay) = &mut self.overlay {
                     overlay.step(step);

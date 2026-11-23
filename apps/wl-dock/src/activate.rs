@@ -331,7 +331,7 @@ pub fn step<'a>(order: &[&'a str], current: Option<&str>, back: bool) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::{self, Window};
+    use crate::dock::{self, Span, Window};
     use crate::strip;
     use wl_shell_core::mru::Mru;
 
@@ -348,6 +348,7 @@ mod tests {
                 .collect(),
             elsewhere: Vec::new(),
             active: false,
+            span: Span::ONE,
         }
     }
 

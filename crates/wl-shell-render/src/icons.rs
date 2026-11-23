@@ -39,6 +39,19 @@ pub struct Key {
     pub shadow: Option<crate::shadow::IconShadow>,
     /// An icon name or path to try first, instead of the desktop entry's.
     pub icon: Option<String>,
+    /// A widget's tile instead of the app's icon (rendered from a UI
+    /// tree: `Assets::ui_icon`).
+    pub tile: Option<Tile>,
+}
+
+/// A widget's tile: which tree it shows, and its size in buffer pixels
+/// (as tall as an icon, up to twice as long along the dock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Tile {
+    /// Changes with every new tree.
+    pub version: u64,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// An icon looked up by its name (or path) alone.
@@ -92,6 +105,7 @@ impl Key {
             scale,
             shadow,
             icon: None,
+            tile: None,
         }
     }
 
@@ -113,9 +127,24 @@ impl Key {
         self.shadow.map_or(0, |s| s.pad())
     }
 
+    /// The same key, for a widget's tile.
+    pub fn with_tile(self, tile: Option<Tile>) -> Self {
+        Self { tile, ..self }
+    }
+
     /// The image's side in buffer pixels.
     pub fn image_size(&self) -> u32 {
         self.size + 2 * (self.pad() * self.scale) as u32
+    }
+
+    /// The image's size in buffer pixels: the icon's (or the tile's),
+    /// padded for the shadow.
+    pub fn image_dims(&self) -> (u32, u32) {
+        let pad = 2 * (self.pad() * self.scale) as u32;
+        match self.tile {
+            Some(t) => (t.w + pad, t.h + pad),
+            None => (self.size + pad, self.size + pad),
+        }
     }
 }
 
@@ -576,7 +605,7 @@ fn resolve(icon: &str, size: u32, theme: &str) -> Option<PathBuf> {
 }
 
 /// Decode an icon file to a `size`x`size` image, fitted and centered.
-fn decode(path: &Path, size: u32) -> Result<Image, String> {
+pub(crate) fn decode(path: &Path, size: u32) -> Result<Image, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

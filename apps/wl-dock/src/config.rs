@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer};
 use wl_shell_config::output::{self, Ident, Mode, Overlay, Tables, overlay_option};
 use wl_shell_config::{ConfigFile, Scheme, de};
-use wl_shell_render::{files, shadow, text};
+use wl_shell_render::{files, shadow, text, ui};
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -1037,6 +1037,46 @@ impl Config {
             color: self.theme().menu_text,
             background: 0,
         }
+    }
+
+    /// How widgets' trees look: from the menu's colors (a widget's
+    /// popup is a bubble like the menu), the launcher's match color as
+    /// the accent, and the font.
+    pub fn ui_theme(&self) -> ui::Theme {
+        use ui::ThemeColor as C;
+        let t = self.theme();
+        let fade = |rgba: u32, f: f64| {
+            let a = ((rgba & 0xff) as f64 * f).round().clamp(0.0, 255.0) as u32;
+            (rgba & !0xff) | a
+        };
+        // Dark text on a light accent, else white.
+        let [r, g, b, _] = t.launcher_match.to_be_bytes();
+        let light = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64 > 150.0;
+        let mut theme = ui::Theme {
+            font: self.appearance.font.clone(),
+            font_size: self.appearance.font_size as f32,
+            radius: (t.menu_radius as f32 * 0.66).round(),
+            spacing: 8.0,
+            icon_size: 16.0,
+            icon_theme: t.icon_theme.clone(),
+            ..ui::Theme::default()
+        };
+        for (c, rgba) in [
+            (C::Text, t.menu_text),
+            (C::Muted, fade(t.menu_text, 0.55)),
+            (C::Accent, t.launcher_match),
+            (C::AccentText, if light { 0x1f1f1fff } else { 0xffffffff }),
+            (C::Surface, t.menu_background),
+            (C::Border, t.menu_border),
+            (C::Hover, t.menu_highlight),
+            (C::Pressed, fade(t.menu_highlight, 1.6)),
+            (C::Track, fade(t.menu_text, 0.2)),
+            (C::Divider, t.menu_separator),
+            (C::Card, fade(t.menu_text, 0.08)),
+        ] {
+            theme.set(c, rgba);
+        }
+        theme
     }
 
     /// The launcher's query font size.

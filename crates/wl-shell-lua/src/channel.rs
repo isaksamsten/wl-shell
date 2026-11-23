@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::ui::Node;
+
 /// Which plugin state a request goes to: one per widget placement, one
 /// per `[plugin.<name>]` table.
 pub type InstanceId = String;
@@ -29,19 +31,51 @@ impl RequestId {
     }
 }
 
-/// What is asked. Widgets ask for their label now; icons, popups and
+/// Which way the dock runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Axis {
+    /// A bottom dock.
+    Horizontal,
+    /// A left or right dock.
+    Vertical,
+}
+
+impl Axis {
+    pub fn name(self) -> &'static str {
+        match self {
+            Axis::Horizontal => "horizontal",
+            Axis::Vertical => "vertical",
+        }
+    }
+}
+
+/// The tile `icon(tile)` draws for: the magnified size in logical pixels
+/// (`span` icons long along the dock), and the output's scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tile {
+    pub w: f64,
+    pub h: f64,
+    pub span: f32,
+    pub axis: Axis,
+    pub scale: i32,
+}
+
+/// What is asked. Widgets ask for their label and icon now; popups and
 /// events, and the launcher's actions and sources, are added as kinds.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum RequestKind {
     /// The widget's `label()`.
     Label,
+    /// The widget's `icon(tile)`.
+    Icon(Tile),
 }
 
 impl RequestKind {
     pub fn topic(&self) -> Topic {
         match self {
             RequestKind::Label => Topic::Label,
+            RequestKind::Icon(_) => Topic::Icon,
         }
     }
 }
@@ -52,6 +86,7 @@ impl RequestKind {
 #[non_exhaustive]
 pub enum Topic {
     Label,
+    Icon,
 }
 
 /// An answer's payload.
@@ -60,6 +95,8 @@ pub enum Topic {
 pub enum Reply {
     /// None: the default label.
     Label(Option<String>),
+    /// None: the app's own icon.
+    Icon(Option<Arc<Node>>),
 }
 
 /// A request as the worker sees it.
@@ -146,11 +183,16 @@ impl Pending {
     /// `now`; else None (late, superseded or cancelled: dropped). Either
     /// way the request is closed.
     pub fn accept(&mut self, answer: Answer, now: Instant) -> Option<Answer> {
+        self.accept_topic(answer, now).map(|(_, a)| a)
+    }
+
+    /// As `accept`, with the topic the request was about.
+    pub fn accept_topic(&mut self, answer: Answer, now: Instant) -> Option<(Topic, Answer)> {
         let key = (self.open.iter())
             .find(|((instance, _), t)| *instance == answer.instance && t.id == answer.id)
             .map(|(k, _)| k.clone())?;
         let ticket = self.open.remove(&key)?;
-        (now <= ticket.deadline).then_some(answer)
+        (now <= ticket.deadline).then_some((key.1, answer))
     }
 
     /// Whether a request of `topic` is open for `instance`.

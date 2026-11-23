@@ -82,7 +82,8 @@ impl Assets {
             | Done::FileType { .. }
             | Done::Apps(_)
             | Done::Paper { .. }
-            | Done::Doc { .. } => {}
+            | Done::Doc { .. }
+            | Done::Ui { .. } => {}
         }
     }
 }

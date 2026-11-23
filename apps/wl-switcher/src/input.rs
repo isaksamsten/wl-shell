@@ -121,6 +121,7 @@ impl Hold {
 pub enum Action {
     Cancel,
     Pick,
+    Close,
     Step(Step),
 }
 
@@ -149,6 +150,7 @@ impl Action {
         Some(match sym {
             Keysym::Escape => Action::Cancel,
             Keysym::Return | Keysym::KP_Enter => Action::Pick,
+            Keysym::q | Keysym::Q => Action::Close,
             Keysym::Tab => app(next),
             Keysym::ISO_Left_Tab => app(false),
             Keysym::Right => app(true),
@@ -240,6 +242,8 @@ mod tests {
         assert_eq!(k(Keysym::Left, false), Some(Action::Step(Step::PrevApp)));
         assert_eq!(k(Keysym::Down, false), Some(Action::Step(Step::NextWindow)));
         assert_eq!(k(Keysym::a, false), None);
+        assert_eq!(k(Keysym::q, false), Some(Action::Close));
+        assert_eq!(k(Keysym::Q, true), Some(Action::Close));
         // The grave key by keycode, whatever the layout maps it to.
         let grave = |sym, shift| Action::from_key(sym, KEY_GRAVE, shift);
         assert_eq!(

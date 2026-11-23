@@ -10,10 +10,16 @@
 //!
 //! `Widgets` is the dock's side of the runtime: what each instance
 //! provides (the registry), its open requests, and what the widgets show
-//! now. For now that is labels: an app widget's `label()` replaces the
-//! app's name. It is asked for once the plugin loads and whenever it
-//! calls `redraw()`; an answer after its deadline is dropped, and a
-//! plugin that fails gives the app its own name back.
+//! now: an app widget's `label()` replaces the app's name, its
+//! `icon(tile)` tree the app's icon, and its span lengthens its tile.
+//! Labels and icons are asked for once the plugin loads and whenever it
+//! calls `redraw()` (icons also when the tile changes); an answer after
+//! its deadline is dropped, and a plugin that fails gives the app its
+//! own name, icon and span back.
+//!
+//! The tile `icon(tile)` gets is the first dock's, magnified, at the
+//! largest scale of any dock: the tree is laid out again for each dock's
+//! own size when it is painted, so one tree serves them all.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,8 +27,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wl_shell_log::warn;
+use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
-    Event, InstanceSpec, Pending, Registry, Reply, RequestKind, Role, Runtime, Settings, Source,
+    Axis, Event, InstanceSpec, Pending, Registry, Reply, RequestKind, Role, Runtime, Settings,
+    Source, Span, Tile, Topic,
 };
 
 use crate::config::{Config, plugin_name_ok};
@@ -32,6 +40,8 @@ pub const BUNDLED: &[(&str, &str)] = &[("clock", include_str!("../plugins/clock.
 
 /// How long a label may take.
 const LABEL_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long an icon may take.
+const ICON_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// The instance of the widget on the app `app_id`.
 pub fn app_instance(app_id: &str) -> String {
@@ -162,10 +172,38 @@ pub fn specs(config: &Config, dir: Option<&Path>) -> Vec<InstanceSpec> {
 }
 
 /// What the dock does about a runtime event.
-pub enum Effect {
+#[derive(Debug, Default, PartialEq)]
+pub struct Effect {
     /// The widgets' labels changed.
-    Labels,
-    Clipboard(String),
+    pub labels: bool,
+    /// Their icons changed.
+    pub icons: bool,
+    /// Their spans changed: the items do.
+    pub spans: bool,
+    pub clipboard: Option<String>,
+}
+
+impl Effect {
+    #[cfg(test)]
+    pub fn any(&self) -> bool {
+        self.labels || self.icons || self.spans || self.clipboard.is_some()
+    }
+}
+
+/// What a widget's tile is, but its span: the icon's magnified size, the
+/// dock's axis, and the scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileBase {
+    pub size: f64,
+    pub axis: Axis,
+    pub scale: i32,
+}
+
+/// A widget's icon: its tree, and a version that changes with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WidgetIcon {
+    pub version: u64,
+    pub tree: Arc<Node>,
 }
 
 /// The dock's side of the plugin runtime.
@@ -176,6 +214,13 @@ pub struct Widgets {
     pending: Pending,
     /// The widgets' labels, by app ID.
     labels: BTreeMap<String, String>,
+    /// Their icons, by app ID.
+    icons: BTreeMap<String, WidgetIcon>,
+    /// Their spans, by app ID (the ones that aren't 1).
+    spans: BTreeMap<String, Span>,
+    versions: u64,
+    /// The tile icons are drawn for; None until there is a dock.
+    tile: Option<TileBase>,
     /// Plugin files changed since they were last reloaded.
     pub touched: Vec<PathBuf>,
     /// The files watched now.
@@ -199,9 +244,11 @@ impl Widgets {
         let kept = |i: &str| ids.iter().any(|id| id == i);
         self.registry.retain(kept);
         self.pending.retain(kept);
-        let before = self.labels.len();
+        let before = (self.labels.len(), self.icons.len(), self.spans.len());
         self.labels.retain(|app, _| kept(&app_instance(app)));
-        self.labels.len() != before
+        self.icons.retain(|app, _| kept(&app_instance(app)));
+        self.spans.retain(|app, _| kept(&app_instance(app)));
+        before != (self.labels.len(), self.icons.len(), self.spans.len())
     }
 
     /// The file at `path` changed.
@@ -214,6 +261,91 @@ impl Widgets {
     /// The widgets' labels, by app ID.
     pub fn labels(&self) -> &BTreeMap<String, String> {
         &self.labels
+    }
+
+    /// The widgets' icons, by app ID.
+    pub fn icons(&self) -> &BTreeMap<String, WidgetIcon> {
+        &self.icons
+    }
+
+    /// The span of `app`'s tile on a dock along `axis`.
+    pub fn span(&self, app: &str, axis: Axis) -> f32 {
+        self.spans.get(app).map_or(1.0, |s| match axis {
+            Axis::Horizontal => s.horizontal,
+            Axis::Vertical => s.vertical,
+        })
+    }
+
+    /// The docks' tile changed: icons are asked for again.
+    pub fn set_tile(&mut self, tile: Option<TileBase>) {
+        if tile == self.tile {
+            return;
+        }
+        self.tile = tile;
+        let instances: Vec<String> = (self.registry.widgets())
+            .filter(|(_, w)| w.icon)
+            .map(|(i, _)| i.to_string())
+            .collect();
+        for instance in instances {
+            self.ask_icon(&instance);
+        }
+    }
+
+    /// Ask `instance` for its icon, if it has one and there is a tile.
+    fn ask_icon(&mut self, instance: &str) {
+        let wants = self.registry.widget(instance).is_some_and(|w| w.icon);
+        let (Some(app), Some(base), true) = (instance_app(instance), self.tile, wants) else {
+            return;
+        };
+        let span = self.span(app, base.axis) as f64;
+        let (w, h) = match base.axis {
+            Axis::Horizontal => (base.size * span, base.size),
+            Axis::Vertical => (base.size, base.size * span),
+        };
+        let tile = Tile {
+            w,
+            h,
+            span: span as f32,
+            axis: base.axis,
+            scale: base.scale,
+        };
+        if let Some(runtime) = &self.runtime
+            && let Some(ticket) = runtime.request(instance, RequestKind::Icon(tile), ICON_TIMEOUT)
+        {
+            self.pending.insert(instance, ticket);
+        }
+    }
+
+    /// Set (or with None, drop) the icon of `instance`'s app; true if it
+    /// changed.
+    fn set_icon(&mut self, instance: &str, tree: Option<Arc<Node>>) -> bool {
+        let Some(app) = instance_app(instance) else {
+            return false;
+        };
+        match tree {
+            Some(t) if self.icons.get(app).is_some_and(|i| i.tree == t) => false,
+            Some(tree) => {
+                self.versions += 1;
+                let version = self.versions;
+                self.icons
+                    .insert(app.to_string(), WidgetIcon { version, tree });
+                true
+            }
+            None => self.icons.remove(app).is_some(),
+        }
+    }
+
+    /// Set the span of `instance`'s app; true if it changed.
+    fn set_span(&mut self, instance: &str, span: Option<Span>) -> bool {
+        let Some(app) = instance_app(instance) else {
+            return false;
+        };
+        let span = span.filter(|s| (s.horizontal, s.vertical) != (1.0, 1.0));
+        let old = match span {
+            Some(s) => self.spans.insert(app.to_string(), s),
+            None => self.spans.remove(app),
+        };
+        old != span
     }
 
     /// Ask `instance` for its label, if it has one.
@@ -243,37 +375,56 @@ impl Widgets {
     }
 
     /// Take in a runtime event.
-    pub fn event(&mut self, event: Event) -> Option<Effect> {
+    pub fn event(&mut self, event: Event) -> Effect {
+        let mut fx = Effect::default();
         match event {
             Event::Loaded { instance, caps } => {
-                let labels = caps.widget.as_ref().is_some_and(|w| w.label);
+                let widget = caps.widget.clone().unwrap_or_default();
                 self.registry.insert(&instance, caps);
+                fx.spans = self.set_span(&instance, Some(widget.span));
                 self.ask_label(&instance);
-                // A reloaded plugin may have no label anymore.
-                (!labels && self.set_label(&instance, None)).then_some(Effect::Labels)
+                self.ask_icon(&instance);
+                // A reloaded plugin may have no label or icon anymore.
+                fx.labels = !widget.label && self.set_label(&instance, None);
+                fx.icons = !widget.icon && self.set_icon(&instance, None);
             }
             Event::Failed { instance, .. } => {
                 self.registry.remove(&instance);
-                self.set_label(&instance, None).then_some(Effect::Labels)
+                fx.labels = self.set_label(&instance, None);
+                fx.icons = self.set_icon(&instance, None);
+                fx.spans = self.set_span(&instance, None);
             }
             Event::Redraw(instance) => {
                 self.ask_label(&instance);
-                None
+                self.ask_icon(&instance);
+            }
+            Event::Span { instance, span } => {
+                fx.spans = self.set_span(&instance, Some(span));
+                // Drawn for the new length.
+                if fx.spans {
+                    self.ask_icon(&instance);
+                }
             }
             Event::Answer(answer) => {
-                let answer = self.pending.accept(answer, Instant::now())?;
-                let label = match answer.result {
-                    Ok(Reply::Label(label)) => label,
-                    // The app's own name, while it fails.
-                    Err(_) => None,
-                    Ok(_) => return None,
+                let Some((topic, answer)) = self.pending.accept_topic(answer, Instant::now())
+                else {
+                    return fx;
                 };
-                (self.set_label(&answer.instance, label)).then_some(Effect::Labels)
+                let instance = &answer.instance;
+                match (answer.result, topic) {
+                    (Ok(Reply::Label(label)), _) => fx.labels = self.set_label(instance, label),
+                    (Ok(Reply::Icon(tree)), _) => fx.icons = self.set_icon(instance, tree),
+                    // The app's own name or icon, while it fails.
+                    (Err(_), Topic::Label) => fx.labels = self.set_label(instance, None),
+                    (Err(_), Topic::Icon) => fx.icons = self.set_icon(instance, None),
+                    _ => {}
+                }
             }
-            Event::Clipboard { text, .. } => Some(Effect::Clipboard(text)),
+            Event::Clipboard { text, .. } => fx.clipboard = Some(text),
             // For the launcher's sources (not yet).
-            Event::Invalidate(_) => None,
+            Event::Invalidate(_) => {}
         }
+        fx
     }
 }
 
@@ -405,11 +556,11 @@ mod tests {
         };
         // Without a runtime nothing is asked; answers to nothing are dropped.
         assert!(
-            w.event(Event::Loaded {
+            !w.event(Event::Loaded {
                 instance: "app:a".into(),
                 caps
             })
-            .is_none()
+            .any()
         );
         let (req, ticket) = Request::new(RequestKind::Label, LABEL_TIMEOUT);
         w.pending.insert("app:a", ticket);
@@ -418,18 +569,123 @@ mod tests {
             id,
             result: Ok(Reply::Label(Some("12:00".into()))),
         };
-        assert!(matches!(
-            w.event(Event::Answer(answer(req.id))),
-            Some(Effect::Labels)
-        ));
+        assert!(w.event(Event::Answer(answer(req.id))).labels);
         assert_eq!(w.labels().get("a").map(String::as_str), Some("12:00"));
         // Answered already: dropped.
-        assert!(w.event(Event::Answer(answer(req.id))).is_none());
+        assert!(!w.event(Event::Answer(answer(req.id))).any());
         let failed = Event::Failed {
             instance: "app:a".into(),
             error: "x".into(),
         };
-        assert!(matches!(w.event(failed), Some(Effect::Labels)));
+        assert!(w.event(failed).labels);
         assert!(w.labels().is_empty());
+    }
+
+    #[test]
+    fn icons_and_spans_follow_answers_and_failures() {
+        use wl_shell_lua::{Answer, Capabilities, Request, WidgetCaps};
+        let mut w = Widgets::default();
+        let caps = Capabilities {
+            widget: Some(WidgetCaps {
+                icon: true,
+                span: Span {
+                    horizontal: 2.0,
+                    vertical: 1.0,
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fx = w.event(Event::Loaded {
+            instance: "app:a".into(),
+            caps,
+        });
+        assert!(fx.spans);
+        assert_eq!(w.span("a", Axis::Horizontal), 2.0);
+        assert_eq!(w.span("a", Axis::Vertical), 1.0);
+        assert_eq!(w.span("b", Axis::Horizontal), 1.0);
+        let tile = Tile {
+            w: 192.0,
+            h: 96.0,
+            span: 2.0,
+            axis: Axis::Horizontal,
+            scale: 1,
+        };
+        let tree = Arc::new(Node::text("x"));
+        let answer = |w: &mut Widgets, tree: Option<Arc<Node>>| {
+            let (req, ticket) = Request::new(RequestKind::Icon(tile), ICON_TIMEOUT);
+            w.pending.insert("app:a", ticket);
+            w.event(Event::Answer(Answer {
+                instance: "app:a".into(),
+                id: req.id,
+                result: Ok(Reply::Icon(tree)),
+            }))
+        };
+        assert!(answer(&mut w, Some(tree.clone())).icons);
+        let v1 = w.icons()["a"].version;
+        // The same tree again: nothing new.
+        assert!(!answer(&mut w, Some(tree)).icons);
+        assert!(answer(&mut w, Some(Arc::new(Node::text("y")))).icons);
+        assert!(w.icons()["a"].version > v1);
+        // nil: the app's own icon.
+        assert!(answer(&mut w, None).icons);
+        assert!(w.icons().is_empty());
+        answer(&mut w, Some(Arc::new(Node::text("z"))));
+        let span = Event::Span {
+            instance: "app:a".into(),
+            span: Span {
+                horizontal: 1.5,
+                vertical: 1.5,
+            },
+        };
+        assert!(w.event(span).spans);
+        assert_eq!(w.span("a", Axis::Vertical), 1.5);
+        let fx = w.event(Event::Failed {
+            instance: "app:a".into(),
+            error: "x".into(),
+        });
+        assert!(fx.icons && fx.spans);
+        assert!(w.icons().is_empty());
+        assert_eq!(w.span("a", Axis::Horizontal), 1.0);
+    }
+
+    /// The bundled clock's face, through the runtime, painted as the
+    /// worker would.
+    #[test]
+    fn the_bundled_clock_draws_its_face() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        w.set_tile(Some(TileBase {
+            size: 96.0,
+            axis: Axis::Horizontal,
+            scale: 2,
+        }));
+        let c = parse("[app.foot]\nwidget = { plugin = 'clock', face = true }");
+        w.configure(specs(&c, None));
+        let end = Instant::now() + Duration::from_secs(5);
+        while !w.icons().contains_key("foot") {
+            let e = recv.recv_timeout(end - Instant::now()).expect("no icon");
+            w.event(e);
+        }
+        let tree = w.icons()["foot"].tree.clone();
+        let req = wl_shell_render::ui::Request {
+            tree,
+            bounds: wl_shell_render::ui::Bounds::Exact(96.0, 96.0),
+            scale: 2,
+            theme: Arc::new(c.ui_theme()),
+            app: Some("foot".into()),
+            state: Default::default(),
+        };
+        let mut text = wl_shell_render::text::Text::new();
+        let r = wl_shell_render::ui::render(&req, &mut text, &mut wl_shell_render::ui::NoResources);
+        assert_eq!((r.image.width, r.image.height), (192, 192));
+        // Opaque in the middle, clear in the corners.
+        let alpha = |x: u32, y: u32| r.image.data[((y * 192 + x) * 4 + 3) as usize];
+        assert!(alpha(96, 96) > 200 && alpha(1, 1) == 0);
     }
 }

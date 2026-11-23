@@ -22,7 +22,11 @@
 //! - Host functions, in the namespace the host names (`dock`):
 //!   `redraw()`, `invalidate()`, `timer(ms, fn)`, `every(ms, fn)`,
 //!   `spawn(argv, {on_line, on_exit})`, `run(argv)`, `json.decode`,
-//!   `json.encode`, `read(path)` and `clipboard(text)` (see `host.rs`).
+//!   `json.encode`, `read(path)`, `clipboard(text)` and `span(n)` (see
+//!   `host.rs`), the `ui` constructors and the `theme`'s color names
+//!   (see [`ui`]).
+//! - Widgets answer `label()` and `icon(tile)`: an icon is a [`ui::Node`]
+//!   tree, built from what the hook returned on the plugin's thread.
 
 mod caps;
 pub mod channel;
@@ -30,12 +34,13 @@ mod host;
 mod runtime;
 mod spec;
 mod state;
+pub mod ui;
 
 pub use caps::{
     API, ActionDecl, Capabilities, Registry, SPANS, SourceDecl, Span, WidgetCaps, span_step,
 };
 pub use channel::{
-    Answer, InstanceId, Pending, Reply, Request, RequestId, RequestKind, Ticket, Topic,
+    Answer, Axis, InstanceId, Pending, Reply, Request, RequestId, RequestKind, Ticket, Tile, Topic,
 };
 pub use runtime::{Event, Runtime, Settings};
 pub use spec::{InstanceSpec, Role, Source};

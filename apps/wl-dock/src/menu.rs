@@ -623,6 +623,7 @@ mod tests {
             windows: windows.to_vec(),
             elsewhere: elsewhere.to_vec(),
             active: false,
+            span: crate::dock::Span::ONE,
         }
     }
 

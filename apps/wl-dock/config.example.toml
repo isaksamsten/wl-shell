@@ -256,13 +256,13 @@
 #]
 
 # --- Widgets (examples) ---------------------------------------------------
-# A widget is a Lua plugin behind an app's item; for now it can set the
-# item's label. A plugin name is looked up as plugins/<name>.lua next to this
+# A widget is a Lua plugin behind an app's item: it can set the item's
+# label and draw its icon. A plugin name is looked up as plugins/<name>.lua next to this
 # file, then among the bundled plugins (clock). Plugin files are reloaded on
 # save.
 
 #[app.foot]
-#widget = { plugin = "clock", format = "%H:%M:%S" }  # Or a name: widget = "clock"
+#widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
 #popup-delay = 400               # Hover before its popup opens (later)
 
 #[plugin.clock]                  # Defaults for every placement of the plugin
