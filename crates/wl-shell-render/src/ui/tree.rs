@@ -430,7 +430,7 @@ pub enum Kind {
         size: Option<f32>,
     },
     Image {
-        /// A path (`~/` expands) or a `file://` URL.
+        /// A path (`~/` expands), a `file://` URL or an `http(s)://` one.
         src: String,
         fit: Fit,
         radius: f32,
@@ -553,6 +553,13 @@ impl Node {
         let mut out = Vec::with_capacity(self.count());
         go(self, &mut out);
         out
+    }
+
+    /// Whether the tree has an image of `src` (so it is painted again
+    /// when a fetch brings it).
+    pub fn shows_image(&self, src: &str) -> bool {
+        matches!(&self.kind, Kind::Image { src: s, .. } if s == src)
+            || self.children.iter().any(|c| c.shows_image(src))
     }
 
     pub fn text(text: impl Into<String>) -> Self {

@@ -787,6 +787,14 @@ impl WlDock {
             self.show_widget_names();
             self.show_widget_icons();
         }
+        // Their apps' names, as far as they are known.
+        let apps: Vec<String> = (self.config.app.iter())
+            .filter(|(_, a)| a.widget.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for app in &apps {
+            self.share_app_names(app);
+        }
         let paths = match self.config.widgets.enabled {
             true => widgets::watched(&self.config, dir.as_deref()),
             false => Vec::new(),
@@ -812,6 +820,25 @@ impl WlDock {
             }
         }
         self.widgets.watching = paths;
+    }
+
+    /// Tell the widget on `app_id` (if it has one) the names its desktop
+    /// entry gives it; ask the worker for the entry if it isn't known.
+    fn share_app_names(&self, app_id: &str) {
+        if !self.config.app(app_id).is_some_and(|a| a.widget.is_some()) {
+            return;
+        }
+        match self.entries.get(app_id) {
+            Some(entry) => {
+                let names = widgets::app_info(&self.config, app_id, entry.as_ref());
+                self.widgets.set_app(names);
+            }
+            None => {
+                if let Some(assets) = &self.assets {
+                    assets.entry(app_id);
+                }
+            }
+        }
     }
 
     /// Something from the plugin runtime.
@@ -2864,11 +2891,19 @@ impl WlDock {
 
     /// Have the worker look up the desktop entries of the pinned and
     /// running apps, so a click launches them and a right click shows
-    /// their menu at once.
+    /// their menu at once (and of the apps widgets back, for their
+    /// names).
     fn prefetch_entries(&self) {
         let Some(assets) = &self.assets else { return };
         let running = self.order.apps().iter().cloned();
-        for app_id in pins::apps(&self.pins).into_iter().chain(running) {
+        let widgets = (self.config.app.iter())
+            .filter(|(_, a)| a.widget.is_some())
+            .map(|(id, _)| id.clone());
+        for app_id in pins::apps(&self.pins)
+            .into_iter()
+            .chain(running)
+            .chain(widgets)
+        {
             if !self.entries.contains_key(&app_id) {
                 assets.entry(&app_id);
             }
@@ -4124,6 +4159,7 @@ impl WlDock {
             }
             Done::Entry { app_id, entry } => {
                 self.entries.insert(app_id.clone(), entry);
+                self.share_app_names(&app_id);
                 // The app may open the files of a drag over the dock.
                 self.refresh_offer(core);
                 if let Some(i) = self.pending_launches.iter().position(|a| *a == app_id) {
@@ -4196,6 +4232,16 @@ impl WlDock {
                         });
                     }
                     break;
+                }
+            }
+            // A widget's cover art (or any remote image) is in: what
+            // shows it is painted again.
+            Done::ImageFetched { src } => {
+                if self.widgets.image_arrived(&src) {
+                    self.show_widget_icons();
+                }
+                for d in &mut self.docks {
+                    d.image_arrived(&src);
                 }
             }
             Done::Paper { .. } | Done::Doc { .. } => {}

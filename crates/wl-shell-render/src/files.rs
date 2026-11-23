@@ -149,17 +149,21 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     out
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `$XDG_CACHE_HOME` (else `~/.cache`).
+pub(crate) fn cache_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
 }
 
 /// `$XDG_CACHE_HOME/thumbnails`.
 fn thumbnail_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))?;
-    Some(base.join("thumbnails"))
+    Some(cache_dir()?.join("thumbnails"))
 }
 
 /// The thumbnail's file name for `path`.

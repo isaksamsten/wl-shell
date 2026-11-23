@@ -259,7 +259,7 @@
 # A widget is a Lua plugin behind an app's item, or an item of its own: it
 # can set the item's label, draw its icon and show a popup. A plugin name
 # is looked up as plugins/<name>.lua next to this file, then among the
-# bundled plugins (clock). Plugin files are reloaded on save.
+# bundled plugins (clock, player). Plugin files are reloaded on save.
 
 #[app.foot]
 #widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
@@ -272,6 +272,19 @@
 #name = "Clock"                  # Its label; default: the table's name
 #popup-delay = 600
 #format = "%H:%M"                # Other keys are options for the plugin
+
+# The media player (MPRIS): the cover as the app's icon, and a popup
+# that plays, pauses, skips and seeks. It finds the app's own player by
+# its names; `player` names one by bus name instead.
+#[app."dev.diegovsky.Riff"]
+#widget = "player"
+#[app.firefox]
+#widget = { plugin = "player", player = "firefox" }
+
+# Standalone, it follows whichever player plays (`wl-dock pin @nowplaying`).
+#[widget.nowplaying]
+#plugin = "player"
+#name = "Now Playing"
 
 #[plugin.clock]                  # Defaults for every placement of the plugin
 #path = "~/src/clock.lua"        # Optional; default lookup by name

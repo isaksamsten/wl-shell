@@ -18,20 +18,24 @@
 //!   for text chunks only, `string`, `table`, `math`, `utf8`,
 //!   `coroutine`, and `os` with `clock`, `date`, `difftime`, `getenv` and
 //!   `time`. No `io`, `debug` or `package`; `require` loads modules from
-//!   the plugin's own folder. `print` goes to the host's log.
+//!   the plugin's own folder, then the host's bundled ones
+//!   ([`Settings::modules`]). `print` goes to the host's log.
 //! - Host functions, in the namespace the host names (`dock`):
 //!   `redraw()`, `invalidate()`, `timer(ms, fn)`, `every(ms, fn)`,
 //!   `spawn(argv, {on_line, on_exit})`, `run(argv)`, `json.decode`,
-//!   `json.encode`, `read(path)`, `clipboard(text)` and `span(n)` (see
-//!   `host.rs`), `app` (the app a widget backs, nil for a standalone
-//!   one), the `ui` constructors and the `theme`'s color names (see
-//!   [`ui`]).
+//!   `json.encode`, `read(path)`, `clipboard(text)`, `span(n)` and
+//!   `now()` (see `host.rs`), `app` (the app a widget backs, by its
+//!   names, nil for a standalone one; see [`AppInfo`]), the `dbus`
+//!   client (see `dbus.rs`), the `ui` constructors and the `theme`'s
+//!   color names (see [`ui`]).
 //! - Widgets answer `label()` and `icon(tile)`: an icon is a [`ui::Node`]
 //!   tree, built from what the hook returned on the plugin's thread. A
-//!   standalone widget's item also hears its clicks (`on_click(button)`).
+//!   standalone widget's item also hears its clicks (`on_click(button)`),
+//!   and an app's widget hears `on_app()` when `dock.app` changes.
 
 mod caps;
 pub mod channel;
+mod dbus;
 mod host;
 mod runtime;
 mod spec;
@@ -45,4 +49,4 @@ pub use channel::{
     Answer, Axis, InstanceId, Pending, Reply, Request, RequestId, RequestKind, Ticket, Tile, Topic,
 };
 pub use runtime::{Event, Runtime, Settings};
-pub use spec::{InstanceSpec, Role, Source};
+pub use spec::{AppInfo, InstanceSpec, Role, Source};

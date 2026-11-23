@@ -28,3 +28,8 @@ url.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 
+
+[dev-dependencies]
+# Fake MPRIS players on a private bus, for the player plugin's tests.
+async-io.workspace = true
+zbus.workspace = true

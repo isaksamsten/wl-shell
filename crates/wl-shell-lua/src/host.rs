@@ -11,10 +11,14 @@
 //! | `read(path)`                      | A file's text (`~/` expands), or nil and the error.                   |
 //! | `clipboard(text)`                 | Copies `text`.                                                        |
 //! | `span(n)`                         | Sets the tile's length along the dock: 1, 1.5 or 2 (or `{horizontal = 2, vertical = 1}`). |
-//! | `app`                             | The app ID the widget backs; nil for a standalone widget.             |
+//! | `now()`                           | Unix time in seconds, with a fraction: the clock of `live.at`.        |
+//! | `app`                             | The app the widget backs (`id`, `desktop`, `wm_class`, `name`); nil for a standalone widget. |
+//! | `dbus.session()`, `dbus.system()` | A D-Bus client (`dbus.rs`).                                           |
 //! | `ui.*`, `theme.*`                 | The UI constructors and the theme's color names (`ui.rs`).            |
 //!
 //! `argv` is a list of strings, or one string run with `sh -c`.
+//! `require(name)` loads `name.lua` from the plugin's folder, else the
+//! host's bundled module of that name.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
@@ -29,7 +33,7 @@ use mlua::{Function, Lua, LuaSerdeExt, MultiValue, Table, UserData, UserDataMeth
 use wl_shell_log::warn;
 
 use crate::runtime::{Event, Job, lock};
-use crate::state::{HANDLERS, LOADED, PROCS, TIMERS, host};
+use crate::state::{BUS, HANDLERS, LOADED, PROCS, TIMERS, host};
 
 /// The largest file `read` reads.
 const MAX_READ: u64 = 16 << 20;
@@ -39,8 +43,10 @@ const MIN_EVERY: u64 = 10;
 const EXIT_POLL: Duration = Duration::from_millis(50);
 
 /// Sandbox the globals of `lua` and add the host functions as
-/// `namespace`.
-pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
+/// `settings.namespace`.
+pub(crate) fn install(lua: &Lua, settings: &crate::runtime::Settings) -> mlua::Result<()> {
+    let namespace = settings.namespace;
+    let modules = settings.modules;
     let g = lua.globals();
     for name in ["dofile", "loadfile"] {
         g.set(name, Value::Nil)?;
@@ -54,7 +60,7 @@ pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
         safe.set(name, os.get::<Value>(name)?)?;
     }
     g.set("os", safe)?;
-    for name in [TIMERS, PROCS, LOADED, HANDLERS] {
+    for name in [TIMERS, PROCS, LOADED, HANDLERS, BUS] {
         lua.set_named_registry_value(name, lua.create_table()?)?;
     }
     // `load` takes text only; `print` goes to the log.
@@ -84,7 +90,10 @@ pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
             table.get::<Value>("concat")?
         },
     ))?;
-    g.set("require", lua.create_function(require)?)?;
+    g.set(
+        "require",
+        lua.create_function(move |lua, name: String| require(lua, name, modules))?,
+    )?;
 
     let ns = lua.create_table()?;
     ns.set(
@@ -157,6 +166,14 @@ pub(crate) fn install(lua: &Lua, namespace: &str) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+    ns.set(
+        "now",
+        lua.create_function(|_, ()| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            Ok(now.map_or(0.0, |d| d.as_secs_f64()))
+        })?,
+    )?;
+    crate::dbus::install(lua, &ns)?;
     crate::ui::install(lua, &ns)?;
     g.set(namespace, ns)?;
     Ok(())
@@ -171,8 +188,9 @@ pub(crate) fn to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
     lua.to_value_with(v, options)
 }
 
-/// `require(name)`: `name.lua` (dots are folders) in the plugin's folder.
-fn require(lua: &Lua, name: String) -> mlua::Result<Value> {
+/// `require(name)`: `name.lua` (dots are folders) in the plugin's
+/// folder, else the bundled module `name` in `modules`.
+fn require(lua: &Lua, name: String, modules: &[(&str, &str)]) -> mlua::Result<Value> {
     let loaded: Table = lua.named_registry_value(LOADED)?;
     match loaded.get::<Value>(name.as_str())? {
         Value::Nil => {}
@@ -188,13 +206,29 @@ fn require(lua: &Lua, name: String) -> mlua::Result<Value> {
         )));
     }
     let host = host(lua)?;
-    let dir = (host.dir.as_ref())
-        .ok_or_else(|| mlua::Error::runtime("require: this plugin has no folder"))?;
-    let path = dir.join(format!("{}.lua", name.replace('.', "/")));
-    let code = std::fs::read_to_string(&path)
-        .map_err(|e| mlua::Error::runtime(format!("require: {}: {e}", path.display())))?;
+    let own = (host.dir.as_ref()).map(|dir| dir.join(format!("{}.lua", name.replace('.', "/"))));
+    let bundled = modules
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, code)| *code);
+    let (code, chunk) = match (own, bundled) {
+        (Some(path), Some(code)) if !path.exists() => {
+            (code.to_string(), format!("@{name}.lua (bundled)"))
+        }
+        (Some(path), _) => {
+            let code = std::fs::read_to_string(&path)
+                .map_err(|e| mlua::Error::runtime(format!("require: {}: {e}", path.display())))?;
+            (code, format!("@{}", path.display()))
+        }
+        (None, Some(code)) => (code.to_string(), format!("@{name}.lua (bundled)")),
+        (None, None) => {
+            return Err(mlua::Error::runtime(format!(
+                "require: no module {name:?} (this plugin has no folder)"
+            )));
+        }
+    };
     let v = (lua.load(code))
-        .set_name(format!("@{}", path.display()))
+        .set_name(chunk)
         .set_mode(ChunkMode::Text)
         .call::<Value>(name.as_str())?;
     let v = match v {

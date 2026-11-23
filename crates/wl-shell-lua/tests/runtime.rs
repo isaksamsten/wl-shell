@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wl_shell_lua::{
-    Event, InstanceSpec, Pending, Reply, RequestKind, Role, Runtime, Settings, Source,
+    AppInfo, Event, InstanceSpec, Pending, Reply, RequestKind, Role, Runtime, Settings, Source,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -105,12 +105,17 @@ fn popup_handlers_run_on_the_instance() {
 fn item_clicks_and_the_app() {
     let (rt, recv) = runtime();
     let source = "local got = 'none'
+        local app = dock.app
         return {
           on_click = function(button) got = button end,
-          label = function() return tostring(dock.app) .. ':' .. got end,
+          on_app = function() got = 'renamed' end,
+          label = function()
+            if not app then return 'nil:' .. got end
+            return app.id .. ':' .. tostring(app.desktop) .. ':' .. app.name .. ':' .. got
+          end,
         }";
     let mut app = code("app", source);
-    app.app = Some("foot".into());
+    app.app = Some(AppInfo::new("foot"));
     rt.configure(vec![code("w", source), app]);
     // Either may load first.
     let mut waiting = vec!["w", "app"];
@@ -131,7 +136,56 @@ fn item_clicks_and_the_app() {
     });
     assert_eq!(done, Ok(Reply::Done));
     assert_eq!(label(&rt, &recv, "w"), Ok(Some("nil:middle".into())));
-    assert_eq!(label(&rt, &recv, "app"), Ok(Some("foot:none".into())));
+    assert_eq!(
+        label(&rt, &recv, "app"),
+        Ok(Some("foot:nil:foot:none".into()))
+    );
+    // The dock learns the app's other names: the same table changes, the
+    // plugin hears of it and redraws.
+    let names = AppInfo {
+        desktop: Some("org.codeberg.dnkl.foot".into()),
+        name: Some("Foot".into()),
+        ..AppInfo::new("foot")
+    };
+    rt.set_app("app", names.clone());
+    next(&recv, |e| {
+        matches!(e, Event::Redraw(i) if i == "app").then_some(())
+    });
+    assert_eq!(
+        label(&rt, &recv, "app"),
+        Ok(Some("foot:org.codeberg.dnkl.foot:Foot:renamed".into()))
+    );
+    // The same names again: nothing.
+    rt.set_app("app", names);
+    assert!(recv.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+#[test]
+fn bundled_modules_and_the_clock() {
+    let (send, recv) = channel();
+    let send = Mutex::new(send);
+    let settings = Settings {
+        threads: 1,
+        modules: &[("greet", "return { hi = function() return 'hi' end }")],
+        ..Settings::default()
+    };
+    let rt = Runtime::new(settings, move |e| {
+        let _ = send.lock().unwrap().send(e);
+    })
+    .unwrap();
+    rt.configure(vec![code(
+        "a",
+        "local g = require 'greet'
+         assert(require 'greet' == g)
+         assert(not pcall(require, 'other'))
+         return { label = function()
+           local now = dock.now()
+           assert(math.type(now) == 'float' and math.abs(now - os.time()) < 2)
+           return g.hi()
+         end }",
+    )]);
+    loaded(&recv, "a");
+    assert_eq!(label(&rt, &recv, "a"), Ok(Some("hi".into())));
 }
 
 #[test]

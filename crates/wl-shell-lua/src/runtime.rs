@@ -22,7 +22,7 @@ use wl_shell_log::warn;
 
 use crate::caps::Capabilities;
 use crate::channel::{Answer, InstanceId, Reply, Request, RequestKind, Ticket};
-use crate::spec::{InstanceSpec, Role};
+use crate::spec::{AppInfo, InstanceSpec, Role};
 use crate::state::{LoadError, Outcome, State};
 
 /// Jobs a worker runs of one slot before it lets the others go first.
@@ -75,6 +75,9 @@ pub struct Settings {
     pub namespace: &'static str,
     /// Bytes of memory per state.
     pub memory: usize,
+    /// Modules `require` finds after the plugin's own folder: (name,
+    /// code).
+    pub modules: &'static [(&'static str, &'static str)],
 }
 
 impl Default for Settings {
@@ -84,6 +87,7 @@ impl Default for Settings {
             threads: cpus.clamp(2, 4),
             namespace: "dock",
             memory: 64 << 20,
+            modules: &[],
         }
     }
 }
@@ -194,6 +198,14 @@ pub(crate) enum Job {
         proc: u64,
         code: Option<i32>,
     },
+    /// D-Bus news for callback `id`.
+    Bus {
+        epoch: u64,
+        id: u64,
+        event: crate::dbus::BusEvent,
+    },
+    /// The app is known by other names now.
+    App(AppInfo),
 }
 
 /// A state's way back to its slot and the runtime, from host functions
@@ -238,6 +250,8 @@ impl Link {
 pub(crate) struct Slot {
     id: InstanceId,
     spec: Mutex<InstanceSpec>,
+    /// What `set_app` learned, over the spec's.
+    app: Mutex<Option<AppInfo>>,
     jobs: Mutex<Jobs>,
     life: Mutex<Life>,
 }
@@ -359,6 +373,18 @@ impl Slot {
                     let _ = self.settle(life, shared, outcome);
                 }
             }
+            Job::Bus { epoch, id, event } => {
+                if let Some(state) = life.state.as_ref().filter(|_| life.epoch == epoch) {
+                    let outcome = state.bus(id, event);
+                    let _ = self.settle(life, shared, outcome);
+                }
+            }
+            Job::App(app) => {
+                if let Some(state) = &life.state {
+                    let outcome = state.set_app(&app, shared.settings.namespace);
+                    let _ = self.settle(life, shared, outcome);
+                }
+            }
         }
         if life.state.as_ref().is_some_and(State::take_redraw) {
             shared.emit(Event::Redraw(self.id.clone()));
@@ -373,7 +399,14 @@ impl Slot {
             return;
         }
         let spec = lock(&self.spec).clone();
-        match State::load(&spec, life.epoch, self.link(shared), &shared.settings) {
+        let app = lock(&self.app).clone().or_else(|| spec.app.clone());
+        match State::load(
+            &spec,
+            app.as_ref(),
+            life.epoch,
+            self.link(shared),
+            &shared.settings,
+        ) {
             Ok((state, mut caps)) => {
                 life.started = Some(Instant::now());
                 // `span(n)` during setup is the widget's span.
@@ -532,6 +565,7 @@ impl Runtime {
                     let slot = Arc::new(Slot {
                         id: spec.id.clone(),
                         spec: Mutex::new(spec.clone()),
+                        app: Mutex::default(),
                         jobs: Mutex::default(),
                         life: Mutex::default(),
                     });
@@ -559,6 +593,22 @@ impl Runtime {
         let (request, ticket) = Request::new(kind, timeout);
         Slot::push(&slot, &self.shared, Job::Request(request));
         Some(ticket)
+    }
+
+    /// `instance`'s app is known by these names now (`dock.app`); a
+    /// running state hears of it, and a (re)started one starts with it.
+    pub fn set_app(&self, instance: &str, app: AppInfo) {
+        let Some(slot) = lock(&self.shared.slots).get(instance).cloned() else {
+            return;
+        };
+        let mut known = lock(&slot.app);
+        let current = known.clone().or_else(|| lock(&slot.spec).app.clone());
+        if current.as_ref() == Some(&app) {
+            return;
+        }
+        *known = Some(app.clone());
+        drop(known);
+        Slot::push(&slot, &self.shared, Job::App(app));
     }
 
     /// The instances configured.

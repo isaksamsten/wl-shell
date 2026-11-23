@@ -147,7 +147,8 @@ impl WlSwitcher {
             | Done::Apps(_)
             | Done::Paper { .. }
             | Done::Doc { .. }
-            | Done::Ui { .. } => {}
+            | Done::Ui { .. }
+            | Done::ImageFetched { .. } => {}
         }
     }
 

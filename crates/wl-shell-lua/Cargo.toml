@@ -10,6 +10,12 @@ license.workspace = true
 wl-shell-log.workspace = true
 wl-shell-render.workspace = true
 
+async-channel.workspace = true
+async-executor.workspace = true
+async-io.workspace = true
+futures-lite.workspace = true
 mlua.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zbus.workspace = true
+

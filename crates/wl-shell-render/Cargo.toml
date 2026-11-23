@@ -17,4 +17,5 @@ resvg.workspace = true
 svgtypes.workspace = true
 taffy.workspace = true
 unicode-normalization.workspace = true
+ureq.workspace = true
 

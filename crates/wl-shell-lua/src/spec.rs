@@ -48,6 +48,30 @@ pub enum Role {
     Plugin,
 }
 
+/// The app a widget backs (`dock.app`), by every name the dock knows it
+/// by: they differ between Wayland, desktop files and services.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppInfo {
+    /// The dock's app ID: the `[app.<id>]` key and the item's key.
+    pub id: String,
+    /// The ID of the desktop entry it matched, without `.desktop`.
+    pub desktop: Option<String>,
+    /// That entry's `StartupWMClass`.
+    pub wm_class: Option<String>,
+    /// The display name (else the ID).
+    pub name: Option<String>,
+}
+
+impl AppInfo {
+    /// An app known by its ID alone.
+    pub fn new(id: impl Into<String>) -> Self {
+        AppInfo {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// One plugin state to run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstanceSpec {
@@ -57,8 +81,9 @@ pub struct InstanceSpec {
     pub source: Source,
     pub role: Role,
     /// The app a widget backs (`dock.app`); None for a standalone widget
-    /// or a plugin table.
-    pub app: Option<String>,
+    /// or a plugin table. What [`Runtime::set_app`](crate::Runtime::set_app)
+    /// learns later goes over it.
+    pub app: Option<AppInfo>,
     /// Passed to `setup(opts)`.
     pub options: serde_json::Value,
     /// Lua instructions per hook call.

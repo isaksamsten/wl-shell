@@ -306,6 +306,13 @@ impl WidgetView {
         }
     }
 
+    /// The remote image `src` arrived: paint again if the tree shows it.
+    pub fn image_arrived(&mut self, src: &str) {
+        if self.tree.shows_image(src) {
+            self.paint();
+        }
+    }
+
     // -- the worker ----------------------------------------------------------
 
     /// The pointer state, at this time.

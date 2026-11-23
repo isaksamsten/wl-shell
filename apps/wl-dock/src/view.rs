@@ -3077,6 +3077,14 @@ impl DockView {
         self.kick();
     }
 
+    /// The remote image `src` arrived: the popup is painted again if it
+    /// shows it.
+    pub fn image_arrived(&mut self, src: &str) {
+        if let Some(w) = &mut self.widget {
+            w.image_arrived(src);
+        }
+    }
+
     /// Show `tree` in `app`'s widget's popup, opening it if it isn't.
     pub fn paint_widget(&mut self, app: &str, tree: Arc<ui::Node>) {
         if let Some(w) = self

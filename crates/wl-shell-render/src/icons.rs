@@ -393,6 +393,8 @@ pub struct AppEntry {
     pub path: PathBuf,
     /// The `Actions=` that have a name and a command, in that order.
     pub actions: Vec<DesktopAction>,
+    /// `StartupWMClass=`: the app ID its windows likely have.
+    pub wm_class: Option<String>,
 }
 
 impl AppEntry {
@@ -429,6 +431,7 @@ impl AppEntry {
             terminal: e.terminal(),
             path: e.path.clone(),
             actions,
+            wm_class: text(e.startup_wm_class().map(Into::into)),
         }
     }
 
@@ -940,6 +943,7 @@ mod exec_tests {
             terminal: false,
             path: "/usr/share/applications/org.example.App.desktop".into(),
             actions: Vec::new(),
+            wm_class: None,
         }
     }
 

@@ -163,6 +163,10 @@ pub enum Done {
         request: ui::Request,
         rendered: ui::Rendered,
     },
+    /// A remote `ui.image` arrived: what shows it can be painted again.
+    ImageFetched {
+        src: String,
+    },
 }
 
 /// The worker, and what was requested from it and not received yet.
@@ -345,7 +349,8 @@ impl Assets {
             | Done::Apps(_)
             | Done::Paper { .. }
             | Done::Doc { .. }
-            | Done::Ui { .. } => {}
+            | Done::Ui { .. }
+            | Done::ImageFetched { .. } => {}
         }
     }
 }
@@ -389,8 +394,18 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
     let mut letters: HashMap<(icons::Key, String), Arc<Image>> = HashMap::new();
     // File types, loaded with the first folder.
     let mut mime: Option<MimeDb> = None;
-    // `ui.image`s.
-    let mut images = ui::images::Images::default();
+    // `ui.image`s; remote ones are fetched into the cache, and their
+    // arrival goes straight to the main thread.
+    let fetched = std::sync::Mutex::new(done.clone());
+    let mut images = match ui::images::Images::cache_dir() {
+        Some(dir) => ui::images::Images::fetching(dir, move |f| {
+            if f.ok {
+                let done = fetched.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = done.send(Done::ImageFetched { src: f.src });
+            }
+        }),
+        None => ui::images::Images::default(),
+    };
     loop {
         let job = match inbox.try_recv() {
             Ok(job) => job,

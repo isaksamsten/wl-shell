@@ -14,7 +14,7 @@ use crate::caps::{self, Capabilities};
 use crate::channel::{InstanceId, Tile};
 use crate::host;
 use crate::runtime::{Job, Link, Settings, lock};
-use crate::spec::{InstanceSpec, Role};
+use crate::spec::{AppInfo, InstanceSpec, Role};
 use crate::ui::{Builder, Node};
 
 /// The budget is counted in steps of this many instructions.
@@ -29,6 +29,8 @@ pub(crate) const PROCS: &str = "wl_shell_procs";
 pub(crate) const LOADED: &str = "wl_shell_loaded";
 /// Handlers of the trees shown, by topic (`icon`), then by node key.
 pub(crate) const HANDLERS: &str = "wl_shell_handlers";
+/// D-Bus callbacks by id: calls waiting for replies, and watches.
+pub(crate) const BUS: &str = "wl_shell_bus";
 
 /// What a call into a state came to.
 pub(crate) enum Outcome<T> {
@@ -114,6 +116,8 @@ pub(crate) struct Host {
     pub span: Mutex<Option<crate::caps::Span>>,
     /// Loaded and set up: `span(n)` is news now.
     pub loaded: AtomicBool,
+    /// D-Bus watches, cancelled with the state.
+    pub subs: Mutex<Vec<(crate::dbus::BusKind, u64)>>,
 }
 
 impl Host {
@@ -129,6 +133,19 @@ pub(crate) fn host(lua: &Lua) -> mlua::Result<Arc<Host>> {
         .ok_or_else(|| mlua::Error::runtime("no host"))
 }
 
+/// `dock.app`: the names the dock knows the app by; nil without one.
+fn app_table(lua: &Lua, app: Option<&AppInfo>) -> mlua::Result<Value> {
+    let Some(app) = app else {
+        return Ok(Value::Nil);
+    };
+    let t = lua.create_table()?;
+    t.set("id", app.id.as_str())?;
+    t.set("desktop", app.desktop.as_deref())?;
+    t.set("wm_class", app.wm_class.as_deref())?;
+    t.set("name", app.name.as_deref().unwrap_or(&app.id))?;
+    Ok(Value::Table(t))
+}
+
 pub(crate) struct State {
     lua: Lua,
     plugin: Table,
@@ -142,13 +159,18 @@ impl Drop for State {
         for (_, child) in lock(&self.host.procs).drain() {
             let _ = lock(&child).kill();
         }
+        for (kind, id) in lock(&self.host.subs).drain(..) {
+            crate::dbus::cancel(kind, id);
+        }
     }
 }
 
 impl State {
-    /// Load `spec`'s plugin and set it up (as generation `epoch`).
+    /// Load `spec`'s plugin (backing `app`) and set it up (as generation
+    /// `epoch`).
     pub fn load(
         spec: &InstanceSpec,
+        app: Option<&AppInfo>,
         epoch: u64,
         link: Link,
         settings: &Settings,
@@ -184,12 +206,13 @@ impl State {
             dir: spec.source.dir(),
             span: Mutex::default(),
             loaded: AtomicBool::new(false),
+            subs: Mutex::default(),
         });
         lua.set_app_data(host.clone());
-        host::install(&lua, settings.namespace).map_err(LoadError::fixed)?;
+        host::install(&lua, settings).map_err(LoadError::fixed)?;
         // The app the widget backs, nil for a standalone one.
         (lua.globals().get::<Table>(settings.namespace))
-            .and_then(|ns| ns.set("app", spec.app.clone()))
+            .and_then(|ns| ns.set("app", app_table(&lua, app)?))
             .map_err(LoadError::fixed)?;
 
         budget.reset(&lua).map_err(LoadError::fixed)?;
@@ -448,6 +471,55 @@ impl State {
             Ok(Some(f)) => self.enter("on_exit", || f.call::<()>(code)),
             Ok(None) => Outcome::Ok(()),
             Err(e) => Outcome::Error(format!("on_exit: {e}")),
+        }
+    }
+
+    /// The dock knows the app by other names now: `dock.app` changes (in
+    /// place, so tables kept from it see the change), `on_app()` hears
+    /// of it, and the plugin redraws.
+    pub fn set_app(&self, app: &AppInfo, namespace: &str) -> Outcome<()> {
+        let set = (|| {
+            let ns: Table = self.lua.globals().get(namespace)?;
+            let Value::Table(new) = app_table(&self.lua, Some(app))? else {
+                return Ok(());
+            };
+            match ns.get::<Value>("app")? {
+                Value::Table(old) => {
+                    for key in ["id", "desktop", "wm_class", "name"] {
+                        old.set(key, new.get::<Value>(key)?)?;
+                    }
+                    Ok(())
+                }
+                _ => ns.set("app", new),
+            }
+        })();
+        if let Err(e) = set {
+            return Outcome::Error(format!("app: {e}"));
+        }
+        self.host.redraw.store(true, Ordering::Relaxed);
+        match self.hook("on_app") {
+            Some(f) => self.enter("on_app", || f.call::<()>(())),
+            None => Outcome::Ok(()),
+        }
+    }
+
+    /// Something from D-Bus for callback `id`.
+    pub fn bus(&self, id: u64, event: crate::dbus::BusEvent) -> Outcome<()> {
+        let found = (|| -> mlua::Result<Option<Table>> {
+            let callbacks: Table = self.lua.named_registry_value(BUS)?;
+            let entry = callbacks.get::<Option<Table>>(id)?;
+            // A call is answered once.
+            if matches!(event, crate::dbus::BusEvent::Reply(_)) {
+                callbacks.set(id, Value::Nil)?;
+            }
+            Ok(entry)
+        })();
+        match found {
+            Ok(Some(entry)) => {
+                self.enter("dbus", || crate::dbus::deliver(&self.lua, &entry, event))
+            }
+            Ok(None) => Outcome::Ok(()),
+            Err(e) => Outcome::Error(format!("dbus: {e}")),
         }
     }
 }

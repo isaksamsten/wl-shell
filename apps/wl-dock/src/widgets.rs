@@ -22,6 +22,12 @@
 //! The tile `icon(tile)` gets is the first dock's, magnified, at the
 //! largest scale of any dock: the tree is laid out again for each dock's
 //! own size when it is painted, so one tree serves them all.
+//!
+//! An app's widget knows the app by its names (`dock.app`): its ID and
+//! configured name from the start, and the desktop entry it matched (and
+//! that entry's `StartupWMClass` and name) once the worker has looked it
+//! up (`set_app`). Plugins `require` the bundled modules (`MODULES`) when
+//! their own folder has no such file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,15 +37,22 @@ use std::time::{Duration, Instant};
 use wl_shell_log::warn;
 use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
-    Axis, Event, InstanceSpec, Pending, Registry, Reply, RequestKind, Role, Runtime, Settings,
-    Source, Span, Tile, Topic,
+    AppInfo, Axis, Event, InstanceSpec, Pending, Registry, Reply, RequestKind, Role, Runtime,
+    Settings, Source, Span, Tile, Topic,
 };
+use wl_shell_render::icons::AppEntry;
 
 use crate::config::{Config, plugin_name_ok};
 use crate::dock;
 
 /// Plugins built into the dock, by name.
-pub const BUNDLED: &[(&str, &str)] = &[("clock", include_str!("../plugins/clock.lua"))];
+pub const BUNDLED: &[(&str, &str)] = &[
+    ("clock", include_str!("../plugins/clock.lua")),
+    ("player", include_str!("../plugins/player.lua")),
+];
+
+/// Modules built into the dock that plugins `require`, by name.
+pub const MODULES: &[(&str, &str)] = &[("mpris", include_str!("../plugins/mpris.lua"))];
 
 /// How long a label may take.
 const LABEL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -163,6 +176,21 @@ fn json(t: &toml::Table) -> serde_json::Value {
     serde_json::to_value(t).unwrap_or_else(|_| serde_json::Value::Object(Default::default()))
 }
 
+/// The names app `app_id` goes by: its ID, its configured name, and
+/// what its desktop `entry` says (if it is known).
+pub fn app_info(config: &Config, app_id: &str, entry: Option<&AppEntry>) -> AppInfo {
+    let own = (config.app(app_id)).and_then(|a| a.name.clone());
+    let text = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    AppInfo {
+        desktop: entry.and_then(|e| text(e.desktop_id.trim_end_matches(".desktop"))),
+        wm_class: entry.and_then(|e| e.wm_class.as_deref().and_then(text)),
+        name: own
+            .and_then(|n| text(&n))
+            .or_else(|| entry.and_then(|e| text(&e.name))),
+        ..AppInfo::new(app_id)
+    }
+}
+
 /// The instances the config asks for, with the standalone widgets
 /// `placed` (their names, as pinned); plugins in `dir`.
 pub fn specs(config: &Config, dir: Option<&Path>, placed: &[String]) -> Vec<InstanceSpec> {
@@ -200,7 +228,8 @@ pub fn specs(config: &Config, dir: Option<&Path>, placed: &[String]) -> Vec<Inst
             plugin: widget.plugin.clone(),
             source,
             role: Role::Widget,
-            app: Some(app_id.clone()),
+            // Its desktop entry's names come later (`set_app`).
+            app: Some(app_info(config, app_id, None)),
             options: merged(config, &widget.plugin, &widget.options),
             budget,
         });
@@ -294,7 +323,11 @@ pub struct Widgets {
 impl Widgets {
     /// Start the runtime; its events go to `sink`.
     pub fn start(&mut self, sink: impl Fn(Event) + Send + Sync + 'static) -> std::io::Result<()> {
-        self.runtime = Some(Runtime::new(Settings::default(), sink)?);
+        let settings = Settings {
+            modules: MODULES,
+            ..Settings::default()
+        };
+        self.runtime = Some(Runtime::new(settings, sink)?);
         Ok(())
     }
 
@@ -321,6 +354,29 @@ impl Widgets {
         if let Some(runtime) = &self.runtime {
             runtime.reload(path);
         }
+    }
+
+    /// The widget on app `app.id` (if there is one) knows it by `app`'s
+    /// names now.
+    pub fn set_app(&self, app: AppInfo) {
+        if let Some(runtime) = &self.runtime {
+            let instance = app_instance(&app.id);
+            runtime.set_app(&instance, app);
+        }
+    }
+
+    /// The remote image `src` arrived: the icons that show it are new
+    /// (with new versions, so they are painted again); true if any are.
+    pub fn image_arrived(&mut self, src: &str) -> bool {
+        let mut any = false;
+        for icon in self.icons.values_mut() {
+            if icon.tree.shows_image(src) {
+                self.versions += 1;
+                icon.version = self.versions;
+                any = true;
+            }
+        }
+        any
     }
 
     /// The widgets' labels, by their items' keys.
@@ -617,10 +673,7 @@ mod tests {
         let specs = specs(&c, Some(dir), &placed);
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["plugin:clock", "widget:utc", "widget:clock"]);
-        assert_eq!(
-            (specs[1].role, specs[1].app.as_deref()),
-            (Role::Widget, None)
-        );
+        assert_eq!((specs[1].role, specs[1].app.as_ref()), (Role::Widget, None));
         assert_eq!(specs[1].plugin, "clock");
         assert_eq!(specs[1].options["format"], "%H");
         assert_eq!(specs[1].options["zone"], "UTC");
@@ -676,6 +729,103 @@ mod tests {
         );
         assert_eq!(source(&c, None, "other"), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_names_an_app_goes_by() {
+        let c = parse(
+            "[app.firefox]\nwidget = 'player'\n[app.foot]\nname = ' Terminal '\nwidget = 'player'",
+        );
+        // Before its entry is known: its ID (and configured name).
+        let specs = specs(&c, None, &[]);
+        assert_eq!(specs[0].app, Some(AppInfo::new("firefox")));
+        assert_eq!(
+            specs[1].app.as_ref().unwrap().name.as_deref(),
+            Some("Terminal")
+        );
+        let entry = AppEntry {
+            desktop_id: "org.mozilla.firefox.desktop".into(),
+            name: "Firefox".into(),
+            wm_class: Some("firefox".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            app_info(&c, "firefox", Some(&entry)),
+            AppInfo {
+                id: "firefox".into(),
+                desktop: Some("org.mozilla.firefox".into()),
+                wm_class: Some("firefox".into()),
+                name: Some("Firefox".into()),
+            }
+        );
+        // The configured name goes over the entry's.
+        assert_eq!(
+            app_info(&c, "foot", Some(&entry)).name.as_deref(),
+            Some("Terminal")
+        );
+    }
+
+    #[test]
+    fn arriving_images_repaint_the_icons_that_show_them() {
+        let mut w = Widgets::default();
+        let image = |src: &str| {
+            let mut n = Node::new(wl_shell_render::ui::Kind::Col);
+            n.children.push(Node::new(wl_shell_render::ui::Kind::Image {
+                src: src.into(),
+                fit: Default::default(),
+                radius: 0.0,
+                blur: 0.0,
+                opacity: 1.0,
+            }));
+            Arc::new(n)
+        };
+        w.icons.insert(
+            "a".into(),
+            WidgetIcon {
+                version: 1,
+                tree: image("https://x/a.png"),
+            },
+        );
+        w.icons.insert(
+            "b".into(),
+            WidgetIcon {
+                version: 2,
+                tree: image("https://x/b.png"),
+            },
+        );
+        w.versions = 2;
+        assert!(w.image_arrived("https://x/a.png"));
+        assert!(w.icons["a"].version > 2 && w.icons["b"].version == 2);
+        assert!(!w.image_arrived("https://x/c.png"));
+    }
+
+    /// The bundled player loads (whatever the session bus has), with its
+    /// `mpris` module.
+    #[test]
+    fn the_bundled_player_loads() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        let c = parse("[widget.nowplaying]\nplugin = 'player'\n[app.spotify]\nwidget = 'player'");
+        w.configure(specs(&c, None, &["nowplaying".to_string()]));
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut loaded = 0;
+        while loaded < 2 {
+            match recv.recv_timeout(end - Instant::now()).expect("not loaded") {
+                Event::Failed { error, .. } => panic!("{error}"),
+                e @ Event::Loaded { .. } => {
+                    loaded += 1;
+                    w.event(e);
+                }
+                _ => {}
+            }
+        }
+        let key = dock::widget_key("nowplaying");
+        assert!(w.supports_popup(&key) && w.supports_popup("spotify"));
     }
 
     #[test]

@@ -351,6 +351,29 @@ shows a placeholder. The bundled `clock` draws an analog clock, with the
 time as its label and the date in its popup (on an app it only sets the
 label, unless `face = true`).
 
+The bundled `player` shows what an MPRIS media player plays: the cover as
+the icon, `title – artist` as the label, and a popup that plays, pauses,
+skips and seeks. On an app it follows that app's own player, matched by the
+player's `DesktopEntry` or bus name (`org.mpris.MediaPlayer2.spotify` is
+`spotify`, without an `.instanceN`) against the app's ID, desktop entry and
+`StartupWMClass`; `player` names one by its bus name instead. Standalone,
+it follows whichever player plays (else the one that changed last), and its
+popup's title raises that player's app.
+
+```toml
+[app.spotify]
+widget = "player"
+
+[app.firefox]
+widget = { plugin = "player", player = "firefox" }  # by bus name; `*` at the end matches any rest
+
+[widget.nowplaying]
+plugin = "player"
+name = "Now Playing"
+# cover = false                # Keep the icon as it is
+# label = false                # Keep the item's name
+```
+
 A plugin is a file that returns a table of hooks:
 
 ```lua
@@ -365,12 +388,55 @@ for the app's own name, and is asked again after `dock.redraw()`. Host
 functions: `dock.redraw()`, `dock.timer(ms, fn)` and `dock.every(ms, fn)`
 (handles with `:cancel()`), `dock.spawn(argv, { on_line = fn, on_exit = fn })`
 (a handle with `:kill()`), `dock.run(argv)` (detached), `dock.read(path)`,
-`dock.json.decode(s)` / `dock.json.encode(v)` and `dock.clipboard(text)`;
-`dock.app` is the app the widget backs (`nil` standalone);
-`argv` is a list, or a string for `sh -c`. Plugins have no `io`, `debug` or
-`os.execute`; `require` loads modules next to the plugin. A hook that runs
-past its budget, or a failing `setup`, restarts the plugin with backoff, and the
-app shows its own name meanwhile. Plugin files reload when saved.
+`dock.json.decode(s)` / `dock.json.encode(v)`, `dock.clipboard(text)` and
+`dock.now()` (Unix time in seconds, with a fraction: the clock of `live.at`);
+`argv` is a list, or a string for `sh -c`. `dock.app` is the app the widget
+backs (`nil` standalone), by every name the dock knows it by: `id` (the
+dock's app ID), `desktop` (the desktop entry it matched, without
+`.desktop`), `wm_class` (that entry's `StartupWMClass`) and `name`. The
+entry's names arrive once the dock has looked it up: the same table changes,
+the plugin's `on_app()` is called, and it redraws. Plugins have no `io`,
+`debug` or `os.execute`; `require` loads modules next to the plugin, then
+the bundled ones (`mpris`). A hook that runs past its budget, or a failing
+`setup`, restarts the plugin with backoff, and the app shows its own name
+meanwhile. Plugin files reload when saved.
+
+`dock.dbus.session()` and `dock.dbus.system()` are D-Bus clients. Every call
+is asynchronous; replies and signals come back as callbacks on the plugin's
+thread:
+
+```lua
+local bus = dock.dbus.session()
+bus:call{dest = 'org.mpris.MediaPlayer2.spotify', path = '/org/mpris/MediaPlayer2',
+  iface = 'org.mpris.MediaPlayer2.Player', method = 'SetPosition',
+  signature = 'ox', args = {track, us}, timeout = 5000,
+  on_reply = function(ret, err) end}           -- ret: the reply's arguments, as a list
+bus:get(dest, path, iface, name, function(value, err) end)
+bus:get_all(dest, path, iface, function(props, err) end)
+bus:set(dest, path, iface, name, signature, value, function(err) end)
+local sub = bus:watch{sender = dest, path = path, iface = iface, member = 'Seeked',
+  arg0 = nil, on_signal = function(args, msg) end}  -- msg: sender, path, iface, member
+bus:watch_props(dest, path, iface, function(changed, invalidated) end)
+bus:watch_names('org.mpris.MediaPlayer2.', function(name, owner) end)  -- owner nil: gone
+sub:cancel()
+```
+
+From D-Bus, variants unwrap, integers (`x` and `t` too) are integers,
+doubles numbers, `a{..}` tables keyed by the key, other arrays and structs
+lists, object paths and signatures strings, and `ay` a string. To D-Bus,
+`signature` says what the arguments are; a value that doesn't fit is an
+error on the call. A `v` is inferred (`b`, `x`, `d`, `s`, a list `as`, `ax`,
+`ad`, `ab` or `av`, another table `a{sv}`); file descriptors aren't
+supported. A call answers `on_reply(nil, err)` when it fails or times out
+(5 s); watches and calls go with the plugin when it reloads or stops.
+
+The bundled `mpris` module does the MPRIS part in Lua: `mpris.watch({app =
+dock.app, player = opts.player}, fn)` calls `fn(player)` with the player
+that app's widget shows (or `nil`) whenever the choice or the player
+changes. A player has `title`, `artist`, `album`, `art`, `length`,
+`position` (as of `at`), `rate`, `playing`, `status`, `can_*` flags,
+`:now()`, and `:play_pause()`, `:next()`, `:previous()`,
+`:set_position(seconds)`, `:raise()` and more; see `plugins/mpris.lua`.
 
 `icon(tile)` returns a UI tree drawn as the app's icon (or `nil` for the
 app's own). `tile` has `w` and `h` (the magnified size in logical pixels),
@@ -404,7 +470,7 @@ positional (`nil` children are skipped).
 | `ui.text{'...'}`                              | `style` (`title`, `body`, `muted`, `caption`), `weight`, `color`, `size`, `align`, `max_lines`                                                                         |
 | `ui.icon{'name'}`                             | `size`, `color` (`-symbolic` icons take the text color)                                                                                                                |
 | `ui.app_icon{}`                               | `app` (default: the widget's), `size`                                                                                                                                  |
-| `ui.image{src = path}`                        | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity`                                                                                                        |
+| `ui.image{src = path}`                        | `fit` (`cover`, `contain`, `fill`), `radius`, `blur`, `opacity`; `src` is a file, a `file://` or an `http(s)://` URL (fetched once, cached on disk)                  |
 | `ui.canvas{draw = fn}`                        | `viewbox = {w, h}` (default 100 x 100)                                                                                                                                 |
 | `ui.button{}`                                 | `label`, `icon`, `variant` (`plain`, `filled`, `ghost`), `enabled`, `selected`, `on_click`                                                                             |
 | `ui.slider{}`, `ui.toggle{}`, `ui.progress{}` | `value`, `min`, `max`, `enabled`, `live`, `on_change`, `on_commit`                                                                                                     |
@@ -429,7 +495,7 @@ pressed looks, slider drags and scrolling are handled by the dock; the
 plugin hears `on_click()`, `on_change(value)` (at most 30 times a second
 while a slider is dragged), `on_commit(value)` (on release) and a toggle's
 `on_change(on)`. A slider or progress bar with `live = { rate = 1, at =
-os.time() }` moves on its own from `value` at `at` (seconds) by `rate` per
+dock.now() }` moves on its own from `value` at `at` (seconds) by `rate` per
 second, so a seek bar keeps up without a redraw; it is painted on its own
 layer, as often as that moves it a pixel.
 
