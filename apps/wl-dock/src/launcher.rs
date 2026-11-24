@@ -6,6 +6,7 @@
 //! | typing                    | edits the query                            |
 //! | the trigger (`'`)         | typed first: search files instead          |
 //! | `@`                       | typed first: search every window instead   |
+//! | a source's trigger        | typed first: search a plugin's source      |
 //! | Backspace, Ctrl+W, Ctrl+U | delete a character, a word, everything     |
 //! | Enter                     | open the selection (`launcher-enter`)      |
 //! | Ctrl+Enter                | the other of activating and launching      |
@@ -22,7 +23,10 @@
 //! Shift+Tab, goes back to the apps with the query empty. A trigger typed
 //! in the file query is a plain character (nucleo's exact-match prefix).
 //! Window search's trigger (`@`) works the same way, with the same ways
-//! back.
+//! back, and so do the triggers of plugins' launcher sources. Which
+//! character enters which scope is a table (`Triggers`): the files
+//! trigger, then the windows trigger, then the sources' in order; the
+//! first to claim a character keeps it.
 //!
 //! Tab on a match (a file, an app or a window) enters its actions, a level with a
 //! query of its own (`Nav`), and Tab (or Enter) on an action with
@@ -110,13 +114,54 @@ pub enum Scope {
     Windows,
     /// A level's choices (a subject's actions, or an action's choices).
     Actions,
+    /// A plugin's launcher source, by its key (sources.rs).
+    Source(u32),
 }
 
 impl Scope {
     /// Backspace on its empty query (and Shift+Tab) goes back to the
     /// apps: the scopes a trigger switched to.
     fn has_way_back(self) -> bool {
-        matches!(self, Scope::Files | Scope::Bang | Scope::Windows)
+        matches!(
+            self,
+            Scope::Files | Scope::Bang | Scope::Windows | Scope::Source(_)
+        )
+    }
+}
+
+/// Which scope a character typed first into an empty app query enters,
+/// in order: the first to claim a character keeps it. Spaces never
+/// trigger.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Triggers(Vec<(char, Scope)>);
+
+impl Triggers {
+    /// The files trigger, then the windows trigger.
+    pub fn new(files: Option<char>, windows: Option<char>) -> Self {
+        let mut t = Triggers::default();
+        for (c, scope) in [(files, Scope::Files), (windows, Scope::Windows)] {
+            if let Some(c) = c {
+                t.add(c, scope);
+            }
+        }
+        t
+    }
+
+    /// `c` enters `scope`, unless it is a space or taken; whether it
+    /// does.
+    pub fn add(&mut self, c: char, scope: Scope) -> bool {
+        if c.is_whitespace() || self.0.iter().any(|(t, _)| *t == c) {
+            return false;
+        }
+        self.0.push((c, scope));
+        true
+    }
+
+    /// The scope `text` enters with its first character, and the rest.
+    fn find<'a>(&self, text: &'a str) -> Option<(Scope, &'a str)> {
+        let c = text.chars().next()?;
+        let (_, scope) = self.0.iter().find(|(t, _)| *t == c)?;
+        Some((*scope, &text[c.len_utf8()..]))
     }
 }
 
@@ -181,23 +226,25 @@ impl Query {
     /// Apply an editing key; `trigger` typed first in an empty app query
     /// switches to files. Returns whether the text or the scope changed.
     pub fn edit(&mut self, key: &Key, trigger: Option<char>) -> bool {
-        self.edit_in(key, trigger, None)
+        self.edit_with(key, &Triggers::new(trigger, None))
     }
 
     /// Like `edit`, with `windows` as the trigger of window search too.
     /// The file trigger wins should they be the same character.
+    #[cfg(test)]
     pub fn edit_in(&mut self, key: &Key, files: Option<char>, windows: Option<char>) -> bool {
+        self.edit_with(key, &Triggers::new(files, windows))
+    }
+
+    /// Apply an editing key; a trigger of `triggers` typed first in an
+    /// empty app query switches to its scope. Returns whether the text or
+    /// the scope changed.
+    pub fn edit_with(&mut self, key: &Key, triggers: &Triggers) -> bool {
         let before = (self.text.len(), self.scope);
         match key {
             Key::Text(t) => {
                 let first = self.scope == Scope::Apps && self.text.is_empty();
-                let triggered = |trigger: Option<char>, scope| {
-                    let c = trigger.filter(|c| !c.is_whitespace() && first)?;
-                    Some((scope, t.strip_prefix(c)?))
-                };
-                let found =
-                    triggered(files, Scope::Files).or_else(|| triggered(windows, Scope::Windows));
-                match found {
+                match triggers.find(t).filter(|_| first) {
                     Some((scope, rest)) => {
                         self.scope = scope;
                         self.text.push_str(rest);
@@ -605,6 +652,44 @@ mod tests {
         q.edit(&Key::Clear, Some('\''));
         assert!(!q.edit(&Key::Back, Some('\'')) && !q.edit(&Key::Backspace, None));
         assert_eq!(q.scope(), Scope::Actions);
+    }
+
+    #[test]
+    fn source_triggers() {
+        let t = |s: &str| Key::Text(s.into());
+        let mut triggers = Triggers::new(Some('\''), Some('@'));
+        assert!(triggers.add('>', Scope::Source(1)));
+        assert!(triggers.add('=', Scope::Source(2)));
+        // Taken (by files, or by an earlier source), or a space: no.
+        assert!(!triggers.add('\'', Scope::Source(3)));
+        assert!(!triggers.add('>', Scope::Source(3)));
+        assert!(!triggers.add(' ', Scope::Source(3)));
+        let edit = |q: &mut Query, key: Key| q.edit_with(&key, &triggers);
+        // `>web` searches the first source for `web`, typed or pasted.
+        let mut q = Query::default();
+        assert!(edit(&mut q, t(">")));
+        assert_eq!((q.scope(), q.text()), (Scope::Source(1), ""));
+        edit(&mut q, t("web"));
+        assert_eq!((q.scope(), q.text()), (Scope::Source(1), "web"));
+        let mut pasted = Query::default();
+        edit(&mut pasted, t("=2*21"));
+        assert_eq!((pasted.scope(), pasted.text()), (Scope::Source(2), "2*21"));
+        // In its query, the triggers are plain characters.
+        edit(&mut pasted, t(">'@"));
+        assert_eq!(pasted.text(), "2*21>'@");
+        // Mid-query it is part of the app query.
+        let mut apps = Query::default();
+        edit(&mut apps, t("a>"));
+        assert_eq!((apps.scope(), apps.text()), (Scope::Apps, "a>"));
+        // The ways back, as for files.
+        assert!(edit(&mut q, Key::DeleteWord) && q.scope() == Scope::Source(1));
+        assert!(edit(&mut q, Key::Backspace));
+        assert_eq!((q.scope(), q.text()), (Scope::Apps, ""));
+        edit(&mut q, t(">abc"));
+        assert!(edit(&mut q, Key::Back));
+        assert_eq!(q.scope(), Scope::Apps);
+        edit(&mut q, t(">abc"));
+        assert_eq!(act(Key::Escape, 0, &q), Act::Clear);
     }
 
     /// A launcher's levels, as app.rs drives them: `S` is what the drum

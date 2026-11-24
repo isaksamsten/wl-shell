@@ -8,8 +8,10 @@
 //! `actions` and `sources` are lists of tables for the launcher. An
 //! action has an `id`, a `name`, an `icon`, a `when` filter (see
 //! `subject.rs`), a `run(s, choice)` function and, optionally,
-//! `choices(s)`; of a source only the id, name and trigger are read for
-//! now (its keys are reserved by `api = 1`). `api`, if given, must be 1.
+//! `choices(s)`. A source has an `id`, a `name`, an `icon`, a `trigger`
+//! (one character), either `items()` (a fixed list the host ranks) or
+//! `search(query, emit)` (live results per query), and optionally
+//! `run(item)`. `api`, if given, must be 1.
 
 use std::collections::HashMap;
 
@@ -87,12 +89,20 @@ pub struct ActionDecl {
     pub choices: bool,
 }
 
-/// A launcher source a plugin declares (reserved: not searched yet).
+/// A launcher source a plugin declares: a scope of its own, entered by
+/// typing its trigger first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceDecl {
     pub id: String,
     pub name: String,
-    pub trigger: Option<String>,
+    pub icon: Option<String>,
+    /// Typed first, it enters the source.
+    pub trigger: char,
+    /// It answers `search(query, emit)` per query; else `items()` gives
+    /// a fixed list the host ranks.
+    pub search: bool,
+    /// It has `run(item)` for Enter.
+    pub run: bool,
 }
 
 /// Everything a loaded plugin declared.
@@ -163,19 +173,48 @@ impl Capabilities {
                 return Err(format!("actions[{}]: the id {:?} is taken", i + 1, a.id));
             }
         }
+        let sources = list(plugin, "sources", |t| {
+            let id = required(t, "id")?;
+            let f = |k: &str| match t.get::<Value>(k).map_err(e)? {
+                Value::Nil => Ok(false),
+                Value::Function(_) => Ok(true),
+                _ => Err(format!("{k}: expected a function")),
+            };
+            let search = match (f("items")?, f("search")?) {
+                (true, false) => false,
+                (false, true) => true,
+                (true, true) => return Err("give items or search, not both".into()),
+                (false, false) => return Err("items or search is missing".into()),
+            };
+            Ok(SourceDecl {
+                name: optional(t, "name")?.unwrap_or_else(|| id.clone()),
+                icon: optional(t, "icon")?,
+                trigger: trigger(&required(t, "trigger")?)?,
+                search,
+                run: f("run")?,
+                id,
+            })
+        })?;
+        for (i, s) in sources.iter().enumerate() {
+            if sources[..i].iter().any(|o| o.id == s.id) {
+                return Err(format!("sources[{}]: the id {:?} is taken", i + 1, s.id));
+            }
+        }
         Ok(Capabilities {
             setup,
             widget: any.then_some(caps),
             actions,
-            sources: list(plugin, "sources", |t| {
-                let id = required(t, "id")?;
-                Ok(SourceDecl {
-                    name: optional(t, "name")?.unwrap_or_else(|| id.clone()),
-                    trigger: optional(t, "trigger")?,
-                    id,
-                })
-            })?,
+            sources,
         })
+    }
+}
+
+/// A source's `trigger`: one character, not a space.
+fn trigger(s: &str) -> Result<char, String> {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if !c.is_whitespace() && !c.is_control() => Ok(c),
+        _ => Err(format!("trigger: expected one character, got {s:?}")),
     }
 }
 
@@ -277,8 +316,8 @@ fn show(v: &Value) -> String {
 }
 
 /// The host's view of what its instances provide: filled as they load,
-/// emptied as they fail or go. Widgets and launcher actions are looked
-/// up here; the launcher's sources will be too.
+/// emptied as they fail or go. Widgets, launcher actions and launcher
+/// sources are looked up here.
 #[derive(Debug, Default)]
 pub struct Registry {
     loaded: HashMap<InstanceId, Capabilities>,
@@ -331,7 +370,7 @@ impl Registry {
             .collect()
     }
 
-    /// The launcher sources declared, with their instances (reserved).
+    /// The launcher sources declared, with their instances.
     pub fn sources(&self) -> impl Iterator<Item = (&str, &SourceDecl)> {
         (self.loaded.iter()).flat_map(|(i, c)| c.sources.iter().map(move |s| (i.as_str(), s)))
     }
@@ -392,13 +431,13 @@ mod tests {
     }
 
     #[test]
-    fn launcher_actions_and_reserved_sources() {
+    fn launcher_actions_and_sources() {
         let c = caps(
             "return { actions = { { id = 'shrink', name = 'Shrink', icon = 'image-x-generic',
                                     when = { kind = 'file', mime = 'image/*' },
                                     choices = function() end, run = function() end },
                                   { id = 'logs', run = function() end } },
-                      sources = { { id = 'ssh', trigger = '>' } } }",
+                      sources = { { id = 'ssh', trigger = '>', items = print } } }",
         )
         .unwrap();
         assert!(c.launcher() && c.widget.is_none());
@@ -410,7 +449,8 @@ mod tests {
         assert_eq!(c.actions[1].name, "logs");
         assert_eq!(c.actions[1].when, When::default());
         assert_eq!(c.sources[0].name, "ssh");
-        assert_eq!(c.sources[0].trigger.as_deref(), Some(">"));
+        assert_eq!(c.sources[0].trigger, '>');
+        assert!(!c.sources[0].search && !c.sources[0].run);
         let err = |code: &str| caps(code).unwrap_err();
         assert!(err("return { actions = { 1 } }").contains("actions[1]"));
         assert!(err("return { actions = { { name = 'x', run = print } } }").contains("id"));
@@ -421,6 +461,44 @@ mod tests {
         assert!(e.contains("when.kind"), "{e}");
         let e =
             err("return { actions = { { id = 'x', run = print }, { id = 'x', run = print } } }");
+        assert!(e.contains("taken"), "{e}");
+    }
+
+    #[test]
+    fn launcher_sources() {
+        let c = caps(
+            "return { sources = {
+               { id = 'calc', name = 'Calculator', icon = 'accessories-calculator',
+                 trigger = '=', search = print, run = print },
+               { id = 'ssh', trigger = '>', items = print } } }",
+        )
+        .unwrap();
+        assert!(c.launcher() && c.actions.is_empty());
+        let calc = &c.sources[0];
+        assert_eq!((calc.name.as_str(), calc.trigger), ("Calculator", '='));
+        assert_eq!(calc.icon.as_deref(), Some("accessories-calculator"));
+        assert!(calc.search && calc.run);
+        let err = |code: &str| caps(code).unwrap_err();
+        let e = err("return { sources = { { id = 'x', trigger = '>' } } }");
+        assert!(e.contains("items or search"), "{e}");
+        let e = err(
+            "return { sources = { { id = 'x', trigger = '>', items = print, search = print } } }",
+        );
+        assert!(e.contains("not both"), "{e}");
+        let e = err("return { sources = { { id = 'x', items = print } } }");
+        assert!(e.contains("trigger"), "{e}");
+        for bad in ["''", "'>>'", "' '"] {
+            let e = err(&format!(
+                "return {{ sources = {{ {{ id = 'x', trigger = {bad}, items = print }} }} }}"
+            ));
+            assert!(e.contains("one character"), "{e}");
+        }
+        let e = err("return { sources = { { id = 'x', trigger = '>', items = {} } } }");
+        assert!(e.contains("items: expected a function"), "{e}");
+        let e = err(
+            "return { sources = { { id = 'x', trigger = '>', items = print },
+                                  { id = 'x', trigger = '<', items = print } } }",
+        );
         assert!(e.contains("taken"), "{e}");
     }
 

@@ -307,6 +307,11 @@
 #command = ["magick"]            # ["convert"] for ImageMagick 6
 #notify = true                   # notify-send when done or failed
 
+# Launcher sources: a plugin with `sources` adds a search behind its
+# trigger (`>ssh-host`, `=2*21`); see PLUGINS.md. Your own plugin in
+# plugins/ssh.lua takes a table like this one.
+#[plugin.ssh]
+
 #[widgets]
 #enabled = true
 #popup-delay = 300

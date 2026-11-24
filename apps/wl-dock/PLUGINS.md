@@ -17,6 +17,7 @@ This document covers [using widgets](#using-widgets), the
 - [Reference](#reference)
   - [Hooks](#hooks)
   - [Launcher actions](#launcher-actions-1)
+  - [Launcher sources](#launcher-sources-1)
   - [The `dock` API](#the-dock-api)
   - [UI trees](#ui-trees)
   - [Canvas](#canvas)
@@ -102,7 +103,8 @@ letters, digits, `-` and `_`.
 
 A placement gets the options of its plugin table, with its own options
 applied key by key on top. A plugin table also adds the plugin's
-[launcher actions](#launcher-actions), if it has any; its `setup(opts)`
+[launcher actions](#launcher-actions) and
+[launcher sources](#launcher-sources), if it has any; its `setup(opts)`
 gets the table's options.
 
 ## Bundled plugins
@@ -384,12 +386,73 @@ plugin doesn't answer within 0.5 s, or fails, the level shows _No choices_
 and you can go back as usual. See the [reference](#launcher-actions-1) for
 the subject tables and `when`.
 
+### Launcher sources
+
+A plugin can also add a search of its own to the launcher, entered by typing
+its trigger first, as `'` enters the file search and `@` the window search.
+Give it a `sources` list and, as for actions, a `[plugin.<name>]` table:
+
+```lua
+local function hosts()
+  local out = {}
+  for host in ('\n' .. (dock.read('~/.ssh/config') or '')):gmatch('\nHost%s+([^%s*]+)') do
+    out[#out + 1] = { id = host, title = host, icon = 'network-server' }
+  end
+  return out
+end
+
+return {
+  sources = {
+    { id = 'ssh', name = 'SSH', trigger = '>', icon = 'network-server',
+      items = hosts,                                 -- a fixed list; the launcher ranks it
+      run = function(item) dock.run{ 'foot', 'ssh', item.id } end },
+    { id = 'calc', name = 'Calculator', trigger = '=', icon = 'accessories-calculator',
+      search = function(query, emit)                 -- live results for each query
+        local f = load('return ' .. query, 'calc', 't', { math = math })
+        local ok, v = pcall(f or error)
+        if ok and v then emit{ { id = 'result', title = tostring(v), subtitle = query } } end
+      end,
+      run = function(item) dock.clipboard(item.title) end },
+  },
+}
+```
+
+Typing `>` in the empty launcher shows the source's name in the bar and its
+icon in front; what you type after it searches the source. Backspace on the
+empty query, or Shift+Tab, goes back to the apps.
+
+- **`items()`** returns the whole list. The launcher asks for it once, when
+  the source is first entered, keeps it, and ranks it itself for every
+  query (by title, then subtitle), so typing never waits for the plugin.
+  Call `dock.invalidate()` when the list has changed (for example from a
+  `dock.watch` callback); it is asked for again. Until it arrives the bar
+  says _Loading…_.
+- **`search(query, emit)`** is called for each query, once typing pauses
+  for 80 ms (at once for an empty query). Call `emit(list)` with the
+  results, while `search` runs or later (from a timer, or a process's
+  `on_line`); each `emit` replaces the results shown. Results for an older
+  query are dropped, however late they come, and the results shown stay
+  until the new query's arrive. `search` may also return the list instead
+  of emitting it.
+- **Enter** calls `run(item)` with the item's table, as the plugin made it.
+  Without `run`, Enter opens a file item or an app item (below), and does
+  nothing on other items.
+- **Tab** on a file item (`kind = 'file'`, with a `path`) offers the file's
+  usual actions, Open with… and the rest; on an app item (`kind = 'app'`,
+  with the app's desktop ID as `app`) the app's. Other items get the
+  [launcher actions](#launcher-actions) whose `when` names their source:
+  `when = { kind = 'item', source = 'ssh' }`.
+
+A trigger already taken (by `'`, `@`, the web search's `!`, or an earlier
+source; plugins by name) is ignored. See the
+[reference](#launcher-sources-1) for the item tables.
+
 ## How a plugin runs
 
 - **One state per placement.** Each `[app.*]` widget and each pinned
   `[widget.*]` gets its own Lua state. Two placements of the same plugin
   share nothing, not even globals. A `[plugin.*]` table whose plugin has
-  launcher `actions` gets one more state for them.
+  launcher `actions` or `sources` gets one more state for them.
 - **Threads.** States run on a small thread pool. A state never runs on two
   threads at once, so a plugin needs no locking. Nothing in the API blocks:
   processes, timers and D-Bus calls all report back through callbacks on the
@@ -413,9 +476,10 @@ the subject tables and `when`.
     standalone widget shows a placeholder.
 - **Deadlines.** `label()` must answer within 0.5 s and `icon()` or `popup()`
   within 1 s, or the answer is thrown away. A launcher action's `choices(s)`
-  has 0.5 s. Do slow work, such as running commands or reading the network,
-  ahead of time in timers or callbacks, and have the hooks only return what
-  is already known.
+  has 0.5 s, a source's `items()` 2 s, and `search` 2 s to run (what it
+  emits later counts as long as its query is the latest). Do slow work,
+  such as running commands or reading the network, ahead of time in timers
+  or callbacks, and have the hooks only return what is already known.
 - **Reloading.** Saving the plugin file starts a fresh state: timers stop,
   processes are killed, and D-Bus and file watches are cancelled. Modules
   loaded with `require` are not watched, so save the plugin file to pick up
@@ -451,8 +515,8 @@ The plugin table also takes these keys:
 | `popup_on` | What opens the popup: `'hover'` (default) or `'click'`. See [`popup()`](#popup). On an app's item the popup always opens on hover.                                                          |
 | `api`      | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
 
-`actions` adds [launcher actions](#launcher-actions). `sources` is reserved
-for launcher sources.
+`actions` adds [launcher actions](#launcher-actions), and `sources`
+[launcher sources](#launcher-sources).
 
 #### `icon(tile)`
 
@@ -517,6 +581,7 @@ The subject `s` is a plain table:
 | `'file'`   | `path`, `name`, `dir` (a folder), `mime` (the type and its parents, nearest first: `{'image/png', 'application/octet-stream'}`) |
 | `'app'`    | `id` (desktop ID), `name`, `running` (has windows), `pinned`, `windows` (a list of `{ id =, title = }`, most recent first)      |
 | `'window'` | `id`, `title`, `app_id`, `app_name`                                                                                             |
+| `'item'`   | `source` (its source's `id`), `id`, `title`, `data` (the item's table, as the plugin made it)                                   |
 
 `when` is checked by the dock, so building the Tab level never waits for a
 plugin. Every key given must hold:
@@ -529,17 +594,50 @@ plugin. Every key given must hold:
 | `dir`     | Folders (`true`) or files (`false`)                                   |
 | `app`     | Apps whose desktop ID, or windows whose app ID, match the glob        |
 | `running` | Apps with windows (`true`) or without (`false`); windows always run   |
+| `source`  | Items of the source with this `id` (a plugin source's)                |
 
 In globs `*` matches any run of characters, `/` included, and `?` one
 character; `mime` and `app` ignore case. A key that doesn't apply to the
 subject, such as `mime` on an app, doesn't hold. An unknown key is an error
 when the plugin loads.
 
+### Launcher sources
+
+`sources` is a list of tables, each with these keys:
+
+| Key       | Meaning                                                                                       |
+| --------- | --------------------------------------------------------------------------------------------- |
+| `id`      | Required, unique in the plugin; what `when.source` names                                      |
+| `name`    | Shown in the bar while nothing is typed; default: the `id`                                    |
+| `icon`    | A theme icon name: the front's while nothing matches, and the items' without one of their own |
+| `trigger` | Required: the one character that enters the source when typed first (not a space)             |
+| `items`   | `function()`: the list of items. Give this or `search`                                        |
+| `search`  | `function(query, emit)`: calls `emit(list)` with the query's results. Give this or `items`    |
+| `run`     | Optional `function(item)`: what Enter does                                                    |
+
+An item is a table with these keys, plus any fields of the plugin's own
+(`run` and the actions' `s.data` get them back, without functions):
+
+| Key        | Meaning                                                                       |
+| ---------- | ----------------------------------------------------------------------------- |
+| `id`       | Unique in the list; an `id` or a `title` is required, each stands in for the other |
+| `title`    | Its name in the launcher                                                      |
+| `subtitle` | Shown dimmed after the title, and searched too                                |
+| `icon`     | A theme icon name or a path; default: the source's                            |
+| `kind`     | `'item'` (default), `'file'` or `'app'`                                       |
+| `path`     | A file item's path (`~/` expands); its icon is the file's thumbnail or type   |
+| `app`      | An app item's desktop ID (`'org.gnome.Nautilus'`); its icon is the app's      |
+
+`items()` keeps at most 10,000 items, and each `emit` 500; a repeated `id`
+counts once. A bad item (no `id` or `title`, a file without `path`) is an
+error in `items()`, or in the `emit` call.
+
 ### The `dock` API
 
 | Function                           | Does                                                                                                                                                                |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `dock.redraw()`                    | Ask the hooks again (once the current call returns)                                                                                                                 |
+| `dock.invalidate()`                | Say a [launcher source](#launcher-sources)'s `items()` changed: they are asked for again (a search source searches again)                                         |
 | `dock.timer(ms, fn)`               | Call `fn()` once after `ms`. Returns a handle with `:cancel()`                                                                                                      |
 | `dock.every(ms, fn)`               | Call `fn()` every `ms` (at least 10). Returns a handle with `:cancel()`                                                                                             |
 | `dock.spawn(argv, opts)`           | Run a process. `opts.on_line(line)` gets each line of its stdout, `opts.on_exit(code)` its exit code (`nil` if killed by a signal). Returns a handle with `:kill()` |

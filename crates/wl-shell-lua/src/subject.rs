@@ -85,8 +85,7 @@ pub enum Subject {
         app_id: String,
         app_name: String,
     },
-    /// An item from a plugin source (reserved: sources aren't searched
-    /// yet).
+    /// An item from a plugin source.
     Item {
         source: String,
         id: String,
@@ -390,6 +389,146 @@ impl Choice {
     }
 }
 
+/// The most items an `items()` answer keeps.
+pub const MAX_ITEMS: usize = 10_000;
+/// The most items one `emit` of `search` keeps.
+pub const MAX_RESULTS: usize = 500;
+
+/// What an item of a source is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    /// Only the plugin knows (`kind` nil or `'item'`).
+    Item,
+    /// A file (`kind = 'file'`, `path`; `~/` expanded): Tab offers the
+    /// built-in file actions.
+    File { path: String },
+    /// An installed app (`kind = 'app'`, `app` its desktop ID): Tab
+    /// offers the app's actions.
+    App { app: String },
+}
+
+/// One item of a launcher source, as `items()` returned it or `search`
+/// emitted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Item {
+    /// Unique among the source's items.
+    pub id: String,
+    pub title: String,
+    /// Shown dimmed after the title.
+    pub subtitle: Option<String>,
+    /// A theme icon name or a path.
+    pub icon: Option<String>,
+    pub kind: ItemKind,
+    /// The whole table (without its functions), handed back to
+    /// `run(item)` and to actions as the subject's `data`.
+    pub data: serde_json::Value,
+}
+
+/// The text at `k` of `t`: a string or a number, else an error.
+fn text_field(t: &Table, k: &str) -> Result<Option<String>, String> {
+    match t.get::<Value>(k).map_err(|e| e.to_string())? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_string_lossy())),
+        Value::Integer(i) => Ok(Some(i.to_string())),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        _ => Err(format!("{k}: expected a string")),
+    }
+}
+
+/// `t` as JSON, functions left out.
+fn table_data(lua: &Lua, t: &Table) -> Option<serde_json::Value> {
+    let options = mlua::serde::DeserializeOptions::new().deny_unsupported_types(false);
+    lua.from_value_with(Value::Table(t.clone()), options).ok()
+}
+
+impl Item {
+    /// Read the item `t`.
+    pub(crate) fn read(lua: &Lua, t: &Table) -> Result<Self, String> {
+        let nonempty = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+        let id = nonempty(text_field(t, "id")?);
+        let title = nonempty(text_field(t, "title")?);
+        let (id, title) = match (id, title) {
+            (Some(id), Some(title)) => (id, title),
+            (Some(id), None) => (id.clone(), id),
+            (None, Some(title)) => (title.clone(), title),
+            (None, None) => return Err("an item needs an id or a title".into()),
+        };
+        let kind = match text_field(t, "kind")?.as_deref() {
+            None | Some("item") => ItemKind::Item,
+            Some("file") => {
+                let path = nonempty(text_field(t, "path")?).ok_or("a file item needs a path")?;
+                let path = crate::host::expand(path.trim());
+                ItemKind::File {
+                    path: path.to_string_lossy().into_owned(),
+                }
+            }
+            Some("app") => ItemKind::App {
+                app: (nonempty(text_field(t, "app")?))
+                    .map(|a| a.trim().trim_end_matches(".desktop").to_string())
+                    .ok_or("an app item needs an app (its desktop ID)")?,
+            },
+            Some(k) => return Err(format!("kind: {k:?} is not 'item', 'file' or 'app'")),
+        };
+        let data = table_data(lua, t).unwrap_or_else(|| serde_json::json!({ "id": id }));
+        Ok(Item {
+            subtitle: nonempty(text_field(t, "subtitle")?),
+            icon: nonempty(text_field(t, "icon")?),
+            id,
+            title,
+            kind,
+            data,
+        })
+    }
+
+    /// The items of the list `v` (nil: none), at most `max`; the first
+    /// of an id counts.
+    pub(crate) fn list(lua: &Lua, v: Value, max: usize) -> Result<Vec<Item>, String> {
+        let list = match v {
+            Value::Nil => return Ok(Vec::new()),
+            Value::Table(t) => t,
+            v => return Err(format!("expected a list of items, got {}", v.type_name())),
+        };
+        let mut items: Vec<Item> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (i, v) in list.sequence_values::<Value>().enumerate() {
+            let Value::Table(t) = v.map_err(|e| e.to_string())? else {
+                return Err(format!("item {}: expected a table", i + 1));
+            };
+            let item = Item::read(lua, &t).map_err(|e| format!("item {}: {e}", i + 1))?;
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
+            if items.len() == max {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// The table `run(item)` gets: what the plugin gave.
+    pub(crate) fn to_lua(&self, lua: &Lua) -> mlua::Result<Value> {
+        match crate::host::to_lua(lua, &self.data)? {
+            Value::Table(t) => Ok(Value::Table(t)),
+            _ => {
+                let t = lua.create_table()?;
+                t.set("id", self.id.as_str())?;
+                t.set("title", self.title.as_str())?;
+                Ok(Value::Table(t))
+            }
+        }
+    }
+
+    /// The item as a subject of actions, from the source `source`.
+    pub fn subject(&self, source: &str) -> Subject {
+        Subject::Item {
+            source: source.to_string(),
+            id: self.id.clone(),
+            title: self.title.clone(),
+            data: self.data.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +703,73 @@ mod tests {
         assert_eq!(Choice::read(&lua, &t).unwrap().id, "x");
         let t: Table = lua.load("return { icon = 'x' }").eval().unwrap();
         assert!(Choice::read(&lua, &t).is_err());
+    }
+
+    #[test]
+    fn items() {
+        let lua = Lua::new();
+        let list = |code: &str, max: usize| {
+            let v: Value = lua.load(code).eval().unwrap();
+            Item::list(&lua, v, max)
+        };
+        let items = list(
+            "return { { id = 'h1', title = 'Host 1', subtitle = 'ssh', icon = 'network-server',
+                        port = 22, f = print },
+                      { title = 'h2' },
+                      { id = 'h1', title = 'again' },
+                      { id = 3 } }",
+            10,
+        )
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        // The first of an id counts; ids and titles stand in for each other.
+        assert_eq!(ids, ["h1", "h2", "3"]);
+        assert_eq!(items[1].title, "h2");
+        assert_eq!(items[0].subtitle.as_deref(), Some("ssh"));
+        assert_eq!(items[0].icon.as_deref(), Some("network-server"));
+        assert_eq!(items[0].kind, ItemKind::Item);
+        // Its own fields come back to `run`.
+        lua.globals()
+            .set("i", items[0].to_lua(&lua).unwrap())
+            .unwrap();
+        let port: i64 = lua.load("return i.port").eval().unwrap();
+        assert_eq!(port, 22);
+        assert_eq!(
+            list("return { {id = 1}, {id = 2}, {id = 3} }", 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(list("return nil", 2).unwrap().is_empty());
+        // Files and apps.
+        let items = list(
+            "return { { kind = 'file', title = 'a', path = '/p/a.txt' },
+                      { kind = 'app', title = 'Foot', app = 'foot.desktop' } }",
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            items[0].kind,
+            ItemKind::File {
+                path: "/p/a.txt".into()
+            }
+        );
+        assert_eq!(items[1].kind, ItemKind::App { app: "foot".into() });
+        assert_eq!(
+            items[1].subject("apps"),
+            Subject::Item {
+                source: "apps".into(),
+                id: "Foot".into(),
+                title: "Foot".into(),
+                data: items[1].data.clone(),
+            }
+        );
+        let err = |code: &str| list(code, 10).unwrap_err();
+        assert!(err("return 'x'").contains("list"));
+        assert!(err("return { 1 }").contains("item 1"));
+        assert!(err("return { { icon = 'x' } }").contains("id or a title"));
+        assert!(err("return { { id = 'x', kind = 'file' } }").contains("path"));
+        assert!(err("return { { id = 'x', kind = 'app' } }").contains("app"));
+        assert!(err("return { { id = 'x', kind = 'dir' } }").contains("kind"));
     }
 }

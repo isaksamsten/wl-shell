@@ -35,6 +35,11 @@
 //! - Launcher actions: the host looks up the ones whose `when` holds for
 //!   a [`Subject`] in the [`Registry`] (in Rust), asks for an action's
 //!   `choices(s)` and runs its `run(s, choice)` (see `subject.rs`).
+//! - Launcher sources: the host asks a source for its `items()` (a list
+//!   it caches and ranks itself; `invalidate()` says it changed), or
+//!   calls its `search(query, emit)` per query with a generation, which
+//!   each [`Event::Emit`] carries back so the host drops what an older
+//!   query emits; Enter runs `run(item)`. Items are [`Item`]s.
 
 mod caps;
 pub mod channel;
@@ -56,4 +61,7 @@ pub use channel::{
 };
 pub use runtime::{Event, Runtime, Settings};
 pub use spec::{AppInfo, InstanceSpec, Role, Source};
-pub use subject::{Choice, MAX_CHOICES, Subject, SubjectKind, SubjectWindow, When, glob};
+pub use subject::{
+    Choice, Item, ItemKind, MAX_CHOICES, MAX_ITEMS, MAX_RESULTS, Subject, SubjectKind,
+    SubjectWindow, When, glob,
+};

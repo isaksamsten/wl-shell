@@ -84,6 +84,17 @@
 //! picked for a query is learned (history.rs), and comes first for that
 //! query and its prefixes from then on.
 //!
+//! Plugins' launcher sources: a source's trigger typed first (the
+//! trigger table: files', windows', then the sources', `triggers`)
+//! enters its scope. A source with `items()` is asked once and its items
+//! ranked here with nucleo for every query (`show_source`); one with
+//! `search` is asked `SEARCH_DEBOUNCE` after the typing stops, and shows
+//! what the plugin emits for the latest query only (`search_source`).
+//! Enter runs the item's `run(item)`, else opens a file item or opens an
+//! app item as an app match would; Tab gives a file item its file's
+//! actions, an app item its app's, and other items the plugins' actions
+//! for items (`when = { kind = 'item', source = … }`).
+//!
 //! Keyboard activation (activate.rs, activateview.rs): `wl-dock
 //! --activate n` asks over the socket and is answered at once. The dock
 //! maps the activate surface, which takes the keyboard on the focused
@@ -168,18 +179,19 @@ use crate::folder;
 use crate::history::{self, History};
 use crate::ipc::DockRequest;
 use crate::launch::{self, Command};
-use crate::launcher::{self, Act, Scope};
+use crate::launcher::{self, Act, Scope, Triggers};
 use crate::launcherview::{
-    Detail, FileMatch, FilesStatus, LauncherInput, LauncherStyle, LauncherView, Match,
+    Detail, FileMatch, FilesStatus, LauncherInput, LauncherStyle, LauncherView, Match, SourceLook,
 };
 use crate::menu::{self, Action, MenuKey};
 use crate::pins::{self, Pin, Zone};
 use crate::search::Search;
+use crate::sources::SourceKey;
 use crate::strip::{self, Key};
 use crate::trash;
 use crate::view::{DockView, MenuEvent, Offer, Style};
 use crate::websuggest;
-use crate::widgets::{self, Effect, Widgets};
+use crate::widgets::{self, Effect, ItemRun, Widgets};
 use crate::windowsearch;
 
 /// How long the launcher (or the activate surface) waits for the
@@ -196,6 +208,14 @@ const SCROLL_STEP: f64 = 50.0;
 /// How long the pointer may be off both the dock and a widget's popup
 /// (on its way from one to the other) before the popup closes.
 const WIDGET_GRACE: Duration = Duration::from_millis(180);
+
+/// How long typing in a source's search settles before the plugin is
+/// asked.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
+/// What a source's scope says while nothing matches the query.
+const NO_MATCHES: &str = "No matches";
+/// What a source's scope says once its plugin is gone.
+const SOURCE_GONE: &str = "Not available";
 
 /// An app launched from the dock, until one of its windows appears.
 struct Launch {
@@ -419,6 +439,66 @@ fn window_match(
     }
 }
 
+/// An item of a plugin's source as the launcher shows it: its title,
+/// its subtitle dimmed after it (`matched` and `detail` are what the
+/// query matched in them), and its icon, else the source's (`fallback`).
+/// A file item is a file match (its icon a thumbnail or its type's, its
+/// folder after it without a subtitle); an app item shows the app's
+/// icon.
+pub(crate) fn item_match(
+    item: &wl_shell_lua::Item,
+    matched: Vec<std::ops::Range<usize>>,
+    detail: Vec<std::ops::Range<usize>>,
+    fallback: Option<&str>,
+    apps: &[IndexedApp],
+    home: Option<&Path>,
+) -> Match {
+    let mut m = Match {
+        id: item.id.clone(),
+        name: item.title.clone(),
+        icon: None,
+        app: None,
+        named: item.icon.iter().cloned().collect(),
+        matched,
+        file: None,
+        window: None,
+        detail: (item.subtitle.clone()).map(|text| Detail {
+            text,
+            matched: detail,
+        }),
+    };
+    match &item.kind {
+        wl_shell_lua::ItemKind::File { path } => {
+            let path = PathBuf::from(path);
+            if m.detail.is_none()
+                && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            {
+                m.detail = Some(Detail {
+                    text: filesearch::tilde(parent, home),
+                    matched: Vec::new(),
+                });
+            }
+            m.file = Some(FileMatch {
+                dir: path.is_dir(),
+                parent: String::new(),
+                parent_matched: Vec::new(),
+                shown: filesearch::tilde(&path, home),
+                shown_matched: Vec::new(),
+                path,
+            });
+        }
+        wl_shell_lua::ItemKind::App { app } => {
+            m.icon = (apps.iter().find(|a| a.id == *app)).and_then(|a| a.entry.icon.clone());
+            m.app = Some(app.clone());
+        }
+        wl_shell_lua::ItemKind::Item => {
+            m.named.extend(fallback.map(str::to_string));
+            m.named.push(actions::PLUGIN_ICON.into());
+        }
+    }
+    m
+}
+
 /// `n` with its thousands separated: `12,345`.
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -522,6 +602,9 @@ pub struct WlDock {
     /// A plugin's action the launcher runs, and what the client is told;
     /// run once it gave up the keyboard.
     pending_plugin: Option<(PluginRun, String)>,
+    /// An item of a plugin's source the launcher runs (`run(item)`),
+    /// and what the client is told.
+    pending_item: Option<(ItemRun, String)>,
     /// An app's action the launcher runs.
     pending_app: Option<PendingApp>,
     /// A window the launcher activates, once it gave up the keyboard.
@@ -630,6 +713,7 @@ impl WlDock {
             pending_with: None,
             pending_terminal: None,
             pending_plugin: None,
+            pending_item: None,
             pending_app: None,
             pending_window: None,
             files: None,
@@ -866,9 +950,19 @@ impl WlDock {
             clipboard,
             popup,
             choices,
+            results,
+            sources,
         } = self.widgets.event(event);
         if let Some((id, answer)) = choices {
             self.choices_arrived(id, answer);
+        }
+        if let Some(instance) = sources {
+            self.sources_changed(core, &instance);
+        }
+        if let Some(key) = results
+            && self.source_shown() == Some(key)
+        {
+            self.show_source(key, true);
         }
         if let Some((app, tree)) = popup
             && let Some((output, key)) = self.widget_target.clone()
@@ -1493,6 +1587,7 @@ impl WlDock {
             Some(Scope::Windows) => self.rank_windows(core, None, false),
             Some(Scope::Bang | Scope::Web) => self.rank_web(),
             Some(Scope::Actions) => self.rank_choices(),
+            Some(Scope::Source(key)) => self.rank_source(core, key),
             None => {}
         }
         // The query can change without changing the file matches or status
@@ -1500,6 +1595,161 @@ impl WlDock {
         if let Some(launcher) = &mut self.launcher {
             launcher.sync_texts();
             launcher.kick();
+        }
+    }
+
+    // -- plugins' sources --------------------------------------------------------
+
+    /// The launcher's triggers: files', windows', then the plugins'
+    /// sources' (a character taken is skipped).
+    fn triggers(&mut self) -> Triggers {
+        let config = &self.config.launcher;
+        let mut triggers = Triggers::new(config.files.trigger, config.windows.trigger);
+        for s in self.widgets.launcher_sources() {
+            triggers.add(s.decl.trigger, Scope::Source(s.key));
+        }
+        triggers
+    }
+
+    /// The source the launcher searches (not in a level, not closing).
+    fn source_shown(&self) -> Option<SourceKey> {
+        let l = (self.launcher.as_ref()).filter(|l| !l.closing() && l.depth() == 0)?;
+        match l.query().scope() {
+            Scope::Source(key) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The query of the source `key`'s scope changed (or it was
+    /// entered): a search asks the plugin once the typing settles, the
+    /// results shown staying until its own come; items are asked for if
+    /// they aren't known, and ranked for the query.
+    fn rank_source(&mut self, core: &Core<Self>, key: SourceKey) {
+        let Some(entry) = self.widgets.source(key) else {
+            return self.show_source(key, false);
+        };
+        if entry.decl.search {
+            self.search_source(core, key);
+            return self.show_source(key, true);
+        }
+        self.widgets.ask_items(key);
+        if let Some(l) = &mut self.launcher {
+            // Typing ranks anew: the best comes to the front again.
+            l.unroll();
+        }
+        self.show_source(key, false);
+    }
+
+    /// Ask the source `key` to search for the launcher's query, after
+    /// `SEARCH_DEBOUNCE` (at once for an empty one) unless the query
+    /// changes before.
+    fn search_source(&mut self, core: &Core<Self>, key: SourceKey) {
+        let Some(l) = &self.launcher else { return };
+        let query = l.query().text().to_string();
+        let generation = self.widgets.begin_search(key, &query);
+        let delay = match query.trim().is_empty() {
+            true => Duration::ZERO,
+            false => SEARCH_DEBOUNCE,
+        };
+        let timer = core.timer(delay, move |app: &mut Self, _| {
+            app.widgets.send_search(generation);
+        });
+        if let Err(e) = timer {
+            warn!("{e}");
+        }
+    }
+
+    /// `instance`'s sources changed (it loaded, failed, or invalidated
+    /// its items): the one searched asks again, keeping what it shows
+    /// until the answer.
+    fn sources_changed(&mut self, core: &Core<Self>, instance: &str) {
+        let Some(key) = self.source_shown() else {
+            return;
+        };
+        if self.widgets.source_instance(key) != Some(instance) {
+            return;
+        }
+        match self.widgets.source(key) {
+            Some(entry) if entry.decl.search => self.search_source(core, key),
+            Some(_) => {
+                self.widgets.ask_items(key);
+                self.show_source(key, true);
+            }
+            // Gone: nothing to show.
+            None => self.show_source(key, false),
+        }
+    }
+
+    /// Put the source `key`'s items (ranked for the query) or search
+    /// results (in the plugin's order) on the drum; `streamed`: they
+    /// arrived, so a rolled-to selection stays.
+    fn show_source(&mut self, key: SourceKey, streamed: bool) {
+        let entry = self.widgets.source(key);
+        let Self {
+            launcher: Some(launcher),
+            search,
+            widgets,
+            apps,
+            config,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let slots = (config.launcher.matches as usize).max(1);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let query = launcher.query().text().to_string();
+        let typed = !query.trim().is_empty();
+        let Some(entry) = entry else {
+            launcher.set_source(SourceLook {
+                status: Some(SOURCE_GONE.into()),
+                ..SourceLook::default()
+            });
+            return launcher.set_matches(Vec::new());
+        };
+        let icon = entry.decl.icon.as_deref();
+        let item = |i: &wl_shell_lua::Item, matched, detail| {
+            item_match(i, matched, detail, icon, apps, home.as_deref())
+        };
+        let (matches, status): (Vec<Match>, Option<&str>) = if entry.decl.search {
+            let results = widgets.search_results(key).unwrap_or_default();
+            let matches = (results.iter().take(slots))
+                .map(|i| item(i, Vec::new(), Vec::new()))
+                .collect();
+            (matches, None)
+        } else {
+            match widgets.source_items(key) {
+                None => {
+                    let loading = widgets.items_loading(key);
+                    (Vec::new(), loading.then_some(actions::LOADING))
+                }
+                Some(items) => {
+                    let fields: Vec<(&str, &str)> = (items.iter())
+                        .map(|i| (i.title.as_str(), i.subtitle.as_deref().unwrap_or("")))
+                        .collect();
+                    let order = search.rank_windows(&fields, &query);
+                    let matches: Vec<Match> = (order.into_iter().take(slots))
+                        .map(|n| &items[n])
+                        .map(|i| {
+                            let matched = search.highlight(&i.title, &query);
+                            let detail = (i.subtitle.as_deref())
+                                .map_or_else(Vec::new, |s| search.highlight(s, &query));
+                            item(i, matched, detail)
+                        })
+                        .collect();
+                    let none = matches.is_empty() && (typed || items.is_empty());
+                    (matches, none.then_some(NO_MATCHES))
+                }
+            }
+        };
+        launcher.set_source(SourceLook {
+            name: entry.decl.name.clone(),
+            icons: entry.decl.icon.iter().cloned().collect(),
+            status: status.map(str::to_string),
+        });
+        match streamed {
+            true => launcher.stream_matches(matches),
+            false => launcher.set_matches(matches),
         }
     }
 
@@ -2115,6 +2365,13 @@ impl WlDock {
     }
 
     fn edit_launcher(&mut self, core: &Core<Self>, edit: launcher::Key, pasted: bool) {
+        // Only the first character of an app query can be a trigger.
+        let first = (self.launcher.as_ref())
+            .is_some_and(|l| l.query().scope() == Scope::Apps && l.query().is_empty());
+        let triggers = match first {
+            true => self.triggers(),
+            false => Triggers::default(),
+        };
         let Some(l) = &mut self.launcher else { return };
         let scope = l.query().scope();
         let config = &self.config.launcher;
@@ -2136,9 +2393,7 @@ impl WlDock {
                 }
                 true
             }
-            _ => l
-                .query_mut()
-                .edit_in(&edit, config.files.trigger, config.windows.trigger),
+            _ => l.query_mut().edit_with(&edit, &triggers),
         };
         if !changed {
             return;
@@ -2147,11 +2402,18 @@ impl WlDock {
             && scope != l.query().scope()
         {
             // Nothing cross-fades into a search of its own.
-            if matches!(l.query().scope(), Scope::Files | Scope::Windows) {
+            if matches!(
+                l.query().scope(),
+                Scope::Files | Scope::Windows | Scope::Source(_)
+            ) {
                 l.set_matches(Vec::new());
             }
             if scope == Scope::Windows {
                 l.clear_candidates();
+            }
+            // Out of a source: its search is over.
+            if matches!(scope, Scope::Source(_)) {
+                self.widgets.end_search();
             }
         }
         if self
@@ -2271,6 +2533,9 @@ impl WlDock {
         } else if left && l.depth() == 0 && l.query().scope() == Scope::Windows {
             // The windows as they are now.
             self.rank_windows(core, None, true);
+        } else if let (true, 0, Scope::Source(key)) = (left, l.depth(), l.query().scope()) {
+            // What the source has now.
+            self.show_source(key, true);
         }
     }
 
@@ -2319,6 +2584,33 @@ impl WlDock {
         if scope == Scope::Bang {
             return;
         }
+        // A source's item: its `run`, else what it is (a file opens, an
+        // app activates or launches; nothing else does anything).
+        let mut app_of_item = None;
+        if let Scope::Source(key) = scope {
+            let (Some(entry), Some(item)) = (
+                self.widgets.source(key),
+                self.widgets.source_item(key, &m.id),
+            ) else {
+                return;
+            };
+            if entry.decl.run {
+                let picked = item.id.clone();
+                self.close_launcher(core, None);
+                let run = ItemRun {
+                    instance: entry.instance,
+                    source: entry.decl.id,
+                    item,
+                };
+                self.pending_item = Some((run, picked));
+                return;
+            }
+            match item.kind {
+                wl_shell_lua::ItemKind::App { app } => app_of_item = Some(app),
+                wl_shell_lua::ItemKind::File { .. } => {}
+                wl_shell_lua::ItemKind::Item => return,
+            }
+        }
         if let Some(f) = &m.file {
             let path = match other {
                 true => f.path.parent().unwrap_or(&f.path).to_path_buf(),
@@ -2329,8 +2621,13 @@ impl WlDock {
             self.pending_path = Some((path, picked));
             return;
         }
-        let query = l.query().text().to_string();
-        let Some(app) = self.apps.iter().find(|a| a.id == m.id).cloned() else {
+        // Not learned for a source's query: it isn't an app query.
+        let query = match app_of_item {
+            Some(_) => String::new(),
+            None => l.query().text().to_string(),
+        };
+        let id = app_of_item.as_deref().unwrap_or(&m.id);
+        let Some(app) = self.apps.iter().find(|a| a.id == id).cloned() else {
             return;
         };
         let launch = (self.config.launcher.enter == LauncherEnter::Launch) != other;
@@ -2452,6 +2749,36 @@ impl WlDock {
                 let pinned = self.pins.contains(&Pin::App(w.app_id.clone()));
                 (Subject::Window(w), None, pinned, false)
             }
+            // A source's item: an app's actions if it is an installed
+            // app, else only the plugins' actions for items.
+            (None, Scope::Source(key)) => {
+                let (Some(entry), Some(item)) = (
+                    self.widgets.source(key),
+                    self.widgets.source_item(key, &m.id),
+                ) else {
+                    return;
+                };
+                let app = match &item.kind {
+                    wl_shell_lua::ItemKind::App { app } => self.apps.iter().find(|a| a.id == *app),
+                    _ => None,
+                };
+                match app {
+                    Some(app) => {
+                        let app_id = self.dock_app_id(core, app);
+                        let subject = Subject::App(self.app_subject(core, app, &app_id));
+                        (subject, None, self.pins.contains(&Pin::App(app_id)), false)
+                    }
+                    None => {
+                        let subject = Subject::Item(actions::ItemSubject {
+                            source: entry.decl.id,
+                            id: item.id,
+                            title: item.title,
+                            data: item.data,
+                        });
+                        (subject, None, false, false)
+                    }
+                }
+            }
             (None, _) => {
                 let Some(app) = self.apps.iter().find(|a| a.id == m.id) else {
                     return;
@@ -2488,6 +2815,10 @@ impl WlDock {
             plugins: &plugins,
         };
         let level = actions::actions(&subject, &cx);
+        // An item no plugin acts on has nothing to enter.
+        if level.choices.is_empty() && matches!(subject, Subject::Item(_)) {
+            return;
+        }
         // Windows… shows the windows' captures: start them now (a frame
         // each), so they are there by the time it is entered.
         let previews = self.config.windows.previews;
@@ -2752,6 +3083,7 @@ impl WlDock {
         self.clear_web();
         self.file_types.clear();
         self.pending_tab = None;
+        self.widgets.end_search();
         let Some(launcher) = &mut self.launcher else {
             return;
         };
@@ -2776,6 +3108,7 @@ impl WlDock {
         self.clear_web();
         self.file_types.clear();
         self.pending_tab = None;
+        self.widgets.end_search();
         let Some(launcher) = self.launcher.take() else {
             return;
         };
@@ -2798,7 +3131,8 @@ impl WlDock {
             || self.pending_terminal.is_some()
             || self.pending_app.is_some()
             || self.pending_window.is_some()
-            || self.pending_plugin.is_some();
+            || self.pending_plugin.is_some()
+            || self.pending_item.is_some();
         if pending {
             // Remove the launcher before starting an opener or activating
             // an existing window. Keep the focus handoff, not the animation.
@@ -2863,6 +3197,12 @@ impl WlDock {
         }
         if let Some((run, picked)) = self.pending_plugin.take() {
             self.widgets.run_action(run);
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(picked));
+            }
+        }
+        if let Some((run, picked)) = self.pending_item.take() {
+            self.widgets.open_item(run);
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(picked));
             }

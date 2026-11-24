@@ -25,6 +25,7 @@ mod outputs;
 mod pins;
 mod row;
 mod search;
+mod sources;
 mod stack;
 mod strip;
 mod stripview;

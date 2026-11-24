@@ -34,6 +34,14 @@
 //! them by subject), ask for an action's choices (`ask_choices`, answered
 //! in `Effect::choices` or dropped after its deadline) and run them
 //! (`run_action`).
+//!
+//! Their launcher sources (`launcher_sources`) are scopes of the
+//! launcher: a source's `items()` is asked for once (`ask_items`) and
+//! kept until the plugin invalidates it, reloads or fails, and its
+//! `search(query, emit)` is asked per query (`begin_search`, then
+//! `send_search` once the typing settles); sources.rs keeps both, and
+//! drops what an older query emits. `Effect::results` says a source has
+//! new items or results, `Effect::sources` that a plugin's changed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,14 +51,15 @@ use std::time::{Duration, Instant};
 use wl_shell_log::warn;
 use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
-    AppInfo, Axis, Choice, Event, InstanceSpec, Pending, PopupOn, Registry, Reply, RequestId,
-    RequestKind, Role, Runtime, Settings, Source, Span, Tile, Topic,
+    AppInfo, Axis, Choice, Event, InstanceSpec, Item, Pending, PopupOn, Registry, Reply, RequestId,
+    RequestKind, Role, Runtime, Settings, Source, SourceDecl, Span, Tile, Topic,
 };
 use wl_shell_render::icons::AppEntry;
 
 use crate::actions::{self, PluginAction, PluginRun};
 use crate::config::{Config, plugin_name_ok};
 use crate::dock;
+use crate::sources::{SourceEntry, SourceKey, Sources};
 
 /// Plugins built into the dock, by name.
 pub const BUNDLED: &[(&str, &str)] = &[
@@ -69,6 +78,11 @@ const LABEL_TIMEOUT: Duration = Duration::from_millis(500);
 const ICON_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How long a launcher action's `run` may wait for its plugin.
 const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a source's `items()` may take.
+const ITEMS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a source's `search` may take to run (what it emits later
+/// counts while its query is the latest).
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The instance of the widget on the app `app_id`.
 pub fn app_instance(app_id: &str) -> String {
@@ -286,6 +300,19 @@ pub struct Effect {
     /// A launcher action's choices, for the level that asked with this
     /// request (an error if the plugin failed).
     pub choices: Option<(RequestId, Result<Vec<Choice>, String>)>,
+    /// A launcher source has new items or search results.
+    pub results: Option<SourceKey>,
+    /// This plugin instance's sources changed (it loaded, failed, or
+    /// invalidated them): what they gave is asked for again.
+    pub sources: Option<String>,
+}
+
+/// An item of a source to run (`run(item)`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemRun {
+    pub instance: String,
+    pub source: String,
+    pub item: Item,
 }
 
 impl Effect {
@@ -332,6 +359,8 @@ pub struct Widgets {
     pub touched: Vec<PathBuf>,
     /// The files watched now.
     pub watching: Vec<PathBuf>,
+    /// The launcher sources' items and search.
+    sources: Sources,
 }
 
 impl Widgets {
@@ -595,6 +624,134 @@ impl Widgets {
         }
     }
 
+    /// The launcher sources of the plugins' own instances (as for
+    /// actions), by instance, each's in the order it declares them.
+    pub fn launcher_sources(&mut self) -> Vec<SourceEntry> {
+        let mut all: Vec<(String, SourceDecl)> = (self.registry.sources())
+            .filter(|(i, _)| i.starts_with("plugin:"))
+            .map(|(i, s)| (i.to_string(), s.clone()))
+            .collect();
+        // Stable: each instance's stay in order.
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        (all.into_iter())
+            .map(|(instance, decl)| SourceEntry {
+                key: self.sources.key(&instance, &decl.id),
+                instance,
+                decl,
+            })
+            .collect()
+    }
+
+    /// The instance of the source `key`.
+    pub fn source_instance(&self, key: SourceKey) -> Option<&str> {
+        self.sources.lookup(key).map(|(i, _)| i)
+    }
+
+    /// The source `key`, if it is (still) declared.
+    pub fn source(&self, key: SourceKey) -> Option<SourceEntry> {
+        let (instance, id) = self.sources.lookup(key)?;
+        let decl = (self.registry.get(instance)?.sources.iter()).find(|s| s.id == id)?;
+        Some(SourceEntry {
+            key,
+            instance: instance.to_string(),
+            decl: decl.clone(),
+        })
+    }
+
+    /// Ask the source `key` for its items, unless it gave them (or they
+    /// are on their way); answered in `Effect::results`.
+    pub fn ask_items(&mut self, key: SourceKey) {
+        if !self.sources.wants_items(key, Instant::now()) {
+            return;
+        }
+        let Some((instance, id)) = self.sources.lookup(key) else {
+            return;
+        };
+        let (instance, source) = (instance.to_string(), id.to_string());
+        let kind = RequestKind::Items { source };
+        if let Some(rt) = &self.runtime
+            && let Some(ticket) = rt.request(&instance, kind, ITEMS_TIMEOUT)
+        {
+            self.sources.asked(key, ticket.id, ticket.deadline);
+            self.pending.insert(&instance, ticket);
+        }
+    }
+
+    /// The items the source `key` gave, once it did.
+    pub fn source_items(&self, key: SourceKey) -> Option<&[Item]> {
+        self.sources.items(key)
+    }
+
+    /// Whether the source `key`'s items are on their way.
+    pub fn items_loading(&self, key: SourceKey) -> bool {
+        self.sources.loading(key, Instant::now())
+    }
+
+    /// The query `query` for the source `key`'s search: its generation,
+    /// for `send_search` once the typing settles. What the plugin emits
+    /// for an older one is dropped from now on.
+    pub fn begin_search(&mut self, key: SourceKey, query: &str) -> u64 {
+        self.sources.begin(key, query)
+    }
+
+    /// Ask for the search of `generation`, if it is still the latest
+    /// (a newer request of the plugin's supersedes an older one).
+    pub fn send_search(&mut self, generation: u64) {
+        let Some((key, query)) = self.sources.due(generation) else {
+            return;
+        };
+        let query = query.to_string();
+        let Some((instance, id)) = self.sources.lookup(key) else {
+            return;
+        };
+        let (instance, source) = (instance.to_string(), id.to_string());
+        let kind = RequestKind::Search {
+            source,
+            query,
+            generation,
+        };
+        if let Some(rt) = &self.runtime
+            && let Some(ticket) = rt.request(&instance, kind, SEARCH_TIMEOUT)
+        {
+            self.pending.insert(&instance, ticket);
+        }
+    }
+
+    /// The search's results, if it is the source `key`'s.
+    pub fn search_results(&self, key: SourceKey) -> Option<&[Item]> {
+        self.sources.results(key)
+    }
+
+    /// The launcher's search is over.
+    pub fn end_search(&mut self) {
+        self.sources.end();
+    }
+
+    /// The source `key`'s item `id`, among what it shows.
+    pub fn source_item(&self, key: SourceKey, id: &str) -> Option<Item> {
+        self.sources.item(key, id).cloned()
+    }
+
+    /// Run `run`'s item (`run(item)`); nobody waits for it.
+    pub fn open_item(&self, run: ItemRun) {
+        let Some(runtime) = &self.runtime else { return };
+        let kind = RequestKind::Open {
+            source: run.source,
+            item: run.item,
+        };
+        if runtime.request(&run.instance, kind, RUN_TIMEOUT).is_none() {
+            warn!("{}: not running", run.instance);
+        }
+    }
+
+    /// `instance`'s sources changed: what they gave goes.
+    fn sources_changed(&mut self, instance: &str, fx: &mut Effect) {
+        if instance.starts_with("plugin:") {
+            self.sources.forget(instance);
+            fx.sources = Some(instance.to_string());
+        }
+    }
+
     /// Set (or with None, drop) the label of `instance`'s item; true if
     /// it changed.
     fn set_label(&mut self, instance: &str, label: Option<String>) -> bool {
@@ -625,6 +782,7 @@ impl Widgets {
                 // A reloaded plugin may have no label or icon anymore.
                 fx.labels = !widget.label && self.set_label(&instance, None);
                 fx.icons = !widget.icon && self.set_icon(&instance, None);
+                self.sources_changed(&instance, &mut fx);
             }
             Event::Failed { instance, .. } => {
                 self.registry.remove(&instance);
@@ -634,6 +792,7 @@ impl Widgets {
                 fx.labels = self.set_label(&instance, None);
                 fx.icons = self.set_icon(&instance, None);
                 fx.spans = self.set_span(&instance, None);
+                self.sources_changed(&instance, &mut fx);
             }
             Event::Redraw(instance) => {
                 self.ask_label(&instance);
@@ -648,8 +807,11 @@ impl Widgets {
                 }
             }
             Event::Answer(answer) => {
+                let id = answer.id;
                 let Some((topic, answer)) = self.pending.accept_topic(answer, Instant::now())
                 else {
+                    // Items too late: asked for again when needed.
+                    fx.results = self.sources.dropped(id);
                     return fx;
                 };
                 let (instance, id) = (&answer.instance, answer.id);
@@ -660,6 +822,13 @@ impl Widgets {
                             r => Err(format!("not choices: {r:?}")),
                         });
                         fx.choices = Some((id, choices));
+                    }
+                    (result, Topic::Items) => {
+                        let items = result.and_then(|r| match r {
+                            Reply::Items(items) => Ok(items),
+                            r => Err(format!("not items: {r:?}")),
+                        });
+                        fx.results = self.sources.answered(id, items);
                     }
                     (Ok(Reply::Label(label)), _) => fx.labels = self.set_label(instance, label),
                     (Ok(Reply::Icon(tree)), _) => fx.icons = self.set_icon(instance, tree),
@@ -681,8 +850,18 @@ impl Widgets {
                 }
             }
             Event::Clipboard { text, .. } => fx.clipboard = Some(text),
-            // For the launcher's sources (not yet).
-            Event::Invalidate(_) => {}
+            Event::Invalidate(instance) => self.sources_changed(&instance, &mut fx),
+            Event::Emit {
+                instance,
+                source,
+                generation,
+                items,
+            } => {
+                let key = self.sources.key(&instance, &source);
+                if self.sources.emitted(key, generation, items) {
+                    fx.results = Some(key);
+                }
+            }
         }
         fx
     }
@@ -1218,6 +1397,175 @@ mod tests {
         // Taken: the next free name.
         w.run_action(webp);
         made("my photo-2.webp");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The SSH and calculator examples as the launcher's sources: their
+    /// triggers, the hosts asked for once and kept until invalidated,
+    /// Enter running the item; a search typed fast showing only the
+    /// latest query's results, however late the older ones come; and a
+    /// file item, which Tab gives its file's actions (Open with…).
+    #[test]
+    fn launcher_sources_from_their_triggers() {
+        use crate::actions::{self, Context, FileType, Subject};
+        use crate::launcher::{Key, Query, Scope, Triggers};
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("wl-dock-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh_config");
+        std::fs::write(&ssh, "Host alpha\n  User me\nHost beta *.example.com\n").unwrap();
+        let notes = dir.join("notes.pdf");
+        std::fs::write(&notes, "%PDF").unwrap();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/plugins/launcher-sources.lua"
+        );
+        let c = parse(&format!(
+            "[plugin.launcher-sources]\npath = '{path}'\ndry = true\n\
+             ssh_config = '{}'\nnotes = '{}'",
+            ssh.display(),
+            notes.display()
+        ));
+        w.configure(specs(&c, None, &[]));
+        let end = Instant::now() + Duration::from_secs(10);
+        let next = || recv.recv_timeout(end - Instant::now()).expect("no event");
+        while w.launcher_sources().is_empty() {
+            w.event(next());
+        }
+        let sources = w.launcher_sources();
+        let ids: Vec<&str> = sources.iter().map(|s| s.decl.id.as_str()).collect();
+        assert_eq!(ids, ["ssh", "calc", "notes"]);
+        // Their triggers enter their scopes.
+        let mut triggers = Triggers::new(Some('\''), Some('@'));
+        for s in &sources {
+            assert!(triggers.add(s.decl.trigger, Scope::Source(s.key)));
+        }
+        let scope = |text: &str| {
+            let mut q = Query::default();
+            q.edit_with(&Key::Text(text.into()), &triggers);
+            (q.scope(), q.text().to_string())
+        };
+        let (ssh_key, calc_key, notes_key) = (sources[0].key, sources[1].key, sources[2].key);
+        assert_eq!(scope(">al"), (Scope::Source(ssh_key), "al".into()));
+        assert_eq!(scope("=2*21"), (Scope::Source(calc_key), "2*21".into()));
+
+        // The hosts, once.
+        let results = |w: &mut Widgets, key| loop {
+            if w.event(next()).results == Some(key) {
+                break;
+            }
+        };
+        w.ask_items(ssh_key);
+        assert!(w.items_loading(ssh_key));
+        results(&mut w, ssh_key);
+        let hosts: Vec<&str> = (w.source_items(ssh_key).unwrap().iter())
+            .map(|i| i.title.as_str())
+            .collect();
+        assert_eq!(hosts, ["alpha", "beta"]);
+        let beta = w.source_item(ssh_key, "beta").unwrap();
+        w.open_item(ItemRun {
+            instance: sources[0].instance.clone(),
+            source: "ssh".into(),
+            item: beta,
+        });
+        let clipboard = |w: &mut Widgets| loop {
+            if let Some(text) = w.event(next()).clipboard {
+                break text;
+            }
+        };
+        assert_eq!(clipboard(&mut w), "foot ssh beta");
+
+        // Typed fast: `slow 1`, then `1+1` before the first answers. The
+        // late answer for the older query is dropped.
+        let g1 = w.begin_search(calc_key, "slow 1");
+        w.send_search(g1);
+        let g2 = w.begin_search(calc_key, "1+1");
+        // Superseded before it was sent: not sent at all.
+        let g3 = w.begin_search(calc_key, "1+1");
+        w.send_search(g2);
+        w.send_search(g3);
+        results(&mut w, calc_key);
+        let shown = |w: &Widgets| {
+            (w.search_results(calc_key).unwrap().iter())
+                .map(|i| i.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&w), ["2"]);
+        let asked = Instant::now();
+        while asked.elapsed() < Duration::from_millis(600) {
+            let Ok(e) = recv.recv_timeout(Duration::from_millis(50)) else {
+                continue;
+            };
+            assert_eq!(w.event(e).results, None, "an older query's results");
+        }
+        assert_eq!(shown(&w), ["2"]);
+        let result = w.source_item(calc_key, "result").unwrap();
+        assert_eq!(result.subtitle.as_deref(), Some("1+1"));
+        w.end_search();
+        assert_eq!(w.search_results(calc_key), None);
+
+        // A file item: a file match, whose Tab offers Open with….
+        w.ask_items(notes_key);
+        results(&mut w, notes_key);
+        let item = &w.source_items(notes_key).unwrap()[0];
+        let m = crate::app::item_match(item, Vec::new(), Vec::new(), None, &[], None);
+        let file = m.file.expect("a file match");
+        assert_eq!((file.path.as_path(), file.dir), (notes.as_path(), false));
+        let mut evince = wl_shell_render::icons::IndexedApp {
+            id: "evince".into(),
+            name: "Evince".into(),
+            generic_name: None,
+            keywords: Vec::new(),
+            categories: Vec::new(),
+            wm_class: None,
+            program: None,
+            mime_types: vec!["application/pdf".into()],
+            entry: AppEntry::default(),
+        };
+        evince.entry.desktop_id = "evince.desktop".into();
+        let apps = [evince];
+        let file_type = FileType {
+            types: vec!["application/pdf".into()],
+            assoc: Default::default(),
+        };
+        let history = |_: &str| 0.0;
+        let cx = Context {
+            apps: &apps,
+            file_type: Some(&file_type),
+            history: &history,
+            trash: false,
+            pinned: false,
+            terminal: false,
+            clipboard: false,
+            close: false,
+            plugins: &[],
+        };
+        let subject = Subject::File(actions::File {
+            path: file.path,
+            dir: file.dir,
+        });
+        let level = actions::actions(&subject, &cx);
+        let ids: Vec<&str> = level.choices.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"open-with"), "{ids:?}");
+
+        // Invalidated (here: reloaded), the hosts are asked for again.
+        std::fs::write(&ssh, "Host alpha\nHost beta\nHost gamma\n").unwrap();
+        w.reload(Path::new(path));
+        loop {
+            if w.event(next()).sources.is_some() {
+                break;
+            }
+        }
+        assert!(w.source_items(ssh_key).is_none());
+        w.ask_items(ssh_key);
+        results(&mut w, ssh_key);
+        assert_eq!(w.source_items(ssh_key).unwrap().len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

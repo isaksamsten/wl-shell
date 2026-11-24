@@ -553,3 +553,145 @@ fn launcher_actions_choose_and_run() {
     assert!(answer.result.unwrap_err().contains("budget"));
     loaded(&recv, "plugin:demo");
 }
+
+/// The SSH and calculator examples, through the runtime: `items()` is a
+/// list, `search` emits (at once, and later from a timer) with its
+/// query's generation, `run` gets the item back, and `invalidate()`
+/// says the items changed.
+#[test]
+fn launcher_sources_list_search_and_run() {
+    use wl_shell_lua::{Item, ItemKind};
+    let (rt, recv) = runtime();
+    let source = r#"
+        local config = 'Host alpha\n  User me\nHost beta *.example.com\nHost gamma\n'
+        return {
+          sources = {
+            { id = 'ssh', name = 'SSH', trigger = '>', icon = 'network-server',
+              items = function()
+                local out = {}
+                for host in ('\n' .. config):gmatch('\nHost%s+([^%s*]+)') do
+                  out[#out + 1] = { id = host, title = host, icon = 'network-server' }
+                end
+                return out
+              end,
+              run = function(item) dock.clipboard('ssh ' .. item.id) end },
+            { id = 'calc', name = 'Calculator', trigger = '=',
+              search = function(query, emit)
+                if query == 'later' then
+                  dock.timer(10, function() emit{ { id = 'late', title = 'late' } } end)
+                  return
+                end
+                local f = load('return ' .. query, 'calc', 't', { math = math })
+                local ok, v = pcall(f or error)
+                if ok and v then emit{ { id = 'result', title = tostring(v), subtitle = query } } end
+              end,
+              run = function(item) dock.clipboard(item.title) end },
+            { id = 'files', trigger = "'", items = function()
+                return { { kind = 'file', title = 'notes', path = '/tmp/notes.md' } }
+              end },
+          },
+          actions = { { id = 'refresh', run = function()
+            config = config .. 'Host delta\n'
+            dock.invalidate()
+          end } },
+        }"#;
+    let spec = InstanceSpec {
+        role: Role::Plugin,
+        ..code("plugin:demo", source)
+    };
+    rt.configure(vec![spec]);
+    let caps = loaded(&recv, "plugin:demo");
+    let triggers: Vec<char> = caps.sources.iter().map(|s| s.trigger).collect();
+    assert_eq!(triggers, ['>', '=', '\'']);
+    assert!(caps.sources[1].search && !caps.sources[0].search);
+    let ask = |kind| {
+        let ticket = rt.request("plugin:demo", kind, WAIT).unwrap();
+        next(&recv, |e| match e {
+            Event::Answer(a) if a.id == ticket.id => Some(a.result),
+            _ => None,
+        })
+    };
+    let items = |source: &str| match ask(RequestKind::Items {
+        source: source.into(),
+    }) {
+        Ok(Reply::Items(items)) => items,
+        r => panic!("no items: {r:?}"),
+    };
+    let hosts: Vec<String> = items("ssh").into_iter().map(|i| i.id).collect();
+    assert_eq!(hosts, ["alpha", "beta", "gamma"]);
+    let files = items("files");
+    assert_eq!(
+        files[0].kind,
+        ItemKind::File {
+            path: "/tmp/notes.md".into()
+        }
+    );
+    let clipboard = |recv: &Receiver<Event>| {
+        next(recv, |e| match e {
+            Event::Clipboard { text, .. } => Some(text),
+            _ => None,
+        })
+    };
+    let open = |source: &str, item: Item| {
+        let kind = RequestKind::Open {
+            source: source.into(),
+            item,
+        };
+        rt.request("plugin:demo", kind, WAIT).unwrap();
+    };
+    open("ssh", items("ssh").remove(1));
+    assert_eq!(clipboard(&recv), "ssh beta");
+
+    // A search emits with its generation.
+    let emitted = |recv: &Receiver<Event>| {
+        next(recv, |e| match e {
+            Event::Emit {
+                source,
+                generation,
+                items,
+                ..
+            } => Some((source, generation, items)),
+            _ => None,
+        })
+    };
+    let search = |query: &str, generation| {
+        let kind = RequestKind::Search {
+            source: "calc".into(),
+            query: query.into(),
+            generation,
+        };
+        rt.request("plugin:demo", kind, WAIT).unwrap();
+    };
+    search("2 * 21", 1);
+    let (source, generation, results) = emitted(&recv);
+    assert_eq!((source.as_str(), generation), ("calc", 1));
+    assert_eq!(results[0].title, "42");
+    assert_eq!(results[0].subtitle.as_deref(), Some("2 * 21"));
+    open("calc", results[0].clone());
+    assert_eq!(clipboard(&recv), "42");
+    // Later, from a timer, still with its own generation.
+    search("later", 2);
+    search("1 + 1", 3);
+    let mut got = [emitted(&recv), emitted(&recv)];
+    got.sort_by_key(|(_, g, _)| *g);
+    assert_eq!((got[0].1, got[0].2[0].title.as_str()), (2, "late"));
+    assert_eq!((got[1].1, got[1].2[0].title.as_str()), (3, "2"));
+    // An unknown source is an error, not a crash.
+    let e = ask(RequestKind::Items {
+        source: "nope".into(),
+    });
+    assert!(e.unwrap_err().contains("no source"));
+
+    // `invalidate()`: the items are asked for again, and have changed.
+    let kind = RequestKind::Run {
+        action: "refresh".into(),
+        subject: files[0].subject("files"),
+        choice: None,
+    };
+    rt.request("plugin:demo", kind, WAIT).unwrap();
+    next(&recv, |e| match e {
+        Event::Invalidate(i) if i == "plugin:demo" => Some(()),
+        _ => None,
+    });
+    assert_eq!(items("ssh").len(), 4);
+}

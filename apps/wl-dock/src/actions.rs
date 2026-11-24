@@ -52,6 +52,9 @@
 //! rest is `APP_ACTIONS`, after them. A window's own are
 //! `WINDOW_ACTIONS`, ahead of its app's.
 //!
+//! An item of a plugin's launcher source that is neither a file nor an
+//! app has no actions of its own: only the plugins' below.
+//!
 //! Plugins' actions (`[plugin.<name>]` tables whose plugin has
 //! `actions`) come after all of these, by plugin, each's in the order it
 //! declares them: those whose `when` holds for the subject as a plugin
@@ -79,7 +82,7 @@ pub const LOADING: &str = "Loading…";
 /// What a level whose plugin gave no choices (or none in time) says.
 pub const NO_CHOICES: &str = "No choices";
 /// The icon of a plugin's action or choice without one of its own.
-const PLUGIN_ICON: &str = "system-run";
+pub const PLUGIN_ICON: &str = "system-run";
 
 /// What the actions act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +90,18 @@ pub enum Subject {
     File(File),
     App(App),
     Window(WindowSubject),
+    Item(ItemSubject),
+}
+
+/// An item of a plugin's launcher source (neither a file nor an app).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemSubject {
+    /// The source's ID.
+    pub source: String,
+    pub id: String,
+    pub title: String,
+    /// The item's table, as the plugin gave it.
+    pub data: serde_json::Value,
 }
 
 /// A file or folder.
@@ -156,6 +171,7 @@ impl Subject {
                 "" => w.app_name.clone(),
                 title => title.to_string(),
             },
+            Subject::Item(i) => i.title.clone(),
         }
     }
 }
@@ -519,6 +535,7 @@ pub fn actions(subject: &Subject, cx: &Context) -> Level {
             }
             all
         }
+        Subject::Item(_) => Vec::new(),
     };
     choices.extend(plugin_actions(subject, cx));
     let placeholder = choices.first().map(|c| c.name.clone()).unwrap_or_default();
@@ -551,6 +568,12 @@ pub fn lua_subject(subject: &Subject, cx: &Context) -> wl_shell_lua::Subject {
             title: w.title.clone(),
             app_id: w.app_id.clone(),
             app_name: w.app_name.clone(),
+        },
+        Subject::Item(i) => wl_shell_lua::Subject::Item {
+            source: i.source.clone(),
+            id: i.id.clone(),
+            title: i.title.clone(),
+            data: i.data.clone(),
         },
     }
 }

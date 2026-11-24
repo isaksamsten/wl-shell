@@ -83,6 +83,12 @@
 //! and, dimmed after it, the app's name (`Match::detail`); the bar
 //! completes the title inline, or shows it at the end with the app after.
 //!
+//! A plugin's launcher source (its trigger typed first): the front shows
+//! the source's icon while nothing matches, the bar its name as the
+//! placeholder and, with a query, a status at the end while nothing
+//! matches (`set_source`). An item's pill has its title and its
+//! subtitle dimmed after it (`Match::detail`).
+//!
 //! Texts (the query, the completion, the name) are lines from the worker;
 //! a line shows its last text until the new one arrives. Icons come from
 //! the shared cache.
@@ -330,6 +336,17 @@ pub struct FileMatch {
 pub struct FilesStatus {
     /// Under the query while nothing is selected: how far the search got.
     pub progress: Option<String>,
+}
+
+/// A plugin's launcher source, as the bar shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceLook {
+    /// The placeholder.
+    pub name: String,
+    /// The front's icon while nothing matches: theme names, best first.
+    pub icons: Vec<String>,
+    /// At the bar's end while nothing matches a query (Loading…).
+    pub status: Option<String>,
 }
 
 /// What the pointer did on the launcher.
@@ -837,6 +854,8 @@ pub struct LauncherView {
     /// Scrolling not yet rolled, in steps.
     scrolled: f64,
     files: FilesStatus,
+    /// The source searched, in its scope.
+    source: SourceLook,
     /// Files' icons from the worker (thumbnails or type icons, best
     /// first), and the files asked for.
     file_icons: HashMap<PathBuf, Vec<String>>,
@@ -941,6 +960,7 @@ impl LauncherView {
             rolled: false,
             scrolled: 0.0,
             files: FilesStatus::default(),
+            source: SourceLook::default(),
             file_icons: HashMap::new(),
             asked_icons: HashSet::new(),
             morph: Spring::new(0.0, response),
@@ -1090,7 +1110,7 @@ impl LauncherView {
         }
         self.caret_buffer = cache::color_buffer(&self.g, caret, &self.qh).ok();
         self.divider_buffer = cache::color_buffer(&self.g, divider, &self.qh).ok();
-        for scope in [Scope::Apps, Scope::Files, Scope::Windows] {
+        for scope in [Scope::Apps, Scope::Files, Scope::Windows, Scope::Source(0)] {
             self.search_key(scope)
                 .inspect(|k| self.assets.named_icon(k));
         }
@@ -1162,8 +1182,8 @@ impl LauncherView {
         }
     }
 
-    /// The front's icon while there is no match: a search icon, or a
-    /// folder for files.
+    /// The front's icon while there is no match: a search icon, a
+    /// folder for files, or a source's own.
     fn search_key(&self, scope: Scope) -> Option<NamedIcon> {
         let a = self.attached.as_ref()?;
         let names: &[&str] = match scope {
@@ -1171,6 +1191,11 @@ impl LauncherView {
             Scope::Files => &files::FOLDER_ICONS,
             Scope::Windows => WINDOWS_ICONS,
             Scope::Bang => &["web-browser"],
+            Scope::Source(_) => {
+                let own = self.source.icons.iter().cloned();
+                let names = own.chain(SEARCH_ICONS.iter().map(|s| s.to_string()));
+                return Self::named(a, self.scale, false, names.collect());
+            }
         };
         let names = names.iter().map(|s| s.to_string()).collect();
         Self::named(a, self.scale, false, names)
@@ -1453,6 +1478,20 @@ impl LauncherView {
         }
     }
 
+    /// How the source searched looks (in its scope).
+    pub fn set_source(&mut self, look: SourceLook) {
+        if look == self.source {
+            return;
+        }
+        let icons = look.icons != self.source.icons;
+        self.source = look;
+        if icons && let Some(k) = self.search_key(Scope::Source(0)) {
+            self.assets.named_icon(&k);
+        }
+        self.sync_texts();
+        self.kick();
+    }
+
     /// Roll the drum `by` steps (positive: the next match comes to the
     /// front).
     pub fn roll(&mut self, by: i32) {
@@ -1556,7 +1595,7 @@ impl LauncherView {
                 };
                 (path, inline, after)
             }
-            Scope::Apps | Scope::Actions => {
+            Scope::Apps | Scope::Actions | Scope::Source(_) => {
                 let name = selected.map(|m| m.name.as_str());
                 // With nothing typed: among actions, the selected choice's
                 // name (the default's at first); else the placeholder.
@@ -1564,6 +1603,7 @@ impl LauncherView {
                     Scope::Actions => (name.filter(|n| !n.is_empty()))
                         .or_else(|| self.level().map(|l| l.placeholder.as_str()))
                         .unwrap_or(""),
+                    Scope::Source(_) => self.source.name.as_str(),
                     _ => PLACEHOLDER,
                 };
                 let fallback = selected.filter(|m| m.id == crate::engines::FALLBACK);
@@ -1579,7 +1619,11 @@ impl LauncherView {
                     (None, Completion::After(name)) => (None, Some(name)),
                 };
                 let inline = inline.map(|t| line(t, style.completion));
-                let after = after.map(|t| line(t, style.completion));
+                // A source's status (Loading…) while nothing matches.
+                let status = (matches!(scope, Scope::Source(_)) && selected.is_none())
+                    .then(|| self.source.status.clone())
+                    .flatten();
+                let after = after.or(status).map(|t| line(t, style.completion));
                 (None, inline, after)
             }
             Scope::Windows => {

@@ -59,7 +59,10 @@ files and `launcher.files.exclude` are skipped, symlinks aren't followed, and
 the walk stays on one file system.
 
 Tab on a file or application shows what you can do with it. Lua plugins can
-add their own actions there; see [PLUGINS.md](PLUGINS.md#launcher-actions).
+add their own actions there, and searches of their own behind a trigger
+character (say, `>` for SSH hosts or `=` for a calculator); see
+[PLUGINS.md](PLUGINS.md#launcher-actions) and
+[launcher sources](PLUGINS.md#launcher-sources).
 
 Start the query with `@` to search every open window by title or app name, on
 any output. The drum shows each window's capture, and `@` followed by Enter goes

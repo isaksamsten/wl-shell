@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::subject::{Choice, Subject};
+use crate::subject::{Choice, Item, Subject};
 use crate::ui::Node;
 
 /// Which plugin state a request goes to: one per widget placement, one
@@ -62,8 +62,8 @@ pub struct Tile {
 }
 
 /// What is asked. Widgets ask for their label, icon and popup and tell
-/// of interaction; the launcher asks for an action's choices and runs
-/// actions. The launcher's sources will be added as kinds.
+/// of interaction; the launcher asks for an action's choices, runs
+/// actions, and asks its sources for items.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum RequestKind {
@@ -91,6 +91,22 @@ pub enum RequestKind {
         subject: Subject,
         choice: Option<Choice>,
     },
+    /// The source `source`'s `items()`.
+    Items {
+        source: String,
+    },
+    /// The source `source`'s `search(query, emit)`: what it emits comes
+    /// as [`Event::Emit`](crate::Event::Emit) with `generation`.
+    Search {
+        source: String,
+        query: String,
+        generation: u64,
+    },
+    /// The source `source`'s `run(item)`.
+    Open {
+        source: String,
+        item: Item,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,7 +127,9 @@ impl RequestKind {
             | RequestKind::Visibility(_)
             | RequestKind::Click(_) => Topic::Interaction,
             RequestKind::Choices { .. } => Topic::Choices,
-            RequestKind::Run { .. } => Topic::Run,
+            RequestKind::Run { .. } | RequestKind::Open { .. } => Topic::Run,
+            RequestKind::Items { .. } => Topic::Items,
+            RequestKind::Search { .. } => Topic::Search,
         }
     }
 }
@@ -127,8 +145,12 @@ pub enum Topic {
     Interaction,
     /// An action's choices: a level waits for them.
     Choices,
-    /// Running an action: nobody waits for it.
+    /// Running an action or an item: nobody waits for it.
     Run,
+    /// A source's items: its scope waits for them.
+    Items,
+    /// A source's search for a query: a newer one supersedes it.
+    Search,
 }
 
 /// An answer's payload.
@@ -142,6 +164,8 @@ pub enum Reply {
     Popup(Option<Arc<Node>>),
     /// An action's choices, in order.
     Choices(Vec<Choice>),
+    /// A source's items, in order.
+    Items(Vec<Item>),
     Done,
 }
 

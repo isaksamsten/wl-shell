@@ -53,6 +53,15 @@ pub enum Event {
     Redraw(InstanceId),
     /// The plugin's items changed (`invalidate()`), for the launcher.
     Invalidate(InstanceId),
+    /// A source's `search` emitted results for the query of
+    /// `generation` (the request's): they replace what it emitted for
+    /// it before. The host drops those of an older query.
+    Emit {
+        instance: InstanceId,
+        source: String,
+        generation: u64,
+        items: Vec<crate::subject::Item>,
+    },
     /// `clipboard(text)`.
     Clipboard {
         instance: InstanceId,
@@ -363,6 +372,22 @@ impl Slot {
                             choice,
                         } => {
                             let outcome = state.run(&action, &subject, choice.as_ref());
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
+                        RequestKind::Items { source } => {
+                            let outcome = state.items(&source);
+                            self.settle(life, shared, outcome).map(Reply::Items)
+                        }
+                        RequestKind::Search {
+                            source,
+                            query,
+                            generation,
+                        } => {
+                            let outcome = state.search(&source, &query, generation);
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
+                        RequestKind::Open { source, item } => {
+                            let outcome = state.open(&source, &item);
                             self.settle(life, shared, outcome).map(|()| Reply::Done)
                         }
                     },

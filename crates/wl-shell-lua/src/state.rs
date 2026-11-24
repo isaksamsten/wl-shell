@@ -15,7 +15,7 @@ use crate::channel::{InstanceId, Tile};
 use crate::host;
 use crate::runtime::{Job, Link, Settings, lock};
 use crate::spec::{AppInfo, InstanceSpec, Role};
-use crate::subject::{Choice, MAX_CHOICES, Subject};
+use crate::subject::{Choice, Item, MAX_CHOICES, MAX_ITEMS, MAX_RESULTS, Subject};
 use crate::ui::{Builder, Node};
 
 /// The budget is counted in steps of this many instructions.
@@ -448,6 +448,62 @@ impl State {
                 None => Value::Nil,
             };
             f.call::<()>((subject.to_lua(&self.lua)?, choice))
+        })
+    }
+
+    /// The launcher source `id`'s table.
+    fn source(&self, id: &str) -> mlua::Result<Table> {
+        let sources: Table = self.plugin.get("sources")?;
+        for t in sources.sequence_values::<Table>() {
+            let t = t?;
+            if t.get::<Option<String>>("id")?.as_deref() == Some(id) {
+                return Ok(t);
+            }
+        }
+        Err(mlua::Error::runtime(format!("no source {id:?}")))
+    }
+
+    /// The source `source`'s `items()`: the list of its items.
+    pub fn items(&self, source: &str) -> Outcome<Vec<Item>> {
+        self.enter("items", || {
+            let f: Function = self.source(source)?.get("items")?;
+            let v = f.call::<Value>(())?;
+            Item::list(&self.lua, v, MAX_ITEMS).map_err(mlua::Error::runtime)
+        })
+    }
+
+    /// The source `source`'s `search(query, emit)` for the query of
+    /// `generation`. Each `emit(items)` (during the call or later, from a
+    /// timer or a process) is an [`Event::Emit`](crate::Event::Emit); a
+    /// list `search` returns is emitted too.
+    pub fn search(&self, source: &str, query: &str, generation: u64) -> Outcome<()> {
+        self.enter("search", || {
+            let f: Function = self.source(source)?.get("search")?;
+            let id = source.to_string();
+            let emit = self.lua.create_function(move |lua, v: Value| {
+                let items = Item::list(lua, v, MAX_RESULTS)
+                    .map_err(|e| mlua::Error::runtime(format!("emit: {e}")))?;
+                let host = host(lua)?;
+                host.link.emit(crate::Event::Emit {
+                    instance: host.instance.clone(),
+                    source: id.clone(),
+                    generation,
+                    items,
+                });
+                Ok(())
+            })?;
+            match f.call::<Value>((query, emit.clone()))? {
+                v @ Value::Table(_) => emit.call::<()>(v),
+                _ => Ok(()),
+            }
+        })
+    }
+
+    /// The source `source`'s `run(item)`.
+    pub fn open(&self, source: &str, item: &Item) -> Outcome<()> {
+        self.enter("run", || {
+            let f: Function = self.source(source)?.get("run")?;
+            f.call::<()>(item.to_lua(&self.lua)?)
         })
     }
 
