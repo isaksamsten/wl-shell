@@ -76,7 +76,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wl_shell_core::dnd::DragIcon;
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::reexports::calloop::RegistrationToken;
-use wl_shell_core::{Core, Shell};
+use wl_shell_core::{Core, FrameClock, Shell};
 use wl_shell_log::warn;
 use wl_shell_notes::due::{self, Local, Preset, TimeOfDay};
 use wl_shell_notes::{Color, PRESETS};
@@ -696,7 +696,8 @@ pub struct Column {
     press: Option<Press>,
     keyboard: KeyboardInteractivity,
     frame_pending: bool,
-    last_frame: Option<Instant>,
+    /// The time of the last frame drawn while anything moves.
+    clock: FrameClock,
     /// Buffers attached by the last frame.
     attached: Vec<WlBuffer>,
     /// On its way out, e.g. to another output: its notes slide away, and
@@ -918,7 +919,7 @@ impl Column {
             press: None,
             keyboard: KeyboardInteractivity::None,
             frame_pending: false,
-            last_frame: None,
+            clock: FrameClock::default(),
             attached: Vec::new(),
             retiring: false,
         };
@@ -3192,24 +3193,23 @@ impl Column {
         if !self.configured || self.frame_pending {
             return;
         }
-        if self.last_frame.is_none() {
-            self.last_frame = Some(Instant::now());
-        }
+        self.clock.start();
         self.request_frame();
         self.layer.commit();
     }
 
-    /// The frame callback: advance the springs and draw.
-    pub fn frame_done(&mut self) {
+    /// The frame callback, with its timestamp: advance the springs and draw.
+    pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
-        let now = Instant::now();
-        let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        let dt = self.clock.tick(time);
         let moving = self.deck.advance(dt);
         for slot in &mut self.row_slots {
             slot.out.advance(dt);
         }
         let moving = moving || self.row_moving();
-        self.last_frame = moving.then_some(now);
+        if !moving {
+            self.clock.stop();
+        }
         self.render();
     }
 

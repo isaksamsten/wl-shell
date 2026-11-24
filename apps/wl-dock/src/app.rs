@@ -4931,15 +4931,15 @@ impl Program for WlDock {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, _: u32) {
+    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, time: u32) {
         if (self.launcher.as_ref()).is_some_and(|l| l.surface() == surface) {
             self.files_frame();
         }
         if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.surface() == surface) {
-            launcher.frame_done();
+            launcher.frame_done(time);
         }
         if let Some(dock) = self.dock_on(surface) {
-            dock.frame_done();
+            dock.frame_done(time);
         }
     }
 

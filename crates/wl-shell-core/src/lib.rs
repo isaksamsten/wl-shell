@@ -5,6 +5,7 @@ pub mod capture;
 pub mod dmabuf;
 pub mod dnd;
 pub mod focus;
+pub mod frame_clock;
 pub mod globals;
 pub mod input;
 pub mod list;
@@ -16,6 +17,7 @@ pub mod spawn;
 pub mod stream;
 pub mod toplevel;
 
+pub use frame_clock::FrameClock;
 pub use shell::{Core, Error, Program, Shell};
 
 /// The crates programs build on, so they use the same versions.

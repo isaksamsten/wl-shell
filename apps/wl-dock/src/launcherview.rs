@@ -98,7 +98,6 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use smithay_client_toolkit::compositor::{FrameCallbackData, Region};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind};
@@ -113,7 +112,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::{Globals, Ignore};
-use wl_shell_core::{Core, Shell};
+use wl_shell_core::{Core, FrameClock, Shell};
 use wl_shell_log::warn;
 use wl_shell_render::icons::{self, NamedIcon};
 use wl_shell_render::worker::{Assets, PillRequest};
@@ -877,7 +876,8 @@ pub struct LauncherView {
     /// Buffers replaced by new texts, destroyed after the next commit.
     stale: Vec<WlBuffer>,
     frame_pending: bool,
-    last_frame: Option<Instant>,
+    /// The time of the last frame drawn while anything moves.
+    clock: FrameClock,
 }
 
 impl LauncherView {
@@ -973,7 +973,7 @@ impl LauncherView {
             bar_at: Rect::default(),
             stale: Vec::new(),
             frame_pending: false,
-            last_frame: None,
+            clock: FrameClock::default(),
         })
     }
 
@@ -1983,9 +1983,7 @@ impl LauncherView {
         if !self.configured || self.frame_pending {
             return;
         }
-        if self.last_frame.is_none() {
-            self.last_frame = Some(Instant::now());
-        }
+        self.clock.start();
         self.request_frame();
         self.layer.commit();
     }
@@ -2007,10 +2005,10 @@ impl LauncherView {
             || self.pinned.iter().any(|p| !p.t.settled())
     }
 
-    pub fn frame_done(&mut self) {
+    /// The frame callback, with its timestamp: advance the springs and draw.
+    pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
-        let now = Instant::now();
-        let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        let dt = self.clock.tick(time);
         let mut moving = self.morph.advance(dt);
         moving |= self.roll.advance(dt);
         moving |= self.searching.advance(dt);
@@ -2037,7 +2035,9 @@ impl LauncherView {
         if self.slide.settled() {
             self.ghost.forget(true, &mut self.stale);
         }
-        self.last_frame = moving.then_some(now);
+        if !moving {
+            self.clock.stop();
+        }
         self.render();
     }
 

@@ -318,16 +318,16 @@ impl Program for Expose {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, _: u32) {
+    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, time: u32) {
         if let Some(overlay) = &mut self.overlay
             && overlay.surface() == surface
         {
-            overlay.frame_done();
+            overlay.frame_done(time);
         }
         if let Some(closing) = &mut self.closing
             && closing.surface() == surface
         {
-            closing.frame_done();
+            closing.frame_done(time);
             if closing.closed() {
                 self.closing = None;
             }

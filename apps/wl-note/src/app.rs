@@ -2869,9 +2869,9 @@ impl Program for WlNote {
         }
     }
 
-    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface, _: u32) {
+    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface, time: u32) {
         if let Some(column) = self.columns.iter_mut().find(|c| c.surface() == surface) {
-            column.frame_done();
+            column.frame_done(time);
             column.update_row_hover(core);
             self.trim = true;
         }

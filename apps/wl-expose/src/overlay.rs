@@ -57,7 +57,7 @@ use wayland_protocols::{
     },
 };
 
-use wl_shell_core::Shell;
+use wl_shell_core::{FrameClock, Shell};
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId, Frame};
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::toplevel::Toplevel;
@@ -703,6 +703,10 @@ pub struct Overlay {
     trace: Option<Instant>,
     /// A frame callback for an animation is pending.
     frame_pending: bool,
+    /// The time of the last frame while animations run.
+    clock: FrameClock,
+    /// The time animations were last advanced to; they never go back.
+    animated_to: Instant,
     /// The card's final rect; the layout is inside it unless the margin is
     /// negative.
     card_rect: IRect,
@@ -892,6 +896,8 @@ impl Overlay {
             blank: false,
             trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
             frame_pending: false,
+            clock: FrameClock::default(),
+            animated_to: Instant::now(),
             card_rect: IRect::default(),
             content_rect: IRect::default(),
             content_shown: false,
@@ -1139,7 +1145,7 @@ impl Overlay {
         for sub in self.all_subs() {
             sub.start_fade(&g, 1.0, &qh); // corrected by apply_alpha
         }
-        self.animate(); // applies the alphas, requests a frame
+        self.animate(Instant::now()); // applies the alphas, requests a frame
         self.commit_parent();
         true
     }
@@ -1495,11 +1501,14 @@ impl Overlay {
     }
 
     /// Advance the opening and start zoom animations toward the current
-    /// targets, advance them to now and place the windows that moved, then
-    /// advance the closing fade-out. Until mapped, zooms jump to their
+    /// targets, advance them to `now` and place the windows that moved,
+    /// then advance the closing fade-out. Until mapped, zooms jump to their
     /// targets. The parent commit is the caller's.
-    fn animate(&mut self) {
-        let now = Instant::now();
+    fn animate(&mut self, now: Instant) {
+        // A frame's time can trail the clock that input (and with it a
+        // started animation) went by.
+        let now = now.max(self.animated_to);
+        self.animated_to = now;
         let opening = self.opening.is_some();
         let mut running = self.animate_opening(now);
         let duration = self.style.zoom_duration;
@@ -1547,19 +1556,24 @@ impl Overlay {
         }
     }
 
-    /// The frame callback of the animations: draw their next step. The first
-    /// one after mapping starts the opening.
-    pub fn frame_done(&mut self) {
+    /// The frame callback of the animations, with its timestamp: draw their
+    /// next step. The first one after mapping starts the opening.
+    pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
+        let now = self.clock.frame(time).max(self.animated_to);
         if let Some(o) = &mut self.opening
             && o.start.is_none()
         {
-            o.start = Some(Instant::now());
+            o.start = Some(now);
             if let Some(t0) = self.trace {
                 trace(t0, format_args!("first frame shown, opening starts"));
             }
         }
-        self.animate();
+        self.animate(now);
+        // Nothing asked for another frame: nothing runs.
+        if !self.frame_pending {
+            self.clock.stop();
+        }
         self.place_pill();
         self.commit_parent();
     }
@@ -1751,7 +1765,7 @@ impl Overlay {
         if let Some(win) = self.selected.and_then(|i| self.windows.get(i)) {
             win.sub.subsurface.place_below(&self.stack_top.surface);
         }
-        self.animate();
+        self.animate(Instant::now());
         self.update_pill();
         self.commit_parent();
     }

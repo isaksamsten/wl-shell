@@ -92,7 +92,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use smithay_client_toolkit::{
     compositor::{FrameCallbackData, Region},
@@ -119,7 +119,7 @@ use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::popup::PopupConfigure;
 use wl_shell_core::reexports::calloop::timer::{TimeoutAction, Timer};
 use wl_shell_core::reexports::calloop::{LoopHandle, RegistrationToken};
-use wl_shell_core::{Core, Shell};
+use wl_shell_core::{Core, FrameClock, Shell};
 use wl_shell_log::warn;
 use wl_shell_lua::channel::PopupEvent;
 use wl_shell_render::bubble::Bubble;
@@ -650,7 +650,8 @@ pub struct DockView {
     widget_icons: BTreeMap<String, WidgetIcon>,
 
     frame_pending: bool,
-    last_frame: Option<Instant>,
+    /// The time of the last frame drawn while anything moves.
+    clock: FrameClock,
 
     /// The output's logical size.
     output_size: Option<(f64, f64)>,
@@ -798,7 +799,7 @@ impl DockView {
             widget_names: BTreeMap::new(),
             widget_icons: BTreeMap::new(),
             frame_pending: false,
-            last_frame: None,
+            clock: FrameClock::default(),
             output_size: None,
             previews: Vec::new(),
             frozen: false,
@@ -2274,9 +2275,7 @@ impl DockView {
         if !self.configured || self.frame_pending {
             return;
         }
-        if self.last_frame.is_none() {
-            self.last_frame = Some(Instant::now());
-        }
+        self.clock.start();
         self.request_frame();
         self.layer.commit();
     }
@@ -2300,11 +2299,10 @@ impl DockView {
             || !self.badge_alpha.settled()
     }
 
-    /// The frame callback: advance the springs and draw.
-    pub fn frame_done(&mut self) {
+    /// The frame callback, with its timestamp: advance the springs and draw.
+    pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
-        let now = Instant::now();
-        let dt = (self.last_frame).map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        let dt = self.clock.tick(time);
         let mut moving = self.hover.advance(dt);
         moving |= self.pointer.advance(dt);
         moving |= self.label_alpha.advance(dt);
@@ -2348,7 +2346,9 @@ impl DockView {
                 self.widget = None;
             }
         }
-        self.last_frame = moving.then_some(now);
+        if !moving {
+            self.clock.stop();
+        }
         self.render();
     }
 

@@ -40,7 +40,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
 
 use smithay_client_toolkit::{
     compositor::{FrameCallbackData, Region},
@@ -61,7 +60,7 @@ use wayland_protocols::{
     },
 };
 
-use wl_shell_core::Shell;
+use wl_shell_core::{FrameClock, Shell};
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_log::warn;
@@ -92,9 +91,6 @@ const CARD_GAP: f64 = 16.0;
 const TITLE_INSET: f64 = 10.0;
 /// How much the icon the selected card grows out of grows with it.
 const MORPH_ICON_GROWTH: f64 = 1.5;
-/// Frame timestamps further apart than this, ms, are a gap (or odd): the
-/// clock measures that frame instead.
-const MAX_FRAME_MS: u32 = 250;
 
 /// The widest a label gets, logical pixels.
 pub fn label_max_width(config: &Config) -> i32 {
@@ -336,10 +332,8 @@ pub struct Overlay {
     /// The selected card, fractional while moving.
     strip_sel: Spring,
     frame_pending: bool,
-    /// When the last frame was drawn, by the clock and by the compositor's
-    /// timestamp; None while nothing moves.
-    last_frame: Option<Instant>,
-    last_time: Option<u32>,
+    /// The time of the last frame drawn while anything moves.
+    clock: FrameClock,
 }
 
 /// The most cards any app needs.
@@ -485,8 +479,7 @@ impl Overlay {
             strip_offset: Spring::new(0.0, response),
             strip_sel: Spring::new(0.0, response),
             frame_pending: false,
-            last_frame: None,
-            last_time: None,
+            clock: FrameClock::default(),
         };
         if overlay.switcher.mode() == Mode::Windows {
             // Previews are needed right away; nothing moves yet.
@@ -900,7 +893,7 @@ impl Overlay {
         self.visible = true;
         self.open.snap(0.0);
         self.open.retarget(1.0);
-        self.last_frame = Some(Instant::now());
+        self.clock.restart();
         self.render();
     }
 
@@ -1141,9 +1134,7 @@ impl Overlay {
         if !self.visible || self.frame_pending {
             return;
         }
-        if self.last_frame.is_none() {
-            self.last_frame = Some(Instant::now());
-        }
+        self.clock.start();
         self.request_frame();
         self.layer.commit();
     }
@@ -1166,23 +1157,14 @@ impl Overlay {
     /// the captures that waited for rest, and draw.
     pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
-        let now = Instant::now();
-        // By the compositor's timestamps, which step evenly from frame to
-        // frame, unlike when the callback gets handled (after whatever else
-        // the loop had to do). The first frame of a movement, or one after
-        // a gap or an odd timestamp, goes by the clock.
-        let step = self.last_time.map(|t| time.wrapping_sub(t));
-        let dt = match (step, self.last_frame) {
-            (Some(ms @ 1..=MAX_FRAME_MS), _) => ms as f64 / 1000.0,
-            (_, Some(t)) => now.saturating_duration_since(t).as_secs_f64(),
-            (_, None) => 0.0,
-        };
+        let dt = self.clock.tick(time);
         let mut moving = false;
         for s in self.springs() {
             moving |= s.advance(dt);
         }
-        self.last_frame = moving.then_some(now);
-        self.last_time = moving.then_some(time);
+        if !moving {
+            self.clock.stop();
+        }
         if !moving && self.captures_stale && !self.closing() {
             self.update_captures(true);
         }
