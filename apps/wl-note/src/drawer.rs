@@ -52,7 +52,7 @@ impl Kind {
     /// What the margin says (before it is uppercased).
     pub fn label(self) -> &'static str {
         match self {
-            Self::Hidden => "Hidden",
+            Self::Hidden => "Archive",
             Self::Due => "Due",
             Self::Templates => "Templates",
         }
@@ -62,8 +62,8 @@ impl Kind {
     /// scope.
     pub fn empty(self, elsewhere: bool) -> &'static str {
         match (self, elsewhere) {
-            (Self::Hidden, false) => "No hidden notes",
-            (Self::Hidden, true) => "No hidden notes here (Tab: all)",
+            (Self::Hidden, false) => "No archived notes",
+            (Self::Hidden, true) => "No archived notes here (Tab: all)",
             (Self::Due, false) => "No notes with a due time",
             (Self::Due, true) => "No due notes here (Tab: all)",
             (Self::Templates, _) => "No templates in .templates",
