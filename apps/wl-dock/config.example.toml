@@ -259,7 +259,7 @@
 # A widget is a Lua plugin behind an app's item, or an item of its own: it
 # can set the item's label, draw its icon and show a popup. A plugin name
 # is looked up as plugins/<name>.lua next to this file, then among the
-# bundled plugins (calc, clock, convert, player, unread). Plugin files are reloaded on save.
+# bundled plugins (calc, calendar, clock, convert, player, recent, unread). Plugin files are reloaded on save.
 
 #[app.foot]
 #widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
@@ -296,6 +296,13 @@
 #plugin = "player"
 #name = "Now Playing"
 #span = 2                        # 1.5 or 2: wider on a bottom dock, with the title beside the cover
+
+# An app's recent documents (from recently-used.xbel) in a popup on hover,
+# with thumbnails; clicking one opens it in the app again.
+#[app."org.gnome.Papers"]
+#widget = "recent"
+# Names the app records files under, if the dock's names don't match:
+# widget = { plugin = "recent", apps = ["soffice"], count = 8 }
 
 #[plugin.clock]                  # Defaults for every placement of the plugin
 #path = "~/src/clock.lua"        # Optional; default lookup by name

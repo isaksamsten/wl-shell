@@ -284,6 +284,94 @@ local time. The sandbox has no time zone database, so a time with a `TZID`
 is read as local time. The agenda lists at most 100 events and counts the
 rest.
 
+### `recent`
+
+Lists the files an app opened last, like the dock menus on macOS. Put it on
+an app, and hovering the app's item shows a popup with its recent files,
+newest first. Each file has its thumbnail (or an icon for its type), its
+folder, and when it was opened. Clicking a file opens it in that app again.
+
+```toml
+[app."org.gnome.Papers"]
+widget = "recent"
+
+[app.libreoffice-writer]
+widget = { plugin = "recent", apps = ["soffice"] }
+
+[widget.recent]                # Standalone: every app's recent files
+name = "Recent Documents"
+```
+
+The list comes from `~/.local/share/recently-used.xbel`. GTK apps, and
+others that use the same file, record there each file they open and which
+app opened it. The plugin watches the file, so the list updates as apps
+open files. Files that no longer exist are left out. Thumbnails come from
+the freedesktop thumbnail cache (`~/.cache/thumbnails`), as the file
+manager made them. An image without a thumbnail shows itself.
+
+An app records itself by a name and a command, such as `Document Viewer`
+and `papers`. A file is the app's if either one matches one of the dock's
+names for the app: its ID, desktop entry, `StartupWMClass` or name. Case,
+spaces and punctuation don't count, and a reverse-DNS ID also matches by
+its last part, so `org.gnome.Papers` matches `papers`. A file manager
+records the files it opens in other apps under its own name, so those
+files show on both items. If an app's files don't show, check the
+`bookmark:application` names in the file and add them to `apps`.
+
+As a standalone widget, a left click opens the popup, which lists the
+recent files of every app. With `apps` set, it lists only those apps'
+files. Each file opens in the app that used it last.
+
+| Option       | Default                               | Meaning                                                                                                                       |
+| ------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `count`      | `10`                                  | Files shown (1–12)                                                                                                            |
+| `apps`       | —                                     | More names the app records files under, e.g. `["soffice"]`. Standalone: list only these apps' files                           |
+| `thumbnails` | `true`                                | `false` shows type icons only                                                                                                 |
+| `open`       | `"app"`                               | `"app"`: the command the app recorded, else `xdg-open`; `"default"`: always `xdg-open`; or an argv with `{path}` and `{uri}` |
+| `file`       | `$XDG_DATA_HOME/recently-used.xbel`   | The bookmark file to read                                                                                                     |
+
+### `downloads`
+
+Shows a browser's downloads in progress as a ring around its icon (or a
+bar along its bottom), and lists finished downloads in a popup, where a
+click opens one. It watches the download folder with `dock.watch`. Firefox
+writes a download to `name.part` and Chromium-based browsers to
+`name.crdownload`, and the file gets its real name when it is done. A
+partial file doesn't say how big the download will be, so the ring turns a
+step each time data arrives instead of filling. If the browser also
+publishes its progress over Unity LauncherEntry, as Chromium does, the
+ring fills to that. With several downloads at once, a badge counts them.
+The label shows the file name, its size so far and the speed, or
+_Waiting_ when nothing has arrived for a few seconds. When the last
+download finishes, the ring stays full for a moment.
+
+```toml
+[app.firefox]
+widget = "downloads"
+
+[app.chromium]
+widget = { plugin = "downloads", style = "bar" }
+
+[widget.downloads]             # Standalone: every browser's downloads
+name = "Downloads"
+```
+
+On an app, the plugin only follows that browser's kind of file, guessed
+from the app's names (Firefox, LibreWolf, Zen… or Chromium, Chrome, Brave,
+Vivaldi, Edge…). While nothing is downloading and nothing has finished
+since the plugin started, the browser keeps its own icon, label and no
+popup. A finished download leaves the list when its file is moved or
+deleted. A cancelled download doesn't show up in the list.
+
+| Option     | Default                                 | Meaning                                                                                 |
+| ---------- | --------------------------------------- | --------------------------------------------------------------------------------------- |
+| `folders`  | The XDG download folder, else `~/Downloads` | Folders to watch: a string or a list                                                |
+| `browser`  | Guessed from the app; standalone `"all"` | `"firefox"` (`.part`), `"chromium"` (`.crdownload`) or `"all"`                         |
+| `style`    | `"ring"`                                | `"ring"` around the icon or `"bar"` along its bottom                                    |
+| `keep`     | `5`                                     | Finished downloads listed (0–20)                                                        |
+| `open`     | `["xdg-open"]`                          | argv that opens a finished download, with its path added at the end                     |
+| `interval` | `1000`                                  | The shortest time in ms between looks at the folders while files change (at least 250) |
+
 The sources in [`plugins/`](plugins) are good starting points for your own
 plugins.
 

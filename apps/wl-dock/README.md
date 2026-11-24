@@ -322,7 +322,8 @@ A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
 The bundled plugins include `clock`, `player` for MPRIS playback,
-`unread` for apps that publish a launcher count, progress or urgency over D-Bus, `convert`,
+`unread` for apps that publish a launcher count, progress or urgency over D-Bus,
+`downloads` for a browser's download progress and finished downloads, `convert`,
 which adds Convert image… to the launcher's actions on images, and `calc`, a
 calculator behind `=` in the launcher with functions, bases and unit
 conversions (`=10 km in mi`). Enable those two with an empty
@@ -334,6 +335,9 @@ widget = "player"              # or { plugin = "player", player = "spotify" }
 
 [app."co.hyprlab.Hylki"]
 widget = "unread"              # Shows the app's published count, progress and urgency
+
+[app.firefox]
+widget = "downloads"           # A progress ring while Firefox downloads; recent downloads on hover
 
 [widget.clock]                 # Shown while `@clock` is pinned
 name = "Clock"
