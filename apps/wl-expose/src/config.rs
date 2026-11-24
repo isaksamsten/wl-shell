@@ -14,6 +14,8 @@ use serde::{Deserialize, Deserializer};
 use wl_shell_config::{ConfigFile, Scheme, de, file::resolve};
 use wl_shell_render::{shadow, text};
 
+use crate::close_button;
+
 pub type Appearance = wl_shell_config::Appearance<Theme>;
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -58,6 +60,12 @@ pub struct Config {
     /// window that gains focus, one per line; windows are then shown most
     /// recently focused first (see mru.rs).
     pub mru_event_stream: Option<String>,
+    /// A command the daemon runs with `sh -c` to close a window, `{id}`
+    /// replaced by its ID. Without it, there is no close button.
+    pub close_command: Option<String>,
+    /// The close button's radius.
+    #[serde(deserialize_with = "close_radius")]
+    pub close_radius: u32,
     pub appearance: Appearance,
 }
 
@@ -77,6 +85,8 @@ impl Default for Config {
             font: "sans-serif".into(),
             font_size: 14,
             mru_event_stream: None,
+            close_command: None,
+            close_radius: 13,
             appearance: Appearance::default(),
         }
     }
@@ -130,6 +140,24 @@ pub struct Theme {
     pub title_color: u32,
     #[serde(deserialize_with = "de::color")]
     pub title_background: u32,
+    /// The close button's circle.
+    #[serde(deserialize_with = "de::color")]
+    pub close_background: u32,
+    /// The close button's cross.
+    #[serde(deserialize_with = "de::color")]
+    pub close_foreground: u32,
+    /// The close button's circle under the pointer.
+    #[serde(deserialize_with = "de::color")]
+    pub close_hover_background: u32,
+    /// Close button shadow color; alpha 0 disables it.
+    #[serde(deserialize_with = "de::color")]
+    pub close_shadow_color: u32,
+    /// Close button shadow blur radius.
+    #[serde(deserialize_with = "de::px")]
+    pub close_shadow_softness: u32,
+    /// How far the close button shadow is moved, `[x, y]`.
+    #[serde(deserialize_with = "de::offset")]
+    pub close_shadow_offset: [i32; 2],
 }
 
 impl Default for Theme {
@@ -150,6 +178,12 @@ impl Default for Theme {
             icon_theme: None,
             title_color: 0xffffffff,
             title_background: 0x000000b3,
+            close_background: 0x303030f2,
+            close_foreground: 0xffffffff,
+            close_hover_background: 0x505050f2,
+            close_shadow_color: 0x00000080,
+            close_shadow_softness: 6,
+            close_shadow_offset: [0, 2],
         }
     }
 }
@@ -190,6 +224,22 @@ impl Config {
             background: self.theme().title_background,
         })
     }
+
+    /// What the close button looks like.
+    pub fn close_look(&self) -> close_button::Look {
+        let t = self.theme();
+        close_button::Look {
+            radius: self.close_radius,
+            background: t.close_background,
+            hover_background: t.close_hover_background,
+            foreground: t.close_foreground,
+            shadow: (t.close_shadow_color & 0xff != 0).then(|| shadow::IconShadow {
+                color: t.close_shadow_color,
+                softness: t.close_shadow_softness,
+                offset: (t.close_shadow_offset[0], t.close_shadow_offset[1]),
+            }),
+        }
+    }
 }
 
 impl ConfigFile for Config {
@@ -213,6 +263,11 @@ impl ConfigFile for Config {
 /// App icon size; 0 disables icons.
 fn icon_size<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     de::bounded(d, 0, 1024)
+}
+
+/// Close button radius.
+fn close_radius<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de::bounded(d, 4, 128)
 }
 
 #[cfg(test)]
@@ -250,6 +305,8 @@ mod tests {
             titles = false
             font = "Inter"
             font-size = 12
+            close-command = "niri msg action close-window --id {id}"
+            close-radius = 16
 
             [appearance]
             mode = "light"
@@ -268,6 +325,12 @@ mod tests {
             icon-theme = "Papirus"
             title-color = "eeeeee"
             title-background = "00000080"
+            close-background = "ff0000"
+            close-foreground = "000000cc"
+            close-hover-background = "00ff00"
+            close-shadow-color = "00000040"
+            close-shadow-softness = 3
+            close-shadow-offset = [1, 2]
             "##,
         )
         .unwrap();
@@ -279,6 +342,24 @@ mod tests {
         assert_eq!(c.icon_size, 0);
         assert!(!c.titles && c.title_style().is_none());
         assert_eq!((c.font.as_str(), c.font_size), ("Inter", 12));
+        assert_eq!(
+            c.close_command.as_deref(),
+            Some("niri msg action close-window --id {id}")
+        );
+        let look = c.close_look();
+        assert_eq!(look.radius, 16);
+        assert_eq!(
+            (look.background, look.hover_background, look.foreground),
+            (0xff0000ff, 0x00ff00ff, 0x000000cc)
+        );
+        assert_eq!(
+            look.shadow,
+            Some(shadow::IconShadow {
+                color: 0x00000040,
+                softness: 3,
+                offset: (1, 2),
+            })
+        );
         assert_eq!(c.appearance.mode, wl_shell_config::Mode::Light);
         // Without overrides, both schemes are the same.
         assert_eq!(c.appearance.dark, c.appearance.light);
@@ -300,6 +381,13 @@ mod tests {
             (t.title_color, t.title_background),
             (0xeeeeeeff, 0x00000080)
         );
+        assert_eq!(
+            (t.close_background, t.close_foreground),
+            (0xff0000ff, 0x000000cc)
+        );
+        let no_shadow =
+            <Config as ConfigFile>::parse("[appearance]\nclose-shadow-color = \"00000000\"");
+        assert_eq!(no_shadow.unwrap().close_look().shadow, None);
     }
 
     #[test]
@@ -357,6 +445,8 @@ mod tests {
         assert!(err("unknown = 1"));
         assert!(err("font-size = 0"));
         assert!(err("icon-size = 2000"));
+        assert!(err("close-radius = 2"));
+        assert!(err("close-radius = 200"));
         assert!(err("titles = 1"));
         // Appearance keys only go in [appearance].
         assert!(err("placeholder = \"222222\""));

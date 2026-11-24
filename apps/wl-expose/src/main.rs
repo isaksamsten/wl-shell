@@ -3,6 +3,7 @@
 mod app;
 mod assets;
 mod background;
+mod close_button;
 mod config;
 mod ipc;
 mod layout;

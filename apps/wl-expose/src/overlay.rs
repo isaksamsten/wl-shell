@@ -20,9 +20,10 @@
 //! window's title pill is above everything. Icons and pills are rendered by
 //! the worker thread and attached when they arrive. The selected thumbnail
 //! is raised above the others and zoomed (animated on frame callbacks, like
-//! the opening), its shadow and icon following it. All subsurfaces have an
-//! empty input region, so pointer events arrive on the main surface and are
-//! hit-tested here.
+//! the opening), its shadow and icon following it. With a `close-command`,
+//! the selected window gets a close button on its top-right corner, on top
+//! of everything. All subsurfaces have an empty input region, so pointer
+//! events arrive on the main surface and are hit-tested here.
 //!
 //! Closing fades everything out (with wp_alpha_modifier_v1) after giving up
 //! the keyboard and input, so the result can be acted on right away.
@@ -68,6 +69,7 @@ use wl_shell_render::{Image, icons, shadow, text};
 use crate::app::Expose;
 use crate::assets::Assets;
 use crate::background;
+use crate::close_button;
 use crate::config::Config;
 use crate::ipc::Request;
 use crate::layout::{self, Dir};
@@ -448,6 +450,8 @@ struct Style {
     /// The background color; with a wallpaper, its tint.
     background: u32,
     background_blur: u32,
+    /// The close button.
+    close: close_button::Look,
 }
 
 impl Style {
@@ -647,6 +651,8 @@ pub struct Overlay {
     pub selected: Option<usize>,
     /// The selected window's title; None with titles disabled.
     pill_sub: Option<Sub>,
+    /// The selected window's close button; None without a close-command.
+    close_sub: Option<Sub>,
     /// An empty subsurface right above every thumbnail: the selected one is
     /// raised to just below it.
     stack_top: Sub,
@@ -681,6 +687,15 @@ pub struct Overlay {
     pill: Option<ShownPill>,
     /// The pill requested from the worker, until it arrives.
     pill_wanted: Option<(CaptureId, PillRequest)>,
+    /// The window the close button is on: the selected one.
+    close_on: Option<CaptureId>,
+    /// The window the close button is attached for, and whether the
+    /// pointer is on it.
+    close_shown: Option<(CaptureId, bool)>,
+    /// Close button buffers by scale and hover.
+    close_buffers: HashMap<(i32, bool), WlBuffer>,
+    /// Where the pointer is, while on the overlay.
+    pointer: Option<(f64, f64)>,
     assets: Rc<Assets>,
     g: Rc<Globals>,
     qh: Qh,
@@ -699,8 +714,6 @@ pub struct Overlay {
     /// A transparent buffer is attached, so the compositor shows the
     /// surface (and says which output it is on) before the real map.
     blank: bool,
-    /// With WL_EXPOSE_TRACE set: when the overlay was created.
-    trace: Option<Instant>,
     /// A frame callback for an animation is pending.
     frame_pending: bool,
     /// The time of the last frame while animations run.
@@ -833,6 +846,8 @@ impl Overlay {
         }
         let title = config.title_style();
         let pill_sub = title.is_some().then(|| Sub::new(&g, parent, &no_input, qh));
+        let close_sub =
+            (config.close_command.is_some()).then(|| Sub::new(&g, parent, &no_input, qh));
 
         let shot = config.open_duration > 0;
         let awaiting_output = shot && only_output.is_none();
@@ -847,6 +862,7 @@ impl Overlay {
             windows,
             selected: None,
             pill_sub,
+            close_sub,
             stack_top,
             content,
             card,
@@ -865,6 +881,10 @@ impl Overlay {
             stale_buffers: Vec::new(),
             pill: None,
             pill_wanted: None,
+            close_on: None,
+            close_shown: None,
+            close_buffers: HashMap::new(),
+            pointer: None,
             assets,
             g,
             qh: qh.clone(),
@@ -885,6 +905,7 @@ impl Overlay {
                 card_scale: config.card_scale,
                 background: theme.background,
                 background_blur: theme.background_blur,
+                close: config.close_look(),
             },
             width: 0,
             height: 0,
@@ -894,7 +915,6 @@ impl Overlay {
             deadline_passed: false,
             awaiting_output,
             blank: false,
-            trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
             frame_pending: false,
             clock: FrameClock::default(),
             animated_to: Instant::now(),
@@ -925,12 +945,6 @@ impl Overlay {
         surface.attach(Some(&self.transparent), 0, 0);
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         self.layer.commit();
-        if let Some(t0) = self.trace {
-            trace(
-                t0,
-                format_args!("blank surface shown, waiting for the output"),
-            );
-        }
     }
 
     /// The overlay is on `output` (`wl_surface.enter`): its scale, and
@@ -944,9 +958,6 @@ impl Overlay {
         }
         self.awaiting_output = false;
         self.screenshot = Screenshot::start(output, &self.g, &self.qh);
-        if let Some(t0) = self.trace {
-            trace(t0, format_args!("entered the output, screenshot started"));
-        }
     }
 
     pub fn index_of(&self, id: CaptureId) -> Option<usize> {
@@ -965,11 +976,6 @@ impl Overlay {
 
     pub fn configure(&mut self, width: u32, height: u32) {
         let changed = !self.configured || (width, height) != (self.width, self.height);
-        if let Some(t0) = self.trace
-            && !self.configured
-        {
-            trace(t0, format_args!("configured {width}x{height}"));
-        }
         self.configured = true;
         self.width = width;
         self.height = height;
@@ -1039,7 +1045,9 @@ impl Overlay {
     /// Every subsurface in `content` that shows something.
     fn content_subs(&mut self) -> impl Iterator<Item = &mut Sub> {
         let windows = self.windows.iter_mut().flat_map(Window::subs);
-        windows.chain(self.pill_sub.iter_mut())
+        windows
+            .chain(self.pill_sub.iter_mut())
+            .chain(self.close_sub.iter_mut())
     }
 
     /// Every subsurface that shows something: the card, its screenshot and
@@ -1051,7 +1059,9 @@ impl Overlay {
                 .flat_map(|s| s.strips.iter_mut()),
         );
         let windows = self.windows.iter_mut().flat_map(Window::subs);
-        card.chain(windows).chain(self.pill_sub.iter_mut())
+        card.chain(windows)
+            .chain(self.pill_sub.iter_mut())
+            .chain(self.close_sub.iter_mut())
     }
 
     /// Start the crossfade from the screenshot to the thumbnails: false
@@ -1128,9 +1138,6 @@ impl Overlay {
             return false;
         }
         self.closing = Some(Instant::now());
-        if let Some(t0) = self.trace {
-            trace(t0, format_args!("closing starts"));
-        }
         self.layer
             .set_keyboard_interactivity(KeyboardInteractivity::None);
         // Copied by set_input_region, so it can go right away.
@@ -1165,11 +1172,6 @@ impl Overlay {
         for sub in self.all_subs() {
             sub.surface.commit();
         }
-        if t >= 1.0
-            && let Some(t0) = self.trace
-        {
-            trace(t0, format_args!("closing done"));
-        }
         t < 1.0
     }
 
@@ -1186,12 +1188,6 @@ impl Overlay {
         // Attached buffers may be destroyed; the surface keeps its contents
         // until the detach applies.
         self.screenshot = None;
-        if let Some(t0) = self.trace {
-            trace(
-                t0,
-                format_args!("screenshot gone, card shows the wallpaper"),
-            );
-        }
     }
 
     /// Show the windows, icons and pill.
@@ -1243,6 +1239,7 @@ impl Overlay {
         self.scale = scale;
         if self.mapped {
             self.attach_background();
+            self.attach_close();
             self.relayout();
         }
     }
@@ -1423,6 +1420,9 @@ impl Overlay {
             });
             icon.sub.surface.commit();
         }
+        if self.close_on == Some(self.windows[i].id) {
+            self.place_close();
+        }
     }
 
     /// The zoom window `i` heads for.
@@ -1479,23 +1479,9 @@ impl Overlay {
         let slide = progress(elapsed.saturating_sub(spread_start), slide_time);
         self.slide = if started { ease_out(slide) } else { 0.0 };
         self.place_card();
-        if let Some(t0) = self.trace {
-            let ms = elapsed.as_secs_f64() * 1000.0;
-            let r = self.card_shown_rect();
-            trace(
-                t0,
-                format_args!(
-                    "opening frame {ms:6.1} ms shrink {:.3} slide {:.3} card {}x{}+{}+{}",
-                    self.shrink, self.slide, r.w, r.h, r.x, r.y
-                ),
-            );
-        }
         let done = started && card >= 1.0 && slide >= 1.0;
         if done {
             self.opening = None;
-            if let Some(t0) = self.trace {
-                trace(t0, format_args!("opening done"));
-            }
         }
         !done
     }
@@ -1565,9 +1551,6 @@ impl Overlay {
             && o.start.is_none()
         {
             o.start = Some(now);
-            if let Some(t0) = self.trace {
-                trace(t0, format_args!("first frame shown, opening starts"));
-            }
         }
         self.animate(now);
         // Nothing asked for another frame: nothing runs.
@@ -1684,22 +1667,7 @@ impl Overlay {
             return self.screenshot_update(f);
         }
         let Some(i) = self.index_of(id) else { return };
-        let had_size = self.windows[i].capture.size().is_some();
-        let had_frame = self.windows[i].shown.is_some();
         let event = f(&mut self.windows[i].capture, &self.g);
-        if let Some(t0) = self.trace {
-            let win = &self.windows[i];
-            if !had_size && let Some((w, h)) = win.capture.size() {
-                trace(t0, format_args!("'{}': size {w}x{h}", win.identifier));
-            }
-            if !had_frame && matches!(event, Some(CaptureEvent::Frame(_))) {
-                let kind = win.capture.buffer_kind().unwrap_or("?");
-                trace(
-                    t0,
-                    format_args!("'{}': first frame ({kind})", win.identifier),
-                );
-            }
-        }
         match event {
             Some(CaptureEvent::Frame(frame)) => self.show_frame(i, frame),
             Some(CaptureEvent::Failed(why)) => {
@@ -1725,11 +1693,6 @@ impl Overlay {
         match f(&mut shot.capture, &self.g) {
             // Static, so the only one; it is shown when the overlay maps.
             Some(CaptureEvent::Frame(frame)) => {
-                if let Some(t0) = self.trace {
-                    let kind = shot.capture.buffer_kind().unwrap_or("?");
-                    let (w, h) = (frame.width, frame.height);
-                    trace(t0, format_args!("screenshot {w}x{h} ({kind})"));
-                }
                 shot.frame = Some((frame.buffer, frame.transform));
             }
             Some(CaptureEvent::Failed(why)) => {
@@ -1767,6 +1730,7 @@ impl Overlay {
         }
         self.animate(Instant::now());
         self.update_pill();
+        self.sync_close();
         self.commit_parent();
     }
 
@@ -1901,15 +1865,6 @@ impl Overlay {
         if !shrink {
             self.screenshot = None;
         }
-        if let Some(t0) = self.trace {
-            let why = if self.deadline_passed {
-                "deadline"
-            } else {
-                "all sized"
-            };
-            let from = if shrink { "screenshot" } else { "wallpaper" };
-            trace(t0, format_args!("mapped ({why}), card from the {from}"));
-        }
         self.attach_background();
         let animated = !self.style.open_duration.is_zero();
         // The thumbnails start transparent, to fade in.
@@ -2001,8 +1956,128 @@ impl Overlay {
             other => other,
         };
         if n > 0 {
-            self.relayout();
+            self.relayout(); // moves the close button
+        } else {
+            self.sync_close();
         }
+    }
+
+    /// The pointer moved to (`x`, `y`): select the window under it, or
+    /// whose close button it is on, and highlight the close button.
+    pub fn hover(&mut self, x: f64, y: f64) {
+        self.pointer = Some((x, y));
+        if let Some(i) = self.close_hit(x, y).or_else(|| self.hit(x, y)) {
+            self.select(i);
+        }
+        if self.sync_close() {
+            self.commit_parent();
+        }
+    }
+
+    /// The pointer left the overlay.
+    pub fn unhover(&mut self) {
+        self.pointer = None;
+        if self.sync_close() {
+            self.commit_parent();
+        }
+    }
+
+    /// The window whose close button is at (`x`, `y`).
+    pub fn close_hit(&self, x: f64, y: f64) -> Option<usize> {
+        if !self.mapped || self.close_sub.is_none() {
+            return None;
+        }
+        let i = self.index_of(self.close_on?)?;
+        let r = self.close_rect(self.zoomed_rect(&self.windows[i]));
+        r.contains(x, y).then_some(i)
+    }
+
+    /// The close button of a window shown at `shown`: centered on its
+    /// top-right corner, on the output.
+    fn close_rect(&self, shown: IRect) -> IRect {
+        let s = self.style.close.size();
+        let max_x = (self.width as i32 - s).max(0);
+        let max_y = (self.height as i32 - s).max(0);
+        IRect {
+            x: (shown.x + shown.w - s / 2).clamp(0, max_x),
+            y: (shown.y - s / 2).clamp(0, max_y),
+            w: s,
+            h: s,
+        }
+    }
+
+    /// Put the close button on the selected window, highlighted if the
+    /// pointer is on it. Returns whether anything changed; the parent
+    /// commit is the caller's then.
+    fn sync_close(&mut self) -> bool {
+        if self.close_sub.is_none() {
+            return false;
+        }
+        let on = self.selected_window().map(|w| w.id);
+        self.close_on = on; // close_hit looks at it
+        let hovered = (self.pointer).is_some_and(|(x, y)| self.close_hit(x, y).is_some());
+        let state = on.map(|id| (id, hovered));
+        if state == self.close_shown {
+            return false;
+        }
+        let moved = on != self.close_shown.map(|(id, _)| id);
+        self.close_shown = state;
+        self.attach_close();
+        if moved {
+            self.place_close();
+        }
+        true
+    }
+
+    /// Attach the close button's buffer while it is on a window, at the
+    /// current scale, or detach it. Committed right away.
+    fn attach_close(&mut self) {
+        let buffer = (self.close_shown).and_then(|(_, hovered)| self.close_buffer(hovered));
+        let Some(sub) = &self.close_sub else { return };
+        match &buffer {
+            Some(buffer) => sub.attach(buffer),
+            None => sub.surface.attach(None, 0, 0),
+        }
+        sub.surface.commit();
+    }
+
+    /// The close button's buffer at the current scale, `hovered` or not,
+    /// drawn when first needed.
+    fn close_buffer(&mut self, hovered: bool) -> Option<WlBuffer> {
+        let key = (self.scale, hovered);
+        if let Some(buffer) = self.close_buffers.get(&key) {
+            return Some(buffer.clone());
+        }
+        let img = close_button::render(&self.style.close, self.scale, hovered);
+        match shm_buffer(&self.g, img.width, img.height, &img.data, Ignore, &self.qh) {
+            Ok(buffer) => {
+                self.close_buffers.insert(key, buffer.clone());
+                Some(buffer)
+            }
+            Err(e) => {
+                warn!("close button buffer: {e}");
+                None
+            }
+        }
+    }
+
+    /// Put the close button on its window's corner where the window is
+    /// shown, and commit it.
+    fn place_close(&self) {
+        let Some(sub) = &self.close_sub else { return };
+        let Some(win) = (self.close_on).and_then(|id| self.windows.iter().find(|w| w.id == id))
+        else {
+            return;
+        };
+        let r = self.close_rect(self.shown_rect(win));
+        let pad = self.style.close.pad();
+        sub.place(IRect {
+            x: r.x - pad,
+            y: r.y - pad,
+            w: r.w + 2 * pad,
+            h: r.h + 2 * pad,
+        });
+        sub.surface.commit();
     }
 }
 
@@ -2024,12 +2099,10 @@ impl Drop for Overlay {
         if let Some(pill) = &self.pill {
             pill.buffer.destroy();
         }
+        for buffer in self.close_buffers.values() {
+            buffer.destroy();
+        }
     }
-}
-
-fn trace(t0: Instant, what: std::fmt::Arguments) {
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    warn!("trace {ms:7.1} ms  {what}");
 }
 
 /// A 1x1 buffer of an 0xRRGGBBAA color, for scaling with a viewport.

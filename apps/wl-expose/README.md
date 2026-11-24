@@ -36,6 +36,8 @@ id=$(wl-expose $ids) && niri msg action focus-window --id "$id"
 - `Tab` / `Shift+Tab`: cycle through windows
 - `1`–`9`: pick a window by position
 - `Enter` picks, `Escape` cancels
+- `q` closes the selected window, like the close button on its corner (both
+  need `close-command`, see below)
 
 ### Options
 
@@ -81,6 +83,8 @@ titles = true               # show the selected window's title
 font = "sans-serif"
 font-size = 14
 # mru-event-stream = "..."  # see "Focus order"
+# close-command = "..."     # see "Closing windows"
+close-radius = 13           # close button radius, px
 
 [appearance]
 mode = "auto"               # "auto" (follow the desktop), "dark" or "light"
@@ -98,6 +102,12 @@ icon-shadow-softness = 6
 icon-shadow-offset = [0, 2]
 title-color = "ffffffff"
 title-background = "000000b3"
+close-background = "303030f2" # the close button's circle
+close-hover-background = "505050f2" # under the pointer
+close-foreground = "ffffffff" # and its cross
+close-shadow-color = "00000080" # 00000000 disables
+close-shadow-softness = 6
+close-shadow-offset = [0, 2]
 # icon-theme = "Adwaita"
 
 [appearance.light]
@@ -111,6 +121,19 @@ title-background = "ffffffb3"
 Keys in `[appearance.dark]` and `[appearance.light]` override `[appearance]` for
 that color scheme. If you set a background image, `background` tints it. Set
 `background` to `00000000` to show the image without a tint.
+
+### Closing windows
+
+Like picking, closing a window is up to your compositor. Set `close-command`
+to a command that closes the window with ID `{id}`, and the selected window
+gets a close button on its top-right corner, whether you selected it with the
+mouse or the keyboard; `q` closes it too.
+The overview stays open, and the window leaves it once it is gone. The daemon
+runs the command with `sh -c`. For niri:
+
+```toml
+close-command = "niri msg action close-window --id {id}"
+```
 
 ### Focus order
 

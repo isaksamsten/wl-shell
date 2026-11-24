@@ -23,6 +23,7 @@ use wl_shell_core::reexports::wayland_client::protocol::{
 use wl_shell_core::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
 use wl_shell_core::globals::Globals;
+use wl_shell_core::spawn::{self, Output};
 use wl_shell_core::toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Daemon, Outcome, Reply};
@@ -195,6 +196,22 @@ impl Expose {
         self.finish(Outcome::Picked(win.identifier.clone()));
     }
 
+    /// Close window `i` with `close-command`. The overlay stays open; the
+    /// window leaves it once the compositor reports it closed.
+    fn close(&self, core: &Core<Self>, i: usize) {
+        let Some(win) = self.overlay.as_ref().and_then(|o| o.windows.get(i)) else {
+            return;
+        };
+        let Some(template) = self.config().close_command.as_deref() else {
+            return warn!("closing windows needs a close-command");
+        };
+        let command = spawn::fill(template, &[("id", &spawn::quote(&win.identifier))]);
+        let output = Output::Prefixed("close-command".into());
+        if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
+            warn!("close-command: {e}");
+        }
+    }
+
     /// Whether `surface` is the open overlay's.
     fn ours(&self, surface: &WlSurface) -> bool {
         self.overlay
@@ -222,6 +239,8 @@ fn load_wallpaper(path: &Path, g: &Globals, core: &Core<Expose>) -> Result<Rc<Wa
 enum Action {
     Cancel,
     PickSelected,
+    /// Close the selected window.
+    CloseSelected,
     /// Pick the n-th window in input order.
     Pick(usize),
     Move(Dir),
@@ -233,6 +252,7 @@ impl Action {
         Some(match sym {
             Keysym::Escape => Action::Cancel,
             Keysym::Return | Keysym::KP_Enter => Action::PickSelected,
+            Keysym::q | Keysym::Q => Action::CloseSelected,
             Keysym::Left | Keysym::h => Action::Move(Dir::Left),
             Keysym::Right | Keysym::l => Action::Move(Dir::Right),
             Keysym::Up | Keysym::k => Action::Move(Dir::Up),
@@ -352,6 +372,11 @@ impl Program for Expose {
                     self.pick(i);
                 }
             }
+            Action::CloseSelected => {
+                if let Some(i) = overlay.selected {
+                    self.close(core, i);
+                }
+            }
             Action::Pick(i) => self.pick(i),
             Action::Move(dir) => overlay.move_selection(dir),
             Action::Cycle(step) => overlay.cycle(step),
@@ -370,16 +395,19 @@ impl Program for Expose {
         match event.kind {
             // Don't select on enter: the pointer may just happen to rest on
             // a thumbnail when the overlay appears.
-            PointerEventKind::Motion { .. } => {
-                if let Some(i) = overlay.hit(x, y) {
-                    overlay.select(i);
-                }
-            }
+            PointerEventKind::Motion { .. } => overlay.hover(x, y),
+            PointerEventKind::Leave { .. } => overlay.unhover(),
             PointerEventKind::Press { button, .. } => {
                 if !overlay.mapped() || !inside {
                     return;
                 }
                 let (px, py) = core.input.pointer_pos;
+                if let Some(i) = overlay.close_hit(px, py) {
+                    if button == BTN_LEFT {
+                        self.close(core, i);
+                    }
+                    return;
+                }
                 match overlay.hit(px, py) {
                     None => self.finish(Outcome::Cancelled), // any click on the background
                     Some(i) if button == BTN_LEFT => self.pick(i),
@@ -549,6 +577,11 @@ mod tests {
         assert_eq!(Action::from_key(Keysym::_9, false), Some(Action::Pick(8)));
         assert_eq!(Action::from_key(Keysym::_0, false), None);
         assert_eq!(Action::from_key(Keysym::a, false), None);
+        assert_eq!(
+            Action::from_key(Keysym::q, false),
+            Some(Action::CloseSelected)
+        );
         assert!(!Action::Pick(0).repeats() && Action::Cycle(1).repeats());
+        assert!(!Action::CloseSelected.repeats());
     }
 }
