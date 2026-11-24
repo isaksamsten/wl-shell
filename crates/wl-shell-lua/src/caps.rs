@@ -5,15 +5,18 @@
 //! `popup`, `on_open`, `on_close`, `on_click`) sit at its top level or
 //! under `widget`, next to `span` and `popup_on`; `setup` at the top
 //! level (or under `widget`).
-//! `actions` and `sources` are lists of tables for the launcher: their
-//! keys are reserved by `api = 1` and only their ids and names are read
-//! for now. `api`, if given, must be 1.
+//! `actions` and `sources` are lists of tables for the launcher. An
+//! action has an `id`, a `name`, an `icon`, a `when` filter (see
+//! `subject.rs`), a `run(s, choice)` function and, optionally,
+//! `choices(s)`; of a source only the id, name and trigger are read for
+//! now (its keys are reserved by `api = 1`). `api`, if given, must be 1.
 
 use std::collections::HashMap;
 
 use mlua::{Table, Value};
 
 use crate::channel::InstanceId;
+use crate::subject::{Subject, When};
 
 /// The API version plugins are written against.
 pub const API: i64 = 1;
@@ -71,12 +74,17 @@ pub fn span_step(v: f64) -> f32 {
         .unwrap_or(1.0)
 }
 
-/// A launcher action a plugin declares (reserved: not run yet).
+/// A launcher action a plugin declares.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionDecl {
     pub id: String,
     pub name: String,
     pub icon: Option<String>,
+    /// Which subjects it applies to.
+    pub when: When,
+    /// It has `choices(s)`: choosing it is a level of choices, which
+    /// `run(s, choice)` then gets one of.
+    pub choices: bool,
 }
 
 /// A launcher source a plugin declares (reserved: not searched yet).
@@ -132,17 +140,33 @@ impl Capabilities {
             popup_on: popup_on(&widget.get::<Value>("popup_on").map_err(e)?)?,
         };
         let any = caps.icon || caps.label || caps.popup || caps.on_click;
+        let actions = list(plugin, "actions", |t| {
+            let id = required(t, "id")?;
+            if !is_fn(t, "run") {
+                return Err("run: expected a function".into());
+            }
+            let choices = match t.get::<Value>("choices").map_err(e)? {
+                Value::Nil => false,
+                Value::Function(_) => true,
+                _ => return Err("choices: expected a function".into()),
+            };
+            Ok(ActionDecl {
+                name: optional(t, "name")?.unwrap_or_else(|| id.clone()),
+                icon: optional(t, "icon")?,
+                when: When::read(&t.get::<Value>("when").map_err(e)?)?,
+                choices,
+                id,
+            })
+        })?;
+        for (i, a) in actions.iter().enumerate() {
+            if actions[..i].iter().any(|b| b.id == a.id) {
+                return Err(format!("actions[{}]: the id {:?} is taken", i + 1, a.id));
+            }
+        }
         Ok(Capabilities {
             setup,
             widget: any.then_some(caps),
-            actions: list(plugin, "actions", |t| {
-                let id = required(t, "id")?;
-                Ok(ActionDecl {
-                    name: optional(t, "name")?.unwrap_or_else(|| id.clone()),
-                    icon: optional(t, "icon")?,
-                    id,
-                })
-            })?,
+            actions,
             sources: list(plugin, "sources", |t| {
                 let id = required(t, "id")?;
                 Ok(SourceDecl {
@@ -253,8 +277,8 @@ fn show(v: &Value) -> String {
 }
 
 /// The host's view of what its instances provide: filled as they load,
-/// emptied as they fail or go. Widgets are asked through it now; the
-/// launcher's actions and sources will be looked up here too.
+/// emptied as they fail or go. Widgets and launcher actions are looked
+/// up here; the launcher's sources will be too.
 #[derive(Debug, Default)]
 pub struct Registry {
     loaded: HashMap<InstanceId, Capabilities>,
@@ -287,9 +311,24 @@ impl Registry {
         (self.loaded.iter()).filter_map(|(i, c)| Some((i.as_str(), c.widget.as_ref()?)))
     }
 
-    /// The launcher actions declared, with their instances (reserved).
+    /// The launcher actions declared, with their instances.
     pub fn actions(&self) -> impl Iterator<Item = (&str, &ActionDecl)> {
         (self.loaded.iter()).flat_map(|(i, c)| c.actions.iter().map(move |a| (i.as_str(), a)))
+    }
+
+    /// The actions of the instances `keep` takes whose `when` holds for
+    /// `subject`: by instance, each's in the order it declared them.
+    pub fn actions_for(
+        &self,
+        subject: &Subject,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Vec<(&str, &ActionDecl)> {
+        let mut instances: Vec<&InstanceId> = (self.loaded.keys()).filter(|i| keep(i)).collect();
+        instances.sort();
+        (instances.into_iter())
+            .flat_map(|i| self.loaded[i].actions.iter().map(move |a| (i.as_str(), a)))
+            .filter(|(_, a)| a.when.matches(subject))
+            .collect()
     }
 
     /// The launcher sources declared, with their instances (reserved).
@@ -353,18 +392,36 @@ mod tests {
     }
 
     #[test]
-    fn launcher_keys_are_reserved() {
+    fn launcher_actions_and_reserved_sources() {
         let c = caps(
-            "return { actions = { { id = 'shrink', name = 'Shrink' } },
+            "return { actions = { { id = 'shrink', name = 'Shrink', icon = 'image-x-generic',
+                                    when = { kind = 'file', mime = 'image/*' },
+                                    choices = function() end, run = function() end },
+                                  { id = 'logs', run = function() end } },
                       sources = { { id = 'ssh', trigger = '>' } } }",
         )
         .unwrap();
         assert!(c.launcher() && c.widget.is_none());
-        assert_eq!(c.actions[0].name, "Shrink");
+        let shrink = &c.actions[0];
+        assert_eq!(shrink.name, "Shrink");
+        assert_eq!(shrink.icon.as_deref(), Some("image-x-generic"));
+        assert!(shrink.choices && !c.actions[1].choices);
+        assert_eq!(shrink.when.mime.as_deref(), Some("image/*"));
+        assert_eq!(c.actions[1].name, "logs");
+        assert_eq!(c.actions[1].when, When::default());
         assert_eq!(c.sources[0].name, "ssh");
         assert_eq!(c.sources[0].trigger.as_deref(), Some(">"));
-        assert!(caps("return { actions = { 1 } }").is_err());
-        assert!(caps("return { actions = { { name = 'x' } } }").is_err());
+        let err = |code: &str| caps(code).unwrap_err();
+        assert!(err("return { actions = { 1 } }").contains("actions[1]"));
+        assert!(err("return { actions = { { name = 'x', run = print } } }").contains("id"));
+        assert!(err("return { actions = { { id = 'x' } } }").contains("run"));
+        let e = err("return { actions = { { id = 'x', run = print, choices = {} } } }");
+        assert!(e.contains("choices"), "{e}");
+        let e = err("return { actions = { { id = 'x', run = print, when = { kind = 'dir' } } } }");
+        assert!(e.contains("when.kind"), "{e}");
+        let e =
+            err("return { actions = { { id = 'x', run = print }, { id = 'x', run = print } } }");
+        assert!(e.contains("taken"), "{e}");
     }
 
     #[test]
@@ -379,15 +436,34 @@ mod tests {
         r.insert("app:a", caps("return { label = function() end }").unwrap());
         r.insert(
             "plugin:b",
-            caps("return { actions = { { id = 'x' } } }").unwrap(),
+            caps(
+                "return { actions = { { id = 'x', run = print },
+                                      { id = 'y', run = print, when = { kind = 'app' } } } }",
+            )
+            .unwrap(),
+        );
+        r.insert(
+            "plugin:a",
+            caps("return { actions = { { id = 'z', run = print } } }").unwrap(),
         );
         assert!(r.widget("app:a").is_some_and(|w| w.label));
         assert!(r.widget("plugin:b").is_none());
         assert_eq!(r.widgets().count(), 1);
-        assert_eq!(
-            r.actions().map(|(i, _)| i).collect::<Vec<_>>(),
-            ["plugin:b"]
-        );
+        assert_eq!(r.actions().count(), 3);
+        // By instance, in order, filtered.
+        let file = Subject::File {
+            path: "/a".into(),
+            name: "a".into(),
+            dir: false,
+            mime: Vec::new(),
+        };
+        let found = |keep: &dyn Fn(&str) -> bool| {
+            (r.actions_for(&file, keep).into_iter())
+                .map(|(i, a)| format!("{i}/{}", a.id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found(&|_| true), ["plugin:a/z", "plugin:b/x"]);
+        assert_eq!(found(&|i| i != "plugin:a"), ["plugin:b/x"]);
         r.retain(|i| i != "app:a");
         assert!(r.get("app:a").is_none());
     }

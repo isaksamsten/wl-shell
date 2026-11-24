@@ -15,6 +15,7 @@ use crate::channel::{InstanceId, Tile};
 use crate::host;
 use crate::runtime::{Job, Link, Settings, lock};
 use crate::spec::{AppInfo, InstanceSpec, Role};
+use crate::subject::{Choice, MAX_CHOICES, Subject};
 use crate::ui::{Builder, Node};
 
 /// The budget is counted in steps of this many instructions.
@@ -387,6 +388,67 @@ impl State {
             return Outcome::Ok(());
         };
         self.enter("on_click", || f.call::<()>(button))
+    }
+
+    /// The launcher action `id`'s table.
+    fn action(&self, id: &str) -> mlua::Result<Table> {
+        let actions: Table = self.plugin.get("actions")?;
+        for t in actions.sequence_values::<Table>() {
+            let t = t?;
+            if t.get::<Option<String>>("id")?.as_deref() == Some(id) {
+                return Ok(t);
+            }
+        }
+        Err(mlua::Error::runtime(format!("no action {id:?}")))
+    }
+
+    /// The launcher action `action`'s `choices(subject)`: a list of
+    /// tables with an `id`, a `name` and an `icon` (nil: none).
+    pub fn choices(&self, action: &str, subject: &Subject) -> Outcome<Vec<Choice>> {
+        self.enter("choices", || {
+            let f: Function = self.action(action)?.get("choices")?;
+            let list = match f.call::<Value>(subject.to_lua(&self.lua)?)? {
+                Value::Nil => return Ok(Vec::new()),
+                Value::Table(t) => t,
+                v => {
+                    return Err(mlua::Error::runtime(format!(
+                        "expected a list of choices, got {}",
+                        v.type_name()
+                    )));
+                }
+            };
+            let mut choices: Vec<Choice> = Vec::new();
+            for (i, v) in list.sequence_values::<Value>().enumerate() {
+                let Value::Table(t) = v? else {
+                    return Err(mlua::Error::runtime(format!(
+                        "choice {}: expected a table",
+                        i + 1
+                    )));
+                };
+                let c = Choice::read(&self.lua, &t)
+                    .map_err(|e| mlua::Error::runtime(format!("choice {}: {e}", i + 1)))?;
+                // The first of an id counts.
+                if !choices.iter().any(|o| o.id == c.id) {
+                    choices.push(c);
+                }
+                if choices.len() == MAX_CHOICES {
+                    break;
+                }
+            }
+            Ok(choices)
+        })
+    }
+
+    /// The launcher action `action`'s `run(subject, choice)`.
+    pub fn run(&self, action: &str, subject: &Subject, choice: Option<&Choice>) -> Outcome<()> {
+        self.enter("run", || {
+            let f: Function = self.action(action)?.get("run")?;
+            let choice = match choice {
+                Some(c) => c.to_lua(&self.lua)?,
+                None => Value::Nil,
+            };
+            f.call::<()>((subject.to_lua(&self.lua)?, choice))
+        })
     }
 
     pub fn interaction(&self, key: &str, event: crate::channel::PopupEvent) -> Outcome<()> {

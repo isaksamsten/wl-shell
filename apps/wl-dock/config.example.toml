@@ -300,6 +300,13 @@
 #path = "~/src/clock.lua"        # Optional; default lookup by name
 #format = "%H:%M"
 
+# Launcher actions: Tab on an image in the launcher offers Convert image…
+# (with ImageMagick). A plugin table is all it takes.
+#[plugin.convert]
+#formats = ["png", "jpg", "webp", "avif"]
+#command = ["magick"]            # ["convert"] for ImageMagick 6
+#notify = true                   # notify-send when done or failed
+
 #[widgets]
 #enabled = true
 #popup-delay = 300

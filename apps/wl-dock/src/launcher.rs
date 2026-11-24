@@ -318,6 +318,11 @@ impl<T, S> Nav<T, S> {
         self.levels.last().map(|(_, _, t)| t)
     }
 
+    /// The current level, to change it (as its choices arrive).
+    pub fn level_mut(&mut self) -> Option<&mut T> {
+        self.levels.last_mut().map(|(_, _, t)| t)
+    }
+
     /// Every level entered, the first first.
     #[cfg(test)]
     pub fn levels(&self) -> impl Iterator<Item = &T> {

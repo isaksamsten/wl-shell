@@ -32,6 +32,9 @@
 //!   tree, built from what the hook returned on the plugin's thread. A
 //!   standalone widget's item also hears its clicks (`on_click(button)`),
 //!   and an app's widget hears `on_app()` when `dock.app` changes.
+//! - Launcher actions: the host looks up the ones whose `when` holds for
+//!   a [`Subject`] in the [`Registry`] (in Rust), asks for an action's
+//!   `choices(s)` and runs its `run(s, choice)` (see `subject.rs`).
 
 mod caps;
 pub mod channel;
@@ -40,6 +43,7 @@ mod host;
 mod runtime;
 mod spec;
 mod state;
+mod subject;
 pub mod ui;
 mod watch;
 
@@ -52,3 +56,4 @@ pub use channel::{
 };
 pub use runtime::{Event, Runtime, Settings};
 pub use spec::{AppInfo, InstanceSpec, Role, Source};
+pub use subject::{Choice, MAX_CHOICES, Subject, SubjectKind, SubjectWindow, When, glob};

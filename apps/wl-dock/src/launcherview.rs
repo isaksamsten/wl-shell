@@ -1244,6 +1244,11 @@ impl LauncherView {
         self.nav.level()?.as_ref()
     }
 
+    /// The level entered, to fill it (a plugin's choices).
+    pub fn level_mut(&mut self) -> Option<&mut Level> {
+        self.nav.level_mut()?.as_mut()
+    }
+
     /// The subject of the actions, while entered.
     pub fn subject(&self) -> Option<&Match> {
         (self.pinned.first())

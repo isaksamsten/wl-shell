@@ -150,13 +150,13 @@ use wl_shell_core::toplevel::Toplevel;
 use wl_shell_core::{Core, Program, Shell};
 use wl_shell_daemon::{Client, Incoming as SocketEvent, Listener, Reply};
 use wl_shell_log::warn;
-use wl_shell_lua::PopupOn;
+use wl_shell_lua::{PopupOn, RequestId};
 use wl_shell_render::files::{self, FileEntry, FolderRequest};
 use wl_shell_render::icons::{AppEntry, DesktopAction, IndexedApp};
 use wl_shell_render::worker::{Assets, Done};
 use wl_shell_ui::Cache;
 
-use crate::actions::{self, Does, FileType, Icon, Subject};
+use crate::actions::{self, Does, FileType, Icon, PluginRun, Subject};
 use crate::activate::{self, Press, Release};
 use crate::activateview::ActivateView;
 use crate::config::{Config, FolderView, LauncherEnter, Previews, Windows};
@@ -519,6 +519,9 @@ pub struct WlDock {
     /// A folder the launcher opens a terminal in, and the path its
     /// client is told; run once it gave up the keyboard.
     pending_terminal: Option<(PathBuf, String)>,
+    /// A plugin's action the launcher runs, and what the client is told;
+    /// run once it gave up the keyboard.
+    pending_plugin: Option<(PluginRun, String)>,
     /// An app's action the launcher runs.
     pending_app: Option<PendingApp>,
     /// A window the launcher activates, once it gave up the keyboard.
@@ -626,6 +629,7 @@ impl WlDock {
             pending_url: None,
             pending_with: None,
             pending_terminal: None,
+            pending_plugin: None,
             pending_app: None,
             pending_window: None,
             files: None,
@@ -861,7 +865,11 @@ impl WlDock {
             spans,
             clipboard,
             popup,
+            choices,
         } = self.widgets.event(event);
+        if let Some((id, answer)) = choices {
+            self.choices_arrived(id, answer);
+        }
         if let Some((app, tree)) = popup
             && let Some((output, key)) = self.widget_target.clone()
             && key == app
@@ -2395,9 +2403,23 @@ impl WlDock {
                 .flat_map(|level| &level.choices)
                 .find(|c| Some(&c.id) == id.as_ref());
             if let Some(Does::Choose(level)) = choice.map(|c| &c.does) {
-                let level = level.clone();
-                l.enter(level);
+                let mut level = level.clone();
+                // A plugin's choices: asked for now, filled when they come.
+                if let Some(ask) = &level.ask {
+                    level.asking = self.widgets.ask_choices(ask);
+                    if level.asking.is_none() {
+                        // Not running: nothing to wait for.
+                        actions::fill(&mut level, Err("not running".into()));
+                    }
+                }
+                let asking = level.asking;
+                if let Some(l) = &mut self.launcher {
+                    l.enter(level);
+                }
                 self.rank_choices();
+                if let Some(id) = asking {
+                    self.give_up_choices(core, id);
+                }
             }
             return;
         }
@@ -2439,6 +2461,7 @@ impl WlDock {
                 (subject, None, self.pins.contains(&Pin::App(app_id)), false)
             }
         };
+        let plugins = self.widgets.launcher_actions();
         let now = history::now();
         let learn = self.config.launcher.history;
         let history = |id: &str| {
@@ -2462,6 +2485,7 @@ impl WlDock {
                 .is_empty(),
             clipboard: core.dnd.available(),
             close: self.config.integration.close_command.is_some(),
+            plugins: &plugins,
         };
         let level = actions::actions(&subject, &cx);
         // Windows… shows the windows' captures: start them now (a frame
@@ -2485,6 +2509,47 @@ impl WlDock {
             l.enter(level);
         }
         self.rank_choices();
+    }
+
+    /// A plugin's choices (request `id`) arrived: the level waiting for
+    /// them, if it is the launcher's current one, shows them (none, for
+    /// an error, which the runtime logged).
+    fn choices_arrived(
+        &mut self,
+        id: RequestId,
+        answer: Result<Vec<wl_shell_lua::Choice>, String>,
+    ) {
+        let Some(level) = (self.launcher.as_mut())
+            .and_then(|l| l.level_mut())
+            .filter(|level| level.waits_for(id))
+        else {
+            return;
+        };
+        actions::fill(level, answer);
+        self.rank_choices();
+        if let Some(l) = &mut self.launcher {
+            l.sync_texts();
+            l.kick();
+        }
+    }
+
+    /// Should the plugin not answer request `id` for its choices in time,
+    /// its level shows that there are none, so it stays usable.
+    fn give_up_choices(&self, core: &Core<Self>, id: RequestId) {
+        // A little past the deadline, so an answer on time comes first.
+        let after = actions::CHOICES_TIMEOUT + Duration::from_millis(20);
+        let timer = core.timer(after, move |app: &mut Self, _| {
+            let waiting =
+                (app.launcher.as_ref().and_then(|l| l.level())).filter(|level| level.waits_for(id));
+            if let Some(level) = waiting {
+                let ms = actions::CHOICES_TIMEOUT.as_millis();
+                warn!("{}: the plugin gave no choices in {ms} ms", level.name);
+                app.choices_arrived(id, Err("no answer in time".into()));
+            }
+        });
+        if let Err(e) = timer {
+            warn!("{e}");
+        }
     }
 
     /// A file's type arrived: a Tab waiting for it goes on, if the file
@@ -2607,6 +2672,10 @@ impl WlDock {
                     warn!("trash-command: {e}");
                 }
             }
+            Does::Plugin(run) => {
+                self.close_launcher(core, None);
+                self.pending_plugin = Some((run, picked));
+            }
         }
     }
 
@@ -2728,7 +2797,8 @@ impl WlDock {
             || self.pending_with.is_some()
             || self.pending_terminal.is_some()
             || self.pending_app.is_some()
-            || self.pending_window.is_some();
+            || self.pending_window.is_some()
+            || self.pending_plugin.is_some();
         if pending {
             // Remove the launcher before starting an opener or activating
             // an existing window. Keep the focus handoff, not the animation.
@@ -2787,6 +2857,12 @@ impl WlDock {
             if let Err(e) = spawn::shell(&core.loop_handle, &command, output) {
                 warn!("open-terminal-command: {e}");
             }
+            if let Some(client) = self.launcher_client.take() {
+                client.answer(Reply::Picked(picked));
+            }
+        }
+        if let Some((run, picked)) = self.pending_plugin.take() {
+            self.widgets.run_action(run);
             if let Some(client) = self.launcher_client.take() {
                 client.answer(Reply::Picked(picked));
             }

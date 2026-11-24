@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::subject::{Choice, Subject};
 use crate::ui::Node;
 
 /// Which plugin state a request goes to: one per widget placement, one
@@ -60,8 +61,9 @@ pub struct Tile {
     pub scale: i32,
 }
 
-/// What is asked. Widgets ask for their label and icon now; popups and
-/// events, and the launcher's actions and sources, are added as kinds.
+/// What is asked. Widgets ask for their label, icon and popup and tell
+/// of interaction; the launcher asks for an action's choices and runs
+/// actions. The launcher's sources will be added as kinds.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum RequestKind {
@@ -78,6 +80,17 @@ pub enum RequestKind {
     /// A standalone widget's item was clicked with this button
     /// (`"left"` or `"middle"`): its `on_click(button)`.
     Click(String),
+    /// The launcher action `action`'s `choices(subject)`.
+    Choices {
+        action: String,
+        subject: Subject,
+    },
+    /// The launcher action `action`'s `run(subject, choice)`.
+    Run {
+        action: String,
+        subject: Subject,
+        choice: Option<Choice>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,6 +110,8 @@ impl RequestKind {
             RequestKind::Interaction { .. }
             | RequestKind::Visibility(_)
             | RequestKind::Click(_) => Topic::Interaction,
+            RequestKind::Choices { .. } => Topic::Choices,
+            RequestKind::Run { .. } => Topic::Run,
         }
     }
 }
@@ -110,6 +125,10 @@ pub enum Topic {
     Icon,
     Popup,
     Interaction,
+    /// An action's choices: a level waits for them.
+    Choices,
+    /// Running an action: nobody waits for it.
+    Run,
 }
 
 /// An answer's payload.
@@ -121,6 +140,8 @@ pub enum Reply {
     /// None: the app's own icon.
     Icon(Option<Arc<Node>>),
     Popup(Option<Arc<Node>>),
+    /// An action's choices, in order.
+    Choices(Vec<Choice>),
     Done,
 }
 

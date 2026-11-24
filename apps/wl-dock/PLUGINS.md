@@ -16,6 +16,7 @@ This document covers [using widgets](#using-widgets), the
 - [How a plugin runs](#how-a-plugin-runs)
 - [Reference](#reference)
   - [Hooks](#hooks)
+  - [Launcher actions](#launcher-actions-1)
   - [The `dock` API](#the-dock-api)
   - [UI trees](#ui-trees)
   - [Canvas](#canvas)
@@ -100,7 +101,9 @@ even if you create the file while the dock is running. Plugin names use
 letters, digits, `-` and `_`.
 
 A placement gets the options of its plugin table, with its own options
-applied key by key on top.
+applied key by key on top. A plugin table also adds the plugin's
+[launcher actions](#launcher-actions), if it has any; its `setup(opts)`
+gets the table's options.
 
 ## Bundled plugins
 
@@ -149,6 +152,24 @@ span = 2               # Wide on a bottom dock: the title and artist beside the 
 | `cover`  | `true`  | `false` keeps the item's icon                                                                                                                                                     |
 | `label`  | `true`  | `false` keeps the item's name                                                                                                                                                     |
 | `span`   | `1`     | `1.5` or `2`: while there is a player, the tile is that many icons wide on a bottom dock, with the title (at `2`, also the artist) beside the cover. Side docks keep square tiles |
+
+### `convert`
+
+A [launcher action](#launcher-actions) rather than a widget: Tab on an image
+in the launcher's file search offers **Convert image…**, whose choices are
+the formats to convert to (not the image's own). The copy is written next
+to the original with ImageMagick, as `photo.webp`, or `photo-2.webp` if that
+name is taken, and `notify-send` says when it is done or what went wrong.
+
+```toml
+[plugin.convert]
+```
+
+| Option    | Default                                 | Meaning                                                                                                                    |
+| --------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `formats` | `["png", "jpg", "webp", "avif", "gif"]` | The formats offered, in order, as file extensions                                                                          |
+| `command` | `["magick"]`                            | The converter, run as `command… <input> <output>`: `["convert"]` for ImageMagick 6, or anything taking those two arguments |
+| `notify`  | `true`                                  | Tell with `notify-send` (if installed) when a conversion is done or fails; errors also go to the dock's stderr             |
 
 ### `calendar`
 
@@ -327,11 +348,48 @@ When a hook returns `nil`, the item keeps its own label, icon or popup. On
 an app that means the app's own; on a standalone widget it means the
 `name` from the config, a placeholder icon, and no popup.
 
+### Launcher actions
+
+A plugin can add rows to what Tab shows on a launcher match: a file, an app
+or a window. Give it an `actions` list and a `[plugin.<name>]` table, since
+the launcher only takes actions from plugin tables (not from each widget
+placement):
+
+```lua
+return {
+  actions = {
+    { id = 'shrink', name = 'Shrink image', icon = 'image-x-generic',
+      when = { kind = 'file', mime = 'image/*' },
+      choices = function(s) return { { id = '50', name = '50%' }, { id = '25', name = '25%' } } end,
+      run = function(s, choice)
+        dock.run{ 'magick', s.path, '-resize', choice.id .. '%', s.path .. '.small.png' }
+      end },
+    { id = 'logs', name = 'Follow logs', icon = 'utilities-terminal',
+      when = { kind = 'app', running = true },
+      run = function(s) dock.run{ 'foot', 'journalctl', '--user', '-f', '-t', s.id } end },
+  },
+}
+```
+
+```toml
+[plugin.tools]                 # plugins/tools.lua
+```
+
+The plugin's rows come after the launcher's own, in the order the plugin
+lists them (plugins by name). An action without `choices` runs when you
+press Enter on it, and the launcher closes. One with `choices` is a level of
+its own, like Open with…: Tab or Enter enters it, it shows _Loading…_ until
+`choices(s)` answers, and Enter on a choice runs `run(s, choice)`. If the
+plugin doesn't answer within 0.5 s, or fails, the level shows _No choices_
+and you can go back as usual. See the [reference](#launcher-actions-1) for
+the subject tables and `when`.
+
 ## How a plugin runs
 
 - **One state per placement.** Each `[app.*]` widget and each pinned
   `[widget.*]` gets its own Lua state. Two placements of the same plugin
-  share nothing, not even globals.
+  share nothing, not even globals. A `[plugin.*]` table whose plugin has
+  launcher `actions` gets one more state for them.
 - **Threads.** States run on a small thread pool. A state never runs on two
   threads at once, so a plugin needs no locking. Nothing in the API blocks:
   processes, timers and D-Bus calls all report back through callbacks on the
@@ -354,9 +412,10 @@ an app that means the app's own; on a standalone widget it means the
   - While a plugin is down, its app shows its own name and icon, and a
     standalone widget shows a placeholder.
 - **Deadlines.** `label()` must answer within 0.5 s and `icon()` or `popup()`
-  within 1 s, or the answer is thrown away. Do slow work, such as running
-  commands or reading the network, ahead of time in timers or callbacks, and
-  have the hooks only return what is already known.
+  within 1 s, or the answer is thrown away. A launcher action's `choices(s)`
+  has 0.5 s. Do slow work, such as running commands or reading the network,
+  ahead of time in timers or callbacks, and have the hooks only return what
+  is already known.
 - **Reloading.** Saving the plugin file starts a fresh state: timers stop,
   processes are killed, and D-Bus and file watches are cancelled. Modules
   loaded with `require` are not watched, so save the plugin file to pick up
@@ -392,7 +451,8 @@ The plugin table also takes these keys:
 | `popup_on` | What opens the popup: `'hover'` (default) or `'click'`. See [`popup()`](#popup). On an app's item the popup always opens on hover.                                                          |
 | `api`      | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
 
-`actions` and `sources` are reserved for future launcher integration.
+`actions` adds [launcher actions](#launcher-actions). `sources` is reserved
+for launcher sources.
 
 #### `icon(tile)`
 
@@ -431,6 +491,50 @@ popup to another widget, the next popup opens at once. The dock handles
 hover and pressed looks, slider drags and scrolling itself. It calls the
 plugin's handlers as described in [Interaction](#interaction).
 
+### Launcher actions
+
+`actions` is a list of tables, each with these keys:
+
+| Key       | Meaning                                                                                       |
+| --------- | --------------------------------------------------------------------------------------------- |
+| `id`      | Required, unique in the plugin                                                                |
+| `name`    | The row's name; default: the `id`                                                             |
+| `icon`    | A theme icon name; default: a generic one                                                     |
+| `when`    | Which subjects it applies to (below); default: all                                            |
+| `choices` | Optional `function(s)`: a list of choices, each `{ id =, name =, icon = }` plus any fields    |
+| `run`     | Required `function(s, choice)`: does the action; `choice` is `nil` for an action without them |
+
+A choice needs an `id` or a `name`; either stands in for the other, and a
+choice without an `icon` gets the action's. `run` gets the choice table back
+as `choices` made it, with its other fields (but not functions), so a choice
+can carry data: `{ id = 'half', name = '50%', factor = 0.5 }`. At most 500
+choices are shown, and a repeated `id` only once.
+
+The subject `s` is a plain table:
+
+| `kind`     | Fields                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `'file'`   | `path`, `name`, `dir` (a folder), `mime` (the type and its parents, nearest first: `{'image/png', 'application/octet-stream'}`) |
+| `'app'`    | `id` (desktop ID), `name`, `running` (has windows), `pinned`, `windows` (a list of `{ id =, title = }`, most recent first)      |
+| `'window'` | `id`, `title`, `app_id`, `app_name`                                                                                             |
+
+`when` is checked by the dock, so building the Tab level never waits for a
+plugin. Every key given must hold:
+
+| Key       | Holds for                                                             |
+| --------- | --------------------------------------------------------------------- |
+| `kind`    | Subjects of this kind, or of one in a list: `{ 'app', 'window' }`     |
+| `mime`    | Files whose type or one of its parents matches the glob (`'image/*'`) |
+| `path`    | Files whose path matches the glob (`'~/notes/*.md'`; `~/` expands)    |
+| `dir`     | Folders (`true`) or files (`false`)                                   |
+| `app`     | Apps whose desktop ID, or windows whose app ID, match the glob        |
+| `running` | Apps with windows (`true`) or without (`false`); windows always run   |
+
+In globs `*` matches any run of characters, `/` included, and `?` one
+character; `mime` and `app` ignore case. A key that doesn't apply to the
+subject, such as `mime` on an app, doesn't hold. An unknown key is an error
+when the plugin loads.
+
 ### The `dock` API
 
 | Function                           | Does                                                                                                                                                                |
@@ -441,7 +545,7 @@ plugin's handlers as described in [Interaction](#interaction).
 | `dock.spawn(argv, opts)`           | Run a process. `opts.on_line(line)` gets each line of its stdout, `opts.on_exit(code)` its exit code (`nil` if killed by a signal). Returns a handle with `:kill()` |
 | `dock.run(argv)`                   | Start a detached process. Returns `true`, or `nil, err`                                                                                                             |
 | `dock.read(path)`                  | A file's text (`~/` expands, at most 16 MiB). Returns `text`, or `nil, err`                                                                                         |
-| `dock.watch(path, fn, opts)`       | Call `fn(paths)` when a file, or anything in a folder, changes. Returns a handle with `:cancel()`, or `nil, err`. See [Watching files](#watching-files)              |
+| `dock.watch(path, fn, opts)`       | Call `fn(paths)` when a file, or anything in a folder, changes. Returns a handle with `:cancel()`, or `nil, err`. See [Watching files](#watching-files)             |
 | `dock.json.decode(s)`              | JSON to Lua (`null` becomes `nil`). Raises an error on bad JSON                                                                                                     |
 | `dock.json.encode(v)`              | Lua to JSON                                                                                                                                                         |
 | `dock.clipboard(text)`             | Copy `text` to the clipboard                                                                                                                                        |

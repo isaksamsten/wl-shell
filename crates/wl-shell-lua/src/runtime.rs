@@ -353,6 +353,18 @@ impl Slot {
                             let outcome = state.click(&button);
                             self.settle(life, shared, outcome).map(|()| Reply::Done)
                         }
+                        RequestKind::Choices { action, subject } => {
+                            let outcome = state.choices(&action, &subject);
+                            self.settle(life, shared, outcome).map(Reply::Choices)
+                        }
+                        RequestKind::Run {
+                            action,
+                            subject,
+                            choice,
+                        } => {
+                            let outcome = state.run(&action, &subject, choice.as_ref());
+                            self.settle(life, shared, outcome).map(|()| Reply::Done)
+                        }
                     },
                 };
                 shared.emit(Event::Answer(Answer {

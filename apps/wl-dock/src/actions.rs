@@ -51,16 +51,35 @@
 //! app's own. Windows… is the table `APP_WINDOWS`, ahead of them; the
 //! rest is `APP_ACTIONS`, after them. A window's own are
 //! `WINDOW_ACTIONS`, ahead of its app's.
+//!
+//! Plugins' actions (`[plugin.<name>]` tables whose plugin has
+//! `actions`) come after all of these, by plugin, each's in the order it
+//! declares them: those whose `when` holds for the subject as a plugin
+//! sees it (`lua_subject`). One without `choices` runs (`Does::Plugin`)
+//! and closes the launcher; one with `choices` is a level that starts
+//! empty (`Level::ask`) and is filled when the plugin answers
+//! (`fill`), or left with nothing after `CHOICES_TIMEOUT`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use wl_shell_lua::{ActionDecl, RequestId, SubjectWindow};
 use wl_shell_render::files::FOLDER_ICONS;
 use wl_shell_render::icons::{DesktopAction, IndexedApp};
 use wl_shell_render::mimeapps::MimeApps;
 
 use crate::config::{AppAction, When};
 use crate::trash::EMPTY_ICON;
+
+/// How long a plugin has to answer `choices(s)`.
+pub const CHOICES_TIMEOUT: Duration = Duration::from_millis(500);
+/// What a level waiting for a plugin's choices says.
+pub const LOADING: &str = "Loading…";
+/// What a level whose plugin gave no choices (or none in time) says.
+pub const NO_CHOICES: &str = "No choices";
+/// The icon of a plugin's action or choice without one of its own.
+const PLUGIN_ICON: &str = "system-run";
 
 /// What the actions act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +169,10 @@ pub struct FileType {
     pub assoc: Arc<MimeApps>,
 }
 
+/// A plugin's launcher action, as the registry has it: its instance and
+/// its declaration.
+pub type PluginAction = (String, ActionDecl);
+
 /// What the actions are worked out from.
 pub struct Context<'a> {
     /// The installed apps.
@@ -168,6 +191,8 @@ pub struct Context<'a> {
     pub clipboard: bool,
     /// Whether there is a `close-command`.
     pub close: bool,
+    /// The plugins' actions, in order.
+    pub plugins: &'a [PluginAction],
 }
 
 impl Context<'_> {
@@ -224,8 +249,24 @@ pub enum Does {
     ActivateWindow { app_id: String, window: String },
     /// `trash-command` on the path; closes the launcher.
     Trash(PathBuf),
+    /// Run a plugin's action (with the choice, if it has choices);
+    /// closes the launcher.
+    Plugin(PluginRun),
     /// Further choices, a level deeper.
     Choose(Level),
+}
+
+/// A plugin's action on a subject, and the choice made, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRun {
+    /// The plugin's instance.
+    pub instance: String,
+    /// The action's ID.
+    pub action: String,
+    pub subject: wl_shell_lua::Subject,
+    pub choice: Option<wl_shell_lua::Choice>,
+    /// The action's icon, for its choices without one.
+    pub icon: Option<String>,
 }
 
 /// One thing on the drum while choosing.
@@ -248,6 +289,28 @@ pub struct Level {
     /// default's (the first) name.
     pub placeholder: String,
     pub choices: Vec<Choice>,
+    /// Its choices are the plugin's answer to this action's `choices(s)`,
+    /// asked for as it is entered.
+    pub ask: Option<PluginRun>,
+    /// The request for them, while the level waits.
+    pub asking: Option<RequestId>,
+}
+
+impl Level {
+    fn new(name: impl Into<String>, placeholder: impl Into<String>, choices: Vec<Choice>) -> Self {
+        Level {
+            name: name.into(),
+            placeholder: placeholder.into(),
+            choices,
+            ask: None,
+            asking: None,
+        }
+    }
+
+    /// Whether it waits for the plugin's answer to request `id`.
+    pub fn waits_for(&self, id: RequestId) -> bool {
+        self.asking == Some(id)
+    }
 }
 
 /// An entry of a table, for subjects `S`.
@@ -306,13 +369,7 @@ const FILE_ACTIONS: &[Action<File>] = &[
             true => cx.candidates().len() > 1,
             false => !cx.candidates().is_empty(),
         },
-        does: |f, cx| {
-            Does::Choose(Level {
-                name: "Open with".into(),
-                placeholder: "Apps".into(),
-                choices: open_with(&f.path, cx),
-            })
-        },
+        does: |f, cx| Does::Choose(Level::new("Open with", "Apps", open_with(&f.path, cx))),
     },
     Action {
         id: "open-directory",
@@ -363,13 +420,7 @@ const APP_WINDOWS: &[Action<App>] = &[Action {
     icon: |_, _| names(&["preferences-system-windows", "window", "view-grid"]),
     // One is what Enter on the app activates already.
     applies: |a, _| a.windows.len() > 1,
-    does: |a, _| {
-        Does::Choose(Level {
-            name: "Windows".into(),
-            placeholder: "Windows".into(),
-            choices: windows(a),
-        })
-    },
+    does: |a, _| Does::Choose(Level::new("Windows", "Windows", windows(a))),
 }];
 
 /// An app's actions, in the order they are shown, after its own.
@@ -445,7 +496,7 @@ fn terminal_dir(file: &File) -> Option<&Path> {
 
 /// The actions that apply to `subject`.
 pub fn actions(subject: &Subject, cx: &Context) -> Level {
-    let choices = match subject {
+    let mut choices = match subject {
         Subject::File(f) => choices(FILE_ACTIONS, f, cx),
         Subject::App(a) => {
             let mut all = choices(APP_WINDOWS, a, cx);
@@ -469,11 +520,105 @@ pub fn actions(subject: &Subject, cx: &Context) -> Level {
             all
         }
     };
-    Level {
-        name: subject.name(),
-        placeholder: choices.first().map(|c| c.name.clone()).unwrap_or_default(),
-        choices,
+    choices.extend(plugin_actions(subject, cx));
+    let placeholder = choices.first().map(|c| c.name.clone()).unwrap_or_default();
+    Level::new(subject.name(), placeholder, choices)
+}
+
+/// `subject` as a plugin sees it.
+pub fn lua_subject(subject: &Subject, cx: &Context) -> wl_shell_lua::Subject {
+    match subject {
+        Subject::File(f) => wl_shell_lua::Subject::File {
+            path: f.path.to_string_lossy().into_owned(),
+            name: subject.name(),
+            dir: f.dir,
+            mime: cx.file_type.map(|t| t.types.clone()).unwrap_or_default(),
+        },
+        Subject::App(a) => wl_shell_lua::Subject::App {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            running: a.running(),
+            pinned: cx.pinned,
+            windows: (a.windows.iter())
+                .map(|w| SubjectWindow {
+                    id: w.id.clone(),
+                    title: w.title.clone(),
+                })
+                .collect(),
+        },
+        Subject::Window(w) => wl_shell_lua::Subject::Window {
+            id: w.id.clone(),
+            title: w.title.clone(),
+            app_id: w.app_id.clone(),
+            app_name: w.app_name.clone(),
+        },
     }
+}
+
+/// A plugin's icon name, else a generic one.
+fn plugin_icon(icon: Option<&str>) -> Icon {
+    let own = icon.map(str::trim).filter(|i| !i.is_empty());
+    names(&own.into_iter().chain([PLUGIN_ICON]).collect::<Vec<_>>())
+}
+
+/// The plugins' actions whose `when` holds for `subject`. Their IDs are
+/// prefixed with their instance's, so they never meet the tables' or
+/// each other's.
+fn plugin_actions(subject: &Subject, cx: &Context) -> Vec<Choice> {
+    if cx.plugins.is_empty() {
+        return Vec::new();
+    }
+    let lua = lua_subject(subject, cx);
+    (cx.plugins.iter())
+        .filter(|(_, a)| a.when.matches(&lua))
+        .map(|(instance, a)| {
+            let run = PluginRun {
+                instance: instance.clone(),
+                action: a.id.clone(),
+                subject: lua.clone(),
+                choice: None,
+                icon: a.icon.clone(),
+            };
+            let does = match a.choices {
+                true => Does::Choose(Level {
+                    ask: Some(run),
+                    ..Level::new(a.name.clone(), LOADING, Vec::new())
+                }),
+                false => Does::Plugin(run),
+            };
+            Choice {
+                id: format!("{instance}:{}", a.id),
+                name: a.name.clone(),
+                icon: plugin_icon(a.icon.as_deref()),
+                does,
+            }
+        })
+        .collect()
+}
+
+/// The plugin's answer to `level`'s request for choices (an error, or
+/// no answer in time, as none): each runs the action with it. The level
+/// waits no more.
+pub fn fill(level: &mut Level, answer: Result<Vec<wl_shell_lua::Choice>, String>) {
+    level.asking = None;
+    let Some(ask) = &level.ask else {
+        return;
+    };
+    level.choices = (answer.unwrap_or_default().into_iter())
+        .map(|c| Choice {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            icon: plugin_icon(c.icon.as_deref().or(ask.icon.as_deref())),
+            does: Does::Plugin(PluginRun {
+                choice: Some(c),
+                ..ask.clone()
+            }),
+        })
+        .collect();
+    level.placeholder = match level.choices.first() {
+        Some(c) => c.name.clone(),
+        None => NO_CHOICES.into(),
+    };
 }
 
 /// `app`'s windows, in its order (the most recently focused first), by
@@ -649,6 +794,29 @@ mod tests {
             terminal: env.terminal,
             clipboard: env.clipboard,
             close: env.close,
+            plugins: &[],
+        };
+        actions(subject, &cx)
+    }
+
+    /// The level of `subject` with the plugins' actions `plugins`.
+    fn with_plugins(
+        subject: &Subject,
+        file_type: Option<&FileType>,
+        pinned: bool,
+        plugins: &[PluginAction],
+    ) -> Level {
+        let history = |_: &str| 0.0;
+        let cx = Context {
+            apps: &[],
+            file_type,
+            history: &history,
+            trash: false,
+            pinned,
+            terminal: false,
+            clipboard: false,
+            close: false,
+            plugins,
         };
         actions(subject, &cx)
     }
@@ -1132,5 +1300,150 @@ mod tests {
             ..w
         });
         assert_eq!(untitled.name(), "Firefox");
+    }
+
+    /// The image-shrink and follow-logs examples.
+    fn examples() -> Vec<PluginAction> {
+        use wl_shell_lua::{SubjectKind, When};
+        let shrink = ActionDecl {
+            id: "shrink".into(),
+            name: "Shrink image".into(),
+            icon: Some("image-x-generic".into()),
+            when: When {
+                kinds: vec![SubjectKind::File],
+                mime: Some("image/*".into()),
+                ..Default::default()
+            },
+            choices: true,
+        };
+        let logs = ActionDecl {
+            id: "logs".into(),
+            name: "Follow logs".into(),
+            icon: None,
+            when: When {
+                kinds: vec![SubjectKind::App],
+                running: Some(true),
+                ..Default::default()
+            },
+            choices: false,
+        };
+        vec![("plugin:img".into(), shrink), ("plugin:logs".into(), logs)]
+    }
+
+    #[test]
+    fn plugin_actions_come_last_where_they_apply() {
+        let plugins = examples();
+        let png = file_type(&["image/png", "application/octet-stream"], "");
+        let pdf = file_type(&["application/pdf"], "");
+        let cat = file("/d/cat.png", false);
+        let l = with_plugins(&cat, Some(&png), false, &plugins);
+        assert_eq!(ids(&l), ["open", "open-directory", "plugin:img:shrink"]);
+        let shrink = l.choices.last().unwrap();
+        assert_eq!(shrink.name, "Shrink image");
+        assert_eq!(shrink.icon, names(&["image-x-generic", "system-run"]));
+        // With choices: a level that waits for them.
+        let Does::Choose(level) = &shrink.does else {
+            panic!("a level");
+        };
+        assert_eq!(
+            (level.placeholder.as_str(), level.choices.len()),
+            (LOADING, 0)
+        );
+        let ask = level.ask.as_ref().unwrap();
+        assert_eq!(
+            (ask.instance.as_str(), ask.action.as_str()),
+            ("plugin:img", "shrink")
+        );
+        assert_eq!(
+            ask.subject,
+            wl_shell_lua::Subject::File {
+                path: "/d/cat.png".into(),
+                name: "cat.png".into(),
+                dir: false,
+                mime: vec!["image/png".into(), "application/octet-stream".into()],
+            }
+        );
+        // Not an image: no Shrink.
+        let l = with_plugins(&file("/d/a.pdf", false), Some(&pdf), false, &plugins);
+        assert_eq!(ids(&l), ["open", "open-directory"]);
+        // Follow logs: running apps only, run at once.
+        let stopped = Subject::App(firefox());
+        let l = with_plugins(&stopped, None, true, &plugins);
+        assert_eq!(ids(&l), ["pin"]);
+        let running = Subject::App(App {
+            windows: vec![window("w1", "Inbox")],
+            ..firefox()
+        });
+        let l = with_plugins(&running, None, true, &plugins);
+        assert_eq!(ids(&l), ["pin", "new-window", "plugin:logs:logs"]);
+        let Does::Plugin(run) = &l.choices[2].does else {
+            panic!("runs");
+        };
+        assert_eq!(l.choices[2].icon, names(&["system-run"]));
+        assert_eq!(run.choice, None);
+        let wl_shell_lua::Subject::App {
+            id,
+            running,
+            pinned,
+            windows,
+            ..
+        } = &run.subject
+        else {
+            panic!("an app");
+        };
+        assert_eq!((id.as_str(), *running, *pinned), ("firefox", true, true));
+        assert_eq!(windows[0].title, "Inbox");
+        // A window is neither a file nor an app.
+        let l = with_plugins(&found(None, &[]), None, false, &plugins);
+        assert_eq!(ids(&l), ["activate"]);
+    }
+
+    #[test]
+    fn filling_a_plugins_level() {
+        let plugins = examples();
+        let png = file_type(&["image/png"], "");
+        let l = with_plugins(&file("/d/cat.png", false), Some(&png), false, &plugins);
+        let Some(Does::Choose(waiting)) = l.choices.last().map(|c| c.does.clone()) else {
+            panic!("a level");
+        };
+        let choice = |id: &str, icon: Option<&str>| wl_shell_lua::Choice {
+            id: id.into(),
+            name: format!("{id}%"),
+            icon: icon.map(Into::into),
+            data: serde_json::json!({ "id": id }),
+        };
+        let mut level = Level {
+            asking: Some(RequestId(7)),
+            ..waiting.clone()
+        };
+        assert!(level.waits_for(RequestId(7)) && !level.waits_for(RequestId(8)));
+        fill(
+            &mut level,
+            Ok(vec![choice("50", None), choice("25", Some("zoom-out"))]),
+        );
+        assert!(level.asking.is_none());
+        assert_eq!(ids(&level), ["50", "25"]);
+        assert_eq!(level.placeholder, "50%");
+        // Each its own icon, else the action's.
+        assert_eq!(
+            level.choices[0].icon,
+            names(&["image-x-generic", "system-run"])
+        );
+        assert_eq!(level.choices[1].icon, names(&["zoom-out", "system-run"]));
+        let Does::Plugin(run) = &level.choices[1].does else {
+            panic!("runs");
+        };
+        assert_eq!(run.action, "shrink");
+        assert_eq!(run.choice, Some(choice("25", Some("zoom-out"))));
+        // An error, or no answer in time: a level with nothing to choose.
+        for answer in [Err("late".to_string()), Ok(Vec::new())] {
+            let mut level = Level {
+                asking: Some(RequestId(9)),
+                ..waiting.clone()
+            };
+            fill(&mut level, answer);
+            assert!(level.choices.is_empty() && level.asking.is_none());
+            assert_eq!(level.placeholder, NO_CHOICES);
+        }
     }
 }

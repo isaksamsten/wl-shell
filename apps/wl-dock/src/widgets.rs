@@ -28,6 +28,12 @@
 //! that entry's `StartupWMClass` and name) once the worker has looked it
 //! up (`set_app`). Plugins `require` the bundled modules (`MODULES`) when
 //! their own folder has no such file.
+//!
+//! The launcher's Tab levels take the launcher actions of the
+//! `[plugin.<name>]` instances (`launcher_actions`; actions.rs filters
+//! them by subject), ask for an action's choices (`ask_choices`, answered
+//! in `Effect::choices` or dropped after its deadline) and run them
+//! (`run_action`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,17 +43,19 @@ use std::time::{Duration, Instant};
 use wl_shell_log::warn;
 use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
-    AppInfo, Axis, Event, InstanceSpec, Pending, PopupOn, Registry, Reply, RequestKind, Role,
-    Runtime, Settings, Source, Span, Tile, Topic,
+    AppInfo, Axis, Choice, Event, InstanceSpec, Pending, PopupOn, Registry, Reply, RequestId,
+    RequestKind, Role, Runtime, Settings, Source, Span, Tile, Topic,
 };
 use wl_shell_render::icons::AppEntry;
 
+use crate::actions::{self, PluginAction, PluginRun};
 use crate::config::{Config, plugin_name_ok};
 use crate::dock;
 
 /// Plugins built into the dock, by name.
 pub const BUNDLED: &[(&str, &str)] = &[
     ("clock", include_str!("../plugins/clock.lua")),
+    ("convert", include_str!("../plugins/convert.lua")),
     ("player", include_str!("../plugins/player.lua")),
     ("unread", include_str!("../plugins/unread.lua")),
 ];
@@ -59,6 +67,8 @@ pub const MODULES: &[(&str, &str)] = &[("mpris", include_str!("../plugins/mpris.
 const LABEL_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long an icon may take.
 const ICON_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long a launcher action's `run` may wait for its plugin.
+const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The instance of the widget on the app `app_id`.
 pub fn app_instance(app_id: &str) -> String {
@@ -273,6 +283,9 @@ pub struct Effect {
     pub spans: bool,
     pub clipboard: Option<String>,
     pub popup: Option<(String, Option<Arc<Node>>)>,
+    /// A launcher action's choices, for the level that asked with this
+    /// request (an error if the plugin failed).
+    pub choices: Option<(RequestId, Result<Vec<Choice>, String>)>,
 }
 
 impl Effect {
@@ -488,7 +501,10 @@ impl Widgets {
     /// always opens on hover (a click is the app's), a standalone
     /// widget's as its plugin says (`popup_on`).
     pub fn popup_on(&self, key: &str) -> Option<PopupOn> {
-        let w = self.registry.widget(&key_instance(key)).filter(|w| w.popup)?;
+        let w = self
+            .registry
+            .widget(&key_instance(key))
+            .filter(|w| w.popup)?;
         match dock::widget_name(key) {
             Some(_) => Some(w.popup_on),
             None => Some(PopupOn::Hover),
@@ -534,6 +550,48 @@ impl Widgets {
             && let Some(ticket) = rt.request(instance, RequestKind::Popup, ICON_TIMEOUT)
         {
             self.pending.insert(instance, ticket);
+        }
+    }
+
+    /// The launcher actions of the plugins' own instances (`[plugin.
+    /// <name>]` tables; a widget placement's are its plugin's too, but
+    /// aren't offered once per placement): by instance, each's in the
+    /// order it declares them.
+    pub fn launcher_actions(&self) -> Vec<PluginAction> {
+        let mut all: Vec<PluginAction> = (self.registry.actions())
+            .filter(|(i, _)| i.starts_with("plugin:"))
+            .map(|(i, a)| (i.to_string(), a.clone()))
+            .collect();
+        // Stable: each instance's stay in order.
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
+    /// Ask for the choices of `run`'s action, due in
+    /// `actions::CHOICES_TIMEOUT` (a newer ask of the plugin's supersedes
+    /// it); the request's ID, which the answer comes with (`Effect`).
+    pub fn ask_choices(&mut self, run: &PluginRun) -> Option<RequestId> {
+        let kind = RequestKind::Choices {
+            action: run.action.clone(),
+            subject: run.subject.clone(),
+        };
+        let ticket =
+            (self.runtime.as_ref())?.request(&run.instance, kind, actions::CHOICES_TIMEOUT)?;
+        let id = ticket.id;
+        self.pending.insert(&run.instance, ticket);
+        Some(id)
+    }
+
+    /// Run `run`'s action (with its choice); nobody waits for it.
+    pub fn run_action(&self, run: PluginRun) {
+        let Some(runtime) = &self.runtime else { return };
+        let kind = RequestKind::Run {
+            action: run.action,
+            subject: run.subject,
+            choice: run.choice,
+        };
+        if runtime.request(&run.instance, kind, RUN_TIMEOUT).is_none() {
+            warn!("{}: not running", run.instance);
         }
     }
 
@@ -594,8 +652,15 @@ impl Widgets {
                 else {
                     return fx;
                 };
-                let instance = &answer.instance;
+                let (instance, id) = (&answer.instance, answer.id);
                 match (answer.result, topic) {
+                    (result, Topic::Choices) => {
+                        let choices = result.and_then(|r| match r {
+                            Reply::Choices(c) => Ok(c),
+                            r => Err(format!("not choices: {r:?}")),
+                        });
+                        fx.choices = Some((id, choices));
+                    }
                     (Ok(Reply::Label(label)), _) => fx.labels = self.set_label(instance, label),
                     (Ok(Reply::Icon(tree)), _) => fx.icons = self.set_icon(instance, tree),
                     (result, Topic::Popup) if instance_key(instance) == self.open => {
@@ -931,6 +996,229 @@ mod tests {
             let e = recv.recv_timeout(end - Instant::now()).expect("no label");
             w.event(e);
         }
+    }
+
+    /// The image-shrink and follow-logs examples from Tab: found for
+    /// their subjects, choices filled from the plugin, run with them; and
+    /// choices that come too late leave a level with nothing to choose.
+    #[test]
+    fn launcher_actions_from_tab() {
+        use crate::actions::{self, Context, Does, FileType, Level, Subject};
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/plugins/launcher-actions.lua"
+        );
+        let c = parse(&format!(
+            "[plugin.launcher-actions]\npath = '{path}'\ndry = true\n\
+             [widgets]\nbudget = 1000000000"
+        ));
+        w.configure(specs(&c, None, &[]));
+        let end = Instant::now() + Duration::from_secs(10);
+        let next = || recv.recv_timeout(end - Instant::now()).expect("no event");
+        while w.launcher_actions().is_empty() {
+            w.event(next());
+        }
+        let plugins = w.launcher_actions();
+        let level = |subject: &Subject, types: &[&str], plugins: &[PluginAction]| {
+            let file_type = FileType {
+                types: types.iter().map(|t| t.to_string()).collect(),
+                assoc: Default::default(),
+            };
+            let history = |_: &str| 0.0;
+            let cx = Context {
+                apps: &[],
+                file_type: Some(&file_type),
+                history: &history,
+                trash: false,
+                pinned: false,
+                terminal: false,
+                clipboard: false,
+                close: false,
+                plugins,
+            };
+            actions::actions(subject, &cx)
+        };
+        // The plugin's level of a choice, as Tab enters it: asked for.
+        let enter = |w: &mut Widgets, l: &Level, id: &str| {
+            let choice = l.choices.iter().find(|c| c.id.ends_with(id)).unwrap();
+            let Does::Choose(level) = &choice.does else {
+                panic!("{id} has choices");
+            };
+            let mut level = level.clone();
+            level.asking = w.ask_choices(level.ask.as_ref().unwrap());
+            assert_eq!(level.placeholder, actions::LOADING);
+            level
+        };
+        let clipboard = |w: &mut Widgets| loop {
+            if let Some(text) = w.event(next()).clipboard {
+                break text;
+            }
+        };
+
+        let cat = Subject::File(actions::File {
+            path: "/p/cat.png".into(),
+            dir: false,
+        });
+        let l = level(&cat, &["image/png"], &plugins);
+        let mut shrink = enter(&mut w, &l, ":shrink");
+        let (id, answer) = loop {
+            if let Some(choices) = w.event(next()).choices {
+                break choices;
+            }
+        };
+        assert!(shrink.waits_for(id));
+        actions::fill(&mut shrink, answer);
+        let names: Vec<&str> = shrink.choices.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["50%", "25%"]);
+        let Does::Plugin(run) = shrink.choices[1].does.clone() else {
+            panic!("runs");
+        };
+        w.run_action(run);
+        assert_eq!(
+            clipboard(&mut w),
+            "magick /p/cat.png -resize 25% /p/cat.png.small.png"
+        );
+
+        // Follow logs runs at once, on a running app.
+        let foot = |windows: Vec<actions::Window>| {
+            Subject::App(actions::App {
+                id: "foot".into(),
+                name: "Foot".into(),
+                desktop: Vec::new(),
+                commands: Vec::new(),
+                windows,
+                launchable: true,
+            })
+        };
+        let stopped = level(&foot(Vec::new()), &[], &plugins);
+        assert!(stopped.choices.iter().all(|c| !c.id.ends_with(":logs")));
+        let window = actions::Window {
+            id: "w1".into(),
+            title: "~".into(),
+        };
+        let l = level(&foot(vec![window]), &[], &plugins);
+        let Some(Does::Plugin(run)) = l.choices.last().map(|c| c.does.clone()) else {
+            panic!("Follow logs runs");
+        };
+        w.run_action(run);
+        assert_eq!(clipboard(&mut w), "foot journalctl --user -f -t foot");
+
+        // Too slow: the answer is dropped, and the level gives up.
+        let stuck = Subject::File(actions::File {
+            path: "/p/stuck".into(),
+            dir: false,
+        });
+        let l = level(&stuck, &["text/plain"], &plugins);
+        let mut slow = enter(&mut w, &l, ":stuck");
+        let asked = Instant::now();
+        while asked.elapsed() < Duration::from_millis(2500) {
+            let Ok(e) = recv.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            assert_eq!(w.event(e).choices, None, "a late answer is dropped");
+        }
+        assert!(slow.asking.is_some());
+        actions::fill(&mut slow, Err("no answer in time".into()));
+        assert!(slow.choices.is_empty() && slow.asking.is_none());
+        assert_eq!(slow.placeholder, actions::NO_CHOICES);
+    }
+
+    /// The bundled `convert`: offered on images, not their own format,
+    /// and writing the copy next to the original under a free name (with
+    /// `cp` standing in for ImageMagick).
+    #[test]
+    fn the_bundled_converter() {
+        use crate::actions::{self, Context, Does, FileType, Subject};
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        let c = parse(
+            "[plugin.convert]\ncommand = ['cp']\nnotify = false\nformats = ['png', '.JPEG', 'webp']",
+        );
+        w.configure(specs(&c, None, &[]));
+        let end = Instant::now() + Duration::from_secs(10);
+        let next = || recv.recv_timeout(end - Instant::now()).expect("no event");
+        while w.launcher_actions().is_empty() {
+            w.event(next());
+        }
+        let plugins = w.launcher_actions();
+        let dir = std::env::temp_dir().join(format!("wl-dock-convert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("my photo.png");
+        std::fs::write(&photo, b"not really a png").unwrap();
+        let level = |path: &Path, types: &[&str]| {
+            let file_type = FileType {
+                types: types.iter().map(|t| t.to_string()).collect(),
+                assoc: Default::default(),
+            };
+            let history = |_: &str| 0.0;
+            let cx = Context {
+                apps: &[],
+                file_type: Some(&file_type),
+                history: &history,
+                trash: false,
+                pinned: false,
+                terminal: false,
+                clipboard: false,
+                close: false,
+                plugins: &plugins,
+            };
+            let subject = Subject::File(actions::File {
+                path: path.to_path_buf(),
+                dir: false,
+            });
+            actions::actions(&subject, &cx)
+        };
+        // Not on other files.
+        let text = level(&dir.join("a.txt"), &["text/plain"]);
+        assert!(
+            text.choices
+                .iter()
+                .all(|c| c.id != "plugin:convert:convert")
+        );
+        let l = level(&photo, &["image/png"]);
+        let convert = l.choices.iter().find(|c| c.id == "plugin:convert:convert");
+        let Some(Does::Choose(waiting)) = convert.map(|c| c.does.clone()) else {
+            panic!("Convert image… has choices");
+        };
+        let mut formats = waiting.clone();
+        formats.asking = w.ask_choices(formats.ask.as_ref().unwrap());
+        let (_, answer) = loop {
+            if let Some(choices) = w.event(next()).choices {
+                break choices;
+            }
+        };
+        actions::fill(&mut formats, answer);
+        let names: Vec<&str> = formats.choices.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["JPG", "WEBP"]);
+        let Does::Plugin(webp) = formats.choices[1].does.clone() else {
+            panic!("runs");
+        };
+        let made = |name: &str| {
+            let path = dir.join(name);
+            while !path.exists() {
+                assert!(Instant::now() < end, "no {name}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::fs::read(path).unwrap()
+        };
+        w.run_action(webp.clone());
+        assert_eq!(made("my photo.webp"), b"not really a png");
+        // Taken: the next free name.
+        w.run_action(webp);
+        made("my photo-2.webp");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The bundled clock standalone: its face, its label and its popup,

@@ -58,7 +58,8 @@ file query, or Shift+Tab, goes back to the apps. Hidden files, `.gitignore`d
 files and `launcher.files.exclude` are skipped, symlinks aren't followed, and
 the walk stays on one file system.
 
-Tab on a file or application shows what you can do with it.
+Tab on a file or application shows what you can do with it. Lua plugins can
+add their own actions there; see [PLUGINS.md](PLUGINS.md#launcher-actions).
 
 Start the query with `@` to search every open window by title or app name, on
 any output. The drum shows each window's capture, and `@` followed by Enter goes
@@ -314,8 +315,10 @@ that app's windows).
 A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
-The bundled plugins include `clock`, `player` for MPRIS playback, and
-`unread` for apps that publish a launcher count over D-Bus.
+The bundled plugins include `clock`, `player` for MPRIS playback,
+`unread` for apps that publish a launcher count over D-Bus, and `convert`,
+which adds Convert image… to the launcher's actions on images (enable it
+with an empty `[plugin.convert]` table).
 
 ```toml
 [app.spotify]

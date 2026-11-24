@@ -426,9 +426,130 @@ fn plugin_tables_only_keep_launcher_states() {
     assert!(loaded(&recv, "w").widget.is_some());
     let l = spec(
         "l",
-        "return { actions = { { id = 'x' } }, setup = function() end }",
+        "return { actions = { { id = 'x', run = function() end } }, setup = function() end }",
     );
     rt.configure(vec![w, l]);
     assert!(loaded(&recv, "l").launcher());
     assert!(label(&rt, &recv, "w").unwrap_err().contains("not running"));
+}
+
+/// The image-shrink and follow-logs examples, through the runtime: what
+/// applies is found in Rust, choices come back with their own fields,
+/// and `run` gets the subject and the choice.
+#[test]
+fn launcher_actions_choose_and_run() {
+    use wl_shell_lua::{Choice, Registry, Subject};
+    let (rt, recv) = runtime();
+    let source = "
+        return {
+          actions = {
+            { id = 'shrink', name = 'Shrink image', icon = 'image-x-generic',
+              when = { kind = 'file', mime = 'image/*' },
+              choices = function(s)
+                return { { id = '50', name = '50%', factor = 0.5 }, { id = '25', name = '25%' },
+                         { id = '50', name = 'again' } }
+              end,
+              run = function(s, choice)
+                dock.clipboard(s.name .. ' ' .. choice.id .. ' ' .. tostring(choice.factor))
+              end },
+            { id = 'logs', name = 'Follow logs', icon = 'utilities-terminal',
+              when = { kind = 'app', running = true },
+              run = function(s, choice) dock.clipboard('logs ' .. s.id .. ' ' .. tostring(choice)) end },
+            { id = 'stuck', when = { kind = 'file' },
+              choices = function(s) while true do end end,
+              run = function() end },
+          },
+        }";
+    let spec = InstanceSpec {
+        role: Role::Plugin,
+        ..code("plugin:demo", source)
+    };
+    rt.configure(vec![spec]);
+    let mut registry = Registry::default();
+    registry.insert("plugin:demo", loaded(&recv, "plugin:demo"));
+    let image = Subject::File {
+        path: "/tmp/cat.png".into(),
+        name: "cat.png".into(),
+        dir: false,
+        mime: vec!["image/png".into(), "application/octet-stream".into()],
+    };
+    let app = |running| Subject::App {
+        id: "foot".into(),
+        name: "Foot".into(),
+        running,
+        pinned: true,
+        windows: Vec::new(),
+    };
+    let ids = |s: &Subject| {
+        (registry.actions_for(s, |_| true).into_iter())
+            .map(|(_, a)| a.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&image), ["shrink", "stuck"]);
+    assert_eq!(ids(&app(true)), ["logs"]);
+    assert!(ids(&app(false)).is_empty());
+
+    let ask = |kind| {
+        let ticket = rt.request("plugin:demo", kind, WAIT).unwrap();
+        next(&recv, |e| match e {
+            Event::Answer(a) if a.id == ticket.id => Some(a.result),
+            _ => None,
+        })
+    };
+    let Ok(Reply::Choices(choices)) = ask(RequestKind::Choices {
+        action: "shrink".into(),
+        subject: image.clone(),
+    }) else {
+        panic!("no choices");
+    };
+    // A repeated id is dropped.
+    let names: Vec<&str> = choices.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["50%", "25%"]);
+    let choice: Choice = choices[0].clone();
+    let clipboard = |recv: &Receiver<Event>| {
+        next(recv, |e| match e {
+            Event::Clipboard { text, .. } => Some(text),
+            _ => None,
+        })
+    };
+    let run = RequestKind::Run {
+        action: "shrink".into(),
+        subject: image.clone(),
+        choice: Some(choice),
+    };
+    rt.request("plugin:demo", run, WAIT).unwrap();
+    assert_eq!(clipboard(&recv), "cat.png 50 0.5");
+    let run = RequestKind::Run {
+        action: "logs".into(),
+        subject: app(true),
+        choice: None,
+    };
+    rt.request("plugin:demo", run, WAIT).unwrap();
+    assert_eq!(clipboard(&recv), "logs foot nil");
+    // An unknown action is an error, not a crash.
+    let e = ask(RequestKind::Choices {
+        action: "nope".into(),
+        subject: image.clone(),
+    });
+    assert!(e.unwrap_err().contains("no action"));
+    // `choices` that never answers within the host's deadline: the
+    // answer is late (dropped by `Pending`), and the state restarts.
+    let mut pending = Pending::default();
+    let ticket = rt
+        .request(
+            "plugin:demo",
+            RequestKind::Choices {
+                action: "stuck".into(),
+                subject: image,
+            },
+            Duration::from_millis(500),
+        )
+        .unwrap();
+    pending.insert("plugin:demo", ticket.clone());
+    let answer = next(&recv, |e| match e {
+        Event::Answer(a) if a.id == ticket.id => Some(a),
+        _ => None,
+    });
+    assert!(answer.result.unwrap_err().contains("budget"));
+    loaded(&recv, "plugin:demo");
 }
