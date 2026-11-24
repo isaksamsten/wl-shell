@@ -318,6 +318,8 @@ that app's windows).
 
 ### Widgets
 
+https://github.com/user-attachments/assets/91522fbc-8969-4ef7-8cc0-24655f02054d
+
 A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
