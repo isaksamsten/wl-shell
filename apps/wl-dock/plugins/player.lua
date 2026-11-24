@@ -114,7 +114,7 @@ local function wide(tile)
 		width = "100%",
 		height = "100%",
 		gap = h * (roomy and 0.08 or 0.06),
-		ui.stack({ width = side, min_width = side, height = "100%", sq }),
+		sq,
 		ui.col({
 			grow = 1,
 			min_width = 0,
