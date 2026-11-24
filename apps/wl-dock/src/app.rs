@@ -4931,7 +4931,7 @@ impl Program for WlDock {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, _: u32) {
         if (self.launcher.as_ref()).is_some_and(|l| l.surface() == surface) {
             self.files_frame();
         }

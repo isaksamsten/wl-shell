@@ -117,8 +117,10 @@ pub trait Program: Sized + 'static {
     /// `surface` is now (also) shown on `output` (`wl_surface.enter`).
     fn surface_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface, output: &WlOutput) {}
 
-    /// A frame callback of `surface` fired.
-    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface) {}
+    /// A frame callback of `surface` fired. `time` is its timestamp in
+    /// milliseconds (from an undefined base): unlike when the callback is
+    /// handled, it steps evenly from frame to frame.
+    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface, time: u32) {}
 
     /// `surface` got keyboard focus.
     fn keyboard_enter(&mut self, core: &mut Core<Self>, surface: &WlSurface) {}
@@ -430,8 +432,8 @@ impl<P: Program> CompositorHandler for Shell<P> {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
-        self.program.frame(&mut self.core, surface);
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, time: u32) {
+        self.program.frame(&mut self.core, surface, time);
     }
 
     fn surface_enter(

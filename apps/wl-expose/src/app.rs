@@ -318,7 +318,7 @@ impl Program for Expose {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, _: u32) {
         if let Some(overlay) = &mut self.overlay
             && overlay.surface() == surface
         {

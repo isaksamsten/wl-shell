@@ -28,10 +28,15 @@
 //! marked by its zoom alone. Tab runs the morph back into the strip's
 //! app's icon while the highlight moves on.
 //!
-//! Previews are captures (capture.rs), planned so the morph never shows
-//! placeholders: one frame of the selected app's windows and its
-//! neighbors' on reveal and when the selection settles (debounced by the
-//! app), live captures for the strip's app while it is open.
+//! Previews are captures (capture.rs). Starting one costs: buffers are
+//! allocated, and the compositor renders the window for it. So the
+//! selected app's windows and its neighbors' are captured (a frame each)
+//! once everything has come to rest, not while anything moves; only
+//! the strip can't wait, and captures its app's windows (live) right away.
+//!
+//! The panel is rendered once for any width (`panel_width`) and stretched,
+//! so neither a different number of apps nor a window closing mid-show
+//! renders it again.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -87,6 +92,9 @@ const CARD_GAP: f64 = 16.0;
 const TITLE_INSET: f64 = 10.0;
 /// How much the icon the selected card grows out of grows with it.
 const MORPH_ICON_GROWTH: f64 = 1.5;
+/// Frame timestamps further apart than this, ms, are a gap (or odd): the
+/// clock measures that frame instead.
+const MAX_FRAME_MS: u32 = 250;
 
 /// The widest a label gets, logical pixels.
 pub fn label_max_width(config: &Config) -> i32 {
@@ -104,9 +112,10 @@ pub fn label_key(app_id: &str, config: &Config, scale: i32) -> Option<LabelKey> 
     })
 }
 
-/// Every subsurface, created in stacking order (bottom first). Rebuilt as
-/// a whole when the number of apps or of strip cards changes, which keeps
-/// the order.
+/// Every subsurface, created in stacking order (bottom first), for the
+/// apps and cards the show starts with. Windows can only close during a
+/// show: the subsurfaces left over are hidden, not destroyed, so nothing
+/// blinks.
 struct Scene {
     dim: Option<Sub>,
     /// Left, middle (stretched), right.
@@ -269,7 +278,6 @@ pub struct Overlay {
     scene: Scene,
     /// Before the buffers they may have attached.
     previews: Vec<Preview>,
-    no_input: Region,
     viewport: WpViewport,
     layer: LayerSurface,
     transparent: WlBuffer,
@@ -299,6 +307,8 @@ pub struct Overlay {
     reveal_wanted: bool,
     layout: Option<Layout>,
     panel_shape: Option<Shape>,
+    /// The panel size `panel_shape` was rendered for.
+    panel_rendered: (f64, f64),
     highlight_shape: Option<Shape>,
     /// Per app; None for apps with one window.
     dot_shapes: Vec<Option<Shape>>,
@@ -309,7 +319,7 @@ pub struct Overlay {
     next_tag: u64,
     /// The strip, once laid out; it stays while it collapses.
     strip: Option<Strip>,
-    /// The selection moved in apps mode; captures follow after a debounce.
+    /// Captures to plan once everything has come to rest.
     captures_stale: bool,
 
     /// Fading and scaling in, 0 to 1.
@@ -326,7 +336,10 @@ pub struct Overlay {
     /// The selected card, fractional while moving.
     strip_sel: Spring,
     frame_pending: bool,
+    /// When the last frame was drawn, by the clock and by the compositor's
+    /// timestamp; None while nothing moves.
     last_frame: Option<Instant>,
+    last_time: Option<u32>,
 }
 
 /// The most cards any app needs.
@@ -335,6 +348,19 @@ fn card_count(switcher: &Switcher) -> usize {
         .map(|a| a.windows.len())
         .max()
         .unwrap_or(0)
+}
+
+/// The width to render a panel `l.panel.w` wide at: the panel is stretched
+/// from its middle column, so any width does that keeps the corners and the
+/// shadow's horizontal falloff out of it (rendered narrower than shown;
+/// stretching can't shrink). Then the shape serves any number of apps.
+fn panel_width(l: &Layout, shadow: Option<shadow::Settings>) -> i32 {
+    let reach = shadow.map_or(0.0, |s| {
+        // The blur's extent (3 sigma), and how far the shadow box reaches.
+        (1.5 * s.softness.max(0.0)).ceil() + s.spread.abs() as f64 + s.offset.0.abs() as f64
+    });
+    let wide_enough = (2.0 * (l.panel_radius + reach + 2.0)).ceil() as i32;
+    (l.panel.w as i32).min(wide_enough)
 }
 
 impl Overlay {
@@ -401,7 +427,6 @@ impl Overlay {
         let mut overlay = Self {
             scene,
             previews: Vec::new(),
-            no_input,
             viewport,
             layer,
             transparent,
@@ -444,6 +469,7 @@ impl Overlay {
             reveal_wanted: false,
             layout: None,
             panel_shape: None,
+            panel_rendered: (0.0, 0.0),
             highlight_shape: None,
             dot_shapes: Vec::new(),
             label: Fade::new(response),
@@ -460,10 +486,11 @@ impl Overlay {
             strip_sel: Spring::new(0.0, response),
             frame_pending: false,
             last_frame: None,
+            last_time: None,
         };
         if overlay.switcher.mode() == Mode::Windows {
-            // Previews are needed right away.
-            overlay.update_captures();
+            // Previews are needed right away; nothing moves yet.
+            overlay.update_captures(true);
         }
         Ok(overlay)
     }
@@ -601,11 +628,12 @@ impl Overlay {
 
         let scale = self.scale;
         let mut cache = self.cache.borrow_mut();
+        let (w, h) = (panel_width(&l, self.style.shadow), l.panel.h as i32);
         self.panel_shape = cache.shape(
             &self.g,
             ShapeKey::Panel {
-                w: l.panel.w as i32,
-                h: l.panel.h as i32,
+                w,
+                h,
                 radius: l.panel_radius as i32,
                 color: self.style.panel_color,
                 shadow: self.style.shadow,
@@ -613,6 +641,7 @@ impl Overlay {
             },
             &self.qh,
         );
+        self.panel_rendered = (w as f64, h as f64);
         let hl = l.highlight_rect(0.0);
         self.highlight_shape = cache.shape(
             &self.g,
@@ -779,24 +808,22 @@ impl Overlay {
 
     // -- captures --------------------------------------------------------
 
-    /// Whether the selection moved in apps mode since the captures were
-    /// last planned. The app calls `update_captures` after a debounce.
-    pub fn captures_stale(&self) -> bool {
-        self.captures_stale
-    }
-
-    /// Capture the windows of the selected app and its neighbors (a frame
-    /// each, kept until the show ends), and the strip's app live while the
-    /// strip is open.
-    pub fn update_captures(&mut self) {
-        self.captures_stale = false;
+    /// Capture the windows of the selected app and, with `neighbors`, its
+    /// neighbors' (a frame each, kept until the show ends), and the
+    /// strip's app live while the strip is open. With `neighbors`, the
+    /// plan is complete: nothing waits for rest anymore.
+    fn update_captures(&mut self, neighbors: bool) {
+        if neighbors || self.style.previews == Previews::Off {
+            self.captures_stale = false;
+        }
         if self.style.previews == Previews::Off {
             return;
         }
         let apps = self.switcher.apps();
         let (n, sel) = (apps.len() as isize, self.switcher.selected_app() as isize);
         let mut wanted: Vec<usize> = Vec::new();
-        for d in [0, 1, -1] {
+        let around: &[isize] = if neighbors { &[0, 1, -1] } else { &[0] };
+        for &d in around {
             let a = (sel + d).rem_euclid(n) as usize;
             for &w in &apps[a].windows {
                 if !wanted.contains(&w) {
@@ -868,7 +895,8 @@ impl Overlay {
         self.retarget_strip(true);
         self.update_label();
         self.update_title();
-        self.update_captures();
+        // Once it has opened.
+        self.captures_stale = true;
         self.visible = true;
         self.open.snap(0.0);
         self.open.retarget(1.0);
@@ -895,9 +923,8 @@ impl Overlay {
     // -- selection -------------------------------------------------------
 
     pub fn step(&mut self, step: Step) {
-        let mode = self.switcher.mode();
         self.switcher.step(step);
-        self.selection_changed(mode);
+        self.selection_changed();
     }
 
     /// Select app `i` (pointer hover).
@@ -905,7 +932,7 @@ impl Overlay {
         let before = (self.switcher.mode(), self.switcher.selected_app());
         self.switcher.select_app(i);
         if (self.switcher.mode(), self.switcher.selected_app()) != before {
-            self.selection_changed(before.0);
+            self.selection_changed();
         }
     }
 
@@ -914,12 +941,12 @@ impl Overlay {
         let before = self.switcher.selected_window();
         self.switcher.select_window(i);
         if self.switcher.selected_window() != before {
-            self.selection_changed(Mode::Windows);
+            self.selection_changed();
         }
     }
 
-    /// The selection changed, from mode `was`.
-    fn selection_changed(&mut self, was: Mode) {
+    /// The selection changed.
+    fn selection_changed(&mut self) {
         let mode = self.switcher.mode();
         let morph = match mode {
             Mode::Apps => 0.0,
@@ -938,37 +965,26 @@ impl Overlay {
         }
         self.update_label();
         self.update_title();
-        // The strip needs its previews now; Tab-cycling can wait.
-        if mode == Mode::Windows || was != mode {
-            self.update_captures();
-        } else {
-            self.captures_stale = true;
+        // The strip needs its previews now. The rest waits until
+        // everything has come to rest, so starting captures doesn't stall
+        // the movement (and Tab-cycling doesn't start a burst of them).
+        if mode == Mode::Windows {
+            self.update_captures(false);
         }
+        self.captures_stale = true;
         self.kick();
     }
 
     /// A window closed. False if none are left.
     pub fn remove(&mut self, id: &str) -> bool {
-        let shape = (self.switcher.apps().len(), card_count(&self.switcher));
-        let mode = self.switcher.mode();
         if !self.switcher.remove(id) {
             return false;
         }
         self.handles.retain(|(_, i)| i != id);
         self.previews.retain(|p| p.window != id);
-        if (self.switcher.apps().len(), card_count(&self.switcher)) != shape {
-            self.scene = Scene::new(
-                &self.g,
-                self.layer.wl_surface(),
-                &self.no_input,
-                self.dim_buffer.is_some(),
-                self.switcher.apps().len(),
-                card_count(&self.switcher),
-                &self.qh,
-            );
-        }
+        // The scene keeps its subsurfaces: `place_all` hides those left over.
         self.relayout();
-        self.selection_changed(mode);
+        self.selection_changed();
         true
     }
 
@@ -1146,18 +1162,30 @@ impl Overlay {
         ]
     }
 
-    /// The frame callback: advance the springs and draw.
-    pub fn frame_done(&mut self) {
+    /// The frame callback, with its timestamp: advance the springs, start
+    /// the captures that waited for rest, and draw.
+    pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
         let now = Instant::now();
-        let dt = self
-            .last_frame
-            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        // By the compositor's timestamps, which step evenly from frame to
+        // frame, unlike when the callback gets handled (after whatever else
+        // the loop had to do). The first frame of a movement, or one after
+        // a gap or an odd timestamp, goes by the clock.
+        let step = self.last_time.map(|t| time.wrapping_sub(t));
+        let dt = match (step, self.last_frame) {
+            (Some(ms @ 1..=MAX_FRAME_MS), _) => ms as f64 / 1000.0,
+            (_, Some(t)) => now.saturating_duration_since(t).as_secs_f64(),
+            (_, None) => 0.0,
+        };
         let mut moving = false;
         for s in self.springs() {
             moving |= s.advance(dt);
         }
         self.last_frame = moving.then_some(now);
+        self.last_time = moving.then_some(time);
+        if !moving && self.captures_stale && !self.closing() {
+            self.update_captures(true);
+        }
         self.render();
     }
 
@@ -1244,7 +1272,7 @@ impl Overlay {
             &mut scene.panel,
             self.panel_shape.as_ref(),
             panel,
-            (l.panel.w, l.panel.h),
+            self.panel_rendered,
             Axis::Horizontal,
             scale,
             &xf,
@@ -1303,6 +1331,11 @@ impl Overlay {
             }
         }
         drop(cache);
+        // Those of apps whose windows closed.
+        let n = keys.len();
+        for sub in (scene.icons.iter_mut().skip(n)).chain(scene.dots.iter_mut().skip(n)) {
+            sub.clear();
+        }
 
         // The label follows the highlight, within the panel.
         let center = hl_x + l.icon / 2.0;

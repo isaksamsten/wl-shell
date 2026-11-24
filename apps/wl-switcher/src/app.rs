@@ -40,10 +40,6 @@ use wl_shell_ui::Cache;
 /// linux/input-event-codes.h
 const BTN_LEFT: u32 = 0x110;
 
-/// How long the selection must rest in apps mode before its neighborhood
-/// is captured.
-const CAPTURE_DEBOUNCE: Duration = Duration::from_millis(50);
-
 pub struct WlSwitcher {
     /// The config, reloaded when its file changes.
     reloader: Reloader<Config>,
@@ -59,8 +55,6 @@ pub struct WlSwitcher {
     hold: Hold,
     /// The show-delay or cancel fade timer of the current show.
     timer: Option<RegistrationToken>,
-    /// The debounce before captures follow an apps-mode selection.
-    capture_timer: Option<RegistrationToken>,
     /// Set once the user picked or cancelled.
     outcome: Option<Outcome>,
 }
@@ -77,7 +71,6 @@ impl WlSwitcher {
             overlay: None,
             hold: Hold::default(),
             timer: None,
-            capture_timer: None,
             outcome: None,
         })
     }
@@ -223,33 +216,6 @@ impl WlSwitcher {
         Ok(())
     }
 
-    /// The selection may have moved: plan the captures for it once it
-    /// rests for a moment, so Tab-cycling doesn't start a burst of
-    /// sessions.
-    fn schedule_captures(&mut self, core: &Core<Self>) {
-        if !self.overlay.as_ref().is_some_and(|o| o.captures_stale()) {
-            return;
-        }
-        if let Some(token) = self.capture_timer.take() {
-            core.loop_handle.remove(token);
-        }
-        let token = core.timer(CAPTURE_DEBOUNCE, |app: &mut Self, _| {
-            app.capture_timer = None;
-            if let Some(overlay) = &mut app.overlay {
-                overlay.update_captures();
-            }
-        });
-        match token {
-            Ok(token) => self.capture_timer = Some(token),
-            // Then right away.
-            Err(_) => {
-                if let Some(overlay) = &mut self.overlay {
-                    overlay.update_captures();
-                }
-            }
-        }
-    }
-
     /// The first outcome wins.
     fn finish(&mut self, outcome: Outcome) {
         self.outcome.get_or_insert(outcome);
@@ -367,11 +333,11 @@ impl Program for WlSwitcher {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface) {
+    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, time: u32) {
         if let Some(overlay) = &mut self.overlay
             && overlay.surface() == surface
         {
-            overlay.frame_done();
+            overlay.frame_done(time);
         }
     }
 
@@ -406,7 +372,6 @@ impl Program for WlSwitcher {
                 if let Some(overlay) = &mut self.overlay {
                     overlay.step(step);
                 }
-                self.schedule_captures(core);
             }
         }
     }
@@ -437,7 +402,6 @@ impl Program for WlSwitcher {
                     Hit::Window(i) => overlay.select_window(i),
                     _ => {}
                 }
-                self.schedule_captures(core);
             }
             PointerEventKind::Press { button, .. } => {
                 if !overlay.visible() || !inside {
@@ -562,10 +526,7 @@ impl Daemon for WlSwitcher {
     /// Destroy the switcher, and with it its captures.
     fn end_show(&mut self, core: &mut Core<Self>) {
         self.overlay = None;
-        for token in [self.timer.take(), self.capture_timer.take()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(token) = self.timer.take() {
             core.loop_handle.remove(token);
         }
         // The next switcher gets a fresh enter.

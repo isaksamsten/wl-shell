@@ -259,6 +259,6 @@ mod tests {
             Some(Action::Step(Step::NextWindow))
         );
         assert!(Action::Step(Step::NextApp).repeats() && !Action::Pick.repeats());
-        assert!(!Action:Close.repeats());
+        assert!(!Action::Close.repeats());
     }
 }
