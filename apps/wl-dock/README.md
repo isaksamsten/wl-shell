@@ -322,7 +322,7 @@ A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
 The bundled plugins include `clock`, `player` for MPRIS playback,
-`unread` for apps that publish a launcher count over D-Bus, `convert`,
+`unread` for apps that publish a launcher count, progress or urgency over D-Bus, `convert`,
 which adds Convert image… to the launcher's actions on images, and `calc`, a
 calculator behind `=` in the launcher with functions, bases and unit
 conversions (`=10 km in mi`). Enable those two with an empty
@@ -333,7 +333,7 @@ conversions (`=10 km in mi`). Enable those two with an empty
 widget = "player"              # or { plugin = "player", player = "spotify" }
 
 [app."co.hyprlab.Hylki"]
-widget = "unread"              # Shows a badge after the app publishes its count
+widget = "unread"              # Shows the app's published count, progress and urgency
 
 [widget.clock]                 # Shown while `@clock` is pinned
 name = "Clock"
@@ -346,6 +346,10 @@ budget = 1000000               # Lua instructions per hook call
 ```
 
 The unread badge appears after the first visible, positive count update.
+While the app reports visible progress (`progress-visible`), a thin arc
+around the icon fills clockwise from the top. While it is `urgent`, the
+badge shows `!` if there is no count to show. Telegram, Thunderbird and
+Discord publish these.
 The plugin matches the app's desktop entry, falling back to its Wayland app
 ID. If the publisher uses a different desktop ID, override it with
 `widget = { plugin = "unread", desktop-entry = "example.desktop" }`.

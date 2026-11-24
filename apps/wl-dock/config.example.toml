@@ -281,7 +281,8 @@
 #[app.firefox]
 #widget = { plugin = "player", player = "firefox" }
 
-# Show the count published by an app over Unity LauncherEntry D-Bus signals.
+# Show the count, progress (an arc around the icon) and urgency ("!")
+# published by an app over Unity LauncherEntry D-Bus signals.
 #[app."co.hyprlab.Hylki"]
 #widget = "unread"
 # Badge position: top-left, top, top-right (default), left, center, right,
