@@ -68,6 +68,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("convert", include_str!("../plugins/convert.lua")),
     ("player", include_str!("../plugins/player.lua")),
     ("unread", include_str!("../plugins/unread.lua")),
+    ("calendar", include_str!("../plugins/calendar.lua")),
 ];
 
 /// Modules built into the dock that plugins `require`, by name.
