@@ -9,7 +9,7 @@
 //! mode (or the one `mode` forces).
 
 use serde::{Deserialize, Deserializer};
-use wl_shell_config::{ConfigFile, Scheme, de};
+use wl_shell_config::{de, ConfigFile, Scheme};
 use wl_shell_render::{shadow, text};
 
 pub type Appearance = wl_shell_config::Appearance<Theme>;
@@ -67,6 +67,7 @@ pub struct Config {
     /// Command (run with `sh -c`) that prints the ID of each window that
     /// gains focus, one per line.
     pub mru_event_stream: Option<String>,
+    pub close_command: Option<String>,
     pub appearance: Appearance,
 }
 
@@ -91,6 +92,7 @@ impl Default for Config {
             font: "sans-serif".into(),
             font_size: 14,
             mru_event_stream: None,
+            close_command: None,
             appearance: Appearance::default(),
         }
     }
@@ -300,6 +302,7 @@ mod tests {
             dim = 0.2
             font = "Inter"
             font-size = 12
+            close-command = "niri msg action close-window --id {id}"
 
             [appearance]
             mode = "light"
@@ -323,6 +326,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.modifier, Modifier::Super);
+        assert_eq!(
+            c.close_command.as_deref(),
+            Some("niri msg action close-window --id {id}")
+        );
         assert_eq!(c.show_delay, 0);
         assert_eq!((c.icon_size, c.icon_gap), (64, 8));
         assert_eq!((c.bar_position, c.max_width), (0.3, 0.5));

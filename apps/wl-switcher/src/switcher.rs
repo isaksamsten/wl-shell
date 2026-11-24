@@ -124,6 +124,16 @@ impl Switcher {
         &self.windows[self.apps[self.app].windows[self.window]]
     }
 
+    pub fn to_close(&self) -> Vec<&str> {
+        let app = &self.apps[self.app];
+        match self.mode {
+            Mode::Windows => vec![self.picked().id.as_str()],
+            Mode::Apps => (app.windows.iter())
+                .map(|&i| self.windows[i].id.as_str())
+                .collect(),
+        }
+    }
+
     fn app_len(&self) -> usize {
         self.apps[self.app].windows.len()
     }
@@ -356,6 +366,18 @@ mod tests {
         assert!(s.remove("4"));
         // mail was the last app; the one now at its place is web.
         assert_eq!((s.mode(), s.picked().id.as_str()), (Mode::Apps, "2"));
+    }
+
+    #[test]
+    fn close_targets() {
+        // Apps mode: every window of the selected app, MRU first.
+        let mut s = open(MIXED, Step::NextApp); // web
+        assert_eq!(s.to_close(), ["2", "5"]);
+        // Windows mode: only the selected window.
+        s.step(Step::PrevWindow); // web:5
+        assert_eq!(s.to_close(), ["5"]);
+        let s = open(MIXED, Step::PrevApp); // mail
+        assert_eq!(s.to_close(), ["4"]);
     }
 
     #[test]
