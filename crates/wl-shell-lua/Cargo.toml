@@ -15,6 +15,7 @@ async-executor.workspace = true
 async-io.workspace = true
 futures-lite.workspace = true
 mlua.workspace = true
+rustix = { workspace = true, features = ["event", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 zbus.workspace = true

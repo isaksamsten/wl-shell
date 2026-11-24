@@ -204,6 +204,12 @@ pub(crate) enum Job {
         id: u64,
         event: crate::dbus::BusEvent,
     },
+    /// Files watched by `id` changed.
+    Watch {
+        epoch: u64,
+        id: u64,
+        paths: Vec<String>,
+    },
     /// The app is known by other names now.
     App(AppInfo),
 }
@@ -376,6 +382,12 @@ impl Slot {
             Job::Bus { epoch, id, event } => {
                 if let Some(state) = life.state.as_ref().filter(|_| life.epoch == epoch) {
                     let outcome = state.bus(id, event);
+                    let _ = self.settle(life, shared, outcome);
+                }
+            }
+            Job::Watch { epoch, id, paths } => {
+                if let Some(state) = life.state.as_ref().filter(|_| life.epoch == epoch) {
+                    let outcome = state.watch(id, paths);
                     let _ = self.settle(life, shared, outcome);
                 }
             }

@@ -31,6 +31,8 @@ pub(crate) const LOADED: &str = "wl_shell_loaded";
 pub(crate) const HANDLERS: &str = "wl_shell_handlers";
 /// D-Bus callbacks by id: calls waiting for replies, and watches.
 pub(crate) const BUS: &str = "wl_shell_bus";
+/// File watch callbacks by id.
+pub(crate) const WATCHES: &str = "wl_shell_watches";
 
 /// What a call into a state came to.
 pub(crate) enum Outcome<T> {
@@ -118,6 +120,8 @@ pub(crate) struct Host {
     pub loaded: AtomicBool,
     /// D-Bus watches, cancelled with the state.
     pub subs: Mutex<Vec<(crate::dbus::BusKind, u64)>>,
+    /// File watches, cancelled with the state.
+    pub watches: Mutex<Vec<u64>>,
 }
 
 impl Host {
@@ -161,6 +165,9 @@ impl Drop for State {
         }
         for (kind, id) in lock(&self.host.subs).drain(..) {
             crate::dbus::cancel(kind, id);
+        }
+        for id in lock(&self.host.watches).drain(..) {
+            crate::watch::cancel(id);
         }
     }
 }
@@ -207,6 +214,7 @@ impl State {
             span: Mutex::default(),
             loaded: AtomicBool::new(false),
             subs: Mutex::default(),
+            watches: Mutex::default(),
         });
         lua.set_app_data(host.clone());
         host::install(&lua, settings).map_err(LoadError::fixed)?;
@@ -520,6 +528,22 @@ impl State {
             }
             Ok(None) => Outcome::Ok(()),
             Err(e) => Outcome::Error(format!("dbus: {e}")),
+        }
+    }
+
+    /// Watch `id` saw `paths` change.
+    pub fn watch(&self, id: u64, paths: Vec<String>) -> Outcome<()> {
+        let found = (|| -> mlua::Result<Option<Function>> {
+            let callbacks: Table = self.lua.named_registry_value(WATCHES)?;
+            callbacks.get(id)
+        })();
+        match found {
+            Ok(Some(f)) => self.enter("watch", || {
+                let paths = self.lua.create_sequence_from(paths)?;
+                f.call::<()>(paths)
+            }),
+            Ok(None) => Outcome::Ok(()),
+            Err(e) => Outcome::Error(format!("watch: {e}")),
         }
     }
 }

@@ -24,10 +24,10 @@
 //!   `redraw()`, `invalidate()`, `timer(ms, fn)`, `every(ms, fn)`,
 //!   `spawn(argv, {on_line, on_exit})`, `run(argv)`, `json.decode`,
 //!   `json.encode`, `read(path)`, `clipboard(text)`, `span(n)` and
-//!   `now()` (see `host.rs`), `app` (the app a widget backs, by its
-//!   names, nil for a standalone one; see [`AppInfo`]), the `dbus`
-//!   client (see `dbus.rs`), the `ui` constructors and the `theme`'s
-//!   color names (see [`ui`]).
+//!   `now()` (see `host.rs`), `watch(path, fn, opts)` (see `watch.rs`),
+//!   `app` (the app a widget backs, by its names, nil for a standalone
+//!   one; see [`AppInfo`]), the `dbus` client (see `dbus.rs`), the `ui`
+//!   constructors and the `theme`'s color names (see [`ui`]).
 //! - Widgets answer `label()` and `icon(tile)`: an icon is a [`ui::Node`]
 //!   tree, built from what the hook returned on the plugin's thread. A
 //!   standalone widget's item also hears its clicks (`on_click(button)`),
@@ -41,6 +41,7 @@ mod runtime;
 mod spec;
 mod state;
 pub mod ui;
+mod watch;
 
 pub use caps::{
     API, ActionDecl, Capabilities, PopupOn, Registry, SPANS, SourceDecl, Span, WidgetCaps,

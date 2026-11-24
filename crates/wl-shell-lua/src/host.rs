@@ -12,6 +12,7 @@
 //! | `clipboard(text)`                 | Copies `text`.                                                        |
 //! | `span(n)`                         | Sets the tile's length along the dock: 1, 1.5 or 2 (or `{horizontal = 2, vertical = 1}`). |
 //! | `now()`                           | Unix time in seconds, with a fraction: the clock of `live.at`.        |
+//! | `watch(path, fn, {recursive})`    | Calls `fn(paths)` when the file, or anything in the folder, changes; returns a handle with `cancel()`, or nil and the error (`watch.rs`). |
 //! | `app`                             | The app the widget backs (`id`, `desktop`, `wm_class`, `name`); nil for a standalone widget. |
 //! | `dbus.session()`, `dbus.system()` | A D-Bus client (`dbus.rs`).                                           |
 //! | `ui.*`, `theme.*`                 | The UI constructors and the theme's color names (`ui.rs`).            |
@@ -33,7 +34,7 @@ use mlua::{Function, Lua, LuaSerdeExt, MultiValue, Table, UserData, UserDataMeth
 use wl_shell_log::warn;
 
 use crate::runtime::{Event, Job, lock};
-use crate::state::{BUS, HANDLERS, LOADED, PROCS, TIMERS, host};
+use crate::state::{BUS, HANDLERS, LOADED, PROCS, TIMERS, WATCHES, host};
 
 /// The largest file `read` reads.
 const MAX_READ: u64 = 16 << 20;
@@ -60,7 +61,7 @@ pub(crate) fn install(lua: &Lua, settings: &crate::runtime::Settings) -> mlua::R
         safe.set(name, os.get::<Value>(name)?)?;
     }
     g.set("os", safe)?;
-    for name in [TIMERS, PROCS, LOADED, HANDLERS, BUS] {
+    for name in [TIMERS, PROCS, LOADED, HANDLERS, BUS, WATCHES] {
         lua.set_named_registry_value(name, lua.create_table()?)?;
     }
     // `load` takes text only; `print` goes to the log.
@@ -174,6 +175,7 @@ pub(crate) fn install(lua: &Lua, settings: &crate::runtime::Settings) -> mlua::R
         })?,
     )?;
     crate::dbus::install(lua, &ns)?;
+    crate::watch::install(lua, &ns)?;
     crate::ui::install(lua, &ns)?;
     g.set(namespace, ns)?;
     Ok(())
@@ -419,7 +421,7 @@ fn run(lua: &Lua, args: Value) -> mlua::Result<(Option<bool>, Option<String>)> {
 }
 
 /// `path` with a leading `~` or `~/` expanded.
-fn expand(path: &str) -> PathBuf {
+pub(crate) fn expand(path: &str) -> PathBuf {
     let home = std::env::var_os("HOME");
     match (path, home) {
         ("~", Some(home)) => PathBuf::from(home),

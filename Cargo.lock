@@ -2843,6 +2843,7 @@ dependencies = [
  "async-io",
  "futures-lite",
  "mlua",
+ "rustix",
  "serde",
  "serde_json",
  "wl-shell-log",

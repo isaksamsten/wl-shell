@@ -150,6 +150,60 @@ span = 2               # Wide on a bottom dock: the title and artist beside the 
 | `label`  | `true`  | `false` keeps the item's name                                                                                                                                                     |
 | `span`   | `1`     | `1.5` or `2`: while there is a player, the tile is that many icons wide on a bottom dock, with the title (at `2`, also the artist) beside the cover. Side docks keep square tiles |
 
+### `calendar`
+
+Shows a month calendar with an agenda of the events in iCalendar (`.ics`)
+files. As a standalone widget it draws a calendar page with today's date as
+its icon. Its label shows the date and the event that is on now or comes
+next today. A left click opens the popup. The popup has the month grid,
+buttons to page through months, and an agenda that starts at the selected
+day. Days with events get a dot for each event, up to three, in the colour of
+its calendar. Clicking a day selects it, and paging to another month selects
+that month's first day, or today in the current month. Clicking an event
+shows its time, place, calendar, recurrence and description, with **Copy**
+and **Open** buttons. **Open** runs `xdg-open` on the event's `URL`, or on
+the first web link in its location or description, such as a meeting link.
+
+```toml
+[widget.calendar]
+name = "Calendar"
+sources = [
+  "~/.local/share/evolution/calendar",           # a folder: every .ics file in it
+  "~/.calendars/work",                           # e.g. a vdirsyncer folder
+  { url = "https://example.com/team.ics", name = "Team", color = "#30d158" },
+]
+```
+
+```sh
+wl-dock pin @calendar
+```
+
+The plugin is [`plugins/calendar.lua`](plugins/calendar.lua). If your dock
+doesn't find it by name, copy it to `~/.config/wl-dock/plugins/` or point
+`[plugin.calendar] path` at it.
+
+| Option         | Default                     | Meaning                                                                                                                                                                        |
+| -------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sources`      | Evolution's local calendars | `.ics` files, folders searched for them, `http(s)://` or `webcal://` URLs (fetched with `curl`), or tables with `path`, `url` or `command` (prints iCalendar), `name`, `color` |
+| `interval`     | `900000`                    | ms between reloads of URLs and commands (at least 60000); files and folders are watched instead. Opening the popup also reloads URLs and commands over a minute old            |
+| `week_start`   | `"monday"`                  | `"monday"`, `"sunday"` or `"saturday"`                                                                                                                                         |
+| `week_numbers` | `false`                     | Show ISO week numbers in the grid                                                                                                                                              |
+| `agenda_days`  | `14`                        | Days the agenda covers from the selected day (1–366)                                                                                                                           |
+| `format`       | `"%A %e %B"`                | `os.date` format of the label's date                                                                                                                                           |
+| `time`         | `"%H:%M"`                   | `os.date` format of times                                                                                                                                                      |
+| `face`         | standalone: on; app: off    | Draw the calendar page as the icon                                                                                                                                             |
+| `label`        | `true`                      | `false` keeps the item's name                                                                                                                                                  |
+| `popup`        | `true`                      | Show the popup                                                                                                                                                                 |
+| `open`         | —                           | argv for **Open**, e.g. `["gnome-calendar", "--date", "{date}"]`. `{title}`, `{url}`, `{uid}`, `{location}`, `{start}` and `{date}` are replaced                               |
+
+Recurring events support `FREQ` `DAILY`, `WEEKLY`, `MONTHLY` and `YEARLY`
+with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`,
+`BYSETPOS` and `WKST`, plus `EXDATE` and moved or changed occurrences
+(`RECURRENCE-ID`). Cancelled events are left out. UTC times are converted to
+local time. The sandbox has no time zone database, so a time with a `TZID`
+is read as local time. The agenda lists at most 100 events and counts the
+rest.
+
 The sources in [`plugins/`](plugins) are good starting points for your own
 plugins.
 
@@ -304,9 +358,9 @@ an app that means the app's own; on a standalone widget it means the
   commands or reading the network, ahead of time in timers or callbacks, and
   have the hooks only return what is already known.
 - **Reloading.** Saving the plugin file starts a fresh state: timers stop,
-  processes are killed and D-Bus watches are cancelled. Modules loaded with
-  `require` are not watched, so save the plugin file to pick up changes to
-  them. Changes to the config apply too.
+  processes are killed, and D-Bus and file watches are cancelled. Modules
+  loaded with `require` are not watched, so save the plugin file to pick up
+  changes to them. Changes to the config apply too.
 - **When hooks run.** The dock calls `label()` and `icon()` when the plugin
   loads and after each `dock.redraw()`. It also calls `icon()` when the tile
   changes size. `popup()` runs when the popup opens and after each
@@ -387,6 +441,7 @@ plugin's handlers as described in [Interaction](#interaction).
 | `dock.spawn(argv, opts)`           | Run a process. `opts.on_line(line)` gets each line of its stdout, `opts.on_exit(code)` its exit code (`nil` if killed by a signal). Returns a handle with `:kill()` |
 | `dock.run(argv)`                   | Start a detached process. Returns `true`, or `nil, err`                                                                                                             |
 | `dock.read(path)`                  | A file's text (`~/` expands, at most 16 MiB). Returns `text`, or `nil, err`                                                                                         |
+| `dock.watch(path, fn, opts)`       | Call `fn(paths)` when a file, or anything in a folder, changes. Returns a handle with `:cancel()`, or `nil, err`. See [Watching files](#watching-files)              |
 | `dock.json.decode(s)`              | JSON to Lua (`null` becomes `nil`). Raises an error on bad JSON                                                                                                     |
 | `dock.json.encode(v)`              | Lua to JSON                                                                                                                                                         |
 | `dock.clipboard(text)`             | Copy `text` to the clipboard                                                                                                                                        |
@@ -412,6 +467,30 @@ libraries, plus `os.time`, `os.date`, `os.clock`, `os.difftime` and
 Read files with `dock.read` and run commands with `dock.spawn` or `dock.run`.
 
 `print(...)` writes to the dock's log.
+
+#### Watching files
+
+```lua
+local w, err = dock.watch('~/.calendars', function(paths)
+  -- paths: a list of the files and folders that changed, each once
+end, { recursive = true })
+w:cancel()
+```
+
+`dock.watch` calls `fn` when the file at `path` changes, or when anything in
+the folder at `path` does. `~/` expands. With `opts.recursive`, a folder's
+subfolders are watched too, including ones made later, except those starting
+with `.` and symlinked ones.
+
+A file is watched through its folder, so it is still seen when it is
+replaced by a rename (how most editors and Evolution save), removed, or
+created later. Its folder must exist; if it doesn't, `dock.watch` returns
+`nil` and the error, so fall back to a timer. Changes are gathered for 200
+ms from the first one and delivered as one call. If the system drops events,
+`fn` gets the watched path itself.
+
+A plugin can have at most 256 watches at a time. They end when the plugin
+reloads or stops, or when you call `:cancel()`.
 
 `require('name')` loads `name.lua` from the plugin's folder, where dots in
 the name are subfolders (`require('lib.util')` loads `lib/util.lua`). If
