@@ -259,7 +259,7 @@
 # A widget is a Lua plugin behind an app's item, or an item of its own: it
 # can set the item's label, draw its icon and show a popup. A plugin name
 # is looked up as plugins/<name>.lua next to this file, then among the
-# bundled plugins (clock, player, unread). Plugin files are reloaded on save.
+# bundled plugins (calc, clock, convert, player, unread). Plugin files are reloaded on save.
 
 #[app.foot]
 #widget = { plugin = "clock", format = "%H:%M:%S", face = true }  # Or a name: widget = "clock"
@@ -307,10 +307,14 @@
 #command = ["magick"]            # ["convert"] for ImageMagick 6
 #notify = true                   # notify-send when done or failed
 
-# Launcher sources: a plugin with `sources` adds a search behind its
-# trigger (`>ssh-host`, `=2*21`); see PLUGINS.md. Your own plugin in
-# plugins/ssh.lua takes a table like this one.
-#[plugin.ssh]
+# Launcher sources: a calculator behind `=` in the launcher (`=2^10`,
+# `=15% of 80`, `=0xff in bin`, `=10 km in mi`); Enter copies the result.
+#[plugin.calc]
+#precision = 12                  # Significant digits; 1-17
+#angle = "rad"                   # or "deg" for sin, cos, tan and their inverses
+#grouping = true                 # 1,234,567 (copied without commas)
+#extras = true                   # Hex and binary, fractions, other units
+#history = 20                    # Results the empty query lists
 
 #[widgets]
 #enabled = true

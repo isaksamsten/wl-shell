@@ -60,9 +60,12 @@ the walk stays on one file system.
 
 Tab on a file or application shows what you can do with it. Lua plugins can
 add their own actions there, and searches of their own behind a trigger
-character (say, `>` for SSH hosts or `=` for a calculator); see
+character (say, `>` for SSH hosts); see
 [PLUGINS.md](PLUGINS.md#launcher-actions) and
-[launcher sources](PLUGINS.md#launcher-sources).
+[launcher sources](PLUGINS.md#launcher-sources). The bundled `calc` is one:
+with `[plugin.calc]` in the config, `=` followed by `2^10`, `sqrt 2`,
+`15% of 80`, `0xff in bin` or `10 km in mi` shows the result as you type,
+and Enter copies it.
 
 Start the query with `@` to search every open window by title or app name, on
 any output. The drum shows each window's capture, and `@` followed by Enter goes
@@ -319,9 +322,11 @@ A widget is a Lua plugin that sits behind an app's item, where it can replace
 the app's label and icon, make its tile longer and add a popup shown on hover.
 It can also be an item of its own that you pin with `wl-dock pin @<name>`.
 The bundled plugins include `clock`, `player` for MPRIS playback,
-`unread` for apps that publish a launcher count over D-Bus, and `convert`,
-which adds Convert image… to the launcher's actions on images (enable it
-with an empty `[plugin.convert]` table).
+`unread` for apps that publish a launcher count over D-Bus, `convert`,
+which adds Convert image… to the launcher's actions on images, and `calc`, a
+calculator behind `=` in the launcher with functions, bases and unit
+conversions (`=10 km in mi`). Enable those two with an empty
+`[plugin.convert]` or `[plugin.calc]` table.
 
 ```toml
 [app.spotify]

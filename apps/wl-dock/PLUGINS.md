@@ -173,6 +173,63 @@ name is taken, and `notify-send` says when it is done or what went wrong.
 | `command` | `["magick"]`                            | The converter, run as `command… <input> <output>`: `["convert"]` for ImageMagick 6, or anything taking those two arguments |
 | `notify`  | `true`                                  | Tell with `notify-send` (if installed) when a conversion is done or fails; errors also go to the dock's stderr             |
 
+### `calc`
+
+A [launcher source](#launcher-sources): type `=` in the empty launcher, then
+an expression. The result is in front as you type, and Enter copies it.
+
+```toml
+[plugin.calc]
+```
+
+| You type                                    | You get                                                 |
+| ------------------------------------------- | ------------------------------------------------------- |
+| `2^10`, `2**10`, `7 // 2`, `7 mod 2`, `5!`  | 1024, 1024, 3, 1, 120                                   |
+| `2(3 + 4)`, `2pi`, `-2^2`, `2^3^2`          | 14, 6.28318530718, −4, 512                              |
+| `sqrt 2`, `√16`, `sin(30°)`, `sin 30 deg`   | 1.41421356237, 4, 0.5, 0.5                              |
+| `log(8, 2)`, `ln e`, `round(pi, 3)`         | 3, 1, 3.142                                             |
+| `15% of 80`, `80 + 15%`, `80 - 25%`, `50%`  | 12, 92, 60, 0.5                                         |
+| `0xff`, `0b1010`, `0o17`, `1_000_000`       | Hexadecimal, binary, octal, separators                  |
+| `0xf0 & 0x3c`, `1 << 10`, `5 xor 3`, `~0`   | 48, 1024, 6, −1: bit operations on integers (and `\|`)  |
+| `255 in hex`, `0xff in bin`, `8 to oct`     | 0xFF, 0b1111 1111, 0o10                                 |
+| `0.75 in frac`, `1999 in roman`, `1e5 as sci` | 3/4, MCMXCIX, 1 × 10⁵                                  |
+| `10 km in mi`, `100°F to C`, `65 mph in km/h` | 6.21371192237 mi, 37.7777777778 °C, 104.60736 km/h    |
+| `1 GiB in MB`, `90 min in h`, `3 cups in ml`, `2 m² in ft²` | 1073.741824 MB, 1.5 h, 709.7647095 ml, 21.5278208334 ft² |
+| `5 ft`                                      | Its usual conversions, the most readable first          |
+| `x = 6 * 7`, then `2x`                      | Enter keeps `x`; then 84                                |
+| `ans + 1`                                   | The last result copied, plus one                        |
+
+- **Functions:** `sqrt`, `cbrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`,
+  `round(x, digits)`, `exp`, `ln`, `log(x, base)` (base 10 by default),
+  `log2`, `log10`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan(y, x)`,
+  `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `hypot`,
+  `min`, `max`, `sum`, `avg`, `gcd`, `lcm`, `fact`, `gamma`, `ncr`, `npr`,
+  `deg(rad)` and `rad(deg)`. Without parentheses a function takes what
+  follows up to the next operator: `sqrt 4 * 2` is 4.
+- **Constants:** `pi` (`π`), `tau`, `e`, `phi`, `inf`, and `deg` (`°`),
+  one degree in the angle unit, so `sin(30°)` works in either mode.
+- **Units:** length, mass, time, temperature, data (`B`, `kB`, `MB`…,
+  `KiB`, `MiB`…, and bits: `b`, `Kb`, `Mb`, `Gb`, `bit`), speed, area,
+  volume, angle, energy, pressure and power, by symbol or name (`km`,
+  `miles`, `°C`, `fahrenheit`, `GiB`, `km/h`, `cups`, `kWh`, `psi`, `hp`).
+  Convert with `in`, `to` or `as`.
+- **Extras:** an integer from hexadecimal, binary or bit operations, or of
+  256 or more, also shows in hexadecimal and binary; a fraction that is
+  exact (`0.1 + 0.2` is 3/10); a quantity, its conversions. Each row copies
+  its own value, without grouping or units.
+- **While typing:** a half-typed expression (`2 * (3 +`) keeps the last
+  result shown until it makes sense again; a mistake shows nothing.
+- **History:** the empty query lists the results copied before, for as
+  long as the plugin runs.
+
+| Option      | Default | Meaning                                                                   |
+| ----------- | ------- | ------------------------------------------------------------------------- |
+| `precision` | `12`    | Significant digits shown and copied (1–17)                                |
+| `angle`     | `"rad"` | `"deg"`: `sin`, `cos` and `tan` take degrees and `asin`… give degrees     |
+| `grouping`  | `true`  | Group long numbers with commas (1,234,567); copies are never grouped      |
+| `extras`    | `true`  | `false` shows only the result                                             |
+| `history`   | `20`    | Results the empty query lists                                             |
+
 ### `calendar`
 
 Shows a month calendar with an agenda of the events in iCalendar (`.ics`)
@@ -446,6 +503,7 @@ empty query, or Shift+Tab, goes back to the apps.
 A trigger already taken (by `'`, `@`, the web search's `!`, or an earlier
 source; plugins by name) is ignored. See the
 [reference](#launcher-sources-1) for the item tables.
+The bundled [`calc`](#calc) is a source too, and its file a fuller example.
 
 ## How a plugin runs
 

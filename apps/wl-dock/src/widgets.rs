@@ -63,6 +63,7 @@ use crate::sources::{SourceEntry, SourceKey, Sources};
 
 /// Plugins built into the dock, by name.
 pub const BUNDLED: &[(&str, &str)] = &[
+    ("calc", include_str!("../plugins/calc.lua")),
     ("clock", include_str!("../plugins/clock.lua")),
     ("convert", include_str!("../plugins/convert.lua")),
     ("player", include_str!("../plugins/player.lua")),
@@ -1567,6 +1568,211 @@ mod tests {
         results(&mut w, ssh_key);
         assert_eq!(w.source_items(ssh_key).unwrap().len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bundled calculator: arithmetic, functions, percentages, bases,
+    /// units, variables and its history, through the runtime.
+    #[test]
+    fn the_bundled_calculator() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let send = std::sync::Mutex::new(send);
+        let mut w = Widgets::default();
+        w.start(move |e| {
+            let _ = send.lock().unwrap().send(e);
+        })
+        .unwrap();
+        w.configure(specs(&parse("[plugin.calc]"), None, &[]));
+        let end = Instant::now() + Duration::from_secs(10);
+        while w.launcher_sources().is_empty() {
+            w.event(recv.recv_timeout(end - Instant::now()).expect("not loaded"));
+        }
+        let source = w.launcher_sources().remove(0);
+        assert_eq!((source.decl.trigger, source.decl.search), ('=', true));
+        let key = source.key;
+        // The rows for `query` (title, copied value, subtitle); None if
+        // the plugin emits nothing (a half-typed query). What it emits
+        // comes before its answer, so the answer ends the wait.
+        let ask = |w: &mut Widgets, query: &str| {
+            let g = w.begin_search(key, query);
+            w.send_search(g);
+            let mut rows = None;
+            loop {
+                let e = recv
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("no answer");
+                let answer = match &e {
+                    Event::Answer(a) => Some(a.result.clone()),
+                    _ => None,
+                };
+                if w.event(e).results == Some(key) {
+                    rows = Some(
+                        (w.search_results(key).unwrap().iter())
+                            .map(|i| {
+                                let value = i.data["value"].as_str().unwrap_or("").to_string();
+                                (
+                                    i.title.clone(),
+                                    value,
+                                    i.subtitle.clone().unwrap_or_default(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                if let Some(result) = answer {
+                    assert!(result.is_ok(), "{query}: {result:?}");
+                    return rows;
+                }
+            }
+        };
+        let front = |w: &mut Widgets, query: &str| {
+            let rows = ask(w, query).unwrap_or_else(|| panic!("{query}: nothing"));
+            let first = rows.first().unwrap_or_else(|| panic!("{query}: no rows"));
+            (first.0.clone(), first.1.clone())
+        };
+        let cases = [
+            ("1 + 2 * 3", "7", "7"),
+            ("0.1 + 0.2", "0.3", "0.3"),
+            ("2^10", "1024", "1024"),
+            ("2**3^2", "512", "512"),
+            ("-2^2", "−4", "-4"),
+            ("7 // 2", "3", "3"),
+            ("7 mod 3", "1", "1"),
+            ("7 % 3", "1", "1"),
+            ("5!", "120", "120"),
+            ("2(3 + 4)", "14", "14"),
+            ("2pi", "6.28318530718", "6.28318530718"),
+            ("sqrt 2", "1.41421356237", "1.41421356237"),
+            ("√16 + 1", "5", "5"),
+            ("sin(30°)", "0.5", "0.5"),
+            ("sin 30 deg", "0.5", "0.5"),
+            ("sin(pi)", "0", "0"),
+            ("log(8, 2)", "3", "3"),
+            ("ln e", "1", "1"),
+            ("max(1, 5, 3)", "5", "5"),
+            ("round(pi, 3)", "3.142", "3.142"),
+            ("ncr(5, 2)", "10", "10"),
+            ("15% of 80", "12", "12"),
+            ("80 + 15%", "92", "92"),
+            ("80 - 25%", "60", "60"),
+            ("1_000_000 * 3", "3,000,000", "3000000"),
+            ("1.5e3", "1500", "1500"),
+            ("1e20", "1 × 10²⁰", "1e20"),
+            ("1/0", "∞", "inf"),
+            ("0xff", "255", "255"),
+            ("0xf0 & 0x3c", "48", "48"),
+            ("1 << 10", "1024", "1024"),
+            ("5 xor 3", "6", "6"),
+            ("255 in hex", "0xFF", "0xFF"),
+            ("0xff in bin", "0b1111 1111", "0b11111111"),
+            ("8 to oct", "0o10", "0o10"),
+            ("0.75 in frac", "3/4", "3/4"),
+            ("1999 in roman", "MCMXCIX", "MCMXCIX"),
+            ("12345 in sci", "1.2345 × 10⁴", "1.2345e4"),
+            ("10 km in mi", "6.21371192237 mi", "6.21371192237"),
+            ("100°F in C", "37.7777777778 °C", "37.7777777778"),
+            ("0 c to f", "32 °F", "32"),
+            ("1 GiB in MB", "1073.741824 MB", "1073.741824"),
+            ("90 min in h", "1.5 h", "1.5"),
+            ("65 mph in km/h", "104.60736 km/h", "104.60736"),
+            ("5 in in cm", "12.7 cm", "12.7"),
+            ("10 cm to in", "3.93700787402 in", "3.93700787402"),
+            ("2 m² in ft²", "21.5278208334 ft²", "21.5278208334"),
+            ("3 cups in ml", "709.7647095 ml", "709.7647095"),
+            ("8 Mb in kB", "1000 kB", "1000"),
+            ("1e5 as sci", "1 × 10⁵", "1e5"),
+            ("~0", "−1", "-1"),
+            ("12 | 3", "15", "15"),
+            ("0b1010 + 0o17", "25", "25"),
+            ("atan(1, 1) * 4", "3.14159265359", "3.14159265359"),
+            ("hypot(3, 4)", "5", "5"),
+            ("gcd(12, 18)", "6", "6"),
+        ];
+        for (query, title, value) in cases {
+            assert_eq!(
+                front(&mut w, query),
+                (title.to_string(), value.to_string()),
+                "{query}"
+            );
+        }
+        // Extras: a fraction, bases, and the usual conversions.
+        let rows = ask(&mut w, "1/3").unwrap();
+        assert_eq!(rows[1].0, "1/3");
+        let rows = ask(&mut w, "0x1f + 1").unwrap();
+        assert_eq!(
+            (rows[1].0.as_str(), rows[2].0.as_str()),
+            ("0x20", "0b10 0000")
+        );
+        let rows = ask(&mut w, "10 km").unwrap();
+        assert_eq!(rows[0].0, "6.21371192237 mi");
+        assert!(
+            rows.len() > 1 && rows.iter().all(|r| r.2 == "10 km"),
+            "{rows:?}"
+        );
+        let rows = ask(&mut w, "x² + 1").unwrap();
+        assert!(rows.is_empty(), "x is unknown: {rows:?}");
+        // Half-typed: the last results stay; mistakes clear them.
+        assert_eq!(ask(&mut w, "2 * (3 +"), None);
+        assert_eq!(ask(&mut w, "10 km in"), None);
+        assert_eq!(ask(&mut w, "10 km in kg"), Some(Vec::new()));
+        assert_eq!(ask(&mut w, "nope(2)"), Some(Vec::new()));
+
+        // Enter copies, keeps a variable, sets `ans`, and remembers.
+        let run = |w: &mut Widgets, query: &str| {
+            ask(w, query).unwrap();
+            let item = w.source_item(key, "result").unwrap();
+            w.open_item(ItemRun {
+                instance: source.instance.clone(),
+                source: "calc".into(),
+                item,
+            });
+            // Its copy, then its answer.
+            let mut copied = None;
+            loop {
+                let e = recv
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("no answer");
+                let answered = matches!(e, Event::Answer(_));
+                if let Some(text) = w.event(e).clipboard {
+                    copied = Some(text);
+                }
+                if answered {
+                    break copied.expect("nothing copied");
+                }
+            }
+        };
+        assert_eq!(run(&mut w, "x = 6 * 7"), "42");
+        assert_eq!(front(&mut w, "x / 2"), ("21".into(), "21".into()));
+        assert_eq!(front(&mut w, "2x"), ("84".into(), "84".into()));
+        assert_eq!(front(&mut w, "ans + 1"), ("43".into(), "43".into()));
+        assert_eq!(run(&mut w, "10 km in mi"), "6.21371192237");
+        let history = ask(&mut w, "").unwrap();
+        let titles: Vec<&str> = history.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(titles, ["6.21371192237 mi", "x = 42"]);
+        assert_eq!(history[0].2, "10 km in mi");
+
+        // In degrees, and with fewer digits: options.
+        w.configure(specs(
+            &parse("[plugin.calc]\nangle = 'deg'\nprecision = 4\ngrouping = false"),
+            None,
+            &[],
+        ));
+        loop {
+            let e = recv
+                .recv_timeout(Duration::from_secs(5))
+                .expect("not reloaded");
+            if matches!(e, Event::Loaded { .. }) {
+                w.event(e);
+                break;
+            }
+            w.event(e);
+        }
+        assert_eq!(front(&mut w, "sin 30"), ("0.5".into(), "0.5".into()));
+        assert_eq!(front(&mut w, "sin(30°)"), ("0.5".into(), "0.5".into()));
+        assert_eq!(front(&mut w, "asin 1"), ("90".into(), "90".into()));
+        assert_eq!(front(&mut w, "pi"), ("3.142".into(), "3.142".into()));
+        assert_eq!(front(&mut w, "123456"), ("123456".into(), "123456".into()));
+        // A new state: no history.
+        assert_eq!(ask(&mut w, "").unwrap()[0].0, "Calculator");
     }
 
     /// The bundled clock standalone: its face, its label and its popup,
