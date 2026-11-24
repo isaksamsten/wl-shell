@@ -94,6 +94,9 @@ end
 
 function P.icon()
 	local unread = badge()
+	if not unread then
+		return ui.app_icon()
+	end
 	return ui.stack({
 		align = position,
 		ui.app_icon({}),
