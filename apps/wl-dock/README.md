@@ -351,15 +351,6 @@ popup-delay = 300
 budget = 1000000               # Lua instructions per hook call
 ```
 
-The unread badge appears after the first visible, positive count update.
-While the app reports visible progress (`progress-visible`), a thin arc
-around the icon fills clockwise from the top. While it is `urgent`, the
-badge shows `!` if there is no count to show. Telegram, Thunderbird and
-Discord publish these.
-The plugin matches the app's desktop entry, falling back to its Wayland app
-ID. If the publisher uses a different desktop ID, override it with
-`widget = { plugin = "unread", desktop-entry = "example.desktop" }`.
-
 Your own plugins go in `~/.config/wl-dock/plugins/<name>.lua` and reload when
 you save them. See [PLUGINS.md](PLUGINS.md) for the widget settings, the
 bundled plugins' options, and a guide and reference for writing plugins.

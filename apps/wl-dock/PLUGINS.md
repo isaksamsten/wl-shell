@@ -232,26 +232,32 @@ an expression. The result is in front as you type, and Enter copies it.
 
 ### `calendar`
 
-Shows a month calendar with an agenda of the events in iCalendar (`.ics`)
-files. As a standalone widget it draws a calendar page with today's date as
-its icon. Its label shows the date and the event that is on now or comes
-next today. A left click opens the popup. The popup has the month grid,
-buttons to page through months, and an agenda that starts at the selected
-day. Days with events get a dot for each event, up to three, in the colour of
-its calendar. Clicking a day selects it, and paging to another month selects
-that month's first day, or today in the current month. Clicking an event
-shows its time, place, calendar, recurrence and description, with **Copy**
-and **Open** buttons. **Open** runs `xdg-open` on the event's `URL`, or on
-the first web link in its location or description, such as a meeting link.
+Shows a month calendar with an agenda of the events in Evolution Data Server
+(EDS), the calendars of GNOME Calendar and Evolution. As a standalone widget
+it draws a calendar page with today's date as its icon. Its label shows the
+date and the event that is on now or comes next today. A left click opens
+the popup. The popup has the month grid, buttons to page through months,
+and an agenda that starts at the selected day. Days with events get a dot
+for each event, up to three, in the colour of its calendar. Clicking a day
+selects it, and paging to another month selects that month's first day, or
+today in the current month. Clicking an event shows its time, place,
+calendar, recurrence and description, with **Copy**, **Calendar** (show it
+in GNOME Calendar) and **Open** buttons. **Open** runs `xdg-open` on the
+event's `URL`, or on the first web link in its location or description,
+such as a meeting link.
+
+The plugin talks to EDS over D-Bus and needs it running (GNOME starts it).
+By default it shows the enabled calendars that are shown in GNOME Calendar,
+with their names and colours, and follows changes as they happen: an event
+added in GNOME Calendar, or a calendar hidden there, shows at once. EDS
+syncs the remote calendars (CalDAV, Google, Microsoft 365, webcal); opening
+the popup asks it to refresh them, at most every five minutes. To add a
+calendar, add it in GNOME Calendar or Evolution.
 
 ```toml
 [widget.calendar]
 name = "Calendar"
-sources = [
-  "~/.local/share/evolution/calendar",           # a folder: every .ics file in it
-  "~/.calendars/work",                           # e.g. a vdirsyncer folder
-  { url = "https://example.com/team.ics", name = "Team", color = "#30d158" },
-]
+calendars = ["Work", "Family"]   # optional: only these
 ```
 
 ```sh
@@ -262,19 +268,23 @@ The plugin is [`plugins/calendar.lua`](plugins/calendar.lua). If your dock
 doesn't find it by name, copy it to `~/.config/wl-dock/plugins/` or point
 `[plugin.calendar] path` at it.
 
-| Option         | Default                     | Meaning                                                                                                                                                                        |
-| -------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sources`      | Evolution's local calendars | `.ics` files, folders searched for them, `http(s)://` or `webcal://` URLs (fetched with `curl`), or tables with `path`, `url` or `command` (prints iCalendar), `name`, `color` |
-| `interval`     | `900000`                    | ms between reloads of URLs and commands (at least 60000); files and folders are watched instead. Opening the popup also reloads URLs and commands over a minute old            |
-| `week_start`   | `"monday"`                  | `"monday"`, `"sunday"` or `"saturday"`                                                                                                                                         |
-| `week_numbers` | `false`                     | Show ISO week numbers in the grid                                                                                                                                              |
-| `agenda_days`  | `14`                        | Days the agenda covers from the selected day (1–366)                                                                                                                           |
-| `format`       | `"%A %e %B"`                | `os.date` format of the label's date                                                                                                                                           |
-| `time`         | `"%H:%M"`                   | `os.date` format of times                                                                                                                                                      |
-| `face`         | standalone: on; app: off    | Draw the calendar page as the icon                                                                                                                                             |
-| `label`        | `true`                      | `false` keeps the item's name                                                                                                                                                  |
-| `popup`        | `true`                      | Show the popup                                                                                                                                                                 |
-| `open`         | —                           | argv for **Open**, e.g. `["gnome-calendar", "--date", "{date}"]`. `{title}`, `{url}`, `{uid}`, `{location}`, `{start}` and `{date}` are replaced                               |
+| Option         | Default                       | Meaning                                                                                                                       |
+| -------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `calendars`    | those shown in GNOME Calendar | Names or EDS source UIDs of the calendars to show (enabled ones, shown in GNOME Calendar or not)                              |
+| `week_start`   | `"monday"`                    | `"monday"`, `"sunday"` or `"saturday"`                                                                                        |
+| `week_numbers` | `false`                       | Show ISO week numbers in the grid                                                                                             |
+| `agenda_days`  | `14`                          | Days the agenda covers from the selected day (1–366)                                                                          |
+| `format`       | `"%A %e %B"`                  | `os.date` format of the label's date                                                                                          |
+| `time`         | `"%H:%M"`                     | `os.date` format of times                                                                                                     |
+| `face`         | standalone: on; app: off      | Draw the calendar page as the icon                                                                                            |
+| `label`        | `true`                        | `false` keeps the item's name                                                                                                 |
+| `popup`        | `true`                        | Show the popup                                                                                                                |
+| `open`         | —                             | argv for **Open**, e.g. `["gnome-calendar", "--date", "{date}"]`                                                              |
+| `calendar_app` | `["gnome-calendar", "--uuid", "{event}"]` | argv for **Calendar**; `false` leaves the button out                                                              |
+
+In `open` and `calendar_app`, `{title}`, `{url}`, `{uid}`, `{location}`,
+`{start}`, `{date}`, `{calendar}` (the EDS source UID) and `{event}` (GNOME
+Calendar's id of the occurrence) are replaced.
 
 Recurring events support `FREQ` `DAILY`, `WEEKLY`, `MONTHLY` and `YEARLY`
 with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`,

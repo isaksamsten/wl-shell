@@ -1,17 +1,178 @@
-//! The bundled calendar plugin reading a folder of `.ics` files, and
-//! reading it again when its files change (`dock.watch`), with no polling.
+//! The bundled calendar plugin against a fake Evolution Data Server on a
+//! private bus (skipped without `dbus-daemon`): the calendars to show come
+//! from the source registry, their events from a view, and the view's
+//! changes show up.
 
-use std::path::Path;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wl_shell_lua::ui::{Kind, Node};
 use wl_shell_lua::{Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source};
+use zbus::interface;
+use zbus::zvariant::OwnedObjectPath;
 
 const CALENDAR: &str = include_str!("../plugins/calendar.lua");
 const WAIT: Duration = Duration::from_secs(10);
+const SOURCES: &str = "/org/gnome/evolution/dataserver/SourceManager";
+const VIEW_IFACE: &str = "org.gnome.evolution.dataserver.CalendarView";
+
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn daemon() -> Option<(Daemon, String)> {
+    let mut child = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--print-address=1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut line = String::new();
+    BufReader::new(child.stdout.take()?)
+        .read_line(&mut line)
+        .ok()?;
+    let address = line.trim().to_string();
+    (!address.is_empty()).then(|| (Daemon(child), address))
+}
+
+/// A source in the registry.
+struct SourceObject {
+    uid: String,
+    data: String,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.Source")]
+impl SourceObject {
+    #[zbus(property, name = "UID")]
+    fn uid(&self) -> String {
+        self.uid.clone()
+    }
+
+    #[zbus(property)]
+    fn data(&self) -> String {
+        self.data.clone()
+    }
+}
+
+/// Opens the calendar of a source UID at `/cal/<uid>`.
+struct Factory;
+
+#[interface(name = "org.gnome.evolution.dataserver.CalendarFactory")]
+impl Factory {
+    fn open_calendar(&self, uid: String) -> (String, String) {
+        (
+            format!("/cal/{uid}"),
+            "org.gnome.evolution.dataserver.Calendar8".into(),
+        )
+    }
+}
+
+/// A calendar, its view at `/view/<uid>`.
+struct Calendar {
+    uid: String,
+    opened: Arc<Mutex<Vec<String>>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.Calendar")]
+impl Calendar {
+    fn open(&self) -> Vec<String> {
+        self.opened.lock().unwrap().push(self.uid.clone());
+        Vec::new()
+    }
+
+    fn get_view(&self, _query: String) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/view/{}", self.uid)).unwrap()
+    }
+
+    fn refresh(&self) {}
+}
+
+/// A view: its events come with `ObjectsAdded`, sent by the test.
+struct View;
+
+#[interface(name = "org.gnome.evolution.dataserver.CalendarView")]
+impl View {
+    fn start(&self) {}
+    fn dispose(&self) {}
+}
+
+/// An all-day event tomorrow (local time), so the agenda shows it.
+fn vevent(uid: &str, title: &str) -> String {
+    let out = Command::new("date")
+        .args(["-d", "tomorrow", "+%Y%m%d"])
+        .output()
+        .unwrap();
+    let day = String::from_utf8(out.stdout).unwrap();
+    format!(
+        "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART;VALUE=DATE:{}\r\nSUMMARY:{title}\r\nEND:VEVENT\r\n",
+        day.trim()
+    )
+}
+
+fn source_data(name: &str, calendar: &str) -> String {
+    format!("[Data Source]\nDisplayName={name}\nEnabled=true\nParent=\n\n{calendar}")
+}
+
+/// The fake EDS: a registry with a calendar shown, one hidden in GNOME
+/// Calendar, and an address book.
+fn fake_eds(address: &str, opened: Arc<Mutex<Vec<String>>>) -> zbus::Connection {
+    let sources = [
+        (
+            "work",
+            source_data("Work", "[Calendar]\nBackendName=caldav\nColor=#ff0000\nSelected=true\n"),
+        ),
+        (
+            "hidden",
+            source_data("Hidden", "[Calendar]\nBackendName=local\nSelected=false\n"),
+        ),
+        (
+            "people",
+            source_data("People", "[Address Book]\nBackendName=local\n"),
+        ),
+    ];
+    async_io::block_on(async {
+        let mut b = zbus::connection::Builder::address(address)?
+            .name("org.gnome.evolution.dataserver.Sources5")?
+            .name("org.gnome.evolution.dataserver.Calendar8")?
+            .serve_at(SOURCES, zbus::fdo::ObjectManager)?
+            .serve_at("/org/gnome/evolution/dataserver/CalendarFactory", Factory)?;
+        for (i, (uid, data)) in sources.into_iter().enumerate() {
+            let source = SourceObject {
+                uid: uid.into(),
+                data,
+            };
+            b = b.serve_at(format!("{SOURCES}/Source_{i}"), source)?;
+            let calendar = Calendar {
+                uid: uid.into(),
+                opened: opened.clone(),
+            };
+            b = b
+                .serve_at(format!("/cal/{uid}"), calendar)?
+                .serve_at(format!("/view/{uid}"), View)?;
+        }
+        b.build().await
+    })
+    .expect("a fake EDS")
+}
+
+fn emit(conn: &zbus::Connection, uid: &str, member: &str, items: Vec<String>) {
+    async_io::block_on(conn.emit_signal(
+        None::<&str>,
+        format!("/view/{uid}").as_str(),
+        VIEW_IFACE,
+        member,
+        &(items,),
+    ))
+    .unwrap();
+}
 
 fn texts(tree: &Node) -> Vec<String> {
     (tree.walk().into_iter())
@@ -22,25 +183,12 @@ fn texts(tree: &Node) -> Vec<String> {
         .collect()
 }
 
-/// An all-day event tomorrow (local time), so the agenda shows it.
-fn ics(title: &str) -> String {
-    let out = Command::new("date")
-        .args(["-d", "tomorrow", "+%Y%m%d"])
-        .output()
-        .unwrap();
-    let day = String::from_utf8(out.stdout).unwrap();
-    format!(
-        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{title}\r\nDTSTART;VALUE=DATE:{}\r\nSUMMARY:{title}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-        day.trim()
-    )
-}
-
-struct Calendar {
+struct Plugin {
     rt: Runtime,
     recv: Receiver<Event>,
 }
 
-impl Calendar {
+impl Plugin {
     fn popup(&self) -> Vec<String> {
         let ticket = self.rt.request("c", RequestKind::Popup, WAIT).unwrap();
         let end = Instant::now() + WAIT;
@@ -60,10 +208,12 @@ impl Calendar {
         }
     }
 
-    /// Until the popup has `want` and not `gone`.
-    fn wait(&self, want: &str, gone: Option<&str>) {
+    /// Until the popup has `want` and not `gone`, doing `poke` (a signal
+    /// that may come before the plugin listens) each time.
+    fn wait(&self, want: &str, gone: Option<&str>, poke: impl Fn()) {
         let end = Instant::now() + WAIT;
         loop {
+            poke();
             let got = self.popup();
             let has = |t: &str| got.iter().any(|g| g == t);
             if has(want) && !gone.is_some_and(has) {
@@ -75,14 +225,20 @@ impl Calendar {
     }
 }
 
-fn start(dir: &Path) -> Calendar {
+#[test]
+fn shown_calendars_are_read_and_followed() {
+    let Some((_daemon, address)) = daemon() else {
+        eprintln!("no dbus-daemon: skipped");
+        return;
+    };
+    // The runtime's session bus is this one.
+    unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &address) };
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let eds = fake_eds(&address, opened.clone());
+
     let (send, recv) = channel();
     let send = Mutex::new(send);
-    let settings = Settings {
-        threads: 2,
-        ..Settings::default()
-    };
-    let rt = Runtime::new(settings, move |e| {
+    let rt = Runtime::new(Settings::default(), move |e| {
         let _ = send.lock().unwrap().send(e);
     })
     .unwrap();
@@ -95,37 +251,24 @@ fn start(dir: &Path) -> Calendar {
         },
         role: Role::Widget,
         app: None,
-        options: serde_json::json!({ "sources": [dir.to_string_lossy()] }),
+        options: serde_json::json!({}),
         budget: 1_000_000,
     }]);
-    Calendar { rt, recv }
-}
+    let p = Plugin { rt, recv };
 
-#[test]
-fn a_watched_folder_is_read_again_when_it_changes() {
-    let dir = std::env::temp_dir().join(format!("wl-dock-calendar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("work")).unwrap();
-    std::fs::write(dir.join("work/a.ics"), ics("Alpha")).unwrap();
-    let cal = start(&dir);
-    cal.wait("Alpha", None);
-
-    // A new file in a subfolder.
-    std::fs::write(dir.join("work/b.ics"), ics("Beta")).unwrap();
-    cal.wait("Beta", None);
-
-    // A file replaced by a rename, as Evolution saves.
-    std::fs::write(dir.join("work/a.tmp"), ics("Gamma")).unwrap();
-    std::fs::rename(dir.join("work/a.tmp"), dir.join("work/a.ics")).unwrap();
-    cal.wait("Gamma", Some("Alpha"));
-
-    // A calendar folder made later.
-    std::fs::create_dir(dir.join("home")).unwrap();
-    std::fs::write(dir.join("home/c.ics"), ics("Delta")).unwrap();
-    cal.wait("Delta", None);
-
+    // The view's events.
+    p.wait("Alpha", None, || {
+        emit(&eds, "work", "ObjectsAdded", vec![vevent("a", "Alpha"), vevent("b", "Beta")])
+    });
+    // Only the calendar shown in GNOME Calendar was opened.
+    assert_eq!(*opened.lock().unwrap(), ["work"]);
+    // Changed: the new version replaces the old.
+    p.wait("Gamma", Some("Alpha"), || {
+        emit(&eds, "work", "ObjectsModified", vec![vevent("a", "Gamma")])
+    });
     // Removed.
-    std::fs::remove_file(dir.join("work/b.ics")).unwrap();
-    cal.wait("Delta", Some("Beta"));
-    std::fs::remove_dir_all(dir).unwrap();
+    p.wait("Beta", Some("Gamma"), || {
+        emit(&eds, "work", "ObjectsRemoved", vec!["a\n".into()])
+    });
 }
+
