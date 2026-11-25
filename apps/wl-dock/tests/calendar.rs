@@ -1,7 +1,8 @@
 //! The bundled calendar plugin against a fake Evolution Data Server on a
 //! private bus (skipped without `dbus-daemon`): the calendars to show come
 //! from the source registry, their events from a view, and the view's
-//! changes show up.
+//! changes show up; times in other zones are read in them, including a
+//! zone only EDS has the definition of.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -93,6 +94,17 @@ impl Calendar {
     }
 
     fn refresh(&self) {}
+
+    /// The one zone only the invites define: three hours east of UTC.
+    fn get_timezone(&self, tzid: String) -> zbus::fdo::Result<String> {
+        match tzid.as_str() {
+            "Customized Time Zone" => Ok("BEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\n\
+                BEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0300\r\n\
+                TZOFFSETTO:+0300\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+                .into()),
+            _ => Err(zbus::fdo::Error::Failed("Object not found".into())),
+        }
+    }
 }
 
 /// A view: its events come with `ObjectsAdded`, sent by the test.
@@ -104,16 +116,39 @@ impl View {
     fn dispose(&self) {}
 }
 
-/// An all-day event tomorrow (local time), so the agenda shows it.
-fn vevent(uid: &str, title: &str) -> String {
+/// Tomorrow, local time, as an iCalendar DATE.
+fn tomorrow() -> String {
     let out = Command::new("date")
         .args(["-d", "tomorrow", "+%Y%m%d"])
         .output()
         .unwrap();
-    let day = String::from_utf8(out.stdout).unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// An all-day event tomorrow, so the agenda shows it.
+fn vevent(uid: &str, title: &str) -> String {
     format!(
         "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART;VALUE=DATE:{}\r\nSUMMARY:{title}\r\nEND:VEVENT\r\n",
-        day.trim()
+        tomorrow()
+    )
+}
+
+/// An hour from noon tomorrow in a zone only EDS knows.
+fn custom(uid: &str, title: &str) -> String {
+    let day = tomorrow();
+    format!(
+        "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART;TZID=Customized Time Zone:{day}T120000\r\n\
+         DTEND;TZID=Customized Time Zone:{day}T130000\r\nSUMMARY:{title}\r\nEND:VEVENT\r\n"
+    )
+}
+
+/// An hour from 18:00 in Tokyo, tomorrow and the day after, with the zone
+/// by its Windows name, as Outlook writes it.
+fn tokyo(uid: &str, title: &str) -> String {
+    let day = tomorrow();
+    format!(
+        "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART;TZID=\"Tokyo Standard Time\":{day}T180000\r\n\
+         DTEND;TZID=\"Tokyo Standard Time\":{day}T190000\r\nRRULE:FREQ=DAILY;COUNT=2\r\nSUMMARY:{title}\r\nEND:VEVENT\r\n"
     )
 }
 
@@ -127,7 +162,10 @@ fn fake_eds(address: &str, opened: Arc<Mutex<Vec<String>>>) -> zbus::Connection 
     let sources = [
         (
             "work",
-            source_data("Work", "[Calendar]\nBackendName=caldav\nColor=#ff0000\nSelected=true\n"),
+            source_data(
+                "Work",
+                "[Calendar]\nBackendName=caldav\nColor=#ff0000\nSelected=true\n",
+            ),
         ),
         (
             "hidden",
@@ -233,6 +271,8 @@ fn shown_calendars_are_read_and_followed() {
     };
     // The runtime's session bus is this one.
     unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &address) };
+    // Local time is UTC, for the event in Tokyo.
+    unsafe { std::env::set_var("TZ", "UTC") };
     let opened = Arc::new(Mutex::new(Vec::new()));
     let eds = fake_eds(&address, opened.clone());
 
@@ -258,8 +298,33 @@ fn shown_calendars_are_read_and_followed() {
 
     // The view's events.
     p.wait("Alpha", None, || {
-        emit(&eds, "work", "ObjectsAdded", vec![vevent("a", "Alpha"), vevent("b", "Beta")])
+        emit(
+            &eds,
+            "work",
+            "ObjectsAdded",
+            vec![
+                vevent("a", "Alpha"),
+                vevent("b", "Beta"),
+                tokyo("t", "Tokyo"),
+                custom("c", "Custom"),
+            ],
+        )
     });
+    // 18:00 in Tokyo is 09:00 here, on both days.
+    let got = p.popup();
+    let after = |title: &str| -> Vec<&str> {
+        (got.iter().enumerate())
+            .filter(|(_, t)| *t == title)
+            .map(|(i, _)| got[i + 1].as_str())
+            .collect()
+    };
+    assert_eq!(
+        after("Tokyo"),
+        ["09:00 – 10:00", "09:00 – 10:00"],
+        "{got:?}"
+    );
+    // Noon three hours east is 09:00 too, once EDS said what the zone is.
+    assert_eq!(after("Custom"), ["09:00 – 10:00"], "{got:?}");
     // Only the calendar shown in GNOME Calendar was opened.
     assert_eq!(*opened.lock().unwrap(), ["work"]);
     // Changed: the new version replaces the old.
@@ -271,4 +336,3 @@ fn shown_calendars_are_read_and_followed() {
         emit(&eds, "work", "ObjectsRemoved", vec!["a\n".into()])
     });
 }
-

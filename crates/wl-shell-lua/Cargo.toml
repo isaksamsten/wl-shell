@@ -14,6 +14,7 @@ async-channel.workspace = true
 async-executor.workspace = true
 async-io.workspace = true
 futures-lite.workspace = true
+jiff.workspace = true
 mlua.workspace = true
 rustix = { workspace = true, features = ["event", "fs"] }
 serde.workspace = true

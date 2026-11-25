@@ -289,10 +289,16 @@ Calendar's id of the occurrence) are replaced.
 Recurring events support `FREQ` `DAILY`, `WEEKLY`, `MONTHLY` and `YEARLY`
 with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`, `BYMONTH`,
 `BYSETPOS` and `WKST`, plus `EXDATE` and moved or changed occurrences
-(`RECURRENCE-ID`). Cancelled events are left out. UTC times are converted to
-local time. The sandbox has no time zone database, so a time with a `TZID`
-is read as local time. The agenda lists at most 100 events and counts the
-rest.
+(`RECURRENCE-ID`). Cancelled events are left out. Times are shown in local
+time. A time with a `TZID` is read in that zone, whether it is an IANA name,
+a Windows name as Outlook and Exchange write it, or libical's, and a
+repeating event keeps its time of day in its zone across DST changes. A zone
+the time zone database doesn't know, such as Outlook's "(UTC+01:00)
+Amsterdam, Berlin, ...", is asked of EDS, which keeps the definitions that
+came with the invites. The event's details show its time in its zone when
+that isn't local time. A `TZID` that nothing is known of is read as local
+time. The agenda
+lists at most 100 events and counts the rest.
 
 ### `recent`
 
@@ -809,6 +815,7 @@ error in `items()`, or in the `emit` call.
 | `dock.ui.*`                        | [UI constructors](#ui-trees)                                                                                                                                        |
 | `dock.theme.*`                     | [Theme color names](#colors)                                                                                                                                        |
 | `dock.dbus.session()`, `.system()` | [D-Bus clients](#d-bus)                                                                                                                                             |
+| `dock.tz.*`                        | `os.time` and `os.date` in any time zone. See [Time zones](#time-zones)                                                                                            |
 
 `argv` is either a list of arguments (`{'notmuch', 'count', 'tag:unread'}`),
 which is safe for arbitrary values, or a single string run with `sh -c`.
@@ -854,6 +861,43 @@ reloads or stops, or when you call `:cancel()`.
 the name are subfolders (`require('lib.util')` loads `lib/util.lua`). If
 there is no such file, it loads the bundled module of that name, currently
 only [`mpris`](#the-mpris-module).
+
+#### Time zones
+
+`os.time` and `os.date` only know local time and UTC. `dock.tz` reads the
+system's time zone database:
+
+```lua
+dock.tz.find('W. Europe Standard Time')  --> 'Europe/Berlin' (nil if unknown)
+dock.tz.system()                         --> 'Europe/Stockholm'
+local t = dock.tz.time('America/New_York', { year = 2026, month = 7, day = 1, hour = 9 })
+local d = dock.tz.date('Asia/Tokyo', t)  --> { year, month, day, hour, min, sec,
+                                         --     wday, yday, isdst, offset, abbrev }
+local z = dock.tz.vtimezone(text)        --> '<+01>-1<+02>,M3.5.0/2,M10.5.0/3'
+```
+
+A zone is an IANA name (`Europe/Stockholm`, `UTC`), a Windows name as
+Outlook and Exchange write them (`W. Europe Standard Time`), or either after
+a prefix as libical writes them (`/freeassociation.sourceforge.net/Europe/Oslo`),
+or a POSIX TZ string (`CET-1CEST,M3.5.0,M10.5.0/3`). `find` returns the IANA
+name, or a POSIX string itself. In `time` and `date`, `nil` or `'local'` is
+the system's zone.
+
+`time` turns a wall-clock time into Unix seconds. `hour`, `min` and `sec`
+default to 0, and nothing is normalized, so the 32nd of a month is an error.
+A time skipped by a change to summer time is moved forward by the change,
+and a time that happens twice is the first one, as RFC 5545 and `os.time` do
+it. `date` is `os.date('*t')` in a zone (`wday` 1 is Sunday), plus `offset`
+(seconds east of UTC) and `abbrev` (`CEST`). Both return `nil, err` for an
+unknown zone or an invalid time. To format a time in a zone, shift it by the
+offset and format it as UTC: `os.date('!%H:%M', t + d.offset)`.
+
+`vtimezone` turns an iCalendar `VTIMEZONE` into a POSIX TZ string, for zones
+that only an invite defines, such as Outlook's "(UTC+01:00) Amsterdam,
+Berlin, ...". It takes the rules in effect now (the latest `STANDARD` and
+`DAYLIGHT` parts, with yearly rules by weekday), so times from before the
+rules last changed may be off. It returns `nil, err` for rules POSIX can't
+express.
 
 ### UI trees
 

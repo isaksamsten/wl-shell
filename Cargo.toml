@@ -34,6 +34,7 @@ gbm = { version = "0.18", default-features = false }
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+jiff = "1"
 libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored", "send", "serialize"] }
 nucleo = "0.5"

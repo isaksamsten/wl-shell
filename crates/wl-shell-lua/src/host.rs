@@ -15,6 +15,7 @@
 //! | `watch(path, fn, {recursive})`    | Calls `fn(paths)` when the file, or anything in the folder, changes; returns a handle with `cancel()`, or nil and the error (`watch.rs`). |
 //! | `app`                             | The app the widget backs (`id`, `desktop`, `wm_class`, `name`); nil for a standalone widget. |
 //! | `dbus.session()`, `dbus.system()` | A D-Bus client (`dbus.rs`).                                           |
+//! | `tz.find`, `tz.system`, `tz.time`, `tz.date`, `tz.vtimezone` | Time zones: `os.time` and `os.date` in any zone (`tz.rs`). |
 //! | `ui.*`, `theme.*`                 | The UI constructors and the theme's color names (`ui.rs`).            |
 //!
 //! `argv` is a list of strings, or one string run with `sh -c`.
@@ -176,6 +177,7 @@ pub(crate) fn install(lua: &Lua, settings: &crate::runtime::Settings) -> mlua::R
     )?;
     crate::dbus::install(lua, &ns)?;
     crate::watch::install(lua, &ns)?;
+    crate::tz::install(lua, &ns)?;
     crate::ui::install(lua, &ns)?;
     g.set(namespace, ns)?;
     Ok(())

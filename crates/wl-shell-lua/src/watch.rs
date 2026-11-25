@@ -201,7 +201,10 @@ impl Watcher {
                 if is_dir && !hidden(&entry.file_name()) {
                     let full = (inner.watches.get(&id)).is_none_or(|w| w.dirs.len() >= MAX_DIRS);
                     if full {
-                        warn!("watch: more than {MAX_DIRS} folders under {}", dir.display());
+                        warn!(
+                            "watch: more than {MAX_DIRS} folders under {}",
+                            dir.display()
+                        );
                         return found;
                     }
                     if self.add_dir(inner, id, &path).is_ok() {
@@ -317,7 +320,8 @@ impl Watcher {
             Some(n) => dir.path.join(n),
             None => dir.path.clone(),
         };
-        let subdir = flags.contains(ReadFlags::ISDIR) && name.as_deref().is_some_and(|n| !hidden(n));
+        let subdir =
+            flags.contains(ReadFlags::ISDIR) && name.as_deref().is_some_and(|n| !hidden(n));
         for id in users {
             let Some(w) = inner.watches.get_mut(&id) else {
                 continue;
@@ -348,7 +352,12 @@ impl Watcher {
                 // folders aren't under this one any more.
                 let gone: Vec<i32> = (w.dirs.iter())
                     .copied()
-                    .filter(|wd| inner.dirs.get(wd).is_some_and(|d| d.path.starts_with(&path)))
+                    .filter(|wd| {
+                        inner
+                            .dirs
+                            .get(wd)
+                            .is_some_and(|d| d.path.starts_with(&path))
+                    })
                     .collect();
                 for wd in gone {
                     self.release(inner, wd, id);
@@ -458,4 +467,3 @@ mod tests {
         assert!(!hidden(OsStr::new("work")));
     }
 }
-

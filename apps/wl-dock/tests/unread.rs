@@ -63,7 +63,9 @@ fn shown(tree: &Node) -> Shown {
         Kind::Canvas { commands, .. } => {
             let sweep = (commands.iter())
                 .filter_map(|c| match c {
-                    Cmd::Arc { start, end, .. } if *start != 0.0 => Some((end - start) / (2.0 * PI)),
+                    Cmd::Arc { start, end, .. } if *start != 0.0 => {
+                        Some((end - start) / (2.0 * PI))
+                    }
                     _ => None,
                 })
                 .next();
@@ -177,14 +179,23 @@ fn launcher_entry_updates_show_on_the_icon() {
     let app = connect(&address);
 
     // Nothing published: the plain icon.
-    assert_eq!(p.icon(), Shown { badge: None, progress: None });
+    assert_eq!(
+        p.icon(),
+        Shown {
+            badge: None,
+            progress: None
+        }
+    );
 
     // A visible count.
     let count = |n: i64, visible: bool| {
         update(
             &app,
             URI,
-            &[("count", Value::I64(n)), ("count-visible", Value::Bool(visible))],
+            &[
+                ("count", Value::I64(n)),
+                ("count-visible", Value::Bool(visible)),
+            ],
         )
     };
     p.wait(|| count(3, true), Some("3"), None);
@@ -218,7 +229,10 @@ fn launcher_entry_updates_show_on_the_icon() {
     update(
         &app,
         "application://other.desktop",
-        &[("count", Value::I64(7)), ("count-visible", Value::Bool(true))],
+        &[
+            ("count", Value::I64(7)),
+            ("count-visible", Value::Bool(true)),
+        ],
     );
     p.wait(|| progress(0.25, true), None, Some(0.25));
 
@@ -226,4 +240,3 @@ fn launcher_entry_updates_show_on_the_icon() {
     drop(app);
     p.wait(|| {}, None, None);
 }
-

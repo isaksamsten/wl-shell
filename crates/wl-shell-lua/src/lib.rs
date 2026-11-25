@@ -26,7 +26,10 @@
 //!   `json.encode`, `read(path)`, `clipboard(text)`, `span(n)` and
 //!   `now()` (see `host.rs`), `watch(path, fn, opts)` (see `watch.rs`),
 //!   `app` (the app a widget backs, by its names, nil for a standalone
-//!   one; see [`AppInfo`]), the `dbus` client (see `dbus.rs`), the `ui`
+//!   one; see [`AppInfo`]), the `dbus` client (see `dbus.rs`), time
+//!   zones as `tz.find`, `tz.system`, `tz.time`, `tz.date` and
+//!   `tz.vtimezone` (see
+//!   `tz.rs`), the `ui`
 //!   constructors and the `theme`'s color names (see [`ui`]).
 //! - Widgets answer `label()` and `icon(tile)`: an icon is a [`ui::Node`]
 //!   tree, built from what the hook returned on the plugin's thread. A
@@ -49,8 +52,10 @@ mod runtime;
 mod spec;
 mod state;
 mod subject;
+mod tz;
 pub mod ui;
 mod watch;
+mod windows_zones;
 
 pub use caps::{
     API, ActionDecl, Capabilities, PopupOn, Registry, SPANS, SourceDecl, Span, WidgetCaps,

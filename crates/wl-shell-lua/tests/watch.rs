@@ -70,7 +70,9 @@ fn label(rt: &Runtime, recv: &Receiver<Event>, id: &str) -> String {
 
 /// The calls the plugin heard since the last time: each a list of paths.
 fn calls(rt: &Runtime, recv: &Receiver<Event>) -> Vec<Vec<String>> {
-    next(recv, |e| matches!(e, Event::Redraw(i) if i == "a").then_some(()));
+    next(recv, |e| {
+        matches!(e, Event::Redraw(i) if i == "a").then_some(())
+    });
     let text = label(rt, recv, "a");
     (text.split(';').filter(|c| !c.is_empty()))
         .map(|c| c.split('|').map(str::to_string).collect())
@@ -107,7 +109,8 @@ fn watcher(path: &Path, opts: &str) -> String {
 }
 
 fn temp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wl-shell-lua-watch-{name}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("wl-shell-lua-watch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -168,7 +171,10 @@ fn folders_and_subfolders() {
     let b = new.join("b.ics");
     std::fs::write(&b, "x").unwrap();
     let heard: Vec<String> = calls(&rt, &recv).concat();
-    assert!(heard.contains(&s(&new)) && heard.contains(&s(&b)), "{heard:?}");
+    assert!(
+        heard.contains(&s(&new)) && heard.contains(&s(&b)),
+        "{heard:?}"
+    );
 
     // And later.
     let c = new.join("c.ics");
@@ -229,7 +235,9 @@ fn errors_limits_cancelling_and_reloading() {
     rt.configure(vec![code("a", &source)]);
     loaded(&recv, "a");
     std::fs::write(dir.join("x"), "x").unwrap();
-    next(&recv, |e| matches!(e, Event::Redraw(i) if i == "a").then_some(()));
+    next(&recv, |e| {
+        matches!(e, Event::Redraw(i) if i == "a").then_some(())
+    });
     assert_eq!(label(&rt, &recv, "a"), "1");
 
     // Gone with the state.
@@ -238,4 +246,3 @@ fn errors_limits_cancelling_and_reloading() {
     quiet(&recv);
     std::fs::remove_dir_all(dir).unwrap();
 }
-

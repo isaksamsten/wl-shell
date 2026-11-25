@@ -36,10 +36,14 @@
 -- (ISO date-time), {date} (ISO date), {calendar} (the EDS source UID) and
 -- {event} (GNOME Calendar's id of the occurrence) are replaced.
 --
--- Events with a TZID are read as local time (there is no time zone database
--- in the sandbox); UTC times ("...Z") are converted. Recurrences support
--- FREQ DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, COUNT, UNTIL, BYDAY,
--- BYMONTHDAY, BYMONTH, BYSETPOS and WKST, plus EXDATE and RECURRENCE-ID.
+-- Times with a TZID are read in that zone, by its IANA name, its Windows
+-- name (Outlook, Exchange) or libical's, or else by the definition EDS
+-- keeps from the invite; UTC times ("...Z") are converted, and a TZID
+-- nothing is known of is read as local time. A repeating
+-- event keeps its wall-clock time in its zone across DST changes.
+-- Recurrences support FREQ DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL,
+-- COUNT, UNTIL, BYDAY, BYMONTHDAY, BYMONTH, BYSETPOS and WKST, plus EXDATE
+-- and RECURRENCE-ID.
 
 local ui, theme = dock.ui, dock.theme
 local P = { api = 1, popup_on = "click" }
@@ -129,10 +133,57 @@ local function ftime(t)
 	return fdate(time_format, t)
 end
 
+-- Time zones -------------------------------------------------------------------
+
+local tz = dock.tz
+local system_zone = tz.system()
+-- What each TZID stands for: an IANA zone or a POSIX TZ string (for a zone
+-- an invite defines, see zones_ready), or false for local
+-- time (the system's zone, or one nothing is known of).
+local zones = {}
+-- The TZIDs of POSIX TZ strings, to show.
+local zone_names = {}
+
+-- Whether `tzid` has been worked out, working it out if the database knows it.
+local function known_zone(tzid)
+	if zones[tzid] ~= nil then
+		return true
+	end
+	local z = tz.find(tzid)
+	if z then
+		zones[tzid] = z ~= system_zone and z
+	end
+	return z ~= nil
+end
+
+local function zone_of(tzid)
+	if not tzid then
+		return nil
+	end
+	if not known_zone(tzid) then
+		print("unknown time zone " .. tzid .. ": read as local time")
+		zones[tzid] = false
+	end
+	return zones[tzid] or nil
+end
+
+-- The time `h:mi:s` on day `day` (a day number) in `zone`.
+local function zone_time(zone, day, h, mi, s)
+	local y, m, d = civil(day)
+	return tz.time(zone, { year = y, month = m, day = d, hour = h, min = mi, sec = s })
+end
+
+-- The day (a day number) time `t` falls on in `zone`.
+local function zone_day(zone, t)
+	local d = tz.date(zone, t)
+	return days_from_civil(d.year, d.month, d.day)
+end
+
 -- iCalendar parsing ----------------------------------------------------------
 
--- A DATE or DATE-TIME value: { day = n } or { t = epoch }.
-local function parse_dt(v)
+-- A DATE or DATE-TIME value, in time zone `tzid` if it has one: { day = n }
+-- or { t = epoch }, with `utc` or the `zone` it was in.
+local function parse_dt(v, tzid)
 	local y, m, d = v:match("^(%d%d%d%d)(%d%d)(%d%d)")
 	if not y then
 		return nil
@@ -145,6 +196,13 @@ local function parse_dt(v)
 	hh, mi, ss = tonumber(hh), tonumber(mi), tonumber(ss)
 	if z == "Z" then
 		return { t = days_from_civil(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss, utc = true }
+	end
+	local zone = zone_of(tzid)
+	if zone then
+		local t = tz.time(zone, { year = y, month = m, day = d, hour = hh, min = mi, sec = ss })
+		if t then
+			return { t = t, zone = zone }
+		end
 	end
 	return { t = os.time({ year = y, month = m, day = d, hour = hh, min = mi, sec = ss }) }
 end
@@ -181,7 +239,8 @@ end
 local WEEKDAYS = { SU = 0, MO = 1, TU = 2, WE = 3, TH = 4, FR = 5, SA = 6 }
 local FREQS = { DAILY = true, WEEKLY = true, MONTHLY = true, YEARLY = true }
 
-local function parse_rrule(v)
+-- An RRULE; `tzid` is DTSTART's, which a local UNTIL is in.
+local function parse_rrule(v, tzid)
 	local r = { interval = 1, wkst = 1 }
 	for k, val in v:gmatch("([^;=]+)=([^;]*)") do
 		k = k:upper()
@@ -192,7 +251,7 @@ local function parse_rrule(v)
 		elseif k == "COUNT" then
 			r.count = math.tointeger(tonumber(val))
 		elseif k == "UNTIL" then
-			r.till = parse_dt(val)
+			r.till = parse_dt(val, tzid)
 		elseif k == "WKST" then
 			r.wkst = WEEKDAYS[val:upper()] or 1
 		elseif k == "BYDAY" then
@@ -226,7 +285,8 @@ local function dt_key(x)
 	return x.day and ("d" .. x.day) or ("t" .. x.t)
 end
 
--- Splits a content line into its upper-cased name and its value.
+-- Splits a content line into its upper-cased name, its value, and its TZID
+-- parameter if it has one.
 local function split(line)
 	local colon = line:find(":", 1, true)
 	if not colon then
@@ -248,7 +308,12 @@ local function split(line)
 	end
 	local head = line:sub(1, colon - 1)
 	local semi = head:find(";", 1, true)
-	return (semi and head:sub(1, semi - 1) or head):upper(), line:sub(colon + 1)
+	local tzid
+	if semi then
+		local params = head:sub(semi)
+		tzid = params:match(';[Tt][Zz][Ii][Dd]="([^"]*)"') or params:match(";[Tt][Zz][Ii][Dd]=([^;]*)")
+	end
+	return (semi and head:sub(1, semi - 1) or head):upper(), line:sub(colon + 1), tzid
 end
 
 -- Recurrence -----------------------------------------------------------------
@@ -420,8 +485,10 @@ local function count_end(r, sday)
 end
 
 -- Turns a VEVENT's properties into an event, or nil. `source` is its calendar.
+-- Turns a VEVENT's properties into an event, or nil. `source` is its calendar.
+-- `e[name .. ";TZID"]` is a property's time zone.
 local function make_event(e, source)
-	local s = e.DTSTART and parse_dt(e.DTSTART)
+	local s = e.DTSTART and parse_dt(e.DTSTART, e["DTSTART;TZID"])
 	if not s then
 		return nil
 	end
@@ -448,10 +515,11 @@ local function make_event(e, source)
 		source = source,
 		allday = s.day ~= nil,
 		utc = s.utc, -- recurs at the same UTC time rather than the same local time
+		zone = s.zone, -- recurs at the same time in this zone (nil: local time)
 	}
-	-- The first day: local, or the UTC day for an event anchored in UTC.
-	ev.sday = ev.allday and s.day or s.utc and s.t // 86400 or day_of(s.t)
-	local en = e.DTEND and parse_dt(e.DTEND)
+	-- The first day: local, or the day in the zone the event recurs in.
+	ev.sday = ev.allday and s.day or s.utc and s.t // 86400 or s.zone and zone_day(s.zone, s.t) or day_of(s.t)
+	local en = e.DTEND and parse_dt(e.DTEND, e["DTEND;TZID"])
 	local dur = e.DURATION and parse_duration(e.DURATION)
 	if ev.allday then
 		ev.s = s.day
@@ -475,10 +543,10 @@ local function make_event(e, source)
 		end
 	end
 	if e["RECURRENCE-ID"] then
-		local r = parse_dt(e["RECURRENCE-ID"])
+		local r = parse_dt(e["RECURRENCE-ID"], e["RECURRENCE-ID;TZID"])
 		ev.recur = r and dt_key(r)
 	elseif e.RRULE then
-		ev.rule = parse_rrule(e.RRULE)
+		ev.rule = parse_rrule(e.RRULE, e["DTSTART;TZID"])
 		if ev.rule and ev.rule.count then
 			ev.rule.last = count_end(ev.rule, ev.sday)
 		end
@@ -486,7 +554,7 @@ local function make_event(e, source)
 	if e.EXDATE then
 		ev.ex = {}
 		for _, v in ipairs(e.EXDATE) do
-			local x = parse_dt(v)
+			local x = parse_dt(v[1], v[2])
 			if x then
 				ev.ex[dt_key(x)] = true
 			end
@@ -502,7 +570,7 @@ local function new_parser(on_event)
 	local cur, depth -- the VEVENT being read, and nesting inside it (VALARM)
 
 	local function handle(line)
-		local name, value = split(line)
+		local name, value, tzid = split(line)
 		if not name then
 			return
 		end
@@ -525,11 +593,12 @@ local function new_parser(on_event)
 			if name == "EXDATE" then
 				local list = cur.EXDATE or {}
 				for v in value:gmatch("[^,]+") do
-					list[#list + 1] = v
+					list[#list + 1] = { v, tzid }
 				end
 				cur.EXDATE = list
 			else
 				cur[name] = value
+				cur[name .. ";TZID"] = tzid
 			end
 		end
 	end
@@ -586,7 +655,8 @@ local function occurrences(ev, d0, d1, emit)
 	local x = ev.x
 	if not x then
 		local _, sm, sd = civil(ev.sday)
-		local wall = not ev.allday and not ev.utc and os.date("*t", ev.s) or nil
+		local wall = not ev.allday and not ev.utc and (ev.zone and tz.date(ev.zone, ev.s) or os.date("*t", ev.s))
+			or nil
 		local dur = ev.e - ev.s
 		x = {
 			st = { m = sm, d = sd, wd = weekday(ev.sday) },
@@ -603,7 +673,8 @@ local function occurrences(ev, d0, d1, emit)
 	-- Skip straight to the periods near the window.
 	local p = math.max(0, (unit_of(r, d0 - reach - 2) - su) // r.interval - 1)
 	local till, last = r.till, r.last
-	local stop = d1 + (ev.utc and 1 or 0)
+	-- Days in another zone may be a day off the local ones.
+	local stop = d1 + ((ev.utc or ev.zone) and 1 or 0)
 	for _ = 1, 5000 do
 		for _, c in ipairs(candidates(r, su + p * r.interval, st)) do
 			if c >= sday then
@@ -615,6 +686,8 @@ local function occurrences(ev, d0, d1, emit)
 					s = c
 				elseif ev.utc then
 					s = c * 86400 + ev.s % 86400
+				elseif ev.zone then
+					s = zone_time(ev.zone, c, wall.hour, wall.min, wall.sec) or (c * 86400 + tod)
 				else
 					s = midnight(c)
 					-- A day with a DST change isn't 24 hours long: let os.time work it out.
@@ -639,7 +712,7 @@ local function occurrences(ev, d0, d1, emit)
 					skip = (ex and (ex[kd] or (kt and ex[kt]))) or (ov and (ov[kd] or (kt and ov[kt]))) or false
 				end
 				if not skip then
-					emit(s, s + dur, wall and c)
+					emit(s, s + dur, (wall and not ev.zone) and c or nil)
 				end
 			end
 		end
@@ -844,8 +917,47 @@ end
 -- Changes from the views, taken in a chunk at a time, in order.
 local queue, qhead, qtail = {}, 1, 0
 local pumping
+local pump
 
-local function pump()
+-- Zones invites define (Outlook's "(UTC+01:00) Amsterdam, Berlin, ..."):
+-- the TZIDs asked of EDS for their VTIMEZONE.
+local asked = {}
+local TZID_PATTERNS = { ';TZID="([^"]*)"', ';TZID=([^";:][^;:]*)' }
+
+-- Whether the zones of component `text` are all known. Asks `cal` for the
+-- ones that aren't, and goes on with the queue when it answers.
+local function zones_ready(cal, text)
+	local ready = true
+	text = text:gsub("\r?\n[ \t]", "")
+	for _, pattern in ipairs(TZID_PATTERNS) do
+		for tzid in text:gmatch(pattern) do
+			if not known_zone(tzid) then
+				ready = false
+				if not asked[tzid] then
+					asked[tzid] = true
+					call(cal.bus, cal.path, CALENDAR, "GetTimezone", "s", { tzid }, function(ret, err)
+						local z, why = nil, err
+						if ret then
+							z, why = tz.vtimezone(ret[1])
+						end
+						if z then
+							zones[tzid], zone_names[z] = z, tzid
+						else
+							zones[tzid] = false
+							print("time zone " .. tzid .. ": " .. tostring(why) .. ": read as local time")
+						end
+						if not pumping and qhead <= qtail then
+							pumping = dock.timer(1, pump)
+						end
+					end)
+				end
+			end
+		end
+	end
+	return ready
+end
+
+pump = function()
 	pumping = nil
 	local n = 0
 	while n < CHUNK and qhead <= qtail do
@@ -853,12 +965,14 @@ local function pump()
 		local item = job.items[job.i]
 		if item == nil or not alive(job.cal) then
 			queue[qhead], qhead = nil, qhead + 1
+		elseif job.remove then
+			remove_object(job.cal, item)
+			job.i, n = job.i + 1, n + 1
+		elseif not zones_ready(job.cal, item) then
+			-- Waiting for EDS: an answer starts the queue again.
+			return
 		else
-			if job.remove then
-				remove_object(job.cal, item)
-			else
-				put_object(job.cal, item)
-			end
+			put_object(job.cal, item)
 			job.i, n = job.i + 1, n + 1
 		end
 	end
@@ -1314,6 +1428,9 @@ local function event_id(o)
 			rid = os.date("%Y%m%d", day_start(o.s))
 		elseif ev.utc then
 			rid = os.date("!%Y%m%dT%H%M%SZ", o.s)
+		elseif ev.zone then
+			local d = tz.date(ev.zone, o.s)
+			rid = string.format("%04d%02d%02dT%02d%02d%02d", d.year, d.month, d.day, d.hour, d.min, d.sec)
 		else
 			rid = os.date("%Y%m%dT%H%M%S", o.s)
 		end
@@ -1604,6 +1721,16 @@ local function details()
 	end
 	if ev.rule then
 		line(ui.icon({ "media-playlist-repeat-symbolic", size = 16 }), repeats(ev.rule), 2)
+	end
+	if ev.zone and not ev.allday then
+		-- The time where the event is: os.date in UTC, moved by the zone's offset.
+		local a, b = tz.date(ev.zone, o.s), tz.date(ev.zone, o.e)
+		local text = fdate("!" .. time_format, o.s + a.offset)
+		if o.e > o.s then
+			text = text .. " – " .. fdate("!" .. time_format, o.e + b.offset)
+		end
+		text = text .. " " .. a.abbrev .. " · " .. (zone_names[ev.zone] or ev.zone:gsub("_", " "))
+		line(ui.icon({ "preferences-system-time-symbolic", size = 16 }), text, 2)
 	end
 	if ev.description then
 		rows[#rows + 1] = ui.col({
