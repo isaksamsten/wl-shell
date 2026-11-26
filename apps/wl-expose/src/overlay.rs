@@ -58,10 +58,10 @@ use wayland_protocols::{
     },
 };
 
-use wl_shell_core::{FrameClock, Shell};
 use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId, Frame};
 use wl_shell_core::globals::{Globals, Ignore};
 use wl_shell_core::toplevel::Toplevel;
+use wl_shell_core::{FrameClock, Shell};
 use wl_shell_log::warn;
 use wl_shell_render::worker::PillRequest;
 use wl_shell_render::{Image, icons, shadow, text};

@@ -9,7 +9,7 @@
 //! mode (or the one `mode` forces).
 
 use serde::{Deserialize, Deserializer};
-use wl_shell_config::{de, ConfigFile, Scheme};
+use wl_shell_config::{ConfigFile, Scheme, de};
 use wl_shell_render::{shadow, text};
 
 pub type Appearance = wl_shell_config::Appearance<Theme>;
