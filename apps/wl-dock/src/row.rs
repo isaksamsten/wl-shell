@@ -102,8 +102,8 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
                     s.leaving = false;
                     s.presence.retarget(1.0);
                     match animate {
-                        true => s.span.retarget(item.span.get()),
-                        false => s.span.snap(item.span.get()),
+                        true => s.span.retarget(item.span.icons()),
+                        false => s.span.snap(item.span.icons()),
                     }
                     s
                 }
@@ -118,7 +118,7 @@ pub fn merge(slots: &mut Vec<Slot>, items: &[Item], response: f64, animate: bool
                         presence,
                         leaving: false,
                         bounce: None,
-                        span: Spring::new(item.span.get(), response),
+                        span: Spring::new(item.span.icons(), response),
                     }
                 }
             },
@@ -187,7 +187,7 @@ mod tests {
             }],
             elsewhere: Vec::new(),
             active: false,
-            span: Span::ONE,
+            span: Span::Normal,
         }
     }
 
@@ -280,7 +280,7 @@ mod tests {
         merge(&mut slots, &[item("a")], 100.0, false);
         assert_eq!(slots[0].span.value, 1.0);
         let mut wide = item("a");
-        wide.span = Span::of(2.0);
+        wide.span = Span::ExtraWide;
         merge(&mut slots, &[wide.clone()], 100.0, true);
         assert_eq!((slots[0].span.value, slots[0].span.target), (1.0, 2.0));
         assert!(advance(&mut slots, 0.05));
@@ -293,7 +293,7 @@ mod tests {
             &mut slots,
             &[wide, {
                 let mut b = item("b");
-                b.span = Span::of(1.5);
+                b.span = Span::Wide;
                 b
             }],
             100.0,

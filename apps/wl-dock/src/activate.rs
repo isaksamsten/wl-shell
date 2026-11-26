@@ -349,7 +349,7 @@ mod tests {
                 .collect(),
             elsewhere: Vec::new(),
             active: false,
-            span: Span::ONE,
+            span: Span::Normal,
         }
     }
 

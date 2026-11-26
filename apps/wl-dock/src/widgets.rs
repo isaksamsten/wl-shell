@@ -52,7 +52,7 @@ use wl_shell_log::warn;
 use wl_shell_lua::ui::Node;
 use wl_shell_lua::{
     AppInfo, Axis, Choice, Event, InstanceSpec, Item, Pending, PopupOn, Registry, Reply, RequestId,
-    RequestKind, Role, Runtime, Settings, Source, SourceDecl, Span, Tile, Topic,
+    RequestKind, Role, Runtime, Settings, Source, SourceDecl, Span, Spans, Tile, Topic,
 };
 use wl_shell_render::icons::AppEntry;
 
@@ -354,8 +354,8 @@ pub struct Widgets {
     labels: BTreeMap<String, String>,
     /// Their icons, by their items' keys.
     icons: BTreeMap<String, WidgetIcon>,
-    /// Their spans, by their items' keys (the ones that aren't 1).
-    spans: BTreeMap<String, Span>,
+    /// Their spans, by their items' keys (the ones that aren't normal).
+    spans: BTreeMap<String, Spans>,
     versions: u64,
     /// The tile icons are drawn for; None until there is a dock.
     tile: Option<TileBase>,
@@ -437,8 +437,8 @@ impl Widgets {
     }
 
     /// The span of the tile of the item `key` on a dock along `axis`.
-    pub fn span(&self, key: &str, axis: Axis) -> f32 {
-        self.spans.get(key).map_or(1.0, |s| match axis {
+    pub fn span(&self, key: &str, axis: Axis) -> Span {
+        self.spans.get(key).map_or(Span::Normal, |s| match axis {
             Axis::Horizontal => s.horizontal,
             Axis::Vertical => s.vertical,
         })
@@ -465,15 +465,16 @@ impl Widgets {
         let (Some(key), Some(base), true) = (instance_key(instance), self.tile, wants) else {
             return;
         };
-        let span = self.span(&key, base.axis) as f64;
+        let span = self.span(&key, base.axis);
+        let long = base.size * span.icons();
         let (w, h) = match base.axis {
-            Axis::Horizontal => (base.size * span, base.size),
-            Axis::Vertical => (base.size, base.size * span),
+            Axis::Horizontal => (long, base.size),
+            Axis::Vertical => (base.size, long),
         };
         let tile = Tile {
             w,
             h,
-            span: span as f32,
+            span,
             axis: base.axis,
             scale: base.scale,
         };
@@ -503,11 +504,11 @@ impl Widgets {
     }
 
     /// Set the span of `instance`'s item; true if it changed.
-    fn set_span(&mut self, instance: &str, span: Option<Span>) -> bool {
+    fn set_span(&mut self, instance: &str, span: Option<Spans>) -> bool {
         let Some(key) = instance_key(instance) else {
             return false;
         };
-        let span = span.filter(|s| (s.horizontal, s.vertical) != (1.0, 1.0));
+        let span = span.filter(|s| *s != Spans::default());
         let old = match span {
             Some(s) => self.spans.insert(key, s),
             None => self.spans.remove(&key),
@@ -1901,9 +1902,9 @@ mod tests {
         let caps = Capabilities {
             widget: Some(WidgetCaps {
                 icon: true,
-                span: Span {
-                    horizontal: 2.0,
-                    vertical: 1.0,
+                span: Spans {
+                    horizontal: Span::ExtraWide,
+                    vertical: Span::Normal,
                 },
                 ..Default::default()
             }),
@@ -1914,13 +1915,13 @@ mod tests {
             caps,
         });
         assert!(fx.spans);
-        assert_eq!(w.span("a", Axis::Horizontal), 2.0);
-        assert_eq!(w.span("a", Axis::Vertical), 1.0);
-        assert_eq!(w.span("b", Axis::Horizontal), 1.0);
+        assert_eq!(w.span("a", Axis::Horizontal), Span::ExtraWide);
+        assert_eq!(w.span("a", Axis::Vertical), Span::Normal);
+        assert_eq!(w.span("b", Axis::Horizontal), Span::Normal);
         let tile = Tile {
             w: 192.0,
             h: 96.0,
-            span: 2.0,
+            span: Span::ExtraWide,
             axis: Axis::Horizontal,
             scale: 1,
         };
@@ -1946,20 +1947,17 @@ mod tests {
         answer(&mut w, Some(Arc::new(Node::text("z"))));
         let span = Event::Span {
             instance: "app:a".into(),
-            span: Span {
-                horizontal: 1.5,
-                vertical: 1.5,
-            },
+            span: Spans::both(Span::Wide),
         };
         assert!(w.event(span).spans);
-        assert_eq!(w.span("a", Axis::Vertical), 1.5);
+        assert_eq!(w.span("a", Axis::Vertical), Span::Wide);
         let fx = w.event(Event::Failed {
             instance: "app:a".into(),
             error: "x".into(),
         });
         assert!(fx.icons && fx.spans);
         assert!(w.icons().is_empty());
-        assert_eq!(w.span("a", Axis::Horizontal), 1.0);
+        assert_eq!(w.span("a", Axis::Horizontal), Span::Normal);
     }
 
     /// The bundled clock's face, through the runtime, painted as the

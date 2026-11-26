@@ -145,15 +145,15 @@ widget = { plugin = "player", player = "firefox" }
 [widget.nowplaying]
 plugin = "player"
 name = "Now Playing"
-span = 2               # Wide on a bottom dock: the title and artist beside the cover
+span = "extra-wide"    # On a bottom dock: the title and artist beside the cover
 ```
 
-| Option   | Default | Meaning                                                                                                                                                                           |
-| -------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `player` | —       | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`)                                                               |
-| `cover`  | `true`  | `false` keeps the item's icon                                                                                                                                                     |
-| `label`  | `true`  | `false` keeps the item's name                                                                                                                                                     |
-| `span`   | `1`     | `1.5` or `2`: while there is a player, the tile is that many icons wide on a bottom dock, with the title (at `2`, also the artist) beside the cover. Side docks keep square tiles |
+| Option   | Default    | Meaning                                                                                                                                                                                  |
+| -------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `player` | —          | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`)                                                                      |
+| `cover`  | `true`     | `false` keeps the item's icon                                                                                                                                                            |
+| `label`  | `true`     | `false` keeps the item's name                                                                                                                                                            |
+| `span`   | `"normal"` | `"wide"` or `"extra-wide"`: while there is a player, the tile is wider on a bottom dock, with the title (when extra-wide, also the artist) beside the cover. Side docks keep square tiles |
 
 ### `convert`
 
@@ -671,11 +671,11 @@ All hooks are optional. A plugin needs at least one of `icon`, `label`,
 
 The plugin table also takes these keys:
 
-| Key        | Meaning                                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `span`     | The tile's length along the dock in icons: `1`, `1.5` or `2` (other values round down), or per dock direction `{ horizontal = 2, vertical = 1 }`. Change it at run time with `dock.span()`. |
-| `popup_on` | What opens the popup: `'hover'` (default) or `'click'`. See [`popup()`](#popup). On an app's item the popup always opens on hover.                                                          |
-| `api`      | The API version the plugin was written for. If given, it must be `1`.                                                                                                                       |
+| Key        | Meaning                                                                                                                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `span`     | The tile's length along the dock: `'normal'` (square, the default), `'wide'` (1.5 icons) or `'extra-wide'` (2 icons), or per dock direction `{ horizontal = 'extra-wide', vertical = 'normal' }`. Change it at run time with `dock.span()`. |
+| `popup_on` | What opens the popup: `'hover'` (default) or `'click'`. See [`popup()`](#popup). On an app's item the popup always opens on hover.                                                                                                          |
+| `api`      | The API version the plugin was written for. If given, it must be `1`.                                                                                                                                                                       |
 
 `actions` adds [launcher actions](#launcher-actions), and `sources`
 [launcher sources](#launcher-sources).
@@ -687,7 +687,7 @@ The plugin table also takes these keys:
 | Field   | Meaning                                                           |
 | ------- | ----------------------------------------------------------------- |
 | `w`,`h` | The magnified size, in logical pixels (`w` is longer with a span) |
-| `span`  | The tile's span                                                   |
+| `span`  | The tile's span: `'normal'`, `'wide'` or `'extra-wide'`           |
 | `axis`  | `'horizontal'` (bottom dock) or `'vertical'` (side dock)          |
 | `scale` | The output's scale factor                                         |
 
@@ -809,7 +809,7 @@ error in `items()`, or in the `emit` call.
 | `dock.json.decode(s)`              | JSON to Lua (`null` becomes `nil`). Raises an error on bad JSON                                                                                                     |
 | `dock.json.encode(v)`              | Lua to JSON                                                                                                                                                         |
 | `dock.clipboard(text)`             | Copy `text` to the clipboard                                                                                                                                        |
-| `dock.span(n)`                     | Set the tile's span: `1`, `1.5`, `2` or `{ horizontal =, vertical = }`                                                                                              |
+| `dock.span(s)`                     | Set the tile's span: `'normal'`, `'wide'`, `'extra-wide'` or `{ horizontal =, vertical = }`                                                                         |
 | `dock.now()`                       | Unix time in seconds, with a fraction. This is the clock `live.at` uses                                                                                             |
 | `dock.app`                         | The app behind the widget, or `nil` (see [above](#standalone-or-on-an-app))                                                                                         |
 | `dock.ui.*`                        | [UI constructors](#ui-trees)                                                                                                                                        |
@@ -1293,17 +1293,17 @@ below it. The ring is green while charging, orange when the battery is low
 and red when it is critical. The label shows the remaining time, and the
 popup adds the status, power draw and energy.
 
-The `span` option makes the tile wider on a bottom dock: 1.5 or 2 icons.
-A wider tile shows the remaining time in large text next to the ring. Side
-docks always use the normal size. The icon has one canvas whose viewbox is
-as wide as the tile, so it scales to every dock's icon size.
+The `span` option makes the tile wider on a bottom dock: `"wide"` or
+`"extra-wide"`. A wider tile shows the remaining time in large text next to
+the ring. Side docks always use the normal size. The icon has one canvas
+whose viewbox is as wide as the tile, so it scales to every dock's icon size.
 
 ```lua
 -- [widget.battery]
 -- name = "Battery"
 -- low = 20          # % below which the ring turns orange
 -- critical = 10     # % below which it turns red
--- span = 2          # Tile width on a bottom dock: 1, 1.5 or 2 icons
+-- span = "extra-wide"  # Tile width on a bottom dock: normal, wide or extra-wide
 local ui, theme = dock.ui, dock.theme
 local P = {}
 local DEST = 'org.freedesktop.UPower'
@@ -1324,8 +1324,8 @@ function P.setup(opts)
   if type(opts.low) == 'number' then low = opts.low end
   if type(opts.critical) == 'number' then critical = opts.critical end
   -- Wider along a bottom dock only; a side dock keeps square tiles.
-  local span = (opts.span == 1.5 or opts.span == 2) and opts.span or 1
-  dock.span({ horizontal = span, vertical = 1 })
+  local span = (opts.span == 'wide' or opts.span == 'extra-wide') and opts.span or 'normal'
+  dock.span({ horizontal = span, vertical = 'normal' })
   local bus = dock.dbus.system()
   bus:get_all(DEST, PATH, IFACE, function(props, err)
     if props then apply(props) else print(err) end
@@ -1385,11 +1385,11 @@ local function draw(c) ring(c, true) end
 
 function P.icon(tile)
   if not b.Percentage or b.IsPresent == false then return nil end   -- the placeholder
-  if tile.span <= 1 then
+  if tile.span == 'normal' then
     return ui.canvas{ draw = draw }
   end
   -- Wide: the ring, and the time beside it, in a viewbox as wide as the tile.
-  local extra = 100 * (tile.span - 1)
+  local extra = 100 * (tile.w / tile.h - 1)
   return ui.canvas{ viewbox = { 100 + extra, 100 }, draw = function(c)
     ring(c, false)
     local s = remaining()

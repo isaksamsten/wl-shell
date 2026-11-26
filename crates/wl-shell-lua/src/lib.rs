@@ -23,7 +23,7 @@
 //! - Host functions, in the namespace the host names (`dock`):
 //!   `redraw()`, `invalidate()`, `timer(ms, fn)`, `every(ms, fn)`,
 //!   `spawn(argv, {on_line, on_exit})`, `run(argv)`, `json.decode`,
-//!   `json.encode`, `read(path)`, `clipboard(text)`, `span(n)` and
+//!   `json.encode`, `read(path)`, `clipboard(text)`, `span(s)` and
 //!   `now()` (see `host.rs`), `watch(path, fn, opts)` (see `watch.rs`),
 //!   `app` (the app a widget backs, by its names, nil for a standalone
 //!   one; see [`AppInfo`]), the `dbus` client (see `dbus.rs`), time
@@ -58,8 +58,7 @@ mod watch;
 mod windows_zones;
 
 pub use caps::{
-    API, ActionDecl, Capabilities, PopupOn, Registry, SPANS, SourceDecl, Span, WidgetCaps,
-    span_step,
+    API, ActionDecl, Capabilities, PopupOn, Registry, SourceDecl, Span, Spans, WidgetCaps,
 };
 pub use channel::{
     Answer, Axis, InstanceId, Pending, Reply, Request, RequestId, RequestKind, Ticket, Tile, Topic,

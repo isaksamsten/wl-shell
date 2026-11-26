@@ -19,9 +19,9 @@
 -- Options: `player`, a bus name suffix (`org.mpris.MediaPlayer2.<suffix>`,
 -- `*` at the end matching any rest) instead of matching the app by its
 -- names; `cover = false` keeps the icon as it is; `label = false` keeps
--- the item's name instead of the title; `span = 1.5` or `2` widens the
--- tile on a bottom dock while there is a player, to show the title (and
--- at 2, the artist) next to the cover.
+-- the item's name instead of the title; `span = "wide"` or `"extra-wide"`
+-- widens the tile on a bottom dock while there is a player, to show the
+-- title (and when extra-wide, the artist) next to the cover.
 
 local ui, theme = dock.ui, dock.theme
 local mpris = require("mpris")
@@ -29,13 +29,13 @@ local mpris = require("mpris")
 local P = {}
 local p, watcher, ticking
 local cover, show_label = true, true
-local span = 1
+local span = "normal"
 local standalone = dock.app == nil
 
 -- Wide only with something to show beside the cover, and only along a
 -- bottom dock.
 local function respan()
-	dock.span({ horizontal = p and span or 1, vertical = 1 })
+	dock.span({ horizontal = p and span or "normal", vertical = "normal" })
 end
 
 local function clock(s)
@@ -54,7 +54,7 @@ function P.setup(opts)
 	if opts.label == false then
 		show_label = false
 	end
-	if opts.span == 1.5 or opts.span == 2 then
+	if opts.span == "wide" or opts.span == "extra-wide" then
 		span = opts.span
 	end
 	watcher = mpris.watch({ app = dock.app, player = opts.player }, function(player)
@@ -74,7 +74,7 @@ end
 local function cover_stack(tile, props)
 	local under = standalone and ui.icon({ "audio-x-generic" }) or ui.app_icon({})
 	props[1] = under
-	props[2] = ui.image({ src = p.art, fit = "cover", radius = math.min(tile.h, tile.w / tile.span) * 0.2 })
+	props[2] = ui.image({ src = p.art, fit = "cover", radius = math.min(tile.w, tile.h) * 0.2 })
 	return ui.stack(props)
 end
 
@@ -93,11 +93,11 @@ end
 -- artist) beside it.
 local function wide(tile)
 	local h = tile.h
-	local roomy = tile.span >= 2
+	local roomy = tile.span == "extra-wide"
 	local name = (p.title and p.title ~= "") and p.title or p.identity or p.id
 	local artist = roomy and p.artist and p.artist ~= "" and p.artist or nil
-	-- As wide as the tile is tall, whatever dock it is laid out for.
-	local side = string.format("%.3f%%", 100 / tile.span)
+	-- As wide as the tile is tall.
+	local side = string.format("%.3f%%", 100 * h / tile.w)
 	local sq
 	if cover and p.art then
 		sq = cover_stack(tile, { width = side, min_width = side, height = "100%" })
@@ -133,7 +133,7 @@ local function wide(tile)
 end
 
 function P.icon(tile)
-	if p and tile.span > 1 then
+	if p and tile.span ~= "normal" then
 		return wide(tile)
 	end
 	return square(tile)

@@ -51,12 +51,12 @@ impl Axis {
 }
 
 /// The tile `icon(tile)` draws for: the magnified size in logical pixels
-/// (`span` icons long along the dock), and the output's scale.
+/// (`span` long along the dock), and the output's scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tile {
     pub w: f64,
     pub h: f64,
-    pub span: f32,
+    pub span: crate::caps::Span,
     pub axis: Axis,
     pub scale: i32,
 }

@@ -10,7 +10,7 @@
 //! | `json.decode(s)` / `json.encode(v)` | JSON; `null` is `nil`.                                              |
 //! | `read(path)`                      | A file's text (`~/` expands), or nil and the error.                   |
 //! | `clipboard(text)`                 | Copies `text`.                                                        |
-//! | `span(n)`                         | Sets the tile's length along the dock: 1, 1.5 or 2 (or `{horizontal = 2, vertical = 1}`). |
+//! | `span(s)`                         | Sets the tile's length along the dock: `'normal'`, `'wide'` or `'extra-wide'` (or `{horizontal = 'extra-wide', vertical = 'normal'}`). |
 //! | `now()`                           | Unix time in seconds, with a fraction: the clock of `live.at`.        |
 //! | `watch(path, fn, {recursive})`    | Calls `fn(paths)` when the file, or anything in the folder, changes; returns a handle with `cancel()`, or nil and the error (`watch.rs`). |
 //! | `app`                             | The app the widget backs (`id`, `desktop`, `wm_class`, `name`); nil for a standalone widget. |

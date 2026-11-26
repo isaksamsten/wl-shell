@@ -115,9 +115,9 @@ pub(crate) struct Host {
     pub procs: Mutex<HashMap<u64, Arc<Mutex<Child>>>>,
     /// The plugin's folder, for `require`.
     pub dir: Option<std::path::PathBuf>,
-    /// What `span(n)` set.
-    pub span: Mutex<Option<crate::caps::Span>>,
-    /// Loaded and set up: `span(n)` is news now.
+    /// What `span(s)` set.
+    pub span: Mutex<Option<crate::caps::Spans>>,
+    /// Loaded and set up: `span(s)` is news now.
     pub loaded: AtomicBool,
     /// D-Bus watches, cancelled with the state.
     pub subs: Mutex<Vec<(crate::dbus::BusKind, u64)>>,
@@ -332,8 +332,8 @@ impl State {
         })
     }
 
-    /// What `span(n)` set, if it was called.
-    pub fn span(&self) -> Option<crate::caps::Span> {
+    /// What `span(s)` set, if it was called.
+    pub fn span(&self) -> Option<crate::caps::Spans> {
         *lock(&self.host.span)
     }
 
@@ -347,7 +347,7 @@ impl State {
             let t = self.lua.create_table()?;
             t.set("w", tile.w)?;
             t.set("h", tile.h)?;
-            t.set("span", tile.span)?;
+            t.set("span", tile.span.name())?;
             t.set("axis", tile.axis.name())?;
             t.set("scale", tile.scale)?;
             let v = icon.call::<Value>(t)?;

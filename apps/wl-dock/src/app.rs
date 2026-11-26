@@ -3497,7 +3497,7 @@ impl WlDock {
             // Widgets' tiles may be longer along the dock.
             let axis = dock.tile_base().axis;
             for item in items.iter_mut().filter(|i| i.is_app() || i.is_widget()) {
-                item.span = dock::Span::of(self.widgets.span(&item.app_id, axis));
+                item.span = self.widgets.span(&item.app_id, axis);
             }
             dock.set_items(core, &items);
         }

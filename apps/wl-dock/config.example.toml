@@ -295,7 +295,7 @@
 #[widget.nowplaying]
 #plugin = "player"
 #name = "Now Playing"
-#span = 2                        # 1.5 or 2: wider on a bottom dock, with the title beside the cover
+#span = "extra-wide"             # wide or extra-wide: wider on a bottom dock, with the title beside the cover
 
 # An app's recent documents (from recently-used.xbel) in a popup on hover,
 # with thumbnails; clicking one opens it in the app again.

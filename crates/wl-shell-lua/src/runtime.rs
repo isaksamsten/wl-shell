@@ -67,11 +67,11 @@ pub enum Event {
         instance: InstanceId,
         text: String,
     },
-    /// `span(n)` changed the widget's span (after it loaded; before, it
+    /// `span(s)` changed the widget's span (after it loaded; before, it
     /// is in the capabilities).
     Span {
         instance: InstanceId,
-        span: crate::caps::Span,
+        span: crate::caps::Spans,
     },
 }
 
@@ -458,7 +458,7 @@ impl Slot {
         ) {
             Ok((state, mut caps)) => {
                 life.started = Some(Instant::now());
-                // `span(n)` during setup is the widget's span.
+                // `span(s)` during setup is the widget's span.
                 if let (Some(w), Some(span)) = (caps.widget.as_mut(), state.span()) {
                     w.span = span;
                 }

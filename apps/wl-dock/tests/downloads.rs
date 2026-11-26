@@ -67,7 +67,7 @@ impl Plugin {
         let tile = Tile {
             w: 96.0,
             h: 96.0,
-            span: 1.0,
+            span: wl_shell_lua::Span::Normal,
             axis: Axis::Horizontal,
             scale: 1,
         };

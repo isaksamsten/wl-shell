@@ -1008,7 +1008,7 @@ impl DockView {
     fn tile(&self, item: &Item) -> Option<icons::Tile> {
         let version = self.widget_icons.get(&item.app_id)?.version;
         let thick = self.style.icon_key_size() * self.scale.max(1) as u32;
-        let long = (thick as f64 * item.span.get()).round() as u32;
+        let long = (thick as f64 * item.span.icons()).round() as u32;
         let (w, h) = match self.frame().axis() {
             shapes::Axis::Horizontal => (long, thick),
             shapes::Axis::Vertical => (thick, long),
@@ -1778,7 +1778,7 @@ impl DockView {
             // As long as the dragged item.
             let span = (self.drag.as_ref())
                 .and_then(|d| self.slots.iter().find(|s| s.item.app_id == d.app_id))
-                .map_or(1.0, |s| s.item.span.get());
+                .map_or(1.0, |s| s.item.span.icons());
             self.gaps.push(Gap {
                 group,
                 before,

@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use wl_shell_lua::channel::PopupEvent;
 use wl_shell_lua::ui::{Kind, Node};
 use wl_shell_lua::{
-    AppInfo, Axis, Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source, Tile,
+    AppInfo, Axis, Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source, Span,
+    Tile,
 };
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -282,7 +283,7 @@ struct Plugins {
     rt: Runtime,
     recv: Receiver<Event>,
     /// The spans asked for, by instance, the latest last.
-    spans: std::cell::RefCell<Vec<(String, f32)>>,
+    spans: std::cell::RefCell<Vec<(String, Span)>>,
 }
 
 impl Plugins {
@@ -305,16 +306,16 @@ impl Plugins {
         }
     }
 
-    /// `id`'s latest span along a bottom dock (1 if it never asked).
-    fn span(&self, id: &str) -> f32 {
+    /// `id`'s latest span along a bottom dock (normal if it never asked).
+    fn span(&self, id: &str) -> Span {
         (self.spans.borrow().iter().rev())
             .find(|(i, _)| i == id)
-            .map_or(1.0, |&(_, s)| s)
+            .map_or(Span::Normal, |&(_, s)| s)
     }
 
-    fn icon(&self, id: &str, span: f32) -> Option<Arc<Node>> {
+    fn icon(&self, id: &str, span: Span) -> Option<Arc<Node>> {
         let tile = Tile {
-            w: 96.0 * span as f64,
+            w: 96.0 * span.icons(),
             h: 96.0,
             span,
             axis: Axis::Horizontal,
@@ -390,12 +391,12 @@ impl wl_shell_render::ui::Resources for Covers {
     }
 }
 
-/// `tree`, painted as a tile `span` icons wide (64 pixels per icon, not
+/// `tree`, painted as a `span` tile (64 pixels per icon, not
 /// the size it was built for), has the cover filling the square at its
 /// start and the text beside it.
-fn assert_wide(tree: &Arc<Node>, span: f32) {
+fn assert_wide(tree: &Arc<Node>, span: Span) {
     use wl_shell_render::ui;
-    let (w, h) = (64.0 * span, 64.0);
+    let (w, h) = (64.0 * span.icons() as f32, 64.0);
     let req = ui::Request::new(
         tree.clone(),
         ui::Bounds::Exact(w, h),
@@ -481,12 +482,12 @@ fn players_are_matched_followed_and_controlled() {
         spec(
             "wide",
             Some(AppInfo::new("foot")),
-            serde_json::json!({ "player": "chrom*", "span": 2 }),
+            serde_json::json!({ "player": "chrom*", "span": "extra-wide" }),
         ),
         spec(
             "half",
             Some(AppInfo::new("Spotify")),
-            serde_json::json!({ "span": 1.5 }),
+            serde_json::json!({ "span": "wide" }),
         ),
     ]);
     let p = Plugins {
@@ -558,18 +559,18 @@ fn players_are_matched_followed_and_controlled() {
     // Wide: the cover, with the title (and with room, the artist) beside it.
     p.wait_label("wide", Some("Video – Artist, Band"));
     p.wait_label("half", Some("Song (next) – Artist, Band"));
-    assert_eq!(p.span("wide"), 2.0);
-    assert_eq!(p.span("half"), 1.5);
-    assert_eq!(p.span("spotify"), 1.0);
-    let tree = p.icon("wide", 2.0).unwrap();
+    assert_eq!(p.span("wide"), Span::ExtraWide);
+    assert_eq!(p.span("half"), Span::Wide);
+    assert_eq!(p.span("spotify"), Span::Normal);
+    let tree = p.icon("wide", Span::ExtraWide).unwrap();
     assert!(tree.shows_image("https://example.com/art.png"));
     assert_eq!(texts(&tree), ["Video", "Artist, Band"]);
-    assert_wide(&tree, 2.0);
-    let tree = p.icon("half", 1.5).unwrap();
+    assert_wide(&tree, Span::ExtraWide);
+    let tree = p.icon("half", Span::Wide).unwrap();
     assert_eq!(texts(&tree), ["Song (next)"]);
-    assert_wide(&tree, 1.5);
+    assert_wide(&tree, Span::Wide);
     // A square tile (a side dock) is just the cover.
-    assert!(texts(&p.icon("wide", 1.0).unwrap()).is_empty());
+    assert!(texts(&p.icon("wide", Span::Normal).unwrap()).is_empty());
 
     // Gone: the widgets it backed are the plain apps again; back, and
     // they show it again.
@@ -578,8 +579,8 @@ fn players_are_matched_followed_and_controlled() {
     p.wait_label("flatpak", None);
     // Nothing to show beside the cover: square again.
     p.wait_label("wide", None);
-    assert_eq!(p.span("wide"), 1.0);
-    assert!(p.icon("wide", 1.0).is_none());
+    assert_eq!(p.span("wide"), Span::Normal);
+    assert!(p.icon("wide", Span::Normal).is_none());
     let _chromium = fake(
         &address,
         "chromium.instance7",

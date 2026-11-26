@@ -33,7 +33,7 @@ pub struct WidgetCaps {
     pub on_close: bool,
     pub on_click: bool,
     /// The tile's length along the dock, per axis.
-    pub span: Span,
+    pub span: Spans,
     /// What opens the popup of a standalone widget (an app's always
     /// opens on hover, since a click is the app's).
     pub popup_on: PopupOn,
@@ -49,31 +49,57 @@ pub enum PopupOn {
     Click,
 }
 
-/// A tile's length along the dock, in icons: 1, 1.5 or 2.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Span {
-    pub horizontal: f32,
-    pub vertical: f32,
+/// A tile's length along the dock: `'normal'` (an icon, square),
+/// `'wide'` (1.5 icons) or `'extra-wide'` (2 icons).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Span {
+    #[default]
+    Normal,
+    Wide,
+    ExtraWide,
 }
 
-impl Default for Span {
-    fn default() -> Self {
-        Span {
-            horizontal: 1.0,
-            vertical: 1.0,
+impl Span {
+    pub const ALL: [Span; 3] = [Span::Normal, Span::Wide, Span::ExtraWide];
+
+    /// Its name in Lua and in the config.
+    pub fn name(self) -> &'static str {
+        match self {
+            Span::Normal => "normal",
+            Span::Wide => "wide",
+            Span::ExtraWide => "extra-wide",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Span> {
+        Span::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// Its length in icons.
+    pub fn icons(self) -> f64 {
+        match self {
+            Span::Normal => 1.0,
+            Span::Wide => 1.5,
+            Span::ExtraWide => 2.0,
         }
     }
 }
 
-/// The steps a span snaps to.
-pub const SPANS: [f32; 3] = [1.0, 1.5, 2.0];
+/// A tile's span on a dock along each axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spans {
+    pub horizontal: Span,
+    pub vertical: Span,
+}
 
-/// `v` rounded down to a step (at least 1).
-pub fn span_step(v: f64) -> f32 {
-    (SPANS.iter().rev())
-        .copied()
-        .find(|&s| v >= s as f64)
-        .unwrap_or(1.0)
+impl Spans {
+    /// The same on both axes.
+    pub fn both(span: Span) -> Self {
+        Spans {
+            horizontal: span,
+            vertical: span,
+        }
+    }
 }
 
 /// A launcher action a plugin declares.
@@ -240,38 +266,35 @@ pub(crate) fn popup_on(v: &Value) -> Result<PopupOn, String> {
     }
 }
 
-/// `span = 2`, or `span = { horizontal = 2, vertical = 1 }`.
-pub(crate) fn span(v: &Value) -> Result<Span, String> {
-    let num = |v: &Value| match v {
-        Value::Integer(i) => Some(*i as f64),
-        Value::Number(n) => Some(*n),
-        _ => None,
+/// `span = 'wide'`, or `span = { horizontal = 'wide', vertical = 'normal' }`.
+pub(crate) fn span(v: &Value) -> Result<Spans, String> {
+    let one = |v: &Value, key: &str| {
+        match v {
+            Value::String(s) => Span::from_name(&s.to_string_lossy()),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            format!(
+                "{key}: expected 'normal', 'wide' or 'extra-wide', got {}",
+                show(v)
+            )
+        })
     };
     match v {
-        Value::Nil => Ok(Span::default()),
+        Value::Nil => Ok(Spans::default()),
         Value::Table(t) => {
-            let axis = |k: &str| -> Result<f32, String> {
+            let axis = |k: &str| -> Result<Span, String> {
                 match t.get::<Value>(k).map_err(|e| e.to_string())? {
-                    Value::Nil => Ok(1.0),
-                    v => num(&v)
-                        .map(span_step)
-                        .ok_or_else(|| format!("span.{k}: expected a number")),
+                    Value::Nil => Ok(Span::Normal),
+                    v => one(&v, &format!("span.{k}")),
                 }
             };
-            Ok(Span {
+            Ok(Spans {
                 horizontal: axis("horizontal")?,
                 vertical: axis("vertical")?,
             })
         }
-        v => {
-            let s = num(v)
-                .map(span_step)
-                .ok_or("span: expected a number or a table")?;
-            Ok(Span {
-                horizontal: s,
-                vertical: s,
-            })
-        }
+        v => one(v, "span").map(Spans::both),
     }
 }
 
@@ -393,31 +416,26 @@ mod tests {
         assert!(c.setup);
         let w = c.widget.unwrap();
         assert!(w.label && !w.icon && !w.popup);
-        let c = caps("return { widget = { icon = function() end, span = 2 } }").unwrap();
+        let c = caps("return { widget = { icon = function() end, span = 'extra-wide' } }").unwrap();
         let w = c.widget.clone().unwrap();
         assert!(w.icon && !w.label);
-        assert_eq!(
-            w.span,
-            Span {
-                horizontal: 2.0,
-                vertical: 2.0
-            }
-        );
+        assert_eq!(w.span, Spans::both(Span::ExtraWide));
         assert!(!c.setup && !c.launcher());
         // No hooks: no widget.
         assert_eq!(caps("return {}").unwrap(), Capabilities::default());
     }
 
     #[test]
-    fn spans_snap_down() {
-        assert_eq!(span_step(0.5), 1.0);
-        assert_eq!(span_step(1.7), 1.5);
-        assert_eq!(span_step(2.0), 2.0);
-        assert_eq!(span_step(9.0), 2.0);
-        let c = caps("return { label = function() end, span = { horizontal = 2 } }").unwrap();
+    fn spans() {
+        let c = caps("return { label = function() end, span = { horizontal = 'wide' } }").unwrap();
         let s = c.widget.unwrap().span;
-        assert_eq!((s.horizontal, s.vertical), (2.0, 1.0));
-        assert!(caps("return { label = function() end, span = 'wide' }").is_err());
+        assert_eq!((s.horizontal, s.vertical), (Span::Wide, Span::Normal));
+        for bad in ["2", "'huge'", "{ vertical = 1 }"] {
+            let e = caps(&format!("return {{ label = print, span = {bad} }}")).unwrap_err();
+            assert!(e.contains("span"), "{e}");
+        }
+        assert_eq!(Span::from_name("extra-wide"), Some(Span::ExtraWide));
+        assert_eq!(Span::Wide.icons(), 1.5);
     }
 
     #[test]
