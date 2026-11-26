@@ -31,6 +31,9 @@
 --                 event's link
 --   calendar_app  argv run by the Calendar button (default: gnome-calendar
 --                 --uuid {event}); false leaves the button out
+--   span          "wide" or "extra-wide": on a bottom dock, the tile is wider,
+--                 with the next event today beside the page (extra-wide: also
+--                 the one after it). Default "normal"; side docks keep it square
 --
 -- In `open` and `calendar_app`, {title}, {url}, {uid}, {location}, {start}
 -- (ISO date-time), {date} (ISO date), {calendar} (the EDS source UID) and
@@ -1824,12 +1827,10 @@ end
 
 -- Icon and label -----------------------------------------------------------------
 
-function P.icon()
-	if not face then
-		return nil
-	end
-	local t = today()
-	local y, m, d = civil(t)
+-- The calendar page with today's date, and a dot for each of today's
+-- events still to come, up to three.
+local function page(t)
+	local _, _, d = civil(t)
 	local month = fdate("%b", day_start(t)):upper()
 	local list = query(t, t + 1)[t] or {}
 	local now = os.time()
@@ -1864,6 +1865,103 @@ function P.icon()
 	})
 end
 
+-- Today's timed events on now or still to come, at most `n`.
+local function upcoming(n)
+	local t, now = today(), os.time()
+	local out = {}
+	for _, o in ipairs(sorted(query(t, t + 1)[t]) or {}) do
+		if #out >= n then
+			break
+		end
+		if not o.ev.allday and not is_past(o, now) then
+			out[#out + 1] = o
+		end
+	end
+	return out
+end
+
+local function when(o, now)
+	return o.s <= now and "Now" or ftime(o.s)
+end
+
+-- A wide tile: the page (or the item's icon) at the start, and beside it
+-- the next event today; extra-wide, also the one after it. With nothing
+-- left today, the weekday.
+local function wide(tile)
+	local h = tile.h
+	local roomy = tile.span == "extra-wide"
+	local t, now = today(), os.time()
+	-- As wide as the tile is tall.
+	local side = string.format("%.3f%%", 100 * h / tile.w)
+	local sq = ui.stack({
+		width = side,
+		min_width = side,
+		height = "100%",
+		face and page(t) or ui.app_icon({}),
+	})
+	local list = upcoming(roomy and 2 or 1)
+	local lines = {
+		grow = 1,
+		min_width = 0,
+		gap = h * 0.02,
+		padding = { right = h * (roomy and 0.04 or 0.02) },
+	}
+	local big, small = h * (roomy and 0.15 or 0.13), h * (roomy and 0.13 or 0.12)
+	local first = list[1]
+	if first then
+		lines[#lines + 1] =
+			ui.text({ when(first, now), size = big, weight = "bold", color = theme.text, max_lines = 1 })
+		lines[#lines + 1] = ui.text({
+			first.ev.title,
+			size = small,
+			color = theme.text,
+			max_lines = (roomy and list[2]) and 2 or 3,
+		})
+		local second = list[2]
+		if second then
+			lines[#lines + 1] = ui.text({
+				when(second, now) .. " " .. second.ev.title,
+				size = small,
+				color = theme.muted,
+				max_lines = 1,
+			})
+		end
+	else
+		local day = day_start(t)
+		lines[#lines + 1] = ui.text({
+			fdate(roomy and "%A" or "%a", day),
+			size = big,
+			weight = "bold",
+			color = theme.text,
+			max_lines = 1,
+		})
+		lines[#lines + 1] = ui.text({
+			roomy and "No more events today" or "No events",
+			size = small,
+			color = theme.muted,
+			max_lines = 2,
+		})
+	end
+	return ui.row({
+		width = "100%",
+		height = "100%",
+		align = "center",
+		gap = h * (roomy and 0.08 or 0.06),
+		sq,
+		ui.col(lines),
+	})
+end
+
+function P.icon(tile)
+	if tile and tile.span and tile.span ~= "normal" then
+		return wide(tile)
+	end
+	if not face then
+		return nil
+	end
+	return page(today())
+end
+
 function P.label()
 	if not show_label then
 		return nil
@@ -1883,7 +1981,8 @@ local function current_signature()
 	local t, now = today(), os.time()
 	local parts = { t }
 	local o = next_event()
-	parts[#parts + 1] = o and (o.s .. o.ev.title) or ""
+	-- Its start too: "Now" replaces its time.
+	parts[#parts + 1] = o and (o.s .. (o.s <= now and "n" or "") .. o.ev.title) or ""
 	for _, x in ipairs(query(t, t + 1)[t] or {}) do
 		parts[#parts + 1] = is_past(x, now) and "p" or "f"
 	end
@@ -1937,6 +2036,10 @@ function P.setup(opts)
 	end
 	if type(opts.face) == "boolean" then
 		face = opts.face
+	end
+	-- Wider along a bottom dock only; a side dock keeps square tiles.
+	if opts.span == "wide" or opts.span == "extra-wide" then
+		dock.span({ horizontal = opts.span, vertical = "normal" })
 	end
 	if type(opts.label) == "boolean" then
 		show_label = opts.label

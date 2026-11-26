@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wl_shell_lua::ui::{Kind, Node};
-use wl_shell_lua::{Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source};
+use wl_shell_lua::{
+    Axis, Event, InstanceSpec, Reply, RequestKind, Role, Runtime, Settings, Source, Span, Tile,
+};
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -116,13 +118,28 @@ impl View {
     fn dispose(&self) {}
 }
 
-/// Tomorrow, local time, as an iCalendar DATE.
-fn tomorrow() -> String {
+/// The local `day` (`today`, `tomorrow`) in `date`'s `format`.
+fn date(day: &str, format: &str) -> String {
     let out = Command::new("date")
-        .args(["-d", "tomorrow", "+%Y%m%d"])
+        .env("LC_ALL", "C")
+        .args(["-d", day, format])
         .output()
         .unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Tomorrow, local time, as an iCalendar DATE.
+fn tomorrow() -> String {
+    date("tomorrow", "+%Y%m%d")
+}
+
+/// A timed event all of today, so it is on now.
+fn all_of_today(uid: &str, title: &str) -> String {
+    format!(
+        "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART:{}T000000\r\nDTEND:{}T000000\r\nSUMMARY:{title}\r\nEND:VEVENT\r\n",
+        date("today", "+%Y%m%d"),
+        tomorrow()
+    )
 }
 
 /// An all-day event tomorrow, so the agenda shows it.
@@ -224,11 +241,13 @@ fn texts(tree: &Node) -> Vec<String> {
 struct Plugin {
     rt: Runtime,
     recv: Receiver<Event>,
+    /// The latest span asked for along a bottom dock.
+    span: std::cell::Cell<Span>,
 }
 
 impl Plugin {
-    fn popup(&self) -> Vec<String> {
-        let ticket = self.rt.request("c", RequestKind::Popup, WAIT).unwrap();
+    fn request(&self, kind: RequestKind) -> Reply {
+        let ticket = self.rt.request("c", kind, WAIT).unwrap();
         let end = Instant::now() + WAIT;
         loop {
             match self
@@ -237,12 +256,41 @@ impl Plugin {
                 .expect("no answer")
             {
                 Event::Answer(a) if a.id == ticket.id => match a.result {
-                    Ok(Reply::Popup(Some(tree))) => return texts(&tree),
-                    r => panic!("{r:?}"),
+                    Ok(r) => return r,
+                    Err(e) => panic!("{e}"),
                 },
                 Event::Failed { error, .. } => panic!("{error}"),
+                // Asked for in setup, it comes with what the widget provides.
+                Event::Loaded { caps, .. } => {
+                    if let Some(w) = caps.widget {
+                        self.span.set(w.span.horizontal);
+                    }
+                }
+                Event::Span { span, .. } => self.span.set(span.horizontal),
                 _ => {}
             }
+        }
+    }
+
+    fn popup(&self) -> Vec<String> {
+        match self.request(RequestKind::Popup) {
+            Reply::Popup(Some(tree)) => texts(&tree),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    /// The texts of the icon on a bottom dock's tile of `span`.
+    fn icon(&self, span: Span) -> Vec<String> {
+        let tile = Tile {
+            w: 96.0 * span.icons(),
+            h: 96.0,
+            span,
+            axis: Axis::Horizontal,
+            scale: 1,
+        };
+        match self.request(RequestKind::Icon(tile)) {
+            Reply::Icon(Some(tree)) => texts(&tree),
+            r => panic!("{r:?}"),
         }
     }
 
@@ -291,10 +339,14 @@ fn shown_calendars_are_read_and_followed() {
         },
         role: Role::Widget,
         app: None,
-        options: serde_json::json!({}),
+        options: serde_json::json!({ "span": "extra-wide" }),
         budget: 1_000_000,
     }]);
-    let p = Plugin { rt, recv };
+    let p = Plugin {
+        rt,
+        recv,
+        span: std::cell::Cell::new(Span::Normal),
+    };
 
     // The view's events.
     p.wait("Alpha", None, || {
@@ -335,4 +387,32 @@ fn shown_calendars_are_read_and_followed() {
     p.wait("Beta", Some("Gamma"), || {
         emit(&eds, "work", "ObjectsRemoved", vec!["a\n".into()])
     });
+
+    // Wider on a bottom dock: with nothing left today, the weekday.
+    let weekday = date("today", "+%A");
+    assert_eq!(
+        p.icon(Span::ExtraWide),
+        [weekday.as_str(), "No more events today"]
+    );
+    assert_eq!(p.span.get(), Span::ExtraWide);
+    let short = date("today", "+%a");
+    assert_eq!(p.icon(Span::Wide), [short.as_str(), "No events"]);
+    // An event on now shows beside the page.
+    let end = Instant::now() + WAIT;
+    loop {
+        emit(
+            &eds,
+            "work",
+            "ObjectsAdded",
+            vec![all_of_today("s", "Standup")],
+        );
+        let got = p.icon(Span::ExtraWide);
+        if got == ["Now", "Standup"] {
+            break;
+        }
+        assert!(Instant::now() < end, "{got:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A side dock's square tile: the page alone.
+    assert!(p.icon(Span::Normal).is_empty());
 }

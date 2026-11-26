@@ -76,6 +76,9 @@ pub struct State {
     pub revealed: Vec<String>,
     /// Sliders being dragged: their values.
     pub sliders: Vec<(String, f64)>,
+    /// Values shown instead of the nodes' own, by key: an easing slider's
+    /// or progress bar's value, an indeterminate bar's phase (0 to 1).
+    pub values: Vec<(String, f64)>,
     /// For live values (`Live::at`'s clock); 0: show them as given.
     pub now: f64,
 }
@@ -93,10 +96,13 @@ pub struct Request {
     /// The image's corners are cut round to this radius (a popup's
     /// bubble); 0: square.
     pub radius: f32,
-    /// Live sliders and progress bars (outside scroll areas) are left
-    /// out of the image and listed in `Rendered::live`, so the host can
-    /// paint them on their own as they move (`Request::part`).
+    /// Live and animated nodes (outside scroll areas) are left out of
+    /// the image and listed in `Rendered::live`, so the host can paint
+    /// them on their own as they move (`Request::part`).
     pub apart: bool,
+    /// With `apart`: only animated canvases are left out (a dock tile,
+    /// whose canvases play as frame sheets; the rest is painted still).
+    pub sheets_only: bool,
 }
 
 impl Request {
@@ -111,6 +117,7 @@ impl Request {
             state: State::default(),
             radius: 0.0,
             apart: false,
+            sheets_only: false,
         }
     }
 
@@ -125,6 +132,7 @@ impl Request {
             bounds: Bounds::Exact(part.rect.w.max(1.0), part.rect.h.max(1.0)),
             radius: 0.0,
             apart: false,
+            sheets_only: false,
             ..self.clone()
         }
     }
@@ -199,6 +207,7 @@ pub fn render(req: &Request, text: &mut Text, res: &mut dyn Resources) -> Render
         hits: Vec::new(),
         nodes: &nodes,
         apart: req.apart,
+        sheets_only: req.sheets_only,
         scrolled: 0,
         live: Vec::new(),
         scroll: Vec::new(),
@@ -555,6 +564,8 @@ struct Painter<'a> {
     nodes: &'a [&'a Node],
     /// Leave live nodes out, into `live`.
     apart: bool,
+    /// Only animated canvases.
+    sheets_only: bool,
     /// How many scroll areas the node being painted is in.
     scrolled: u32,
     live: Vec<LivePart>,
@@ -578,6 +589,14 @@ impl Painter<'_> {
         (self.state.scroll.iter())
             .find(|(k, _)| k == key)
             .map_or(0.0, |(_, v)| *v)
+    }
+
+    /// The value the host shows for node `key` instead of its own.
+    fn value_of(&self, key: Option<&str>) -> Option<f64> {
+        let key = key?;
+        (self.state.values.iter())
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| *v)
     }
 
     /// Scroll area `i`'s (`rect`) offset `offset`, moved to show the
@@ -662,10 +681,10 @@ impl Painter<'_> {
             });
         }
         // Painted on its own by the host, as it moves.
-        let moves = matches!(
-            n.kind,
-            Kind::Slider { live: Some(_), .. } | Kind::Progress { live: Some(_), .. }
-        );
+        let moves = match self.sheets_only {
+            true => matches!(n.kind, Kind::Canvas { anim: Some(_), .. }),
+            false => n.kind.moves(),
+        };
         if self.apart && self.scrolled == 0 && moves {
             self.live.push(LivePart {
                 index: i,
@@ -805,7 +824,9 @@ impl Painter<'_> {
                     None => {}
                 }
             }
-            Kind::Canvas { viewbox, commands } => {
+            Kind::Canvas {
+                viewbox, commands, ..
+            } => {
                 let (vw, vh) = (viewbox.0.max(1e-3), viewbox.1.max(1e-3));
                 let base = Transform::from_row(r.2 / vw, 0.0, 0.0, r.3 / vh, r.0, r.1);
                 let t = &mut *self.text;
@@ -833,7 +854,8 @@ impl Painter<'_> {
                 let dragged = (self.state.sliders.iter())
                     .find(|(k, _)| Some(k.as_str()) == key)
                     .map(|(_, v)| *v);
-                let v = dragged.unwrap_or_else(|| live_value(*value, *lv, self.state.now));
+                let v = (dragged.or_else(|| self.value_of(key)))
+                    .unwrap_or_else(|| live_value(*value, *lv, self.state.now));
                 let f = fraction(v, *min, *max);
                 let knob = (r.3 / 2.0 - 2.0 * s).max(2.0 * s);
                 let knob = if (hovered || pressed) && enabled {
@@ -880,18 +902,25 @@ impl Painter<'_> {
                 value,
                 max,
                 live: lv,
+                indeterminate,
+                ..
             } => {
-                let v = live_value(*value, *lv, self.state.now);
-                let f = fraction(v, 0.0, *max);
                 fill_rounded(pm, r, r.3 / 2.0, fade(theme.get(ThemeColor::Track), alpha));
-                if f > 0.0 {
-                    let done = (r.0, r.1, (r.2 * f).max(r.3), r.3);
-                    fill_rounded(
-                        pm,
-                        done,
-                        r.3 / 2.0,
-                        fade(theme.get(ThemeColor::Accent), alpha),
-                    );
+                let accent = fade(theme.get(ThemeColor::Accent), alpha);
+                if *indeterminate {
+                    // A third of the track, at its phase along it.
+                    let phase = self.value_of(key).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                    let w = (r.2 / 3.0).max(r.3);
+                    let x = r.0 + (r.2 - w).max(0.0) * phase;
+                    fill_rounded(pm, (x, r.1, w.min(r.2), r.3), r.3 / 2.0, accent);
+                } else {
+                    let v = (self.value_of(key))
+                        .unwrap_or_else(|| live_value(*value, *lv, self.state.now));
+                    let f = fraction(v, 0.0, *max);
+                    if f > 0.0 {
+                        let done = (r.0, r.1, (r.2 * f).max(r.3), r.3);
+                        fill_rounded(pm, done, r.3 / 2.0, accent);
+                    }
                 }
             }
             _ => {}

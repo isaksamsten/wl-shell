@@ -84,6 +84,8 @@ impl Assets {
             | Done::Paper { .. }
             | Done::Doc { .. }
             | Done::Ui { .. }
+            | Done::Sheet { .. }
+            | Done::Tile { .. }
             | Done::ImageFetched { .. } => {}
         }
     }

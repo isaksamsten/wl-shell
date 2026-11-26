@@ -291,6 +291,7 @@ fn canvas(cmds: Vec<Cmd>) -> Node {
     Node::new(Kind::Canvas {
         viewbox: (100.0, 100.0),
         commands: cmds,
+        anim: None,
     })
 }
 
@@ -618,6 +619,7 @@ fn controls() {
                     max: 100.0,
                     enabled,
                     live: None,
+                    transition: 0.0,
                 }),
                 |n| n.key = Some(format!("slider{value}")),
             )
@@ -669,6 +671,8 @@ fn controls() {
                     value: 0.25,
                     max: 1.0,
                     live: None,
+                    indeterminate: false,
+                    transition: 0.0,
                 }),
             ],
         );
@@ -762,6 +766,7 @@ fn live_parts_apart() {
                 max: 100.0,
                 enabled: true,
                 live,
+                transition: 0.0,
             }),
             200.0,
             20.0,
@@ -773,6 +778,8 @@ fn live_parts_apart() {
             value: 0.5,
             max: 1.0,
             live,
+            indeterminate: false,
+            transition: 0.0,
         }),
         200.0,
         6.0,
@@ -852,4 +859,210 @@ fn live_parts_apart() {
         })
         .count();
     assert_eq!(differ, 0);
+}
+
+/// Images side by side, top aligned.
+fn strip(images: &[Image]) -> Image {
+    let w: u32 = images.iter().map(|i| i.width).sum();
+    let h = images.iter().map(|i| i.height).max().unwrap_or(0);
+    let mut data = vec![0u8; (w * h * 4) as usize];
+    let mut x0 = 0;
+    for img in images {
+        for y in 0..img.height {
+            let src = &img.data[(y * img.width * 4) as usize..((y + 1) * img.width * 4) as usize];
+            let at = ((y * w + x0) * 4) as usize;
+            data[at..at + src.len()].copy_from_slice(src);
+        }
+        x0 += img.width;
+    }
+    Image {
+        width: w,
+        height: h,
+        data,
+    }
+}
+
+/// A spinner: a quarter arc turning, sampled at 8 values of `t`.
+fn spinner() -> Node {
+    let frames: Vec<Vec<Cmd>> = (0..8)
+        .map(|i| {
+            let a = i as f32 / 8.0 * std::f32::consts::TAU;
+            vec![
+                Cmd::Circle {
+                    x: 50.0,
+                    y: 50.0,
+                    r: 40.0,
+                    ink: Ink {
+                        stroke: Some(Color::Theme(ThemeColor::Track)),
+                        width: 10.0,
+                        ..Ink::default()
+                    },
+                },
+                Cmd::Arc {
+                    x: 50.0,
+                    y: 50.0,
+                    r: 40.0,
+                    start: a,
+                    end: a + 1.6,
+                    pie: false,
+                    ink: Ink {
+                        stroke: Some(Color::Theme(ThemeColor::Accent)),
+                        width: 10.0,
+                        cap: Cap::Round,
+                        fill: None,
+                    },
+                },
+            ]
+        })
+        .collect();
+    with(
+        Node::new(Kind::Canvas {
+            viewbox: (100.0, 100.0),
+            commands: frames[0].clone(),
+            anim: Some(Box::new(ui::Frames {
+                frames,
+                drive: ui::Drive::Loop {
+                    period: 1.2,
+                    mirror: false,
+                },
+            })),
+        }),
+        |n| {
+            n.key = Some("spin".into());
+            n.layout.width = Some(Length::Px(24.0));
+            n.layout.height = Some(Length::Px(24.0));
+        },
+    )
+}
+
+/// A tile painted apart for frame sheets: its spinner is left out (and
+/// listed), its still progress bar isn't; the spinner's sheet has every
+/// frame, as big as its rect, at scales 1 and 2.
+#[test]
+fn frame_sheets() {
+    let bar = with(
+        Node::new(Kind::Progress {
+            value: 0.0,
+            max: 1.0,
+            live: None,
+            indeterminate: true,
+            transition: 0.0,
+        }),
+        |n| n.key = Some("bar".into()),
+    );
+    let tile = Node::new(Kind::Stack {
+        place: Place {
+            x: Align::End,
+            y: Align::End,
+        },
+    })
+    .with_children(vec![
+        Node::new(Kind::AppIcon {
+            app: None,
+            size: None,
+        }),
+        spinner(),
+        with(bar, |n| n.layout.width = Some(Length::Px(30.0))),
+    ]);
+    let mut text = Text::new();
+    for scale in [1, 2] {
+        let req = Request {
+            app: Some("app".into()),
+            apart: true,
+            sheets_only: true,
+            ..Request::new(
+                Arc::new(tile.clone()),
+                ui::Bounds::Exact(48.0, 48.0),
+                scale,
+                theme(),
+            )
+        };
+        let r = ui::render(&req, &mut text, &mut Fake);
+        let keys: Vec<_> = r.live.iter().map(|p| p.node.key.as_deref()).collect();
+        assert_eq!(keys, [Some("spin")], "only the canvas plays apart");
+        let part = &r.live[0];
+        assert_eq!((part.rect.x, part.rect.y, part.rect.w), (24.0, 24.0, 24.0));
+        let sheet = ui::render_sheet(&req.part(part), &mut text, &mut Fake, 16 << 20);
+        assert_eq!((sheet.images.len(), sheet.step), (8, 1));
+        let px = 24 * scale as u32;
+        assert!(
+            (sheet.images.iter()).all(|i| (i.width, i.height) == (px, px)),
+            "as big as the part"
+        );
+        assert_ne!(sheet.images[0], sheet.images[2], "the frames differ");
+        golden(&format!("sheet@{scale}"), &strip(&sheet.images));
+        // Over a cap that fits three: every fourth frame.
+        let small = ui::render_sheet(
+            &req.part(part),
+            &mut text,
+            &mut Fake,
+            (px * px * 4 * 3) as usize,
+        );
+        assert_eq!((small.images.len(), small.step), (2, 4));
+        assert_eq!(small.images[1], sheet.images[4]);
+    }
+    // Painted inline (in a popup that isn't apart, or with animations
+    // off), a canvas shows its still frame.
+    let still = ui::render(
+        &Request::new(
+            Arc::new(spinner()),
+            ui::Bounds::Exact(24.0, 24.0),
+            1,
+            theme(),
+        ),
+        &mut text,
+        &mut Fake,
+    );
+    let req = Request::new(
+        Arc::new(spinner()),
+        ui::Bounds::Exact(24.0, 24.0),
+        1,
+        theme(),
+    );
+    let first = ui::render_sheet(&req, &mut text, &mut Fake, 16 << 20);
+    assert_eq!(still.image, first.images[0]);
+}
+
+/// An indeterminate bar's segment is where its phase says; an eased
+/// value shows the host's value, not the node's.
+#[test]
+fn values_from_the_host() {
+    let bar = |indeterminate| {
+        sized(
+            with(
+                Node::new(Kind::Progress {
+                    value: 1.0,
+                    max: 1.0,
+                    live: None,
+                    indeterminate,
+                    transition: 300.0,
+                }),
+                |n| n.key = Some("bar".into()),
+            ),
+            90.0,
+            6.0,
+        )
+    };
+    let at = |tree: Node, v: f64| {
+        let state = State {
+            values: vec![("bar".into(), v)],
+            ..State::default()
+        };
+        paint(tree, ui::Bounds::Exact(90.0, 6.0), 1, state).image
+    };
+    let alpha_at = |img: &Image, x: u32| img.data[((3 * img.width + x) * 4 + 3) as usize];
+    let accent = |img: &Image, x: u32| {
+        let i = ((3 * img.width + x) * 4) as usize;
+        // Blue-ish: the accent (0x81d0ff), not the track (white).
+        img.data[i] > img.data[i + 2] + 40
+    };
+    // Phase 0: the segment's at the start; 1: at the end.
+    let start = at(bar(true), 0.0);
+    assert!(accent(&start, 10) && !accent(&start, 80));
+    let end = at(bar(true), 1.0);
+    assert!(!accent(&end, 10) && accent(&end, 80));
+    // Eased to 0.5: half full, though the node says 1.
+    let half = at(bar(false), 0.5);
+    assert!(accent(&half, 30) && !accent(&half, 60));
+    assert_eq!(alpha_at(&half, 60), alpha_at(&start, 80));
 }

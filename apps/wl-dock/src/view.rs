@@ -132,6 +132,7 @@ use wl_shell_ui::shapes::{self, Shape, ShapeKey};
 use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
 use crate::activate;
+use crate::anim::{self, Pacer, Sheets};
 use crate::app::WlDock;
 use crate::autohide;
 use crate::config::{Config, DockLayer, DockLayout, FolderView, Indicator, Position, Previews};
@@ -249,6 +250,8 @@ pub struct Style {
     badge: Option<BadgeStyle>,
     /// How widgets' trees look.
     pub ui_theme: Arc<ui::Theme>,
+    /// Widgets' animations play (`[widgets] animations`).
+    pub animations: bool,
 }
 
 impl Style {
@@ -340,6 +343,7 @@ impl Style {
                 text,
             }),
             ui_theme: Arc::new(config.ui_theme()),
+            animations: config.widgets.animations,
         }
     }
 
@@ -409,6 +413,17 @@ impl Style {
 struct SlotSubs {
     indicator: Sub,
     icon: Sub,
+    /// Over the icon, per animated canvas of a widget's tile; made when
+    /// first needed.
+    anims: Vec<Sub>,
+}
+
+/// A widget tile's animated canvases, played over its icon (anim.rs).
+struct TileAnim {
+    /// The tile's logical size, which the parts' rects are in.
+    size: (f32, f32),
+    sheets: Sheets<WlBuffer>,
+    player: ui::Player,
 }
 
 /// The pinned items that have an order among themselves: the zones on
@@ -648,6 +663,18 @@ pub struct DockView {
     /// The trees widgets draw as their apps' icons, by app ID, with
     /// their versions.
     widget_icons: BTreeMap<String, WidgetIcon>,
+    /// Widget tiles' animated canvases, by app ID.
+    tile_anims: BTreeMap<String, TileAnim>,
+    /// Per slot, where its tile's animated canvases go (its icon's rect
+    /// and alpha), as last placed; None where none show.
+    anim_at: Vec<Option<(Rect, f64)>>,
+    /// Paces the tiles' animations.
+    anim_pacer: Pacer,
+    /// The frame callback pending was asked for by the animations
+    /// alone: when it comes, nothing else is drawn.
+    anim_frame: bool,
+    /// Replaced frame buffers, destroyed after the next commit.
+    anim_stale: Vec<WlBuffer>,
 
     frame_pending: bool,
     /// The time of the last frame drawn while anything moves.
@@ -798,6 +825,11 @@ impl DockView {
             label_timer: None,
             widget_names: BTreeMap::new(),
             widget_icons: BTreeMap::new(),
+            tile_anims: BTreeMap::new(),
+            anim_at: Vec::new(),
+            anim_pacer: Pacer::default(),
+            anim_frame: false,
+            anim_stale: Vec::new(),
             frame_pending: false,
             clock: FrameClock::default(),
             output_size: None,
@@ -946,7 +978,11 @@ impl DockView {
             };
             let indicator = sub();
             let icon = sub();
-            self.slot_subs.push(SlotSubs { indicator, icon });
+            self.slot_subs.push(SlotSubs {
+                indicator,
+                icon,
+                anims: Vec::new(),
+            });
         }
         // The hovered app went: its label goes too.
         if let Some(app_id) = &self.hovered
@@ -1033,11 +1069,16 @@ impl DockView {
         let tile = key.tile?;
         let tree = &self.widget_icons.get(&key.app_id)?.tree;
         let s = key.scale.max(1) as f32;
+        // Its animated canvases play over it, from frame sheets.
+        let apart = self.style.animations
+            && (tree.walk().iter()).any(|n| matches!(n.kind, ui::Kind::Canvas { anim: Some(_), .. }));
         Some(ui::Request {
             // A standalone widget has no app of its own.
             app: dock::widget_name(&key.app_id)
                 .is_none()
                 .then(|| key.app_id.clone()),
+            apart,
+            sheets_only: apart,
             ..ui::Request::new(
                 tree.clone(),
                 ui::Bounds::Exact(tile.w as f32 / s, tile.h as f32 / s),
@@ -1061,8 +1102,155 @@ impl DockView {
             return;
         }
         self.widget_icons = icons.clone();
+        // A tile that is an app's icon again plays nothing.
+        let gone: Vec<String> = (self.tile_anims.keys())
+            .filter(|app| !icons.contains_key(*app))
+            .cloned()
+            .collect();
+        for app in gone {
+            self.drop_tile_anim(&app);
+        }
         self.request_assets(false);
         self.kick();
+    }
+
+    // -- tiles' animations ---------------------------------------------------
+
+    fn drop_tile_anim(&mut self, app_id: &str) {
+        if let Some(mut a) = self.tile_anims.remove(app_id) {
+            self.anim_stale.extend(a.sheets.drain());
+        }
+    }
+
+    /// A widget's tile `key` was painted, leaving out its animated
+    /// canvases `live` (painted with `request`): play them over it, if
+    /// it is this dock's.
+    pub fn tile_painted(&mut self, key: &icons::Key, request: &ui::Request, live: &[ui::LivePart]) {
+        let ours = (self.slots.iter())
+            .any(|s| !s.leaving && self.icon_key(&s.item).as_ref() == Some(key));
+        if !ours {
+            return;
+        }
+        if live.is_empty() {
+            self.drop_tile_anim(&key.app_id);
+            return self.kick();
+        }
+        let size = match request.bounds {
+            ui::Bounds::Exact(w, h) => (w, h),
+            ui::Bounds::Content { max_w, max_h } => (max_w, max_h),
+        };
+        let animations = self.style.animations;
+        let a = (self.tile_anims.entry(key.app_id.clone())).or_insert_with(|| TileAnim {
+            size,
+            sheets: Sheets::default(),
+            player: ui::Player::new(animations),
+        });
+        a.size = size;
+        let parts: Vec<ui::LivePart> = live.iter().take(anim::MAX_PER_TILE).cloned().collect();
+        let (paint, stale) = a.sheets.sync(parts, request);
+        a.player.sync(a.sheets.nodes(), anim::now());
+        self.anim_stale.extend(stale);
+        for (i, req) in paint {
+            let tag = next_tag();
+            self.assets.sheet(tag, req);
+            a.sheets.asked(i, tag);
+        }
+        self.kick();
+    }
+
+    /// A frame sheet arrived; true if it is this dock's (a tile's, or its
+    /// widget popup's).
+    pub fn sheet_ready(&mut self, tag: u64, sheet: &ui::Sheet) -> bool {
+        if let Some(w) = &mut self.widget
+            && w.sheet_ready(tag, sheet)
+        {
+            w.render();
+            return true;
+        }
+        let Some(a) = self.tile_anims.values_mut().find(|a| a.sheets.wants(tag)) else {
+            return false;
+        };
+        let buffers = (sheet.images.iter())
+            .filter_map(|image| match cache::shm_buffer(&self.g, image, &self.qh) {
+                Ok(buffer) => Some(buffer),
+                Err(e) => {
+                    warn!("tile frame buffer: {e}");
+                    None
+                }
+            })
+            .collect();
+        let old = a.sheets.arrived(tag, buffers, sheet.step);
+        self.anim_stale.extend(old);
+        self.kick();
+        true
+    }
+
+    /// Show the tiles' frames for now, where `place_all` last put them.
+    fn place_anims(&mut self, now: f64) {
+        for (i, subs) in self.slot_subs.iter_mut().enumerate() {
+            let at = self.anim_at.get(i).copied().flatten();
+            let anim = (self.slots.get(i)).and_then(|s| self.tile_anims.get(&s.item.app_id));
+            let (Some((r, alpha)), Some(a)) = (at, anim) else {
+                for sub in &mut subs.anims {
+                    sub.clear();
+                }
+                continue;
+            };
+            let (kx, ky) = (r.w / a.size.0.max(1.0) as f64, r.h / a.size.1.max(1.0) as f64);
+            while subs.anims.len() < a.sheets.layers.len() {
+                let sub = Sub::new(&self.g, self.layer.wl_surface(), &self.no_input, &self.qh);
+                sub.place_above(subs.icon.surface());
+                subs.anims.push(sub);
+            }
+            for (k, sub) in subs.anims.iter_mut().enumerate() {
+                let Some(l) = a.sheets.layers.get(k) else {
+                    sub.clear();
+                    continue;
+                };
+                let p = l.part.rect;
+                let at = Rect::new(
+                    r.x + p.x as f64 * kx,
+                    r.y + p.y as f64 * ky,
+                    p.w as f64 * kx,
+                    p.h as f64 * ky,
+                );
+                sub.present(a.sheets.shown(k, &a.player, now), at, alpha);
+            }
+        }
+    }
+
+    /// When the tiles' animations are due again, if they play where they
+    /// can be seen and the last frame is on screen. Once per tick.
+    pub fn anim_tick_due(&mut self) -> Option<Duration> {
+        if !self.configured {
+            return None;
+        }
+        let now = anim::now();
+        let due = (self.slots.iter().zip(&self.anim_at))
+            .filter(|(_, at)| at.is_some())
+            .filter_map(|(s, _)| self.tile_anims.get(&s.item.app_id))
+            .filter_map(|a| a.sheets.due(&a.player, now, anim::TILE_FPS))
+            .reduce(f64::min);
+        self.anim_pacer.arm(due)
+    }
+
+    /// The tiles' animations are due: show their frames for now. The
+    /// next tick waits for this frame to be shown.
+    pub fn anim_tick(&mut self) {
+        self.anim_pacer.fired();
+        if !self.configured {
+            return;
+        }
+        self.place_anims(anim::now());
+        if !self.frame_pending {
+            self.request_frame();
+            self.anim_frame = true;
+        }
+        self.anim_pacer.drew();
+        self.layer.commit();
+        for buffer in self.anim_stale.drain(..) {
+            buffer.destroy();
+        }
     }
 
     /// The icon of `item`; None for the separator.
@@ -2272,7 +2460,14 @@ impl DockView {
 
     /// Something changed: draw it on the next frame.
     pub fn kick(&mut self) {
-        if !self.configured || self.frame_pending {
+        if !self.configured {
+            return;
+        }
+        // A frame the animations asked for draws everything now.
+        if std::mem::take(&mut self.anim_frame) {
+            self.clock.start();
+        }
+        if self.frame_pending {
             return;
         }
         self.clock.start();
@@ -2299,9 +2494,15 @@ impl DockView {
             || !self.badge_alpha.settled()
     }
 
-    /// The frame callback, with its timestamp: advance the springs and draw.
+    /// The frame callback, with its timestamp: advance the springs and
+    /// draw. One only the animations asked for (`anim_tick`) draws
+    /// nothing: they're drawn on their timer.
     pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
+        self.anim_pacer.shown();
+        if std::mem::take(&mut self.anim_frame) {
+            return;
+        }
         let dt = self.clock.tick(time);
         let mut moving = self.hover.advance(dt);
         moving |= self.pointer.advance(dt);
@@ -2359,10 +2560,17 @@ impl DockView {
             return;
         }
         self.place_all();
-        if self.moving() && !self.frame_pending {
-            self.request_frame();
+        if self.moving() {
+            // The frame pending (if the animations asked for it) draws.
+            self.anim_frame = false;
+            if !self.frame_pending {
+                self.request_frame();
+            }
         }
         self.layer.commit();
+        for buffer in self.anim_stale.drain(..) {
+            buffer.destroy();
+        }
         self.render_strip();
         self.render_menu();
         if let Some(w) = &mut self.widget {
@@ -2433,6 +2641,7 @@ impl DockView {
         let mut landing = None;
         // Each slot's icon as drawn, for the badges.
         let mut icons: Vec<Option<Rect>> = vec![None; self.slots.len()];
+        let mut anim_at: Vec<Option<(Rect, f64)>> = vec![None; self.slots.len()];
         let cache = self.cache.borrow();
         for (i, subs) in self.slot_subs.iter_mut().enumerate() {
             let (Some(slot), Some(cell)) = (self.slots.get(i), laid.cell(i)) else {
@@ -2500,6 +2709,10 @@ impl DockView {
                     };
                     subs.icon
                         .present(cache.icon_or_older(&key).as_ref(), padded, alpha);
+                    // A tile's animated canvases go over it.
+                    if key.tile.is_some() && alpha > 0.0 {
+                        anim_at[i] = Some((r, alpha));
+                    }
                 }
                 _ => subs.icon.clear(),
             }
@@ -2621,6 +2834,8 @@ impl DockView {
             _ => self.label_sub.clear(),
         }
         drop(cache);
+        self.anim_at = anim_at;
+        self.place_anims(anim::now());
 
         // Input: the panel, and while magnified, the band the icons cover.
         // An autohiding dock reaches down to its edge, so the pointer
@@ -3129,6 +3344,7 @@ impl DockView {
             self.style.layout.position,
             icon,
             self.scale,
+            self.style.animations,
         );
         match widget {
             Ok(w) => {
@@ -3165,6 +3381,18 @@ impl DockView {
     pub fn widget_tick(&mut self, id: u64) {
         if let Some(w) = self.widget.as_mut().filter(|w| w.id == id) {
             w.tick();
+        }
+    }
+
+    /// The widget's popup's frame callback (on `surface`); true if it is
+    /// this dock's.
+    pub fn widget_frame(&mut self, surface: &WlSurface) -> bool {
+        match self.widget.as_mut().filter(|w| w.has_surface(surface)) {
+            Some(w) => {
+                w.frame_done();
+                true
+            }
+            None => false,
         }
     }
 
@@ -3585,6 +3813,12 @@ impl Drop for DockView {
     fn drop(&mut self) {
         self.cancel_label_timer();
         self.cancel_autohide_timer();
+        for (_, mut a) in std::mem::take(&mut self.tile_anims) {
+            self.anim_stale.extend(a.sheets.drain());
+        }
+        for buffer in self.anim_stale.drain(..) {
+            buffer.destroy();
+        }
         self.viewport.destroy();
         self.transparent.destroy();
     }

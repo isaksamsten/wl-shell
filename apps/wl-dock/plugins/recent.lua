@@ -733,7 +733,7 @@ local function row(e, i)
 		gap = 10,
 		padding = { 4, 6 },
 		radius = 6,
-		align = "center",
+		align = "left",
 		hover = { background = theme.hover },
 		on_click = function()
 			open(e)

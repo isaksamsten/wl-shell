@@ -74,7 +74,10 @@ pub const BUNDLED: &[(&str, &str)] = &[
 ];
 
 /// Modules built into the dock that plugins `require`, by name.
-pub const MODULES: &[(&str, &str)] = &[("mpris", include_str!("../plugins/mpris.lua"))];
+pub const MODULES: &[(&str, &str)] = &[
+    ("anim", include_str!("../plugins/anim.lua")),
+    ("mpris", include_str!("../plugins/mpris.lua")),
+];
 
 /// How long a label may take.
 const LABEL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -1111,12 +1114,19 @@ mod tests {
 
     #[test]
     fn kitchen_sink_popup_loads() {
+        use wl_shell_lua::channel::PopupEvent;
+        use wl_shell_render::ui::{Drive, Kind};
         let (send, recv) = std::sync::mpsc::channel();
         let mut w = Widgets::default();
         w.start(move |e| {
             let _ = send.send(e);
         })
         .unwrap();
+        w.set_tile(Some(TileBase {
+            size: 96.0,
+            axis: Axis::Horizontal,
+            scale: 1,
+        }));
         // Not bundled: loaded from its file under tests/.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1128,34 +1138,92 @@ mod tests {
         let specs = specs(&c, None, &[]);
         w.configure(specs);
         let end = Instant::now() + Duration::from_secs(5);
-        while !w.supports_popup("demo") {
+        while !(w.supports_popup("demo") && w.icons().contains_key("demo")) {
             w.event(recv.recv_timeout(end - Instant::now()).unwrap());
         }
+        let spinner = |tree: &Node| {
+            (tree.walk().into_iter())
+                .find(|n| n.key.as_deref() == Some("spin"))
+                .cloned()
+                .expect("a spinner")
+        };
+        // The tile's spinner: a loop of 24 frames.
+        let icon = w.icons()["demo"].clone();
+        let spin = spinner(&icon.tree);
+        assert!(matches!(
+            &spin.kind,
+            Kind::Canvas { anim: Some(a), .. }
+                if a.frames.len() == 24 && matches!(a.drive, Drive::Loop { .. })
+        ));
         w.select_popup(Some("demo"));
-        loop {
+        let popup = |w: &mut Widgets| loop {
             let e = recv.recv_timeout(end - Instant::now()).unwrap();
             if let Event::Answer(a) = &e {
                 assert!(a.result.is_ok(), "{:?}", a.result);
             }
             if let Some((_, tree)) = w.event(e).popup {
-                let tree = tree.unwrap();
-                let nodes = tree.walk();
-                assert!(nodes.iter().any(|n| n.handlers.commit));
-                // A live seek bar and progress bar, for their own layers.
-                use wl_shell_render::ui::Kind;
-                let live = (nodes.iter())
-                    .filter(|n| {
-                        matches!(
-                            n.kind,
-                            Kind::Slider { live: Some(_), .. }
-                                | Kind::Progress { live: Some(_), .. }
-                        )
-                    })
-                    .count();
-                assert_eq!(live, 2);
-                break;
+                break tree.unwrap();
+            }
+        };
+        let tree = popup(&mut w);
+        let nodes = tree.walk();
+        assert!(nodes.iter().any(|n| n.handlers.commit));
+        // A live seek bar and progress bar, for their own layers.
+        let live = (nodes.iter())
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    Kind::Slider { live: Some(_), .. } | Kind::Progress { live: Some(_), .. }
+                )
+            })
+            .count();
+        assert_eq!(live, 2);
+        // A spinner, a pulse, a ring, a sweeping bar and an eased one.
+        let animated: Vec<&str> = (nodes.iter())
+            .filter(|n| n.kind.animated())
+            .filter_map(|n| n.key.as_deref())
+            .collect();
+        assert_eq!(animated, ["spin", "pulse", "ring", "busy", "eased"]);
+        // A click redraws: the label changes, the tile's spinner doesn't
+        // (so it keeps turning where it was), and the ring's value moves.
+        let step = |w: &mut Widgets, key: &str| {
+            let kind = RequestKind::Interaction {
+                key: key.into(),
+                event: PopupEvent::Click,
+            };
+            w.notify("demo", kind);
+        };
+        step(&mut w, "count");
+        let mut again = None;
+        while again.is_none() || w.labels().get("demo").map(String::as_str) != Some("Clicked 1")
+        {
+            let fx = w.event(recv.recv_timeout(end - Instant::now()).unwrap());
+            if let Some((_, tree)) = fx.popup {
+                again = tree;
             }
         }
+        let again = again.unwrap();
+        assert_eq!(spinner(&w.icons()["demo"].tree), spin);
+        assert_eq!(spinner(&again), spinner(&tree));
+        step(&mut w, "step");
+        let stepped = popup(&mut w);
+        let ring = |t: &Node| {
+            (t.walk().into_iter()).find_map(|n| match &n.kind {
+                Kind::Canvas { anim: Some(a), .. } if n.key.as_deref() == Some("ring") => {
+                    Some(a.drive)
+                }
+                _ => None,
+            })
+        };
+        assert!(matches!(ring(&again), Some(Drive::Value { value: 0.25, .. })));
+        assert!(matches!(
+            ring(&stepped),
+            Some(Drive::Value {
+                value: 0.5,
+                transition: 300.0,
+                ..
+            })
+        ));
     }
 
     /// The bundled clock, through the runtime and back into the labels.

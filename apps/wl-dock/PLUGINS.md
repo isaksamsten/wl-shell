@@ -148,11 +148,11 @@ name = "Now Playing"
 span = "extra-wide"    # On a bottom dock: the title and artist beside the cover
 ```
 
-| Option   | Default    | Meaning                                                                                                                                                                                  |
-| -------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `player` | —          | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`)                                                                      |
-| `cover`  | `true`     | `false` keeps the item's icon                                                                                                                                                            |
-| `label`  | `true`     | `false` keeps the item's name                                                                                                                                                            |
+| Option   | Default    | Meaning                                                                                                                                                                                   |
+| -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `player` | —          | Pick the player by its bus name suffix instead of matching the app; a trailing `*` matches any rest (`"chromium*"`)                                                                       |
+| `cover`  | `true`     | `false` keeps the item's icon                                                                                                                                                             |
+| `label`  | `true`     | `false` keeps the item's name                                                                                                                                                             |
 | `span`   | `"normal"` | `"wide"` or `"extra-wide"`: while there is a player, the tile is wider on a bottom dock, with the title (when extra-wide, also the artist) beside the cover. Side docks keep square tiles |
 
 ### `convert`
@@ -182,22 +182,22 @@ an expression. The result is in front as you type, and Enter copies it.
 [plugin.calc]
 ```
 
-| You type                                    | You get                                                 |
-| ------------------------------------------- | ------------------------------------------------------- |
-| `2^10`, `2**10`, `7 // 2`, `7 mod 2`, `5!`  | 1024, 1024, 3, 1, 120                                   |
-| `2(3 + 4)`, `2pi`, `-2^2`, `2^3^2`          | 14, 6.28318530718, −4, 512                              |
-| `sqrt 2`, `√16`, `sin(30°)`, `sin 30 deg`   | 1.41421356237, 4, 0.5, 0.5                              |
-| `log(8, 2)`, `ln e`, `round(pi, 3)`         | 3, 1, 3.142                                             |
-| `15% of 80`, `80 + 15%`, `80 - 25%`, `50%`  | 12, 92, 60, 0.5                                         |
-| `0xff`, `0b1010`, `0o17`, `1_000_000`       | Hexadecimal, binary, octal, separators                  |
-| `0xf0 & 0x3c`, `1 << 10`, `5 xor 3`, `~0`   | 48, 1024, 6, −1: bit operations on integers (and `\|`)  |
-| `255 in hex`, `0xff in bin`, `8 to oct`     | 0xFF, 0b1111 1111, 0o10                                 |
-| `0.75 in frac`, `1999 in roman`, `1e5 as sci` | 3/4, MCMXCIX, 1 × 10⁵                                  |
-| `10 km in mi`, `100°F to C`, `65 mph in km/h` | 6.21371192237 mi, 37.7777777778 °C, 104.60736 km/h    |
+| You type                                                    | You get                                                  |
+| ----------------------------------------------------------- | -------------------------------------------------------- |
+| `2^10`, `2**10`, `7 // 2`, `7 mod 2`, `5!`                  | 1024, 1024, 3, 1, 120                                    |
+| `2(3 + 4)`, `2pi`, `-2^2`, `2^3^2`                          | 14, 6.28318530718, −4, 512                               |
+| `sqrt 2`, `√16`, `sin(30°)`, `sin 30 deg`                   | 1.41421356237, 4, 0.5, 0.5                               |
+| `log(8, 2)`, `ln e`, `round(pi, 3)`                         | 3, 1, 3.142                                              |
+| `15% of 80`, `80 + 15%`, `80 - 25%`, `50%`                  | 12, 92, 60, 0.5                                          |
+| `0xff`, `0b1010`, `0o17`, `1_000_000`                       | Hexadecimal, binary, octal, separators                   |
+| `0xf0 & 0x3c`, `1 << 10`, `5 xor 3`, `~0`                   | 48, 1024, 6, −1: bit operations on integers (and `\|`)   |
+| `255 in hex`, `0xff in bin`, `8 to oct`                     | 0xFF, 0b1111 1111, 0o10                                  |
+| `0.75 in frac`, `1999 in roman`, `1e5 as sci`               | 3/4, MCMXCIX, 1 × 10⁵                                    |
+| `10 km in mi`, `100°F to C`, `65 mph in km/h`               | 6.21371192237 mi, 37.7777777778 °C, 104.60736 km/h       |
 | `1 GiB in MB`, `90 min in h`, `3 cups in ml`, `2 m² in ft²` | 1073.741824 MB, 1.5 h, 709.7647095 ml, 21.5278208334 ft² |
-| `5 ft`                                      | Its usual conversions, the most readable first          |
-| `x = 6 * 7`, then `2x`                      | Enter keeps `x`; then 84                                |
-| `ans + 1`                                   | The last result copied, plus one                        |
+| `5 ft`                                                      | Its usual conversions, the most readable first           |
+| `x = 6 * 7`, then `2x`                                      | Enter keeps `x`; then 84                                 |
+| `ans + 1`                                                   | The last result copied, plus one                         |
 
 - **Functions:** `sqrt`, `cbrt`, `abs`, `sign`, `floor`, `ceil`, `trunc`,
   `round(x, digits)`, `exp`, `ln`, `log(x, base)` (base 10 by default),
@@ -222,13 +222,13 @@ an expression. The result is in front as you type, and Enter copies it.
 - **History:** the empty query lists the results copied before, for as
   long as the plugin runs.
 
-| Option      | Default | Meaning                                                                   |
-| ----------- | ------- | ------------------------------------------------------------------------- |
-| `precision` | `12`    | Significant digits shown and copied (1–17)                                |
-| `angle`     | `"rad"` | `"deg"`: `sin`, `cos` and `tan` take degrees and `asin`… give degrees     |
-| `grouping`  | `true`  | Group long numbers with commas (1,234,567); copies are never grouped      |
-| `extras`    | `true`  | `false` shows only the result                                             |
-| `history`   | `20`    | Results the empty query lists                                             |
+| Option      | Default | Meaning                                                               |
+| ----------- | ------- | --------------------------------------------------------------------- |
+| `precision` | `12`    | Significant digits shown and copied (1–17)                            |
+| `angle`     | `"rad"` | `"deg"`: `sin`, `cos` and `tan` take degrees and `asin`… give degrees |
+| `grouping`  | `true`  | Group long numbers with commas (1,234,567); copies are never grouped  |
+| `extras`    | `true`  | `false` shows only the result                                         |
+| `history`   | `20`    | Results the empty query lists                                         |
 
 ### `calendar`
 
@@ -268,19 +268,20 @@ The plugin is [`plugins/calendar.lua`](plugins/calendar.lua). If your dock
 doesn't find it by name, copy it to `~/.config/wl-dock/plugins/` or point
 `[plugin.calendar] path` at it.
 
-| Option         | Default                       | Meaning                                                                                                                       |
-| -------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `calendars`    | those shown in GNOME Calendar | Names or EDS source UIDs of the calendars to show (enabled ones, shown in GNOME Calendar or not)                              |
-| `week_start`   | `"monday"`                    | `"monday"`, `"sunday"` or `"saturday"`                                                                                        |
-| `week_numbers` | `false`                       | Show ISO week numbers in the grid                                                                                             |
-| `agenda_days`  | `14`                          | Days the agenda covers from the selected day (1–366)                                                                          |
-| `format`       | `"%A %e %B"`                  | `os.date` format of the label's date                                                                                          |
-| `time`         | `"%H:%M"`                     | `os.date` format of times                                                                                                     |
-| `face`         | standalone: on; app: off      | Draw the calendar page as the icon                                                                                            |
-| `label`        | `true`                        | `false` keeps the item's name                                                                                                 |
-| `popup`        | `true`                        | Show the popup                                                                                                                |
-| `open`         | —                             | argv for **Open**, e.g. `["gnome-calendar", "--date", "{date}"]`                                                              |
-| `calendar_app` | `["gnome-calendar", "--uuid", "{event}"]` | argv for **Calendar**; `false` leaves the button out                                                              |
+| Option         | Default                                   | Meaning                                                                                                                                                                                                             |
+| -------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `calendars`    | those shown in GNOME Calendar             | Names or EDS source UIDs of the calendars to show (enabled ones, shown in GNOME Calendar or not)                                                                                                                    |
+| `week_start`   | `"monday"`                                | `"monday"`, `"sunday"` or `"saturday"`                                                                                                                                                                              |
+| `week_numbers` | `false`                                   | Show ISO week numbers in the grid                                                                                                                                                                                   |
+| `agenda_days`  | `14`                                      | Days the agenda covers from the selected day (1–366)                                                                                                                                                                |
+| `format`       | `"%A %e %B"`                              | `os.date` format of the label's date                                                                                                                                                                                |
+| `time`         | `"%H:%M"`                                 | `os.date` format of times                                                                                                                                                                                           |
+| `face`         | standalone: on; app: off                  | Draw the calendar page as the icon                                                                                                                                                                                  |
+| `label`        | `true`                                    | `false` keeps the item's name                                                                                                                                                                                       |
+| `popup`        | `true`                                    | Show the popup                                                                                                                                                                                                      |
+| `open`         | —                                         | argv for **Open**, e.g. `["gnome-calendar", "--date", "{date}"]`                                                                                                                                                    |
+| `calendar_app` | `["gnome-calendar", "--uuid", "{event}"]` | argv for **Calendar**; `false` leaves the button out                                                                                                                                                                |
+| `span`         | `"normal"`                                | `"wide"` or `"extra-wide"`: on a bottom dock, the tile is wider, with the next event today (when extra-wide, also the one after it) beside the page, or the weekday when none is left. Side docks keep square tiles |
 
 In `open` and `calendar_app`, `{title}`, `{url}`, `{uid}`, `{location}`,
 `{start}`, `{date}`, `{calendar}` (the EDS source UID) and `{event}` (GNOME
@@ -338,28 +339,37 @@ As a standalone widget, a left click opens the popup, which lists the
 recent files of every app. With `apps` set, it lists only those apps'
 files. Each file opens in the app that used it last.
 
-| Option       | Default                               | Meaning                                                                                                                       |
-| ------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `count`      | `10`                                  | Files shown (1–12)                                                                                                            |
-| `apps`       | —                                     | More names the app records files under, e.g. `["soffice"]`. Standalone: list only these apps' files                           |
-| `thumbnails` | `true`                                | `false` shows type icons only                                                                                                 |
-| `open`       | `"app"`                               | `"app"`: the command the app recorded, else `xdg-open`; `"default"`: always `xdg-open`; or an argv with `{path}` and `{uri}` |
-| `file`       | `$XDG_DATA_HOME/recently-used.xbel`   | The bookmark file to read                                                                                                     |
+| Option       | Default                             | Meaning                                                                                                                      |
+| ------------ | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `count`      | `10`                                | Files shown (1–12)                                                                                                           |
+| `apps`       | —                                   | More names the app records files under, e.g. `["soffice"]`. Standalone: list only these apps' files                          |
+| `thumbnails` | `true`                              | `false` shows type icons only                                                                                                |
+| `open`       | `"app"`                             | `"app"`: the command the app recorded, else `xdg-open`; `"default"`: always `xdg-open`; or an argv with `{path}` and `{uri}` |
+| `file`       | `$XDG_DATA_HOME/recently-used.xbel` | The bookmark file to read                                                                                                    |
 
 ### `downloads`
 
-Shows a browser's downloads in progress as a ring around its icon (or a
-bar along its bottom), and lists finished downloads in a popup, where a
-click opens one. It watches the download folder with `dock.watch`. Firefox
-writes a download to `name.part` and Chromium-based browsers to
-`name.crdownload`, and the file gets its real name when it is done. A
-partial file doesn't say how big the download will be, so the ring turns a
-step each time data arrives instead of filling. If the browser also
-publishes its progress over Unity LauncherEntry, as Chromium does, the
-ring fills to that. With several downloads at once, a badge counts them.
-The label shows the file name, its size so far and the speed, or
-_Waiting_ when nothing has arrived for a few seconds. When the last
-download finishes, the ring stays full for a moment.
+Shows a browser's downloads in progress as a disc at the bottom-right
+corner of its icon (or a bar along its bottom), and lists them in a popup.
+It watches the download folder with `dock.watch`. Firefox writes a download
+to `name.part` and Chromium-based browsers to `name.crdownload`, and the file
+gets its real name when it is done. A partial file doesn't say how big the
+download will be, so the disc shows an arc that turns while data arrives
+(the bar, a segment sweeping back and forth). If the browser also publishes
+its progress over Unity LauncherEntry, as Chromium does, the disc fills to
+that instead, easing to each new value. A download that hasn't grown for a
+few seconds is _waiting_: the arc stands still, in grey. When the last
+download finishes, the disc fills with a check mark for a moment. With
+several downloads at once, a badge at the top-right corner counts them. The
+app's icon itself is left as it is.
+
+The label shows the file name, its size so far and the speed, or _Waiting_
+in the speed's place. A download whose name the browser doesn't know yet is
+_Starting…_. In the popup, a download in progress has a bar (filling, or
+sweeping while its size is unknown) and a click opens its folder; a finished
+one opens on a click, and its folder button shows it selected in the file
+manager (`org.freedesktop.FileManager1`, else it opens the folder). **Clear**
+empties the list of finished downloads, not the folder.
 
 ```toml
 [app.firefox]
@@ -379,14 +389,14 @@ since the plugin started, the browser keeps its own icon, label and no
 popup. A finished download leaves the list when its file is moved or
 deleted. A cancelled download doesn't show up in the list.
 
-| Option     | Default                                 | Meaning                                                                                 |
-| ---------- | --------------------------------------- | --------------------------------------------------------------------------------------- |
-| `folders`  | The XDG download folder, else `~/Downloads` | Folders to watch: a string or a list                                                |
-| `browser`  | Guessed from the app; standalone `"all"` | `"firefox"` (`.part`), `"chromium"` (`.crdownload`) or `"all"`                         |
-| `style`    | `"ring"`                                | `"ring"` around the icon or `"bar"` along its bottom                                    |
-| `keep`     | `5`                                     | Finished downloads listed (0–20)                                                        |
-| `open`     | `["xdg-open"]`                          | argv that opens a finished download, with its path added at the end                     |
-| `interval` | `1000`                                  | The shortest time in ms between looks at the folders while files change (at least 250) |
+| Option     | Default                                     | Meaning                                                                                |
+| ---------- | ------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `folders`  | The XDG download folder, else `~/Downloads` | Folders to watch: a string or a list                                                   |
+| `browser`  | Guessed from the app; standalone `"all"`    | `"firefox"` (`.part`), `"chromium"` (`.crdownload`) or `"all"`                         |
+| `style`    | `"ring"`                                    | `"ring"`: a disc at the icon's corner; `"bar"`: a pill along its bottom                |
+| `keep`     | `5`                                         | Finished downloads listed (0–20)                                                       |
+| `open`     | `["xdg-open"]`                              | argv that opens a finished download, with its path added at the end                    |
+| `interval` | `1000`                                      | The shortest time in ms between looks at the folders while files change (at least 250) |
 
 The sources in [`plugins/`](plugins) are good starting points for your own
 plugins.
@@ -780,15 +790,15 @@ when the plugin loads.
 An item is a table with these keys, plus any fields of the plugin's own
 (`run` and the actions' `s.data` get them back, without functions):
 
-| Key        | Meaning                                                                       |
-| ---------- | ----------------------------------------------------------------------------- |
+| Key        | Meaning                                                                            |
+| ---------- | ---------------------------------------------------------------------------------- |
 | `id`       | Unique in the list; an `id` or a `title` is required, each stands in for the other |
-| `title`    | Its name in the launcher                                                      |
-| `subtitle` | Shown dimmed after the title, and searched too                                |
-| `icon`     | A theme icon name or a path; default: the source's                            |
-| `kind`     | `'item'` (default), `'file'` or `'app'`                                       |
-| `path`     | A file item's path (`~/` expands); its icon is the file's thumbnail or type   |
-| `app`      | An app item's desktop ID (`'org.gnome.Nautilus'`); its icon is the app's      |
+| `title`    | Its name in the launcher                                                           |
+| `subtitle` | Shown dimmed after the title, and searched too                                     |
+| `icon`     | A theme icon name or a path; default: the source's                                 |
+| `kind`     | `'item'` (default), `'file'` or `'app'`                                            |
+| `path`     | A file item's path (`~/` expands); its icon is the file's thumbnail or type        |
+| `app`      | An app item's desktop ID (`'org.gnome.Nautilus'`); its icon is the app's           |
 
 `items()` keeps at most 10,000 items, and each `emit` 500; a repeated `id`
 counts once. A bad item (no `id` or `title`, a file without `path`) is an
@@ -799,7 +809,7 @@ error in `items()`, or in the `emit` call.
 | Function                           | Does                                                                                                                                                                |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `dock.redraw()`                    | Ask the hooks again (once the current call returns)                                                                                                                 |
-| `dock.invalidate()`                | Say a [launcher source](#launcher-sources)'s `items()` changed: they are asked for again (a search source searches again)                                         |
+| `dock.invalidate()`                | Say a [launcher source](#launcher-sources)'s `items()` changed: they are asked for again (a search source searches again)                                           |
 | `dock.timer(ms, fn)`               | Call `fn()` once after `ms`. Returns a handle with `:cancel()`                                                                                                      |
 | `dock.every(ms, fn)`               | Call `fn()` every `ms` (at least 10). Returns a handle with `:cancel()`                                                                                             |
 | `dock.spawn(argv, opts)`           | Run a process. `opts.on_line(line)` gets each line of its stdout, `opts.on_exit(code)` its exit code (`nil` if killed by a signal). Returns a handle with `:kill()` |
@@ -815,7 +825,7 @@ error in `items()`, or in the `emit` call.
 | `dock.ui.*`                        | [UI constructors](#ui-trees)                                                                                                                                        |
 | `dock.theme.*`                     | [Theme color names](#colors)                                                                                                                                        |
 | `dock.dbus.session()`, `.system()` | [D-Bus clients](#d-bus)                                                                                                                                             |
-| `dock.tz.*`                        | `os.time` and `os.date` in any time zone. See [Time zones](#time-zones)                                                                                            |
+| `dock.tz.*`                        | `os.time` and `os.date` in any time zone. See [Time zones](#time-zones)                                                                                             |
 
 `argv` is either a list of arguments (`{'notmuch', 'count', 'tag:unread'}`),
 which is safe for arbitrary values, or a single string run with `sh -c`.

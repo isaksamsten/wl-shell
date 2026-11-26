@@ -56,6 +56,8 @@ enum Job {
     Doc { tag: u64, doc: Doc },
     /// A UI tree (a widget's popup).
     Ui { tag: u64, request: ui::Request },
+    /// An animated canvas's frames (`ui::render_sheet`).
+    Sheet { tag: u64, request: ui::Request },
     /// A widget's tile: a UI tree as the icon of `key`.
     UiIcon {
         key: icons::Key,
@@ -157,11 +159,25 @@ pub enum Done {
         rendered: doc::Rendered,
     },
     /// A UI tree (`Assets::ui`). Widget tiles (`Assets::ui_icon`) come
-    /// as `Icon`s.
+    /// as `Icon`s, then a `Tile`.
     Ui {
         tag: u64,
         request: ui::Request,
         rendered: ui::Rendered,
+    },
+    /// An animated canvas's frames (`Assets::sheet`).
+    Sheet {
+        tag: u64,
+        request: ui::Request,
+        sheet: ui::Sheet,
+    },
+    /// What a widget's tile left out of its icon (`Request::apart`):
+    /// its animated canvases, for the host to play over it. Follows the
+    /// tile's `Icon`.
+    Tile {
+        key: icons::Key,
+        request: ui::Request,
+        live: Vec<ui::LivePart>,
     },
     /// A remote `ui.image` arrived: what shows it can be painted again.
     ImageFetched {
@@ -235,6 +251,12 @@ impl Assets {
     /// Paint a UI tree; arrives as `Done::Ui`.
     pub fn ui(&self, tag: u64, request: ui::Request) {
         self.send(Job::Ui { tag, request });
+    }
+
+    /// Paint the frames of the animated canvas `request` paints (a live
+    /// part); arrives as `Done::Sheet`.
+    pub fn sheet(&self, tag: u64, request: ui::Request) {
+        self.send(Job::Sheet { tag, request });
     }
 
     /// Request the icon named `key.name`, unless it is on its way already.
@@ -350,6 +372,8 @@ impl Assets {
             | Done::Paper { .. }
             | Done::Doc { .. }
             | Done::Ui { .. }
+            | Done::Sheet { .. }
+            | Done::Tile { .. }
             | Done::ImageFetched { .. } => {}
         }
     }
@@ -552,6 +576,20 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     rendered,
                 }
             }
+            Job::Sheet { tag, request } => {
+                let mut res = UiResources {
+                    icons: &mut icons,
+                    images: &mut images,
+                    theme: request.theme.icon_theme.clone(),
+                };
+                let text = text.get_or_insert_with(Text::new);
+                let sheet = ui::render_sheet(&request, text, &mut res, ui::anim::SHEET_CAP);
+                Done::Sheet {
+                    tag,
+                    request,
+                    sheet,
+                }
+            }
             Job::UiIcon { key, request } => {
                 let mut res = UiResources {
                     icons: &mut icons,
@@ -559,14 +597,22 @@ fn run(inbox: mpsc::Receiver<Job>, done: channel::Sender<Done>) {
                     theme: request.theme.icon_theme.clone(),
                 };
                 let text = text.get_or_insert_with(Text::new);
-                let image = ui::render(&request, text, &mut res).image;
+                let rendered = ui::render(&request, text, &mut res);
                 let image = match &key.shadow {
-                    Some(s) => crate::shadow::icon(&image, s, key.scale),
-                    None => image,
+                    Some(s) => crate::shadow::icon(&rendered.image, s, key.scale),
+                    None => rendered.image,
                 };
-                Done::Icon {
-                    key,
+                let icon = Done::Icon {
+                    key: key.clone(),
                     image: Arc::new(image),
+                };
+                if done.send(icon).is_err() {
+                    return;
+                }
+                Done::Tile {
+                    key,
+                    request,
+                    live: rendered.live,
                 }
             }
             Job::ClearIcons => {

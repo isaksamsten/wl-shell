@@ -4680,20 +4680,27 @@ impl WlDock {
             } => {
                 // A widget's popup, or one of its live layers.
                 for d in &mut self.docks {
-                    if !d.widget_ready(tag, &request, &rendered) {
-                        continue;
+                    if d.widget_ready(tag, &request, &rendered) {
+                        break;
                     }
-                    // Its live layers are painted again when they are due.
-                    if let Some((id, due)) = d.widget_tick_due() {
-                        let output = d.output.clone();
-                        let _ = core.timer(due, move |s: &mut Self, _| {
-                            if let Some(d) = s.dock_mut(&output) {
-                                d.widget_tick(id);
-                            }
-                        });
-                    }
-                    break;
                 }
+                self.schedule_ticks(core);
+            }
+            // An animated canvas's frames: a popup's or a tile's.
+            Done::Sheet { tag, sheet, .. } => {
+                for d in &mut self.docks {
+                    if d.sheet_ready(tag, &sheet) {
+                        break;
+                    }
+                }
+                self.schedule_ticks(core);
+            }
+            // What a widget's tile left out, to play over it.
+            Done::Tile { key, request, live } => {
+                for d in &mut self.docks {
+                    d.tile_painted(&key, &request, &live);
+                }
+                self.schedule_ticks(core);
             }
             // A widget's cover art (or any remote image) is in: what
             // shows it is painted again.
@@ -4706,6 +4713,32 @@ impl WlDock {
                 }
             }
             Done::Paper { .. } | Done::Doc { .. } => {}
+        }
+    }
+
+    /// Set the timers of what moves on its own: widget popups' live
+    /// layers and animations, and tiles' animations. Each is set once
+    /// per tick, and only once its surface showed the last frame.
+    fn schedule_ticks(&mut self, core: &Core<Self>) {
+        for d in &mut self.docks {
+            let output = d.output.clone();
+            if let Some((id, due)) = d.widget_tick_due() {
+                let output = output.clone();
+                let _ = core.timer(due, move |s: &mut Self, core| {
+                    if let Some(d) = s.dock_mut(&output) {
+                        d.widget_tick(id);
+                    }
+                    s.schedule_ticks(core);
+                });
+            }
+            if let Some(due) = d.anim_tick_due() {
+                let _ = core.timer(due, move |s: &mut Self, core| {
+                    if let Some(d) = s.dock_mut(&output) {
+                        d.anim_tick();
+                    }
+                    s.schedule_ticks(core);
+                });
+            }
         }
     }
 }
@@ -4931,15 +4964,24 @@ impl Program for WlDock {
         }
     }
 
-    fn frame(&mut self, _: &mut Core<Self>, surface: &WlSurface, time: u32) {
+    fn frame(&mut self, core: &mut Core<Self>, surface: &WlSurface, time: u32) {
         if (self.launcher.as_ref()).is_some_and(|l| l.surface() == surface) {
             self.files_frame();
         }
         if let Some(launcher) = (self.launcher.as_mut()).filter(|l| l.surface() == surface) {
             launcher.frame_done(time);
         }
+        // What moves on its own waits for its last frame to show.
+        let mut shown = false;
         if let Some(dock) = self.dock_on(surface) {
             dock.frame_done(time);
+            shown = true;
+        }
+        for dock in &mut self.docks {
+            shown |= dock.widget_frame(surface);
+        }
+        if shown {
+            self.schedule_ticks(core);
         }
     }
 

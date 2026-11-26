@@ -30,6 +30,8 @@ const MAX_NODES: usize = 5000;
 const MAX_DEPTH: usize = 64;
 /// The longest text kept.
 const MAX_TEXT: usize = 10_000;
+/// The most commands an animated canvas's frames have in all.
+const MAX_FRAME_COMMANDS: usize = 4 * MAX_COMMANDS;
 
 /// Add `ns.ui` and `ns.theme`.
 pub(crate) fn install(lua: &Lua, ns: &Table) -> mlua::Result<()> {
@@ -409,7 +411,8 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        if node.key.is_none() && (node.kind.interactive() || node.reveal || !found.is_empty()) {
+        let tracked = node.kind.interactive() || node.kind.animated();
+        if node.key.is_none() && (tracked || node.reveal || !found.is_empty()) {
             node.key = Some(format!("#{at}"));
         }
         if !found.is_empty() {
@@ -591,6 +594,7 @@ impl<'a> Builder<'a> {
                 max: p.num("max")?.unwrap_or(1.0),
                 enabled: p.bool("enabled")?.unwrap_or(true),
                 live: live(p)?,
+                transition: transition(p)?,
             },
             "toggle" => Kind::Toggle {
                 value: p.bool("value")?.unwrap_or(false),
@@ -600,6 +604,8 @@ impl<'a> Builder<'a> {
                 value: p.num("value")?.unwrap_or(0.0),
                 max: p.num("max")?.unwrap_or(1.0),
                 live: live(p)?,
+                indeterminate: p.bool("indeterminate")?.unwrap_or(false),
+                transition: transition(p)?,
             },
             k => return Err(format!("{}: no such node {k:?}", p.path)),
         })
@@ -648,7 +654,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// A canvas: its `draw(c)` runs now, recording.
+    /// A canvas: its `draw(c)` runs now, recording; with `frames = n`,
+    /// `n` times, as `draw(c, t)`.
     fn canvas(&self, p: &Props) -> R<Kind> {
         let viewbox = match p.get("viewbox")? {
             Value::Nil => (100.0, 100.0),
@@ -662,21 +669,113 @@ impl<'a> Builder<'a> {
             }
             _ => return Err(p.err("viewbox", "expected { width, height }")),
         };
-        let commands = match p.get("draw")? {
-            Value::Nil => Vec::new(),
-            Value::Function(f) => record(self.lua, &f).map_err(|e| p.err("draw", &e))?,
+        let draw = match p.get("draw")? {
+            Value::Nil => None,
+            Value::Function(f) => Some(f),
             _ => return Err(p.err("draw", "expected a function")),
         };
-        Ok(Kind::Canvas { viewbox, commands })
+        let record = |t: Option<f64>, room: usize| match &draw {
+            Some(f) => record(self.lua, f, t, room).map_err(|e| p.err("draw", &e)),
+            None => Ok(Vec::new()),
+        };
+        let looped = p.num("loop")?;
+        let value = p.num("value")?;
+        let mirror = p.bool("mirror")?;
+        let transition = p.num("transition")?;
+        let lv = live(p)?;
+        let Some(n) = p.num("frames")? else {
+            if looped.is_some()
+                || value.is_some()
+                || mirror.is_some()
+                || transition.is_some()
+                || lv.is_some()
+            {
+                return Err(p.err(
+                    "frames",
+                    "`loop`, `value`, `transition`, `live` and `mirror` need `frames`",
+                ));
+            }
+            return Ok(Kind::Canvas {
+                viewbox,
+                commands: record(None, MAX_COMMANDS)?,
+                anim: None,
+            });
+        };
+        let (lo, hi) = (anim::MIN_FRAMES, anim::MAX_FRAMES);
+        if n.fract() != 0.0 || !(lo as f64..=hi as f64).contains(&n) {
+            return Err(p.err("frames", &format!("expected a whole number, {lo} to {hi}")));
+        }
+        let n = n as usize;
+        let drive = match (looped, value) {
+            (Some(period), None) => {
+                if period < anim::MIN_LOOP as f64 {
+                    return Err(p.err(
+                        "loop",
+                        &format!("at least {} seconds", anim::MIN_LOOP),
+                    ));
+                }
+                if transition.is_some() || lv.is_some() {
+                    return Err(p.err("loop", "a loop takes no `transition` or `live`"));
+                }
+                Drive::Loop {
+                    period: period as f32,
+                    mirror: mirror.unwrap_or(false),
+                }
+            }
+            (None, Some(value)) => {
+                if mirror.is_some() {
+                    return Err(p.err("mirror", "only a `loop` mirrors"));
+                }
+                Drive::Value {
+                    value: match lv {
+                        Some(_) => value,
+                        None => value.clamp(0.0, 1.0),
+                    },
+                    transition: transition.unwrap_or(0.0).max(0.0) as f32,
+                    live: lv,
+                }
+            }
+            _ => return Err(p.err("frames", "needs exactly one of `loop` and `value`")),
+        };
+        let wraps = drive.wraps();
+        let mut frames = Vec::with_capacity(n);
+        let mut left = MAX_FRAME_COMMANDS;
+        for i in 0..n {
+            let cmds = record(Some(tree::sample(i, n, wraps)), left.min(MAX_COMMANDS))?;
+            left -= cmds.len();
+            frames.push(cmds);
+        }
+        let still = match drive {
+            Drive::Loop { .. } => 0,
+            Drive::Value { value, .. } => tree::frame_at(value, n, wraps),
+        };
+        Ok(Kind::Canvas {
+            viewbox,
+            commands: frames[still].clone(),
+            anim: Some(Box::new(Frames { frames, drive })),
+        })
     }
 }
 
-/// Run `draw(c)` with a recorder, and take its commands.
-fn record(lua: &Lua, draw: &Function) -> R<Vec<Cmd>> {
+/// `transition = ms`.
+fn transition(p: &Props) -> R<f32> {
+    Ok(p.f32("transition")?.unwrap_or(0.0).clamp(0.0, 10_000.0))
+}
+
+/// Run `draw(c)` (or `draw(c, t)`) with a recorder keeping at most
+/// `room` commands, and take them.
+fn record(lua: &Lua, draw: &Function, t: Option<f64>, room: usize) -> R<Vec<Cmd>> {
     let c: AnyUserData = lua
-        .create_userdata(Recorder::default())
+        .create_userdata(Recorder {
+            room,
+            ..Recorder::default()
+        })
         .map_err(|e| e.to_string())?;
-    draw.call::<()>(c.clone()).map_err(|e| e.to_string())?;
+    match t {
+        Some(t) => draw.call::<()>((c.clone(), t)),
+        None => draw.call::<()>(c.clone()),
+    }
+    .map_err(|e| e.to_string())?;
     let r: Recorder = c.take().map_err(|e| e.to_string())?;
     match r.error {
         Some(e) => Err(e),
@@ -688,14 +787,16 @@ fn record(lua: &Lua, draw: &Function) -> R<Vec<Cmd>> {
 #[derive(Default)]
 struct Recorder {
     cmds: Vec<Cmd>,
+    /// The most it keeps.
+    room: usize,
     error: Option<String>,
 }
 
 impl Recorder {
     fn push(&mut self, cmd: Cmd) -> mlua::Result<()> {
-        if self.cmds.len() >= MAX_COMMANDS {
+        if self.cmds.len() >= self.room {
             return Err(mlua::Error::runtime(format!(
-                "a canvas draws at most {MAX_COMMANDS} commands"
+                "a canvas draws at most {MAX_COMMANDS} commands a frame, {MAX_FRAME_COMMANDS} in all"
             )));
         }
         self.cmds.push(cmd);
@@ -887,7 +988,12 @@ mod tests {
              end }",
         );
         let tree = tree.unwrap().unwrap();
-        let Kind::Canvas { viewbox, commands } = tree.kind else {
+        let Kind::Canvas {
+            viewbox,
+            commands,
+            anim: None,
+        } = tree.kind
+        else {
             panic!()
         };
         assert_eq!(viewbox, (100.0, 50.0));
@@ -905,6 +1011,121 @@ mod tests {
             }
         ));
         assert_eq!(commands[9], Cmd::Scale(2.0, 2.0));
+    }
+
+    #[test]
+    fn animated_canvases_sample_their_frames() {
+        let frames = |code: &str| {
+            let (_lua, tree, _) = build(code);
+            match tree.unwrap().unwrap().kind {
+                Kind::Canvas {
+                    commands,
+                    anim: Some(a),
+                    ..
+                } => (commands, *a),
+                k => panic!("{k:?}"),
+            }
+        };
+        // A loop: t = 0, 1/4, 2/4, 3/4; still, its first frame.
+        let (still, a) = frames(
+            "return dock.ui.canvas{ frames = 4, loop = 1.2, draw = function(c, t)
+               c:rotate(t)
+             end }",
+        );
+        assert_eq!(a.drive, Drive::Loop { period: 1.2, mirror: false });
+        let ts: Vec<Cmd> = a.frames.iter().map(|f| f[0].clone()).collect();
+        assert_eq!(
+            ts,
+            [0.0, 0.25, 0.5, 0.75].map(Cmd::Rotate),
+            "sampled at i / n"
+        );
+        assert_eq!(still, [Cmd::Rotate(0.0)]);
+        // A value: t = 0, 1/2, 1; still, the frame of its value.
+        let (still, a) = frames(
+            "return dock.ui.canvas{ frames = 3, value = 0.9, transition = 300,
+               draw = function(c, t) c:rotate(t) end }",
+        );
+        assert_eq!(
+            a.drive,
+            Drive::Value {
+                value: 0.9,
+                transition: 300.0,
+                live: None
+            }
+        );
+        assert_eq!(a.frames[2], [Cmd::Rotate(1.0)]);
+        assert_eq!(still, [Cmd::Rotate(1.0)]);
+        // A mirrored loop has both ends.
+        let (_, a) = frames(
+            "return dock.ui.canvas{ frames = 3, loop = 1, mirror = true,
+               draw = function(c, t) c:rotate(t) end }",
+        );
+        assert_eq!(a.frames[2], [Cmd::Rotate(1.0)]);
+        // Without `frames`, `t` is nil.
+        let (_lua, tree, _) = build(
+            "return dock.ui.canvas{ draw = function(c, t) c:rotate(t == nil and 7 or 0) end }",
+        );
+        assert!(matches!(
+            tree.unwrap().unwrap().kind,
+            Kind::Canvas { commands, anim: None, .. } if commands == [Cmd::Rotate(7.0)]
+        ));
+    }
+
+    #[test]
+    fn animated_nodes_get_keys() {
+        let (_lua, tree, _) = build(
+            "local ui = dock.ui
+             return ui.col{
+               ui.canvas{ frames = 2, loop = 1, draw = function(c, t) end },
+               ui.progress{ indeterminate = true },
+               ui.progress{ value = 0.5, transition = 300 },
+               ui.progress{ value = 0.5 },
+               ui.canvas{ key = 'mine', frames = 2, value = 1 },
+             }",
+        );
+        let tree = tree.unwrap().unwrap();
+        let keys: Vec<Option<&str>> = tree.children.iter().map(|c| c.key.as_deref()).collect();
+        assert_eq!(
+            keys,
+            [Some("#1.1"), Some("#1.2"), Some("#1.3"), None, Some("mine")]
+        );
+        assert!(matches!(
+            tree.children[1].kind,
+            Kind::Progress {
+                indeterminate: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree.children[2].kind,
+            Kind::Progress {
+                transition: 300.0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn animation_errors() {
+        let err = |code: &str| build(code).1.unwrap_err();
+        let canvas = |props: &str| err(&format!("return dock.ui.canvas{{ {props} }}"));
+        assert!(canvas("loop = 1").contains("need `frames`"));
+        assert!(canvas("frames = 1, loop = 1").contains("2 to 60"));
+        assert!(canvas("frames = 61, loop = 1").contains("2 to 60"));
+        assert!(canvas("frames = 2.5, loop = 1").contains("whole number"));
+        assert!(canvas("frames = 4").contains("exactly one"));
+        assert!(canvas("frames = 4, loop = 1, value = 0").contains("exactly one"));
+        assert!(canvas("frames = 4, loop = 0.1").contains("at least"));
+        assert!(canvas("frames = 4, loop = 1, transition = 3").contains("loop"));
+        assert!(canvas("frames = 4, value = 1, mirror = true").contains("mirror"));
+        // Every frame's commands count.
+        assert!(
+            canvas(
+                "frames = 60, loop = 1, draw = function(c)
+                   for i = 1, 2000 do c:save() end end"
+            )
+            .contains("in all")
+        );
     }
 
     #[test]

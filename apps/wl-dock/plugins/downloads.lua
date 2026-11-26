@@ -1,6 +1,6 @@
--- Downloads: a browser's downloads in progress as a progress ring (or bar)
--- over its icon, and the downloads that finished in its popup, where a
--- click opens one.
+-- Downloads: a browser's downloads in progress as a progress disc (or bar)
+-- at the corner of its icon, and the downloads in its popup, where a click
+-- opens a finished one or shows it in its folder.
 --
 -- Put it on the browser:
 --
@@ -15,17 +15,20 @@
 --
 -- Downloads are seen in the folder: Firefox writes to `name.part` and
 -- Chromium-based browsers to `name.crdownload`, and the file gets its own
--- name when it is done. A file doesn't say how big it will be, so the ring
--- turns as data arrives instead of filling, unless the browser publishes
--- its progress over D-Bus (Unity LauncherEntry, as Chromium does), which
--- the ring then shows.
+-- name when it is done. A file doesn't say how big it will be, so the disc
+-- turns while data arrives instead of filling, unless the browser publishes
+-- its progress over D-Bus (Unity LauncherEntry, as Chromium does), which the
+-- disc then fills to. A download that hasn't grown for a while stands still
+-- in grey (waiting); one that finished fills the disc with a check mark for
+-- a moment.
 --
 -- Options:
 --   folders   Folders to watch, a string or a list (default: the XDG download
 --             folder, else ~/Downloads)
 --   browser   "firefox" (.part files), "chromium" (.crdownload files) or "all";
 --             default: guessed from the app's names, "all" standalone
---   style     "ring" (default) around the icon, or "bar" along its bottom
+--   style     "ring" (default): a disc at the icon's corner, or "bar": a pill
+--             along its bottom
 --   keep      Finished downloads the popup lists (default 5, 0–20)
 --   open      argv that opens a finished download, the path appended
 --             (default ["xdg-open"])
@@ -33,6 +36,7 @@
 --             (default 1000, at least 250)
 
 local ui, theme = dock.ui, dock.theme
+local anim = require("anim")
 local P = {}
 
 local HOME = os.getenv("HOME") or ""
@@ -69,8 +73,7 @@ local active = {}
 local finished = {}
 -- Paths the watches reported since the last look.
 local changed = {}
--- Turns the ring while the size is unknown; one step per look that saw data arrive.
-local spin = 0
+-- Until when (dock.now()) the disc shows a finished download.
 local done_until = 0
 -- What the browser publishes over D-Bus: whether progress shows, and 0–1.
 local entry_visible, entry_value
@@ -248,7 +251,6 @@ local function apply(partials, stats, touched)
 					d.rate = d.rate and (d.rate + rate) / 2 or rate
 				end
 				d.size, d.at = f.size, now
-				spin = spin + 1
 			elseif now - d.at >= STALL then
 				d.rate = 0
 			end
@@ -536,21 +538,24 @@ local function bytes(n)
 	return string.format(n < 10 and "%.1f %s" or "%.0f %s", n, units[i])
 end
 
+-- A download's name, or "Starting…" while it isn't known.
 local function title(d)
-	return d.base ~= "" and d.base or "Download"
+	return d.base ~= "" and d.base or "Starting…"
 end
 
+-- `45% · 2.1 GB · 12 MB/s`; while it waits, "Waiting" for the speed.
 local function detail(d, p)
-	local text = bytes(d.size)
+	local parts = {}
 	if p then
-		text = string.format("%d%% · %s", math.floor(p * 100 + 0.5), text)
+		parts[#parts + 1] = string.format("%d%%", math.floor(p * 100 + 0.5))
 	end
+	parts[#parts + 1] = bytes(d.size)
 	if d.rate and d.rate > 0 then
-		text = text .. " · " .. bytes(d.rate) .. "/s"
+		parts[#parts + 1] = bytes(d.rate) .. "/s"
 	elseif d.rate then
-		text = text .. " · Waiting"
+		parts[#parts + 1] = "Waiting"
 	end
-	return text
+	return table.concat(parts, " · ")
 end
 
 local function ago(t)
@@ -587,11 +592,16 @@ local function ext(name)
 	return (name:match("%.([^.]+)$") or ""):lower()
 end
 
-local function thumb(name, path, size)
+-- A file's picture in a THUMB × THUMB frame, so images and icons line up.
+local THUMB = 36
+local function thumb(name, path)
+	local pic
 	if path and THUMBS[ext(name)] then
-		return ui.image({ src = path, width = size, height = size, fit = "cover", radius = 4 })
+		pic = ui.image({ src = path, width = THUMB, height = THUMB, fit = "cover", radius = 4 })
+	else
+		pic = ui.icon({ ICONS[ext(name)] or "text-x-generic", size = 32 })
 	end
-	return ui.icon({ ICONS[ext(name)] or "text-x-generic", size = size })
+	return ui.stack({ width = THUMB, height = THUMB, pic })
 end
 
 local function open(path)
@@ -606,59 +616,169 @@ local function open(path)
 	end
 end
 
--- A thin ring along the tile's edge: filled clockwise from 12 o'clock to
--- `p`, or a quarter that turns as data arrives when `p` is nil.
-local function ring(p)
-	return ui.canvas({
-		draw = function(c)
-			c:circle({ x = 50, y = 50, r = 47, stroke = theme.track, width = 4 })
-			local top = -math.pi / 2
-			local from, to
-			if p then
-				from, to = top, top + p * 2 * math.pi
-			else
-				from = top + spin * math.pi / 6
-				to = from + math.pi / 2
-			end
-			if to > from then
-				c:arc({ x = 50, y = 50, r = 47, from = from, to = to, stroke = theme.accent, width = 4, cap = "round" })
-			end
-		end,
-	})
+-- `path` as a file:// URI.
+local function uri(path)
+	local escaped = path:gsub("[^%w%-%._~/]", function(ch)
+		return string.format("%%%02X", ch:byte())
+	end)
+	return "file://" .. escaped
 end
 
--- A bar along the tile's bottom: filled to `p`, or a moving segment.
-local function bar(p)
-	return ui.canvas({
-		draw = function(c)
-			local x, y, w, h = 14, 88, 72, 6
-			c:rect({ x = x, y = y, w = w, h = h, radius = h / 2, fill = theme.track })
-			if p then
-				if p > 0 then
-					c:rect({ x = x, y = y, w = math.max(h, w * p), h = h, radius = h / 2, fill = theme.accent })
+-- Show `path` selected in the file manager (FileManager1), else open its
+-- folder.
+local function show(path)
+	local dir = split(path) or folders[1]
+	local ok, err = pcall(function()
+		dock.dbus.session():call({
+			dest = "org.freedesktop.FileManager1",
+			path = "/org/freedesktop/FileManager1",
+			iface = "org.freedesktop.FileManager1",
+			method = "ShowItems",
+			signature = "ass",
+			args = { { uri(path) }, "" },
+			on_reply = function(_, e)
+				if e then
+					open(dir)
 				end
-			else
-				local seg = w / 3
-				c:rect({ x = x + (spin * 8) % (w - seg), y = y, w = seg, h = h, radius = h / 2, fill = theme.accent })
+			end,
+		})
+	end)
+	if not ok then
+		print(err)
+		open(dir)
+	end
+end
+
+-- Downloads in progress have progress (0–1, eased in), are busy (data
+-- arriving, size unknown), or wait (nothing arrived for STALL s); then they
+-- are done for DONE s. nil: nothing to show.
+local function state(list)
+	if #list > 0 then
+		local p = fraction()
+		if p then
+			return "progress", p
+		end
+		for _, d in ipairs(list) do
+			if d.rate ~= 0 then
+				return "busy"
 			end
-		end,
+		end
+		return "waiting"
+	elseif dock.now() < done_until then
+		return "done"
+	end
+end
+
+-- The corner disc, in a 100 × 100 viewbox: a surface disc with an outline,
+-- and a ring on it.
+local RING = { x = 50, y = 50, r = 29, width = 11 }
+local function disc(c)
+	c:circle({ x = 50, y = 50, r = 45, fill = theme.surface, stroke = theme.border, width = 2 })
+end
+local function with(t, more)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+	end
+	for k, v in pairs(more) do
+		out[k] = v
+	end
+	return out
+end
+
+-- The disc for `kind`, `size` pixels: 42% of the tile's thickness, inset
+-- 2% from its corner.
+local function corner(kind, p, size)
+	local c = { key = "disc", width = size, height = size }
+	if kind == "progress" then
+		local ring = anim.ring(RING)
+		c.frames, c.value, c.transition = 60, p, 300
+		c.draw = function(cv, t)
+			disc(cv)
+			ring(cv, t)
+		end
+	elseif kind == "busy" then
+		local spinner = anim.spinner(RING)
+		c.frames, c.loop = 24, 1.2
+		c.draw = function(cv, t)
+			disc(cv)
+			spinner(cv, t)
+		end
+	elseif kind == "waiting" then
+		local still = anim.spinner(with(RING, { color = theme.muted }))
+		c.draw = function(cv)
+			disc(cv)
+			still(cv, 0)
+		end
+	else
+		c.draw = function(cv)
+			cv:circle({ x = 50, y = 50, r = 45, fill = theme.accent })
+			cv:path({ d = "M 31 51 L 44 64 L 69 37", stroke = theme.accent_text, width = 9, cap = "round" })
+		end
+	end
+	return ui.canvas(c)
+end
+
+-- The bar for `kind`: a pill along the tile's bottom, 64% of its length.
+local function pill(kind, p, tile, thick)
+	local inset, h, w = thick * 0.02, thick * 0.1, tile.w * 0.64
+	local bw, bh = w + 2 * inset, h + 2 * inset
+	local function back(cv)
+		cv:rect({ x = 0, y = 0, w = bw, h = bh, radius = bh / 2, fill = theme.surface })
+	end
+	local track = { x = inset, y = inset, w = w, h = h }
+	local c = { key = "bar", width = bw, height = bh, viewbox = { bw, bh } }
+	local bar
+	if kind == "progress" then
+		bar = anim.bar(with(track, { fill = true }))
+		c.frames, c.value, c.transition = 60, p, 300
+	elseif kind == "busy" then
+		bar = anim.bar(track)
+		c.frames, c.loop, c.mirror = 24, 1.6, true
+	elseif kind == "waiting" then
+		bar = anim.bar(with(track, { color = theme.muted }))
+	else
+		bar = anim.bar(with(track, { fill = true }))
+	end
+	local t = kind == "done" and 1 or nil
+	c.draw = function(cv, s)
+		back(cv)
+		bar(cv, s or t)
+	end
+	return ui.row({
+		width = tile.w,
+		height = tile.h,
+		justify = "center",
+		align = "end",
+		padding = { 0, 0, thick * 0.04, 0 },
+		ui.canvas(c),
 	})
 end
 
-function P.icon()
+function P.icon(tile)
+	tile = tile or { w = 96, h = 96 }
+	local thick = math.min(tile.w, tile.h)
 	local list = downloads()
-	local base = dock.app and ui.app_icon({}) or ui.icon({ "folder-download" })
-	local p
-	if #list > 0 then
-		p = fraction()
-	elseif dock.now() < done_until then
-		p = 1
-	else
+	local base = dock.app and ui.app_icon({}) or ui.icon({ "folder-download", size = thick })
+	local kind, p = state(list)
+	if not kind then
 		return not dock.app and base or nil
 	end
-	local layers = { align = "top-right", base, (style == "bar" and bar or ring)(p) }
+	local shown
+	if style == "bar" then
+		shown = pill(kind, p, tile, thick)
+	else
+		shown = corner(kind, p, thick * 0.46)
+	end
+	local layers = { align = "bottom-right", base, shown }
 	if #list > 1 then
-		layers[#layers + 1] = ui.box({ variant = "badge", ui.text({ tostring(#list), style = "caption" }) })
+		layers[#layers + 1] = ui.row({
+			width = tile.w,
+			height = tile.h,
+			justify = "end",
+			align = "start",
+			ui.box({ variant = "badge", ui.text({ tostring(#list), style = "caption" }) }),
+		})
 	end
 	return ui.stack(layers)
 end
@@ -685,29 +805,45 @@ function P.label()
 	return nil
 end
 
+-- A download in progress: its name, a bar and how far it got; a click opens
+-- its folder.
 local function active_row(d, p)
-	return ui.col({
-		gap = 6,
+	local key = "active:" .. d.path
+	local bar
+	if p then
+		bar = ui.progress({ key = "bar:" .. d.path, value = p, transition = 300, height = 4 })
+	elseif d.rate == 0 then
+		bar = ui.progress({ key = "bar:" .. d.path, value = 0, height = 4 })
+	else
+		bar = ui.progress({ key = "bar:" .. d.path, indeterminate = true, height = 4 })
+	end
+	local named = d.base ~= ""
+	return ui.row({
+		key = key,
+		gap = 10,
 		padding = { 4, 6 },
-		ui.row({
-			gap = 8,
-			align = "center",
-			thumb(title(d), nil, 32),
-			ui.col({
-				grow = 1,
-				gap = 1,
-				ui.text({ title(d), max_lines = 1 }),
-				ui.text({ detail(d, p), style = "caption", color = theme.muted, max_lines = 1 }),
-			}),
+		radius = 6,
+		align = "center",
+		hover = { background = theme.hover },
+		on_click = function()
+			open(d.dir)
+		end,
+		thumb(named and d.base or ""),
+		ui.col({
+			grow = 1,
+			gap = 4,
+			ui.text({ title(d), max_lines = 1, color = not named and theme.muted or nil }),
+			bar,
+			ui.text({ detail(d, p), style = "caption", color = theme.muted, max_lines = 1 }),
 		}),
-		p and ui.progress({ value = p }) or nil,
 	})
 end
 
+-- A finished download: a click opens it, its button shows it in its folder.
 local function finished_row(f)
 	return ui.row({
 		key = "open:" .. f.path,
-		gap = 8,
+		gap = 10,
 		padding = { 4, 6 },
 		radius = 6,
 		align = "center",
@@ -715,14 +851,36 @@ local function finished_row(f)
 		on_click = function()
 			open(f.path)
 		end,
-		thumb(f.name, f.path, 32),
+		thumb(f.name, f.path),
 		ui.col({
 			grow = 1,
 			gap = 1,
 			ui.text({ f.name, max_lines = 1 }),
 			ui.text({ bytes(f.size) .. " · " .. ago(f.at), style = "caption", color = theme.muted, max_lines = 1 }),
 		}),
+		ui.button({
+			key = "show:" .. f.path,
+			icon = "folder-open-symbolic",
+			variant = "ghost",
+			tooltip = "Show in folder",
+			on_click = function()
+				show(f.path)
+			end,
+		}),
 	})
+end
+
+-- A section's caption, lined up with the rows; `apart`: 6 px more above.
+local function header(text, apart)
+	return ui.row({
+		padding = apart and { 6, 6, 0, 6 } or { 0, 6 },
+		ui.text({ text, style = "caption", weight = "bold", color = theme.muted }),
+	})
+end
+
+local function clear()
+	finished = {}
+	dock.redraw()
 end
 
 function P.popup()
@@ -731,30 +889,35 @@ function P.popup()
 		return nil
 	end
 	local p = #list == 1 and fraction() or nil
+	local both = #list > 0 and #finished > 0
 	local rows = { gap = 2 }
+	if both then
+		rows[#rows + 1] = header("In progress", false)
+	end
 	for _, d in ipairs(list) do
 		rows[#rows + 1] = active_row(d, p)
 	end
-	if #finished > 0 then
-		if #list > 0 then
-			rows[#rows + 1] = ui.divider({})
-		end
-		rows[#rows + 1] = ui.text({ "Recent", style = "caption", weight = "bold", color = theme.muted })
-		for _, f in ipairs(finished) do
-			rows[#rows + 1] = finished_row(f)
-		end
+	if both then
+		rows[#rows + 1] = header("Recent", true)
+	end
+	for _, f in ipairs(finished) do
+		rows[#rows + 1] = finished_row(f)
 	end
 	if #list == 0 and #finished == 0 then
-		rows[1] = ui.text({ "No downloads", style = "muted" })
+		rows[1] = ui.row({ padding = { 4, 6 }, ui.text({ "No downloads", style = "muted" }) })
 	end
+	local app = dock.app and (dock.app.name or dock.app.id)
 	return ui.col({
-		padding = 16,
-		gap = 10,
-		width = 320,
+		padding = 12,
+		gap = 8,
+		width = 300,
 		ui.row({
+			padding = { 0, 6 },
+			gap = 4,
 			align = "center",
-			justify = "between",
-			ui.text({ "Downloads", style = "title" }),
+			ui.text({ app and (app .. " Downloads") or "Downloads", style = "title", max_lines = 1 }),
+			ui.spacer({}),
+			#finished > 0 and ui.button({ key = "clear", label = "Clear", variant = "ghost", on_click = clear }) or nil,
 			folders[1] and ui.button({
 				key = "folder",
 				icon = "folder-open-symbolic",
@@ -770,4 +933,3 @@ function P.popup()
 end
 
 return P
-

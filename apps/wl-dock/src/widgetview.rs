@@ -11,13 +11,17 @@
 //! the dock drops it once it's gone.
 //!
 //! On the popup, as subsurfaces: the bubble (its shadow included), the
-//! tree, and per live slider or progress bar (`live = {rate, at}`) one of
-//! its own. The tree is painted `apart`: without its live nodes, which
-//! are painted alone, at their rects, again and again as their values
-//! move (as often as that moves them a pixel, at most 30 times a second),
-//! so a playing track's seek bar advances without repainting the popup.
-//! Live nodes inside a scroll area are painted with the tree instead, as
-//! they are at the time.
+//! tree, and per live or animated node one of its own. The tree is
+//! painted `apart`: without those nodes, which are shown on their own,
+//! at their rects. Live sliders and progress bars (`live = {rate, at}`),
+//! indeterminate ones and values easing in (`transition`) are painted
+//! alone again and again as they move (as often as that moves them a
+//! pixel, at most 30 times a second), so a playing track's seek bar
+//! advances without repainting the popup. Animated canvases (`frames`)
+//! are painted once into a frame sheet and played from it (anim.rs), at
+//! most 60 frames a second. One timer paces them all, set again once the
+//! compositor shows the last frame. Live nodes inside a scroll area are
+//! painted with the tree instead, as they are at the time.
 //!
 //! Interaction state (hover, pressed, slider drags, scroll offsets) is
 //! kept here and painted without asking the plugin; what it changes is
@@ -30,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use smithay_client_toolkit::compositor::Region;
+use smithay_client_toolkit::compositor::{FrameCallbackData, Region};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind};
 use smithay_client_toolkit::shell::wlr_layer::LayerSurface;
 use smithay_client_toolkit::shell::xdg::{XdgPositioner, popup::Popup};
@@ -52,6 +56,7 @@ use wl_shell_render::worker::Assets;
 use wl_shell_ui::cache;
 use wl_shell_ui::{IRect, Rect, Spring, Sub, lerp};
 
+use crate::anim::{self, Pacer, Sheets};
 use crate::app::WlDock;
 use crate::config::Position;
 use crate::menu::{self, Metrics, Place};
@@ -141,6 +146,8 @@ fn interval(part: &ui::LivePart, scale: i32) -> Option<f64> {
 struct Surface {
     // Field order is drop order: children before their parent.
     lives: Vec<LiveLayer>,
+    /// Per animated canvas (`WidgetView::sheets`).
+    sheet_subs: Vec<Sub>,
     content: Sub,
     bubble: Sub,
     viewport: WpViewport,
@@ -193,8 +200,12 @@ pub struct WidgetView {
     closing: bool,
     /// When a dragged slider last told the plugin.
     last_change: Option<Instant>,
-    /// A timer for the live layers is set.
-    ticking: bool,
+    /// The timer for what moves.
+    pacer: Pacer,
+    /// Plays the animated nodes.
+    player: ui::Player,
+    /// The animated canvases, and their frame sheets.
+    sheets: Sheets<WlBuffer>,
 }
 
 impl WidgetView {
@@ -214,6 +225,7 @@ impl WidgetView {
         position: Position,
         icon: Rect,
         scale: i32,
+        animations: bool,
     ) -> Result<Self, String> {
         let transparent = cache::color_buffer(&g, 0, qh).map_err(|e| e.to_string())?;
         let no_input = Region::new(&g.compositor).map_err(|e| e.to_string())?;
@@ -244,7 +256,9 @@ impl WidgetView {
             shown: false,
             closing: false,
             last_change: None,
-            ticking: false,
+            pacer: Pacer::default(),
+            player: ui::Player::new(animations),
+            sheets: Sheets::default(),
         };
         w.paint();
         Ok(w)
@@ -358,7 +372,7 @@ impl WidgetView {
     /// Paint live layer `i` with the current state (after its paint in
     /// flight).
     fn paint_live(&mut self, i: usize) {
-        let state = self.state_now();
+        let mut state = self.state_now();
         let (Some(s), Some(c)) = (&mut self.surface, &self.content) else {
             return;
         };
@@ -367,6 +381,8 @@ impl WidgetView {
             l.again = true;
             return;
         }
+        // Where an easing value or a sweeping bar is now.
+        state.values = self.player.values([&l.part.node], state.now);
         let request = ui::Request {
             state,
             ..c.request.part(&l.part)
@@ -448,10 +464,16 @@ impl WidgetView {
         self.sync_lives();
     }
 
-    /// Give each live part of the tree a layer, and paint them all.
+    /// Give each live part of the tree a layer, and paint them all; and
+    /// each animated canvas one, playing its frame sheet.
     fn sync_lives(&mut self) {
-        let parts = (self.content.as_ref()).map_or(Vec::new(), |c| c.live.clone());
+        let (canvases, parts): (Vec<ui::LivePart>, Vec<ui::LivePart>) =
+            (self.content.as_ref().map_or(Vec::new(), |c| c.live.clone()))
+                .into_iter()
+                .partition(|p| matches!(p.node.kind, Kind::Canvas { anim: Some(_), .. }));
         let Some(s) = &mut self.surface else { return };
+        let now = now();
+        (self.player).sync(parts.iter().chain(&canvases).map(|p| &p.node), now);
         // Layers go on top, in tree order.
         while s.lives.len() > parts.len() {
             if let Some(mut l) = s.lives.pop() {
@@ -474,43 +496,106 @@ impl WidgetView {
                 }
             }
         }
+        // The canvases' sheets: painted only if they paint differently.
+        if let Some(c) = &self.content {
+            let (paint, stale) = self.sheets.sync(canvases, &c.request);
+            self.stale.extend(stale);
+            for (i, request) in paint {
+                let tag = next_tag();
+                self.assets.sheet(tag, request);
+                self.sheets.asked(i, tag);
+            }
+        }
+        while s.sheet_subs.len() > self.sheets.layers.len() {
+            if let Some(mut sub) = s.sheet_subs.pop() {
+                sub.hide();
+            }
+        }
+        while s.sheet_subs.len() < self.sheets.layers.len() {
+            let sub = Sub::new(&self.g, s.popup.wl_surface(), &self.no_input, &self.qh);
+            s.sheet_subs.push(sub);
+        }
         for i in 0..s.lives.len() {
             self.paint_live(i);
         }
     }
 
-    /// If the live layers move and none is being painted, set the timer:
-    /// when they are due again (and this popup's ID). Once per tick.
+    /// A frame sheet arrived; true if it is this popup's.
+    pub fn sheet_ready(&mut self, tag: u64, sheet: &ui::Sheet) -> bool {
+        if !self.sheets.wants(tag) {
+            return false;
+        }
+        let buffers = (sheet.images.iter())
+            .filter_map(|image| match cache::shm_buffer(&self.g, image, &self.qh) {
+                Ok(buffer) => Some(buffer),
+                Err(e) => {
+                    warn!("widget frame buffer: {e}");
+                    None
+                }
+            })
+            .collect();
+        let old = self.sheets.arrived(tag, buffers, sheet.step);
+        self.stale.extend(old);
+        true
+    }
+
+    /// How soon live layer `l` moves, if it does.
+    fn live_due(&self, l: &LiveLayer, now: f64) -> Option<f64> {
+        let dragged = (self.state.sliders.iter()).any(|(k, _)| Some(k.as_str()) == l.key());
+        if dragged {
+            return None;
+        }
+        let live = l.interval(self.scale);
+        let anim = self.player.due(&l.part.node, now, LIVE_FASTEST);
+        live.into_iter().chain(anim).reduce(f64::min)
+    }
+
+    /// Whether anything on it moves.
+    fn moves(&self, now: f64) -> bool {
+        let lives = (self.surface.iter()).flat_map(|s| &s.lives);
+        (lives.into_iter()).any(|l| self.live_due(l, now).is_some())
+            || self.sheets.due(&self.player, now, anim::POPUP_FPS).is_some()
+    }
+
+    /// If the live layers or animated canvases move and none is being
+    /// painted, set the timer: when they are due again (and this popup's
+    /// ID). Once per tick, and only once the last one is on screen.
     pub fn tick_due(&mut self) -> Option<(u64, Duration)> {
-        if self.ticking || self.closing {
+        if self.closing {
             return None;
         }
         let s = self.surface.as_ref()?;
         if s.lives.iter().any(|l| l.wanted.is_some()) {
             return None;
         }
-        let dragged =
-            |l: &LiveLayer| (self.state.sliders.iter()).any(|(k, _)| Some(k.as_str()) == l.key());
-        let due = (s.lives.iter())
-            .filter(|l| !dragged(l))
-            .filter_map(|l| l.interval(self.scale))
-            .fold(None, |a: Option<f64>, d| Some(a.map_or(d, |a| a.min(d))))?;
-        self.ticking = true;
-        Some((self.id, Duration::from_secs_f64(due)))
+        let now = now();
+        let lives = s.lives.iter().filter_map(|l| self.live_due(l, now));
+        let sheets = self.sheets.due(&self.player, now, anim::POPUP_FPS);
+        let due = lives.chain(sheets).reduce(f64::min);
+        let after = self.pacer.arm(due)?;
+        Some((self.id, after))
     }
 
-    /// The timer: paint the moving live layers at this time.
+    /// The timer: paint the moving live layers at this time, and show
+    /// the canvases' frames for it.
     pub fn tick(&mut self) {
-        self.ticking = false;
+        self.pacer.fired();
+        let now = now();
         let n = self.surface.as_ref().map_or(0, |s| s.lives.len());
         for i in 0..n {
             let moves = (self.surface.as_ref())
                 .and_then(|s| s.lives.get(i))
-                .is_some_and(|l| l.interval(self.scale).is_some());
+                .is_some_and(|l| self.live_due(l, now).is_some());
             if moves {
                 self.paint_live(i);
             }
         }
+        self.render();
+    }
+
+    /// The popup's frame callback: what it drew is on screen.
+    pub fn frame_done(&mut self) {
+        self.pacer.shown();
     }
 
     /// A bubble arrived; true if it is this popup's.
@@ -633,6 +718,7 @@ impl WidgetView {
         let viewport = self.g.viewporter.get_viewport(parent, &self.qh, Ignore);
         self.surface = Some(Surface {
             lives: Vec::new(),
+            sheet_subs: Vec::new(),
             content,
             bubble,
             viewport,
@@ -891,17 +977,34 @@ impl WidgetView {
         s.bubble.present(Some(bubble_buffer), xf(whole), alpha);
         let tree = Rect::new(cx, cy, c.size.0, c.size.1);
         s.content.present(Some(&c.buffer), xf(tree), alpha);
-        for l in &mut s.lives {
-            let r = l.part.rect;
-            let r = Rect::new(
+        let at = |r: ui::Rect| {
+            Rect::new(
                 (cx + r.x as f64).round(),
                 (cy + r.y as f64).round(),
                 (r.w as f64).round().max(1.0),
                 (r.h as f64).round().max(1.0),
-            );
-            l.sub.present(l.buffer.as_ref(), xf(r), alpha);
+            )
+        };
+        for l in &mut s.lives {
+            l.sub.present(l.buffer.as_ref(), xf(at(l.part.rect)), alpha);
         }
-        s.popup.wl_surface().commit();
+        // The canvases' frames for now.
+        let now = now();
+        for (i, sub) in s.sheet_subs.iter_mut().enumerate() {
+            let Some(l) = self.sheets.layers.get(i) else {
+                sub.clear();
+                continue;
+            };
+            let buffer = self.sheets.shown(i, &self.player, now);
+            sub.present(buffer, xf(at(l.part.rect)), alpha);
+        }
+        // While anything moves, the next tick waits for this frame to show.
+        let surface = s.popup.wl_surface().clone();
+        if !self.closing && !self.pacer.waiting() && self.moves(now) {
+            surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+            self.pacer.drew();
+        }
+        surface.commit();
         for buffer in self.stale.drain(..) {
             buffer.destroy();
         }
@@ -916,6 +1019,7 @@ impl Drop for WidgetView {
                 self.stale.extend(l.buffer.take());
             }
         }
+        self.stale.extend(self.sheets.drain());
         if let Some(c) = self.content.take() {
             c.buffer.destroy();
         }
@@ -999,6 +1103,7 @@ mod tests {
                 max: 200.0,
                 enabled: true,
                 live: Some(ui::Live { rate, at: 0.0 }),
+                transition: 0.0,
             }),
         }
     }
@@ -1017,6 +1122,8 @@ mod tests {
             value: 0.0,
             max: 1.0,
             live: None,
+            indeterminate: false,
+            transition: 0.0,
         };
         assert_eq!(interval(&still, 1), None);
     }

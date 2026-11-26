@@ -637,6 +637,7 @@ mod tests {
         let mut c = Node::new(Kind::Canvas {
             viewbox: (100.0, 50.0),
             commands: Vec::new(),
+            anim: None,
         });
         c.layout.width = Some(Length::Px(80.0));
         let col = Node::new(Kind::Col).with_children(vec![c]);
@@ -689,6 +690,7 @@ mod tests {
                 max: 1.0,
                 enabled: true,
                 live: None,
+                transition: 0.0,
             }),
             Node::new(Kind::Divider),
         ]);

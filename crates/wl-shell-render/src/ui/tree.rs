@@ -364,6 +364,74 @@ pub struct Live {
     pub at: f64,
 }
 
+/// What plays an animated canvas: what its parameter `t` is when.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Drive {
+    /// `t` runs from 0 to 1 every `period` seconds, for as long as the
+    /// canvas shows; with `mirror`, back to 0 over another `period`.
+    Loop { period: f32, mirror: bool },
+    /// `t` is `value` (0 to 1), eased from the value shown to a new one
+    /// over `transition` ms; with `live`, it moves on its own (wrapping
+    /// at 1).
+    Value {
+        value: f64,
+        transition: f32,
+        live: Option<Live>,
+    },
+}
+
+impl Drive {
+    /// Whether `t` wraps around at 1 (a loop's or a live value's), so
+    /// frames are sampled at `i / n`, not `i / (n - 1)`.
+    pub fn wraps(&self) -> bool {
+        matches!(
+            self,
+            Drive::Loop { mirror: false, .. } | Drive::Value { live: Some(_), .. }
+        )
+    }
+}
+
+/// An animated canvas's frames: `draw(c, t)` sampled at `n` values of
+/// `t`, and what plays them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frames {
+    pub frames: Vec<Vec<Cmd>>,
+    pub drive: Drive,
+}
+
+impl Frames {
+    /// The `t` frame `i` was drawn at.
+    pub fn t(&self, i: usize) -> f64 {
+        sample(i, self.frames.len(), self.drive.wraps())
+    }
+
+    /// The frame showing `t` (0 to 1; wrapping ones may go past).
+    pub fn index(&self, t: f64) -> usize {
+        frame_at(t, self.frames.len(), self.drive.wraps())
+    }
+}
+
+/// The `t` of frame `i` of `n`: `i / n` if `t` wraps, else `i / (n - 1)`
+/// (so both 0 and 1 have a frame).
+pub fn sample(i: usize, n: usize, wraps: bool) -> f64 {
+    match (wraps, n) {
+        (_, 0 | 1) => 0.0,
+        (true, n) => i as f64 / n as f64,
+        (false, n) => i as f64 / (n - 1) as f64,
+    }
+}
+
+/// The frame of `n` nearest to `t`.
+pub fn frame_at(t: f64, n: usize, wraps: bool) -> usize {
+    if n <= 1 || !t.is_finite() {
+        return 0;
+    }
+    match wraps {
+        true => ((t.rem_euclid(1.0) * n as f64).round() as usize) % n,
+        false => (t.clamp(0.0, 1.0) * (n - 1) as f64).round() as usize,
+    }
+}
+
 /// The handlers a node has (kept in its Lua state, by the node's key).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Handlers {
@@ -439,9 +507,13 @@ pub enum Kind {
         opacity: f32,
     },
     /// Vector drawing in viewbox units, scaled to the node's box.
+    /// `commands` is what shows when it doesn't move: an animated one's
+    /// first frame (a loop's), or the frame of its value.
     Canvas {
         viewbox: (f32, f32),
         commands: Vec<Cmd>,
+        /// Its frames, if it is animated (`frames = n`).
+        anim: Option<Box<Frames>>,
     },
     /// Its content is its children (the builder turns `label` and `icon`
     /// into children).
@@ -457,6 +529,8 @@ pub enum Kind {
         max: f64,
         enabled: bool,
         live: Option<Live>,
+        /// Ms a new value takes to ease in (never while dragged).
+        transition: f32,
     },
     Toggle {
         value: bool,
@@ -466,6 +540,10 @@ pub enum Kind {
         value: f64,
         max: f64,
         live: Option<Live>,
+        /// A segment sweeps along the track instead of a value.
+        indeterminate: bool,
+        /// Ms a new value takes to ease in.
+        transition: f32,
     },
 }
 
@@ -500,6 +578,30 @@ impl Kind {
             self,
             Kind::Button { .. } | Kind::Slider { .. } | Kind::Toggle { .. } | Kind::Scroll
         )
+    }
+
+    /// Whether it moves without a new tree: an animated canvas, an
+    /// indeterminate progress bar, or a value that eases in.
+    pub fn animated(&self) -> bool {
+        match self {
+            Kind::Canvas { anim, .. } => anim.is_some(),
+            Kind::Progress {
+                indeterminate,
+                transition,
+                ..
+            } => *indeterminate || *transition > 0.0,
+            Kind::Slider { transition, .. } => *transition > 0.0,
+            _ => false,
+        }
+    }
+
+    /// Whether it changes as time passes: animated, or live.
+    pub fn moves(&self) -> bool {
+        self.animated()
+            || matches!(
+                self,
+                Kind::Slider { live: Some(_), .. } | Kind::Progress { live: Some(_), .. }
+            )
     }
 }
 

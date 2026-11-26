@@ -659,6 +659,9 @@ pub struct WidgetsConfig {
     /// Lua instructions per hook call.
     #[serde(deserialize_with = "budget")]
     pub budget: u32,
+    /// Off: animated canvases show their still frame, values jump, and
+    /// indeterminate progress bars stand still.
+    pub animations: bool,
 }
 
 impl Default for WidgetsConfig {
@@ -667,6 +670,7 @@ impl Default for WidgetsConfig {
             enabled: true,
             popup_delay: 300,
             budget: 1_000_000,
+            animations: true,
         }
     }
 }
