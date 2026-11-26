@@ -993,7 +993,19 @@ impl LauncherView {
     pub fn configure(&mut self, width: u32, height: u32) {
         let first = !self.configured;
         self.configured = true;
+        // What came from the dock is anchored to the bottom edge: it moves
+        // with it. Some compositors (niri) send `wl_surface.enter`, and so
+        // `attach`, before the first configure, while the height is still 0.
+        let dy = height as f64 - self.height;
         (self.width, self.height) = (width as f64, height as f64);
+        if dy != 0.0 {
+            if let Some(a) = &mut self.attached {
+                a.from.y += dy;
+            }
+            if let Some(f) = &mut self.fly {
+                f.to.y += dy;
+            }
+        }
         if width > 0 && height > 0 {
             self.viewport.set_destination(width as i32, height as i32);
         }
