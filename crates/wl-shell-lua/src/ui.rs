@@ -394,6 +394,7 @@ impl<'a> Builder<'a> {
                     .unwrap_or_default(),
             ),
         };
+        node.reveal = p.bool("reveal")?.unwrap_or(false);
         // Handlers, kept by key.
         let mut found = Vec::new();
         for (field, flag) in [("on_click", 0usize), ("on_change", 1), ("on_commit", 2)] {
@@ -408,7 +409,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        if node.key.is_none() && (node.kind.interactive() || !found.is_empty()) {
+        if node.key.is_none() && (node.kind.interactive() || node.reveal || !found.is_empty()) {
             node.key = Some(format!("#{at}"));
         }
         if !found.is_empty() {
@@ -838,7 +839,7 @@ mod tests {
                  ui.button{icon = 'go-next', label = 'Next', on_click = function() end},
                  ui.slider{key = 'seek', value = 3, max = 10, on_commit = function(v) end},
                },
-               ui.box{variant = 'badge', hover = {background = dock.theme.hover}, ui.text{7}},
+               ui.box{variant = 'badge', reveal = true, hover = {background = dock.theme.hover}, ui.text{7}},
              }",
         );
         let tree = tree.unwrap().unwrap();
@@ -866,6 +867,9 @@ mod tests {
             Some(Color::Theme(ThemeColor::Hover))
         );
         assert!(matches!(&badge.children[0].kind, Kind::Text { text, .. } if text == "7"));
+        // Revealing needs a key: it got its path.
+        assert!(badge.reveal && !row.reveal);
+        assert_eq!(badge.key.as_deref(), Some("#1.4"));
     }
 
     #[test]

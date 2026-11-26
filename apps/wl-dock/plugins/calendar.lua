@@ -4,8 +4,8 @@
 -- Standalone it draws a calendar page as its icon, shows the date and the
 -- next event as its label, and opens a popup on click with the month grid,
 -- paging, and an agenda of the selected day and the days after it. Clicking
--- an event shows its details, with buttons to open its link, show it in
--- GNOME Calendar and copy it.
+-- an event expands its details in the agenda, with buttons to open its link,
+-- show it in GNOME Calendar and copy it.
 --
 -- The calendars are read over D-Bus, with their names and colours, and
 -- followed as they change: an event edited in GNOME Calendar shows here at
@@ -655,8 +655,7 @@ local function occurrences(ev, d0, d1, emit)
 	local x = ev.x
 	if not x then
 		local _, sm, sd = civil(ev.sday)
-		local wall = not ev.allday and not ev.utc and (ev.zone and tz.date(ev.zone, ev.s) or os.date("*t", ev.s))
-			or nil
+		local wall = not ev.allday and not ev.utc and (ev.zone and tz.date(ev.zone, ev.s) or os.date("*t", ev.s)) or nil
 		local dur = ev.e - ev.s
 		x = {
 			st = { m = sm, d = sd, wd = weekday(ev.sday) },
@@ -1302,8 +1301,8 @@ end
 
 local view_y, view_m -- the month shown
 local selected -- the selected day; the agenda starts there
-local detail -- the occurrence whose details are shown
-local copied -- the occurrence last copied
+local detail -- the row_key() of the agenda row that is expanded
+local copied -- the row_key() of the row last copied
 local is_open, closed_at = false, nil
 
 local function go_today()
@@ -1570,28 +1569,24 @@ local function month_grid(t, days)
 		add(ui.text({ "", style = "caption" }))
 	end
 	for i = 0, 6 do
-		add(
-			ui.text({
-				weekday_name((week_start + i) % 7),
-				style = "caption",
-				color = theme.muted,
-				align = "center",
-				max_lines = 1,
-			})
-		)
+		add(ui.text({
+			weekday_name((week_start + i) % 7),
+			style = "caption",
+			color = theme.muted,
+			align = "center",
+			max_lines = 1,
+		}))
 	end
 	for w = 0, 5 do
 		local ws = start + w * 7
 		if week_numbers then
 			-- The ISO week of the row's Monday.
 			local monday = ws + (1 - week_start) % 7
-			add(
-				ui.col({
-					align = "center",
-					padding = { 4, 0 },
-					ui.text({ tonumber(os.date("%V", day_start(monday))), style = "caption", color = theme.muted }),
-				})
-			)
+			add(ui.col({
+				align = "center",
+				padding = { 4, 0 },
+				ui.text({ tonumber(os.date("%V", day_start(monday))), style = "caption", color = theme.muted }),
+			}))
 		end
 		for i = 0, 6 do
 			add(day_cell(ws + i, days[ws + i], t))
@@ -1600,31 +1595,131 @@ local function month_grid(t, days)
 	return ui.grid(cells)
 end
 
+-- Identifies the row of occurrence `o` on day `d` across redraws, which
+-- may rebuild the occurrence tables.
+local function row_key(o, d)
+	return o.ev.okey .. "\n" .. (o.ev.rid or "") .. "\n" .. o.s .. "\n" .. d
+end
+
+-- The details of an expanded agenda row, shown below its title.
+local function details(o, key)
+	local ev = o.ev
+	local link = link_of(ev)
+	local rows = { gap = 8, padding = { 2, 6, 8, 17 } }
+	local function line(lead, text, lines)
+		rows[#rows + 1] = ui.row({
+			gap = 8,
+			align = "start",
+			ui.stack({ width = 16, height = 16, lead }),
+			ui.text({ text, grow = 1, max_lines = lines }),
+		})
+	end
+	line(ui.box({ width = 10, height = 10, radius = 5, background = ev.source.color }), ev.source.name, 1)
+	if ev.location then
+		line(ui.icon({ "mark-location-symbolic", size = 16 }), ev.location, 3)
+	end
+	if ev.rule then
+		line(ui.icon({ "media-playlist-repeat-symbolic", size = 16 }), repeats(ev.rule), 2)
+	end
+	if ev.zone and not ev.allday then
+		-- The time where the event is: os.date in UTC, moved by the zone's offset.
+		local a, b = tz.date(ev.zone, o.s), tz.date(ev.zone, o.e)
+		local text = fdate("!" .. time_format, o.s + a.offset)
+		if o.e > o.s then
+			text = text .. " – " .. fdate("!" .. time_format, o.e + b.offset)
+		end
+		text = text .. " " .. a.abbrev .. " · " .. (zone_names[ev.zone] or ev.zone:gsub("_", " "))
+		line(ui.icon({ "preferences-system-time-symbolic", size = 16 }), text, 2)
+	end
+	if ev.description then
+		-- Clamped rather than scrolled: the agenda around it already scrolls.
+		rows[#rows + 1] = ui.text({ ev.description, style = "muted", max_lines = 8 })
+	end
+	rows[#rows + 1] = ui.row({
+		gap = 8,
+		justify = "end",
+		ui.button({
+			key = "copy",
+			icon = "edit-copy-symbolic",
+			label = copied == key and "Copied" or "Copy",
+			on_click = function()
+				local text = ev.title .. "\n" .. when_long(o)
+				if ev.location then
+					text = text .. "\n" .. ev.location
+				end
+				if link then
+					text = text .. "\n" .. link
+				end
+				dock.clipboard(text)
+				copied = key
+				dock.redraw()
+			end,
+		}),
+		calendar_argv and ui.button({
+			key = "calendar",
+			icon = "x-office-calendar-symbolic",
+			tooltip = "Show in Calendar",
+			on_click = function()
+				run_for("calendar", calendar_argv, o)
+			end,
+		}) or nil,
+		(open_argv or link) and ui.button({
+			key = "open",
+			label = "Open",
+			variant = "filled",
+			icon = "send-to-symbolic",
+			tooltip = link,
+			on_click = function()
+				open_event(o)
+			end,
+		}) or nil,
+	})
+	return ui.col(rows)
+end
+
+-- An agenda row; clicking it expands its details in place, or collapses them.
 local function event_row(o, d, i, now)
 	local ev = o.ev
-	local sub = when_on(o, d)
-	if ev.location then
-		sub = sub .. " · " .. ev.location
+	local key = row_key(o, d)
+	local open = detail == key
+	local sub
+	if open then
+		sub = when_long(o)
+	else
+		sub = when_on(o, d)
+		if ev.location then
+			sub = sub .. " · " .. ev.location
+		end
 	end
-	return ui.row({
-		key = "ev" .. d .. "-" .. i,
-		gap = 8,
-		padding = { 4, 6 },
+	-- Keys are global to the popup: each row's must be its own.
+	local id = "ev" .. d .. "-" .. i
+	return ui.col({
+		key = id,
+		-- Scrolls the agenda to show the details when they open.
+		reveal = open,
 		radius = 6,
-		align = "stretch",
-		opacity = is_past(o, now) and 0.5 or nil,
-		hover = { background = theme.hover },
-		on_click = function()
-			detail, copied = o, nil
-			dock.redraw()
-		end,
-		ui.box({ width = 3, radius = 2, background = ev.source.color }),
-		ui.col({
-			grow = 1,
-			gap = 1,
-			ui.text({ ev.title, max_lines = 1 }),
-			ui.text({ sub, style = "caption", color = theme.muted, max_lines = 1 }),
+		background = open and theme.inset or nil,
+		opacity = not open and is_past(o, now) and 0.5 or nil,
+		ui.row({
+			key = id .. "-head",
+			gap = 8,
+			padding = { 4, 6 },
+			radius = 6,
+			align = "stretch",
+			hover = { background = theme.hover },
+			on_click = function()
+				detail, copied = not open and key or nil, nil
+				dock.redraw()
+			end,
+			ui.box({ width = 3, radius = 2, background = ev.source.color }),
+			ui.col({
+				grow = 1,
+				gap = 1,
+				ui.text({ ev.title, max_lines = open and 3 or 1, weight = open and "bold" or "normal" }),
+				ui.text({ sub, style = "caption", color = theme.muted, max_lines = open and 2 or 1 }),
+			}),
 		}),
+		open and details(o, key) or nil,
 	})
 end
 
@@ -1677,109 +1772,8 @@ local function agenda(t, days)
 		end
 		items[1] = ui.text({ text, style = "muted" })
 	end
-	return ui.scroll({ key = "agenda", max_height = 260, ui.col(items) })
-end
-
-local function details()
-	local o = detail
-	local ev = o.ev
-	local link = link_of(ev)
-	local rows = {
-		gap = 10,
-		ui.row({
-			gap = 6,
-			align = "start",
-			ui.button({
-				key = "back",
-				icon = "go-previous-symbolic",
-				variant = "ghost",
-				tooltip = "Back",
-				on_click = function()
-					detail = nil
-					dock.redraw()
-				end,
-			}),
-			ui.col({
-				grow = 1,
-				gap = 2,
-				ui.text({ ev.title, style = "title", max_lines = 3 }),
-				ui.text({ when_long(o), style = "muted", max_lines = 2 }),
-			}),
-		}),
-	}
-	local function line(lead, text, lines)
-		rows[#rows + 1] = ui.row({
-			gap = 8,
-			align = "start",
-			ui.stack({ width = 16, height = 16, lead }),
-			ui.text({ text, grow = 1, max_lines = lines }),
-		})
-	end
-	line(ui.box({ width = 10, height = 10, radius = 5, background = ev.source.color }), ev.source.name, 1)
-	if ev.location then
-		line(ui.icon({ "mark-location-symbolic", size = 16 }), ev.location, 3)
-	end
-	if ev.rule then
-		line(ui.icon({ "media-playlist-repeat-symbolic", size = 16 }), repeats(ev.rule), 2)
-	end
-	if ev.zone and not ev.allday then
-		-- The time where the event is: os.date in UTC, moved by the zone's offset.
-		local a, b = tz.date(ev.zone, o.s), tz.date(ev.zone, o.e)
-		local text = fdate("!" .. time_format, o.s + a.offset)
-		if o.e > o.s then
-			text = text .. " – " .. fdate("!" .. time_format, o.e + b.offset)
-		end
-		text = text .. " " .. a.abbrev .. " · " .. (zone_names[ev.zone] or ev.zone:gsub("_", " "))
-		line(ui.icon({ "preferences-system-time-symbolic", size = 16 }), text, 2)
-	end
-	if ev.description then
-		rows[#rows + 1] = ui.col({
-			padding = 8,
-			radius = 8,
-			background = theme.inset,
-			ui.scroll({ key = "description", max_height = 160, ui.text({ ev.description, style = "muted" }) }),
-		})
-	end
-	rows[#rows + 1] = ui.row({
-		gap = 8,
-		justify = "end",
-		ui.button({
-			key = "copy",
-			icon = "edit-copy-symbolic",
-			label = copied == o and "Copied" or "Copy",
-			on_click = function()
-				local text = ev.title .. "\n" .. when_long(o)
-				if ev.location then
-					text = text .. "\n" .. ev.location
-				end
-				if link then
-					text = text .. "\n" .. link
-				end
-				dock.clipboard(text)
-				copied = o
-				dock.redraw()
-			end,
-		}),
-		calendar_argv and ui.button({
-			key = "calendar",
-			icon = "x-office-calendar-symbolic",
-			tooltip = "Show in Calendar",
-			on_click = function()
-				run_for("calendar", calendar_argv, o)
-			end,
-		}) or nil,
-		(open_argv or link) and ui.button({
-			key = "open",
-			label = "Open",
-			variant = "filled",
-			icon = "external-link-symbolic",
-			tooltip = link,
-			on_click = function()
-				open_event(o)
-			end,
-		}) or nil,
-	})
-	return ui.col(rows)
+	-- A fixed height, so the popup keeps its size across days and months.
+	return ui.scroll({ key = "agenda", height = 260, ui.col(items) })
 end
 
 function P.popup()
@@ -1792,9 +1786,6 @@ function P.popup()
 		view_y, view_m = civil(t)
 	end
 	local width = week_numbers and 330 or 300
-	if detail then
-		return ui.col({ padding = 14, width = width, details() })
-	end
 	-- One query for the grid and the agenda when they are close together.
 	local gs, ae = grid_start(), selected + agenda_days
 	local grid_days, list_days

@@ -14,7 +14,10 @@
 //! - Boxes in their variant's colors; buttons with hover, pressed,
 //!   selected and disabled looks; sliders, toggles and progress bars as
 //!   tracks, fills and knobs in the accent.
-//! - A scroll area's content is cut to it, moved by its offset.
+//! - A scroll area's content is cut to it, moved by its offset. A node
+//!   that starts asking to be revealed (`Node::reveal`, not in
+//!   `State::revealed`) moves the offset of the innermost area it is in
+//!   as little as shows it whole (its top, if it is taller than the area).
 //!
 //! The result is an image and, per node the host tracks (interactive
 //! ones, and keyed ones with a `hover` look), its key and rect.
@@ -68,6 +71,9 @@ pub struct State {
     pub pressed: Option<String>,
     /// Scroll areas' offsets, logical pixels.
     pub scroll: Vec<(String, f32)>,
+    /// The keys of the nodes that asked to be revealed when last painted
+    /// (`Rendered::revealed`): only the others scroll their area.
+    pub revealed: Vec<String>,
     /// Sliders being dragged: their values.
     pub sliders: Vec<(String, f64)>,
     /// For live values (`Live::at`'s clock); 0: show them as given.
@@ -161,6 +167,11 @@ pub struct Rendered {
     pub hits: Vec<Hit>,
     /// The live nodes left out (`Request::apart`), in tree order.
     pub live: Vec<LivePart>,
+    /// The scroll areas whose offsets revealing moved, at their new
+    /// offsets: the host keeps them in `State::scroll`.
+    pub scroll: Vec<(String, f32)>,
+    /// The keys of the nodes asking to be revealed, for `State::revealed`.
+    pub revealed: Vec<String>,
 }
 
 /// Lay `req.tree` out and paint it.
@@ -190,12 +201,18 @@ pub fn render(req: &Request, text: &mut Text, res: &mut dyn Resources) -> Render
         apart: req.apart,
         scrolled: 0,
         live: Vec::new(),
+        scroll: Vec::new(),
     };
     let mut index = 0;
     let fg = theme.get(ThemeColor::Text);
     p.node(&mut pixmap, &mut index, 0.0, fg, 1.0, true);
     let hits = std::mem::take(&mut p.hits);
     let live = std::mem::take(&mut p.live);
+    let scroll = std::mem::take(&mut p.scroll);
+    let revealed = (nodes.iter())
+        .filter(|n| n.reveal)
+        .filter_map(|n| n.key.clone())
+        .collect();
     let radius = req.radius.min(w.min(h) / 2.0);
     if radius > 0.0
         && let Some(mut mask) = Mask::new(pw, ph)
@@ -210,6 +227,8 @@ pub fn render(req: &Request, text: &mut Text, res: &mut dyn Resources) -> Render
         image: crate::doc::bgra(&pixmap),
         hits,
         live,
+        scroll,
+        revealed,
     }
 }
 
@@ -539,6 +558,8 @@ struct Painter<'a> {
     /// How many scroll areas the node being painted is in.
     scrolled: u32,
     live: Vec<LivePart>,
+    /// Scroll areas revealing moved, and their offsets.
+    scroll: Vec<(String, f32)>,
 }
 
 impl Painter<'_> {
@@ -557,6 +578,36 @@ impl Painter<'_> {
         (self.state.scroll.iter())
             .find(|(k, _)| k == key)
             .map_or(0.0, |(_, v)| *v)
+    }
+
+    /// Scroll area `i`'s (`rect`) offset `offset`, moved to show the
+    /// nodes in it that start asking to be revealed. Those in a scroll
+    /// area inside it are that area's to show.
+    fn reveal(&self, i: usize, rect: Rect, mut offset: f32) -> f32 {
+        let end = i + self.nodes[i].count();
+        let mut j = i + 1;
+        while j < end {
+            let n = self.nodes[j];
+            if let Kind::Scroll = n.kind {
+                j += n.count();
+                continue;
+            }
+            if n.reveal
+                && let Some(key) = &n.key
+                && !self.state.revealed.contains(key)
+            {
+                let r = self.laid.rects[j];
+                let top = r.y - rect.y;
+                if top + r.h > offset + rect.h {
+                    offset = top + r.h - rect.h;
+                }
+                if top < offset {
+                    offset = top;
+                }
+            }
+            j += 1;
+        }
+        offset
     }
 
     /// Paint node `*index` (and its children) onto `pm`, scrolled up by
@@ -849,7 +900,14 @@ impl Painter<'_> {
         // it and moved by its offset.
         if let Kind::Scroll = n.kind {
             let content = self.laid.content[i];
-            let offset = self.scroll_of(key).clamp(0.0, (content - rect.h).max(0.0));
+            let max = (content - rect.h).max(0.0);
+            let was = self.scroll_of(key).clamp(0.0, max);
+            let offset = self.reveal(i, rect, was).clamp(0.0, max);
+            if offset != was
+                && let Some(key) = key
+            {
+                self.scroll.push((key.to_string(), offset));
+            }
             let mut layer = Pixmap::new(pm.width(), pm.height());
             let mask = clip(pm, r);
             match (&mut layer, mask) {

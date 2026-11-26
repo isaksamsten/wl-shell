@@ -426,6 +426,18 @@ impl WidgetView {
         if let Some(old) = self.content.replace(painted) {
             self.stale.push(old.buffer);
         }
+        // Keep what revealing scrolled to, unless the wheel moved the area
+        // since; and which nodes asked, so they scroll only once.
+        for (key, offset) in &r.scroll {
+            let at = |s: &ui::State| s.scroll.iter().position(|(k, _)| k == key);
+            let sent = at(&request.state).map(|i| request.state.scroll[i].1);
+            match at(&self.state) {
+                Some(i) if Some(self.state.scroll[i].1) == sent => self.state.scroll[i].1 = *offset,
+                Some(_) => {}
+                None => self.state.scroll.push((key.clone(), *offset)),
+            }
+        }
+        self.state.revealed = r.revealed.clone();
         if self.closing {
             return;
         }

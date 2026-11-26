@@ -397,6 +397,56 @@ fn containers() {
     assert!(hit.content > 100.0);
 }
 
+/// A node that starts asking to be revealed scrolls its area as little
+/// as shows it whole, once.
+#[test]
+fn revealing_scrolls_once() {
+    // Ten rows 20 high in an area 50 high: row `i` spans 20i..20i+20.
+    let area = |reveal: usize, tall: bool| {
+        let rows = (0..10)
+            .map(|i| {
+                let h = if tall && i == reveal { 80.0 } else { 20.0 };
+                with(block(0xffffffff, 100.0, h), |n| {
+                    // Boxes would shrink to fit the area; text doesn't.
+                    n.layout.min_height = Some(Length::Px(h));
+                    n.key = Some(format!("r{i}"));
+                    n.reveal = i == reveal;
+                })
+            })
+            .collect();
+        let mut scroll = Node::new(Kind::Scroll).with_children(rows);
+        scroll.layout.max_height = Some(Length::Px(50.0));
+        scroll.layout.gap = Some(0.0);
+        scroll.key = Some("s".into());
+        scroll
+    };
+    let bounds = ui::Bounds::Content {
+        max_w: 400.0,
+        max_h: 600.0,
+    };
+    let at = |offset: f32, revealed: &[&str]| State {
+        scroll: vec![("s".into(), offset)],
+        revealed: revealed.iter().map(|s| s.to_string()).collect(),
+        ..State::default()
+    };
+    // Below: its bottom comes up to the area's.
+    let r = paint(area(7, false), bounds, 1, at(0.0, &[]));
+    assert_eq!(r.scroll, [("s".to_string(), 110.0)]);
+    assert_eq!(r.revealed, ["r7"]);
+    // Painted again, it asked already: the wheel may scroll it away.
+    let r = paint(area(7, false), bounds, 1, at(0.0, &["r7"]));
+    assert!(r.scroll.is_empty());
+    // Above: its top goes down to the area's.
+    let r = paint(area(2, false), bounds, 1, at(150.0, &["r7"]));
+    assert_eq!(r.scroll, [("s".to_string(), 40.0)]);
+    // Already shown: nothing moves.
+    let r = paint(area(1, false), bounds, 1, at(0.0, &[]));
+    assert!(r.scroll.is_empty());
+    // Taller than the area: its top shows.
+    let r = paint(area(3, true), bounds, 1, at(0.0, &[]));
+    assert_eq!(r.scroll, [("s".to_string(), 60.0)]);
+}
+
 #[test]
 fn texts() {
     let styled = |style, s: &str| text(s, style);

@@ -960,6 +960,7 @@ Values for the layout props:
 | `opacity`                                            | 0–1                                                                                           |
 | `hover`                                              | `background`, `radius`, `border` and `opacity` to use while hovered                           |
 | `key`                                                | A stable name for the node (see below)                                                        |
+| `reveal`                                             | `true`: scroll the `ui.scroll` it is in to show it whole, when it becomes `true` (see below)  |
 
 Sizes are logical pixels. Images and icons are rendered at the output's
 scale.
@@ -1000,6 +1001,12 @@ or a scroll position. A node without a `key` gets one from its position in
 the tree. Give interactive and scrolling nodes an explicit `key` whenever
 the tree's shape can change, for example when nodes before them appear and
 disappear. Keys must be unique within a tree.
+
+**Revealing.** A node with `reveal = true` scrolls the innermost `ui.scroll`
+it is in as little as needed to show it whole (its top, if it is taller than
+the area). It does so once, when the node starts asking (by its key), so the
+user can scroll it away again. For example, an expanding row sets
+`reveal = expanded` to bring its new content into view.
 
 **Live sliders and progress bars.** A seek bar for a playing track would
 otherwise need a redraw every frame. Instead, give it

@@ -515,6 +515,9 @@ pub struct Node {
     /// interactive nodes and nodes with handlers.
     pub key: Option<String>,
     pub handlers: Handlers,
+    /// Scroll the scroll area it is in to show it when it starts asking
+    /// (`State::revealed`), by its key (generated if none is given).
+    pub reveal: bool,
     pub children: Vec<Node>,
 }
 
@@ -527,6 +530,7 @@ impl Node {
             hover: None,
             key: None,
             handlers: Handlers::default(),
+            reveal: false,
             children: Vec::new(),
         }
     }
