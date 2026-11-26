@@ -584,7 +584,7 @@ impl Screenshot {
     /// Start capturing `output`; None if it can't.
     fn start(output: &WlOutput, g: &Globals, qh: &Qh) -> Option<Self> {
         let id = CaptureId::next();
-        let capture = Capture::output(id, output, g, qh)?;
+        let capture = Capture::output(id, output, g, false, qh)?;
         Some(Self {
             id,
             capture,

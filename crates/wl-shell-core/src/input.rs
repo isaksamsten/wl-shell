@@ -9,7 +9,9 @@ use wayland_client::{
         wl_keyboard::WlKeyboard, wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface::WlSurface,
     },
 };
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+    Shape, WpCursorShapeDeviceV1,
+};
 
 #[derive(Default)]
 pub struct Input {
@@ -52,6 +54,15 @@ impl Input {
     /// The serial of the last keyboard enter, key press or button press.
     pub fn serial(&self) -> Option<u32> {
         self.serial
+    }
+
+    /// Show the cursor `shape` on the program's surface the pointer
+    /// entered with `serial` (the shell shows the default one on enter).
+    /// Nothing without wp_cursor_shape_manager_v1.
+    pub fn set_cursor(&self, serial: u32, shape: Shape) {
+        if let Some(device) = &self.cursor_shape {
+            device.set_shape(serial, shape);
+        }
     }
 
     /// Forget the pointer's surface, e.g. because the program destroyed it:

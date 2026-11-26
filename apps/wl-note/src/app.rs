@@ -61,6 +61,14 @@
 //!   (template.rs), and so does a file drop on one.
 //! - **Fonts on the main thread**, for the open note's editable title,
 //!   are loaded on a thread of their own at the start.
+//! - **Screenshots** (select.rs): the camera on an open note's bar or on
+//!   a shelf, the `+` row's Screenshot button and `wl-note screenshot`.
+//!   The columns hide (`Column::stow`) and, once that is on screen (their
+//!   frame callbacks), every output is captured once; overlays show the
+//!   frozen frames to select on. The selection is encoded as a PNG on a
+//!   thread of its own, saved in `.files/` like a dropped image, and
+//!   linked onto its note (or a new one); then the columns come back as
+//!   they were.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -76,6 +84,8 @@ use wayland_client::protocol::{
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wl_shell_config::{Reloader, TreeEvent};
+use wl_shell_core::capture::{Capture, CaptureEvent, CaptureId};
+use wl_shell_core::globals::Globals;
 use wl_shell_core::reexports::calloop::generic::Generic;
 use wl_shell_core::reexports::calloop::{Interest, Mode, PostAction, RegistrationToken, channel};
 use wl_shell_core::spawn::{self, Output};
@@ -95,16 +105,21 @@ use crate::context::{Proposal, Settle};
 use crate::deck::{self, Group, Item, Look};
 use crate::draft::{Draft, SaveBody, read_note, save_body};
 use crate::drawer::{self, Entry as DrawerEntry};
-use crate::ipc::{NewNote, NoteRequest};
+use crate::ipc::{self, NewNote, NoteRequest};
 use crate::markdown::{self, Content};
 use crate::outputs::{self, Whereabouts};
 use crate::papers::Papers;
 use crate::row::{self, Available, Button};
-use crate::{bar, create, files, find, list, reorder, scratch, template};
+use crate::select::{Outcome, Phase, Screenshot, Target as ShotTarget};
+use crate::{bar, create, files, find, list, reorder, scratch, select, template};
 
 /// Windows whose output is remembered at most: the stream may report
 /// windows the toplevel list never announces, so not all are forgotten.
 const MAX_PLACED: usize = 4096;
+/// How long a screenshot waits for the column to be out of the way (its
+/// frame callback), and for the outputs' frames.
+const SHOT_HIDE_WAIT: Duration = Duration::from_millis(300);
+const SHOT_CAPTURE_WAIT: Duration = Duration::from_secs(3);
 
 /// The window the notes follow.
 #[derive(Clone, Debug, PartialEq)]
@@ -272,6 +287,8 @@ pub struct WlNote {
     alarm: Option<Alarm>,
     /// The notes changed since the alarm was last armed.
     alarm_stale: bool,
+    /// The screenshot being taken (select.rs).
+    screenshot: Option<Screenshot>,
 }
 
 impl WlNote {
@@ -328,6 +345,7 @@ impl WlNote {
             fonts: Rc::new(RefCell::new(None)),
             alarm: None,
             alarm_stale: true,
+            screenshot: None,
         })
     }
 
@@ -892,6 +910,7 @@ impl WlNote {
         if std::mem::take(&mut self.outputs_dirty) {
             self.sync_columns(core);
         }
+        self.advance_screenshot(core);
         self.rearm_alarm();
         if std::mem::take(&mut self.dirty) {
             self.show_notes();
@@ -1620,6 +1639,17 @@ impl WlNote {
                 }
             }
             Act::Reorder(key, shown, gap) => self.reorder(&key, &shown, gap),
+            Act::Screenshot(key) => {
+                if let Err(e) = self.start_screenshot(core, ShotTarget::Note(key)) {
+                    warn!("screenshot: {e}");
+                }
+            }
+            Act::Row(Button::Screenshot) => {
+                let app = self.window().map(|w| w.app_id.clone());
+                if let Err(e) = self.start_screenshot(core, ShotTarget::New(app)) {
+                    warn!("screenshot: {e}");
+                }
+            }
         }
     }
 
@@ -2247,6 +2277,7 @@ impl WlNote {
             }),
             window: self.scratch.is_some() && self.scratch_context().is_some(),
             paste: !clipboard_mimes(core).is_empty(),
+            screenshot: core.g.output_source_manager.is_some(),
             templates: self.templates.len(),
             hidden_here,
             hidden_all,
@@ -2458,7 +2489,7 @@ impl WlNote {
         &mut self,
         core: &mut Core<Self>,
         drop: FileDrop,
-        mut dropped: files::Dropped,
+        dropped: files::Dropped,
     ) -> Result<(), String> {
         if self.index.dir() != drop.dir {
             return Err("notes directory changed during drop".into());
@@ -2494,45 +2525,57 @@ impl WlNote {
                 self.open_created(core, &drop.surface, &key);
             }
             FileTarget::Note { key, editor } => {
-                let path = self.path(&key);
-                let note = self.drop_note(&key)?;
-                if let files::Dropped::Files(paths) = &mut dropped {
-                    files::keep_unlinked(paths, note.body());
-                    if paths.is_empty() {
-                        return Ok(());
-                    }
-                }
-                if let Some(i) = self
-                    .columns
-                    .iter()
-                    .position(|c| c.draft.as_ref().is_some_and(|d| d.key == key))
-                {
-                    let editor = (self.columns[i].surface() == &drop.surface)
-                        .then_some(editor)
-                        .flatten();
-                    self.columns[i].attach(&key, editor, &dropped);
-                    self.save_draft(i, false);
-                } else if self.detached_drafts.contains_key(&path) {
-                    return Err(
-                        "reopen the note to resolve its unsaved draft before dropping on it".into(),
-                    );
-                } else {
-                    let newline = if note.text().contains("\r\n") {
-                        "\r\n"
-                    } else {
-                        "\n"
-                    };
-                    let added = dropped.append(note.body(), newline);
-                    let mut text = note.text().to_owned();
-                    if note.body().is_empty() && !text.is_empty() && !text.ends_with('\n') {
-                        text.push_str(newline);
-                    }
-                    text.push_str(&added);
-                    wl_shell_notes::write_atomic(&path, &text)
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
-                    self.touch_note(&path);
-                }
+                self.add_to_note(&key, dropped, Some((&drop.surface, editor)))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Add `dropped` to the note `key`: to its draft if it is open (at
+    /// the editor's offset, if `at` is that column's surface and an
+    /// offset in it), else at the end of its file. Files it links already
+    /// aren't linked again.
+    fn add_to_note(
+        &mut self,
+        key: &str,
+        mut dropped: files::Dropped,
+        at: Option<(&WlSurface, Option<(usize, String)>)>,
+    ) -> Result<(), String> {
+        let path = self.path(key);
+        let note = self.drop_note(key)?;
+        if let files::Dropped::Files(paths) = &mut dropped {
+            files::keep_unlinked(paths, note.body());
+            if paths.is_empty() {
+                return Ok(());
+            }
+        }
+        if let Some(i) = self
+            .columns
+            .iter()
+            .position(|c| c.draft.as_ref().is_some_and(|d| d.key == key))
+        {
+            let editor = at
+                .filter(|(surface, _)| self.columns[i].surface() == *surface)
+                .and_then(|(_, editor)| editor);
+            self.columns[i].attach(key, editor, &dropped);
+            self.save_draft(i, false);
+        } else if self.detached_drafts.contains_key(&path) {
+            return Err("reopen the note to resolve its unsaved draft before adding to it".into());
+        } else {
+            let newline = if note.text().contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let added = dropped.append(note.body(), newline);
+            let mut text = note.text().to_owned();
+            if note.body().is_empty() && !text.is_empty() && !text.ends_with('\n') {
+                text.push_str(newline);
+            }
+            text.push_str(&added);
+            wl_shell_notes::write_atomic(&path, &text)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            self.touch_note(&path);
         }
         Ok(())
     }
@@ -2552,6 +2595,7 @@ impl WlNote {
                 NoteRequest::Nothing => Err("nothing asked".into()),
                 NoteRequest::New(new) => self.new_note(core, new),
                 NoteRequest::Focus(note) => self.focus_request(core, note.as_deref()),
+                NoteRequest::Screenshot(s) => self.screenshot_request(core, s),
                 NoteRequest::Keep(query) => (|| {
                     self.scan_scratch();
                     let index = self
@@ -2621,6 +2665,188 @@ impl WlNote {
         };
         self.focus_note(core, &key);
         Ok(())
+    }
+
+    // -- screenshots --------------------------------------------------------
+
+    /// `wl-note screenshot`: onto the note named so, else the open note,
+    /// else (or with `--new`) a new one.
+    fn screenshot_request(
+        &mut self,
+        core: &mut Core<Self>,
+        req: ipc::Screenshot,
+    ) -> Result<(), String> {
+        let open = || {
+            self.columns
+                .iter()
+                .find_map(|c| c.open_key().map(String::from))
+        };
+        let target = match (&req.note, req.new) {
+            (Some(q), _) => {
+                self.notes_touched = true;
+                self.rescan(core);
+                let notes: Vec<(&Path, Option<&str>)> = (self.index.iter())
+                    .map(|(p, e)| (p, e.note.title()))
+                    .collect();
+                let found = find::find(self.index.dir(), &notes, q)?;
+                ShotTarget::Note(found.to_string_lossy().into_owned())
+            }
+            (None, false) if let Some(key) = open() => ShotTarget::Note(key),
+            (None, _) => ShotTarget::New(self.window().map(|w| w.app_id.clone())),
+        };
+        self.start_screenshot(core, target)
+    }
+
+    /// Take a screenshot onto `target`: the columns get out of the way
+    /// first (`advance_screenshot` goes on once they are).
+    fn start_screenshot(&mut self, core: &Core<Self>, target: ShotTarget) -> Result<(), String> {
+        if self.screenshot.is_some() {
+            return Err("a screenshot is being taken already".into());
+        }
+        let shot = Screenshot::new(core, target, self.fonts.clone())?;
+        for column in &mut self.columns {
+            column.stow();
+        }
+        self.screenshot = Some(shot);
+        // To look again once the wait is over, if nothing else comes.
+        for wait in [SHOT_HIDE_WAIT, SHOT_CAPTURE_WAIT] {
+            if let Err(e) = core.timer(wait, |_: &mut Self, _| {}) {
+                warn!("screenshot: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Go on with the screenshot: capture once the columns are out of
+    /// the way, and show the overlays once the frames are in.
+    fn advance_screenshot(&mut self, core: &Core<Self>) {
+        let Some(shot) = &mut self.screenshot else {
+            return;
+        };
+        // Columns made meanwhile too.
+        for column in &mut self.columns {
+            column.stow();
+        }
+        let result = match shot.phase {
+            Phase::Hiding => {
+                let hidden = self.columns.iter().all(Column::stowed);
+                match hidden || shot.since.elapsed() >= SHOT_HIDE_WAIT {
+                    true => shot.capture(core),
+                    false => Ok(()),
+                }
+            }
+            Phase::Capturing if shot.captured() => shot.show(),
+            Phase::Capturing if shot.since.elapsed() >= SHOT_CAPTURE_WAIT => {
+                Err("the outputs' frames didn't come".into())
+            }
+            _ => Ok(()),
+        };
+        if let Err(e) = result {
+            warn!("screenshot: {e}");
+            self.end_screenshot();
+        }
+    }
+
+    /// The screenshot is over (taken or not): the overlays go, and the
+    /// columns come back as they were.
+    fn end_screenshot(&mut self) {
+        self.screenshot = None;
+        for column in &mut self.columns {
+            column.unstow();
+        }
+        self.dirty = true;
+    }
+
+    /// What an event on the overlays asked for.
+    fn screenshot_outcome(&mut self, core: &Core<Self>, outcome: Outcome) {
+        let copy = match outcome {
+            Outcome::Nothing => return,
+            Outcome::Cancel => return self.end_screenshot(),
+            Outcome::Save { copy } => copy,
+        };
+        let Some(shot) = &mut self.screenshot else {
+            return;
+        };
+        let Some(taken) = shot.take() else {
+            // Nothing selected (or nothing left of it): keep selecting.
+            return;
+        };
+        // Saving since then: what tells this screenshot from a later one.
+        let since = shot.since;
+        // Encoded on a thread of its own; the overlays stay meanwhile (and
+        // keep the keyboard, for the clipboard).
+        let (send, result) = channel::channel();
+        let registered =
+            core.loop_handle
+                .insert_source(result, move |event, _, shell: &mut Shell<Self>| {
+                    if let channel::Event::Msg(png) = event {
+                        shell
+                            .program
+                            .screenshot_encoded(&mut shell.core, since, png, copy);
+                    }
+                });
+        let token = match registered {
+            Ok(token) => token,
+            Err(e) => {
+                warn!("screenshot: {e}");
+                return self.end_screenshot();
+            }
+        };
+        let started = std::thread::Builder::new()
+            .name("wl-note-screenshot".into())
+            .spawn(move || {
+                let _ = send.send(select::png(&taken.rgb, taken.width, taken.height));
+            });
+        if let Err(e) = started {
+            core.loop_handle.remove(token);
+            warn!("screenshot: {e}");
+            self.end_screenshot();
+        }
+    }
+
+    /// The screenshot is a PNG now: copy it (with Ctrl+C), save it with
+    /// the notes, and link it onto its note.
+    fn screenshot_encoded(
+        &mut self,
+        core: &mut Core<Self>,
+        since: Instant,
+        png: Result<Vec<u8>, String>,
+        copy: bool,
+    ) {
+        let Some(target) = (self.screenshot.as_ref())
+            .filter(|s| s.phase == Phase::Saving && s.since == since)
+            .map(|s| s.target.clone())
+        else {
+            return;
+        };
+        let png = match png {
+            Ok(png) => png,
+            Err(e) => {
+                warn!("screenshot: encoding: {e}");
+                return self.end_screenshot();
+            }
+        };
+        // While an overlay still has the keyboard.
+        if copy && let Err(e) = core.set_selection(vec![("image/png".into(), png.clone())]) {
+            warn!("screenshot: copying: {e}");
+        }
+        self.end_screenshot();
+        let result =
+            files::keep_image(self.index.dir(), "png", &png, None).and_then(
+                |dropped| match target {
+                    ShotTarget::Note(key) => self.add_to_note(&key, dropped, None),
+                    ShotTarget::New(app) => {
+                        let body = dropped.append("", "\n");
+                        let text = create::text(app.as_deref(), None, None, Some(&body), None)?;
+                        let key = self.write_new_note(core, &text)?;
+                        self.focus_note(core, &key);
+                        Ok(())
+                    }
+                },
+            );
+        if let Err(e) = result {
+            warn!("screenshot: {e}");
+        }
     }
 
     fn worker_done(&mut self, core: &Core<Self>, done: Done) {
@@ -2810,6 +3036,17 @@ impl Program for WlNote {
         self.update_context(core, None);
     }
 
+    fn capture_update(
+        &mut self,
+        _: &mut Core<Self>,
+        id: CaptureId,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
+    ) {
+        if let Some(shot) = self.screenshot.as_mut().filter(|s| s.has_capture(id)) {
+            shot.capture_update(id, f);
+        }
+    }
+
     fn output_new(&mut self, _: &mut Core<Self>, _: &WlOutput) {
         self.outputs_dirty = true;
     }
@@ -2819,6 +3056,11 @@ impl Program for WlNote {
     }
 
     fn output_removed(&mut self, core: &mut Core<Self>, output: &WlOutput) {
+        if let Some(shot) = &mut self.screenshot
+            && !shot.output_removed(output)
+        {
+            self.end_screenshot();
+        }
         self.remove_columns(core, |c| c.output == *output);
         self.outputs_dirty = true;
     }
@@ -2826,6 +3068,9 @@ impl Program for WlNote {
     /// The compositor closed a column, e.g. because its output is going
     /// away. It comes back if the outputs or the config change.
     fn layer_closed(&mut self, core: &mut Core<Self>, layer: &LayerSurface) {
+        if self.screenshot.as_ref().is_some_and(|s| s.is(layer)) {
+            return self.end_screenshot();
+        }
         self.remove_columns(core, |c| c.is(layer));
     }
 
@@ -2835,6 +3080,10 @@ impl Program for WlNote {
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
     ) {
+        if let Some(shot) = self.screenshot.as_mut().filter(|s| s.is(layer)) {
+            let (width, height) = configure.new_size;
+            return shot.configure(layer, width, height);
+        }
         if let Some(column) = self.columns.iter_mut().find(|c| c.is(layer)) {
             let (width, height) = configure.new_size;
             column.configure(width, height);
@@ -2848,6 +3097,12 @@ impl Program for WlNote {
     }
 
     fn pointer(&mut self, core: &mut Core<Self>, event: &PointerEvent) {
+        if let Some(shot) = &mut self.screenshot
+            && shot.owns_surface(&event.surface)
+        {
+            let outcome = shot.pointer(core, event);
+            return self.screenshot_outcome(core, outcome);
+        }
         let Some(i) = self.column_at(&event.surface) else {
             return;
         };
@@ -2860,6 +3115,12 @@ impl Program for WlNote {
         let Some(surface) = core.input.keyboard_focus().cloned() else {
             return;
         };
+        if let Some(shot) = &mut self.screenshot
+            && shot.owns_surface(&surface)
+        {
+            let outcome = shot.key(event, &core.input.modifiers);
+            return self.screenshot_outcome(core, outcome);
+        }
         let Some(i) = self.column_at(&surface) else {
             return;
         };

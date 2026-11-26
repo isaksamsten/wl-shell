@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 
 /// Sticky notes along a screen edge, belonging to apps: the notes shown
 /// follow the focused window. Start it with the compositor. `new`,
-/// `keep`, `focus` and `show --focus` ask the running wl-note; the other
+/// `keep`, `focus`, `screenshot` and `show --focus` ask the running
+/// wl-note; the other
 /// commands work directly with the files.
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -88,6 +89,16 @@ pub enum Cmd {
     Focus {
         #[arg(value_name = "NOTE")]
         note: Option<String>,
+    },
+    /// Take a screenshot: select an area of the screen and put it on a
+    /// note (a path, file name or title); without one, on the open note,
+    /// else on a new one (asks the running wl-note)
+    Screenshot {
+        #[arg(value_name = "NOTE", conflicts_with = "new")]
+        note: Option<String>,
+        /// Onto a new note for the focused app
+        #[arg(long)]
+        new: bool,
     },
     /// Hide a note: it stays on disk, but isn't shown until `show`
     Hide {
@@ -253,6 +264,32 @@ mod tests {
         assert_eq!(o.command, Some(Cmd::Outputs));
         assert!(o.config.is_some());
         assert!(parse(&["outputs", "--output", "DP-1"]).is_err());
+    }
+
+    #[test]
+    fn screenshot_command() {
+        assert_eq!(
+            parse(&["screenshot"]).unwrap().command,
+            Some(Cmd::Screenshot {
+                note: None,
+                new: false
+            })
+        );
+        assert_eq!(
+            parse(&["screenshot", "--new"]).unwrap().command,
+            Some(Cmd::Screenshot {
+                note: None,
+                new: true
+            })
+        );
+        assert_eq!(
+            parse(&["screenshot", "groceries"]).unwrap().command,
+            Some(Cmd::Screenshot {
+                note: Some("groceries".into()),
+                new: false
+            })
+        );
+        assert!(parse(&["screenshot", "groceries", "--new"]).is_err());
     }
 
     #[test]

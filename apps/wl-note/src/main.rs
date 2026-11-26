@@ -25,6 +25,7 @@ mod papers;
 mod reorder;
 mod row;
 mod scratch;
+mod select;
 mod shelf;
 mod template;
 
@@ -64,7 +65,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// `new`, `keep`, `focus` and `show --focus` ask the running wl-note.
+/// `new`, `keep`, `focus`, `screenshot` and `show --focus` ask the
+/// running wl-note.
 /// Other commands only read or change files.
 fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
     match cmd {
@@ -115,6 +117,13 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         }
         Cmd::Keep { note } => {
             return wl_shell_daemon::client_to(&NoteRequest::Keep(note.clone()), MISSING);
+        }
+        Cmd::Screenshot { note, new } => {
+            let req = NoteRequest::Screenshot(ipc::Screenshot {
+                note: note.clone(),
+                new: *new,
+            });
+            return wl_shell_daemon::client_to(&req, MISSING);
         }
         Cmd::List {
             scratch: true,
@@ -175,7 +184,12 @@ fn command(opts: &Options, cmd: &Cmd) -> ExitCode {
         warn!("{e}");
     }
     let result = match cmd {
-        Cmd::New { .. } | Cmd::Focus { .. } | Cmd::Keep { .. } | Cmd::Path | Cmd::Outputs => {
+        Cmd::New { .. }
+        | Cmd::Focus { .. }
+        | Cmd::Keep { .. }
+        | Cmd::Screenshot { .. }
+        | Cmd::Path
+        | Cmd::Outputs => {
             unreachable!("done above")
         }
         Cmd::Due { note, when } => find_note(&index, note).and_then(|path| {

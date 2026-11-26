@@ -12,7 +12,8 @@
 //! Buffers are dmabufs when the session offers a device and a format the
 //! compositor accepts (the copy stays on the GPU), and shm otherwise. A
 //! session whose dmabuf allocation or first dmabuf frame fails switches to
-//! shm.
+//! shm. A capture that needs its pixels (a screenshot to save) is shm
+//! from the start, and `pixels` reads a frame's memory.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -71,6 +72,16 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub transform: Transform,
+}
+
+/// A frame's memory, as captured: `stride` bytes per row, in `format`
+/// (one of the 32-bit RGB formats: X/ARGB8888 or X/ABGR8888).
+pub struct Pixels<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: wl_shm::Format,
 }
 
 enum State {
@@ -189,18 +200,22 @@ impl Capture {
     }
 
     /// Capture one frame of `output`, without cursors (the compositor draws
-    /// the real one). None without ext_output_image_capture_source_manager_v1.
+    /// the real one). With `pixels`, its buffers are shm, so `pixels` can
+    /// read the frame. None without ext_output_image_capture_source_manager_v1.
     pub fn output<P: Program>(
         id: CaptureId,
         output: &WlOutput,
         g: &Globals,
+        pixels: bool,
         qh: &QueueHandle<Shell<P>>,
     ) -> Option<Self> {
         let source = g
             .output_source_manager
             .as_ref()?
             .create_source(output, qh, Ignore);
-        Some(Self::new(id, source, g, false, false, qh))
+        let mut capture = Self::new(id, source, g, false, false, qh);
+        capture.no_dmabuf = pixels;
+        Some(capture)
     }
 
     fn new<P: Program>(
@@ -491,6 +506,28 @@ impl Capture {
     /// handed out before a reallocation are gone and must not be attached.
     pub fn owns(&self, buffer: &WlBuffer) -> bool {
         (self.buffers.as_ref()).is_some_and(|b| b.slots.contains(buffer))
+    }
+
+    /// The memory of the frame in `buffer` (one this capture handed out),
+    /// if its buffers are shm: what the compositor copied into it, valid
+    /// until the buffer is captured into again (never, for a capture that
+    /// isn't live).
+    pub fn pixels(&mut self, buffer: &WlBuffer) -> Option<Pixels<'_>> {
+        let bufs = self.buffers.as_mut()?;
+        let slot = bufs.slots.iter().position(|s| s == buffer)?;
+        let (Kind::Shm(format), Storage::Shm(pool)) = (&bufs.kind, &mut bufs._storage) else {
+            return None;
+        };
+        let stride = bufs.width.checked_mul(4)?;
+        let size = stride.checked_mul(bufs.height)? as usize;
+        let data = pool.mmap().get(size * slot..size * (slot + 1))?;
+        Some(Pixels {
+            data,
+            width: bufs.width,
+            height: bufs.height,
+            stride,
+            format: *format,
+        })
     }
 
     /// The program replaced a frame it never attached, so the compositor

@@ -2846,6 +2846,7 @@ dependencies = [
  "clap",
  "libc",
  "nucleo-matcher",
+ "png",
  "pulldown-cmark",
  "serde",
  "smithay-client-toolkit",

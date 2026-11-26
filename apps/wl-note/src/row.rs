@@ -14,17 +14,19 @@ pub enum Button {
     Window,
     Global,
     Paste,
+    Screenshot,
     Templates,
     Hidden,
     Due,
 }
 
 impl Button {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Undo,
         Self::Window,
         Self::Global,
         Self::Paste,
+        Self::Screenshot,
         Self::Templates,
         Self::Hidden,
         Self::Due,
@@ -36,6 +38,7 @@ impl Button {
             Self::Window => "builtin:note-window",
             Self::Global => "builtin:note-global",
             Self::Paste => "builtin:note-paste",
+            Self::Screenshot => "builtin:screenshot",
             Self::Templates => "builtin:note-templates",
             Self::Hidden => "builtin:note-hidden",
             Self::Due => "builtin:clock",
@@ -55,6 +58,8 @@ pub struct Available {
     pub undo: Option<Removed>,
     pub window: bool,
     pub paste: bool,
+    /// Outputs can be captured, for screenshots.
+    pub screenshot: bool,
     /// How many templates there are.
     pub templates: usize,
     /// The notes hidden from this context, and those hidden anywhere.
@@ -92,6 +97,7 @@ pub fn label(button: Button, state: Available) -> String {
         Button::Window => "New scratch note for this window".into(),
         Button::Global => "New note for all apps".into(),
         Button::Paste => "New note from clipboard".into(),
+        Button::Screenshot => "New note from a screenshot".into(),
         Button::Templates => "New note from template".into(),
         Button::Hidden => match (state.hidden_here, state.hidden_all) {
             (0, all) => format!("Hidden notes (none here, {all} elsewhere)"),
@@ -121,6 +127,7 @@ pub fn buttons(order: &[Button], state: Available, mode: Mode) -> Vec<Button> {
             Button::Window => state.window && mode != Mode::Closed,
             Button::Global => mode != Mode::Closed,
             Button::Paste => state.paste && mode == Mode::Rest,
+            Button::Screenshot => state.screenshot && mode == Mode::Rest,
             Button::Templates => state.templates > 0 && mode == Mode::Rest,
             Button::Hidden => state.hidden_all > 0 && mode == Mode::Rest,
             Button::Due => state.due_all > 0 && mode == Mode::Rest,
@@ -343,6 +350,28 @@ mod tests {
             ..some
         };
         assert_eq!(buttons(&order, due, Mode::Rest), [Due]);
+    }
+
+    #[test]
+    fn screenshot_shows_at_rest_with_the_protocol() {
+        let order = [Paste, Screenshot];
+        let none = Available::default();
+        let some = Available {
+            screenshot: true,
+            ..none
+        };
+        for mode in [Mode::Closed, Mode::Drag, Mode::Rest] {
+            assert!(buttons(&order, none, mode).is_empty());
+        }
+        assert!(buttons(&order, some, Mode::Drag).is_empty());
+        assert!(buttons(&order, some, Mode::Closed).is_empty());
+        assert_eq!(buttons(&order, some, Mode::Rest), [Screenshot]);
+        assert_eq!(label(Screenshot, some), "New note from a screenshot");
+        assert_eq!(count(Screenshot, some), None);
+        // After Paste by default.
+        let all = Button::ALL;
+        let at = |b| all.iter().position(|x| *x == b).unwrap();
+        assert_eq!(at(Screenshot), at(Paste) + 1);
     }
 
     #[test]

@@ -415,6 +415,8 @@ pub enum Act {
     Due(String, Option<String>),
     Trash(String),
     RemoveFile(String, PathBuf),
+    /// Take a screenshot onto this note.
+    Screenshot(String),
     /// This note was dropped at this slot of these notes (the group it
     /// lands in, in order).
     Reorder(String, Vec<String>, usize),
@@ -477,6 +479,8 @@ enum BarHit {
     Trash,
     Archive,
     Pin,
+    /// The camera: a screenshot onto the note.
+    Screenshot,
 }
 
 /// Where the parts of a sheet's file bar are, on the surface.
@@ -491,6 +495,8 @@ struct BarLayout {
     trash: Option<Rect>,
     archive: Option<Rect>,
     pin: Option<Rect>,
+    /// The camera, on an open sheet's bar and on the shelf's caption line.
+    cameras: Vec<Rect>,
     hit_pad: f64,
     /// Where names go: from `name_x`, up to `name_end`, centered on
     /// `mid`.
@@ -777,6 +783,22 @@ pub struct Column {
     /// On its way out, e.g. to another output: its notes slide away, and
     /// the program drops it once they are gone (`retired`).
     pub retiring: bool,
+    /// Out of the way of a screenshot.
+    stow: Stow,
+    /// Frame callbacks asked for and done.
+    frames: (u64, u64),
+}
+
+/// Whether the column is out of the way of a screenshot: nothing of it
+/// shows and nothing takes input, while its state (the open note, the
+/// shelf) stays for when it comes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stow {
+    Shown,
+    /// Hidden by the commit whose frame callback is the n-th asked for.
+    Hiding(u64),
+    /// That commit is on screen.
+    Hidden,
 }
 
 impl BarSubs {
@@ -1022,6 +1044,8 @@ impl Column {
             clock: FrameClock::default(),
             attached: Vec::new(),
             retiring: false,
+            stow: Stow::Shown,
+            frames: (0, 0),
         };
         column.ask_standard_icons();
         Ok(column)
@@ -2215,6 +2239,7 @@ impl Column {
                 confirmed.then(|| Act::Trash(key.into()))
             }
             BarHit::Archive => Some(Act::Hide(key.to_string())),
+            BarHit::Screenshot => Some(Act::Screenshot(key.to_string())),
             BarHit::Pin => match &note.pin {
                 Pin::Unpinned(_) => Some(Act::Pin(key.to_string(), shift)),
                 Pin::Pinned { .. } => Some(Act::Unpin(key.to_string())),
@@ -2500,6 +2525,9 @@ impl Column {
                 return Some((key, hit));
             }
         }
+        if layout.cameras.iter().any(near) {
+            return Some((key, BarHit::Screenshot));
+        }
         if let Some((i, b, (x, y))) = self.shelf_at(&key, x, y) {
             let hit = self.file_hit(&key, i, shelf_icon(b), x, y);
             return Some((key, hit));
@@ -2773,6 +2801,7 @@ impl Column {
             self.named(&["builtin:close"]),
             self.named(&["builtin:shelf"]),
             self.named(&["builtin:back"]),
+            self.named(&["builtin:screenshot"]),
         ] {
             self.assets.named_icon(&key);
         }
@@ -3513,6 +3542,73 @@ impl Column {
         let surface = self.layer.wl_surface();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         self.frame_pending = true;
+        self.frames.0 += 1;
+    }
+
+    // -- screenshots ---------------------------------------------------------
+
+    /// Get out of the way of a screenshot: hide everything at once, and
+    /// know when that is on screen (`stowed`).
+    pub fn stow(&mut self) {
+        if self.stow != Stow::Shown {
+            return;
+        }
+        if !self.configured {
+            self.stow = Stow::Hidden;
+            return;
+        }
+        self.clear_all();
+        self.set_input(&[]);
+        self.input = Some(Vec::new());
+        // A callback of its own, even if one is pending for an earlier
+        // commit.
+        self.request_frame();
+        self.stow = Stow::Hiding(self.frames.0);
+        self.layer.commit();
+    }
+
+    /// Whether the column's hiding for a screenshot is on screen.
+    pub fn stowed(&self) -> bool {
+        self.stow == Stow::Hidden
+    }
+
+    /// Come back as it was after a screenshot; an open note (or drawer)
+    /// asks for the keyboard again.
+    pub fn unstow(&mut self) {
+        if self.stow == Stow::Shown {
+            return;
+        }
+        self.stow = Stow::Shown;
+        self.input = None;
+        if self.deck.open().is_some() {
+            self.keyboard = KeyboardInteractivity::None;
+            self.set_keyboard(KeyboardInteractivity::Exclusive);
+        }
+        self.clock.restart();
+        self.render();
+    }
+
+    /// Hide every subsurface.
+    fn clear_all(&mut self) {
+        for slot in &mut self.slots {
+            slot.sub.clear();
+            slot.under.clear();
+        }
+        for sub in (self.backdrops.iter_mut().flatten()).chain([
+            &mut self.plus,
+            &mut self.row_label,
+            &mut self.text,
+            &mut self.notice,
+        ]) {
+            sub.clear();
+        }
+        for slot in &mut self.row_slots {
+            slot.disc.clear();
+            slot.glyph.clear();
+            slot.count.clear();
+        }
+        self.open_bar.clear();
+        self.reveal_bar.clear();
     }
 
     /// Something changed: draw it on the next frame.
@@ -3528,6 +3624,12 @@ impl Column {
     /// The frame callback, with its timestamp: advance the springs and draw.
     pub fn frame_done(&mut self, time: u32) {
         self.frame_pending = false;
+        self.frames.1 += 1;
+        if let Stow::Hiding(n) = self.stow
+            && self.frames.1 >= n
+        {
+            self.stow = Stow::Hidden;
+        }
         let dt = self.clock.tick(time);
         let moving = self.deck.advance(dt);
         for slot in &mut self.row_slots {
@@ -3544,6 +3646,12 @@ impl Column {
     /// another frame while anything moves.
     pub fn render(&mut self) {
         if !self.configured || self.width == 0 || self.height == 0 {
+            return;
+        }
+        if self.stow != Stow::Shown {
+            // Nothing shows until it comes back, which draws it all.
+            self.clock.stop();
+            self.layer.commit();
             return;
         }
         self.place_all();
@@ -3753,10 +3861,19 @@ impl Column {
         let mid = bar.y + bar.h / 2.0;
         let preview_palette = !open && note.pin != Pin::Locked;
         let has_details = !note.files.is_empty() || note.due.is_some();
-        let slots = if open {
+        let grid = self.showing_files(key);
+        let camera = open && self.row_available.screenshot;
+        // A hovered sheet has the camera too, at the bar's end, for a
+        // screenshot in one click (on the shelf, its own camera is there).
+        let preview_camera = !open && !grid && self.row_available.screenshot;
+        let slots = if camera {
+            8.0
+        } else if open {
             7.0
         } else if preview_palette && has_details {
-            3.0
+            if preview_camera { 4.0 } else { 3.0 }
+        } else if preview_camera {
+            2.0
         } else {
             1.0
         };
@@ -3769,24 +3886,28 @@ impl Column {
         let palette_open = open && self.palette_since.is_some();
         // The color row slides over the clock, which is out of its way.
         let clock = control(if note.scratch { 3 } else { 4 }).filter(|_| !palette_open);
+        // The camera, the first control, left of the clock; on a hovered
+        // sheet, at the bar's end.
+        let camera = if open {
+            (control(if note.scratch { 4 } else { 5 })).filter(|_| camera && !palette_open)
+        } else {
+            preview_camera.then(|| rect(bar.right() - size))
+        };
         // Leave room for attachments or the due label beside the preview palette.
         let palette_left = if preview_palette && has_details {
             bar.x + bar.w / 3.0
         } else {
             bar.x
         };
-        let file_end = clock.or(color).map_or_else(
-            || {
-                if preview_palette {
-                    palette_left
-                } else {
-                    bar.right()
-                }
-            },
-            |r| r.x - (pitch - size),
-        );
+        let file_end = if preview_palette {
+            palette_left
+        } else {
+            camera
+                .or(clock)
+                .or(color)
+                .map_or(bar.right(), |r| r.x - (pitch - size))
+        };
         let count = note.files.len();
-        let grid = self.showing_files(key);
         let swatches = match (color, self.palette_since) {
             (Some(dot), Some(start)) => {
                 let p = (start.elapsed().as_secs_f64() / PALETTE_TIME.as_secs_f64()).min(1.0);
@@ -3795,7 +3916,9 @@ impl Column {
                 colors.into_iter().zip(rects).collect()
             }
             _ if preview_palette => {
-                let anchor = rect(bar.right());
+                // Up to the bar's end, or to the camera there.
+                let anchor =
+                    camera.map_or(rect(bar.right()), |c| rect(c.x - (pitch - size).max(4.0)));
                 let colors: Vec<_> = bar::colors(note.color).collect();
                 let rects = bar::palette(palette_left, anchor, colors.len(), 1.0);
                 colors.into_iter().zip(rects).collect()
@@ -3822,6 +3945,11 @@ impl Column {
             _ => Vec::new(),
         };
         let picking = !due_row.is_empty();
+        // On the shelf, the camera is at the caption line's end too.
+        let shelf_camera = (grid && self.row_available.screenshot)
+            .then(|| self.shelf_layout(key))
+            .flatten()
+            .map(|shelf| shelf_camera(shelf.caption));
         let shelf = (count > 0 && !palette_open && !picking)
             .then(|| (if grid { 0 } else { count }, slot(0)));
         let used = usize::from(count > 0);
@@ -3829,6 +3957,9 @@ impl Column {
             shelf,
             // The due row takes the whole bar: the controls step aside.
             pin: control(0).filter(|_| !picking),
+            cameras: (camera.filter(|_| !picking).into_iter())
+                .chain(shelf_camera)
+                .collect(),
             archive: if note.scratch { None } else { control(1) }.filter(|_| !picking),
             trash: control(if note.scratch { 1 } else { 2 }).filter(|_| !picking),
             color: color.filter(|_| !picking),
@@ -3853,6 +3984,9 @@ impl Column {
                 *r = turn(*r);
             }
             for (_, r) in &mut layout.swatches {
+                *r = turn(*r);
+            }
+            for r in &mut layout.cameras {
                 *r = turn(*r);
             }
             let (x, mid) = rotate((layout.name_x, layout.mid), (cx, cy), tilt);
@@ -4769,6 +4903,16 @@ impl Column {
             let icon = self.archive_icon();
             plan.archive = Some((self.icon_buffer(&icon, tint), rect, a));
         }
+        for &rect in &layout.cameras {
+            let a = if hover == Some(BarHit::Screenshot) {
+                1.0
+            } else {
+                0.75
+            };
+            let icon = self.named(&["builtin:screenshot"]);
+            plan.icons
+                .push((self.icon_buffer(&icon, Some(ink)), rect, a));
+        }
         // The name of what is hovered.
         // The name of what is hovered (on the shelf, what the keys are on).
         let cursor = (self.all_files[self.view_index(key)].as_ref())
@@ -4834,6 +4978,7 @@ impl Column {
                 false,
             )),
             Some(BarHit::Archive) => Some((ARCHIVE_LABEL.to_string(), false)),
+            Some(BarHit::Screenshot) => Some(("Add a screenshot".into(), false)),
             Some(BarHit::Pin) => Some((pin_label(&pin), false)),
             _ => None,
         };
@@ -4843,6 +4988,7 @@ impl Column {
                 Some(
                     BarHit::Pin
                         | BarHit::Archive
+                        | BarHit::Screenshot
                         | BarHit::Trash
                         | BarHit::Color
                         | BarHit::Swatch(_)
@@ -4993,7 +5139,10 @@ impl Column {
         let caption = LineKey {
             text: shelf::caption(count, missing),
             color: (ink & !0xff) | 0x99,
-            width: shelf.caption.w as i32,
+            width: match self.row_available.screenshot {
+                true => (shelf.caption.w - ICON - 6.0) as i32,
+                false => shelf.caption.w as i32,
+            },
             strike: false,
             tooltip: false,
             badge: false,
@@ -5205,6 +5354,12 @@ fn place_image(
 fn shelf_icon(b: Rect) -> Rect {
     let (cx, size) = (b.center().0, SHELF_ICON);
     Rect::new(cx - size / 2.0, b.bottom() - size, size, size)
+}
+
+/// Where the shelf's camera is: at its caption line's end.
+fn shelf_camera(caption: Rect) -> Rect {
+    let y = caption.y + (caption.h - ICON) / 2.0;
+    Rect::new(caption.right() - ICON, y, ICON, ICON)
 }
 
 fn remove_rect(icon: Rect) -> Rect {

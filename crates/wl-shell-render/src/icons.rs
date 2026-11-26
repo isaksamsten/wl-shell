@@ -339,6 +339,7 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
         "builtin:clock" => Some(include_bytes!("../assets/clock.svg")),
         "builtin:shelf" => Some(include_bytes!("../assets/shelf.svg")),
         "builtin:back" => Some(include_bytes!("../assets/back.svg")),
+        "builtin:screenshot" => Some(include_bytes!("../assets/screenshot.svg")),
         "builtin:note-undo" => Some(include_bytes!("../assets/note-undo.svg")),
         "builtin:note-window" => Some(include_bytes!("../assets/note-window.svg")),
         "builtin:note-global" => Some(include_bytes!("../assets/note-global.svg")),
@@ -1126,7 +1127,18 @@ mod tests {
             let clock = find("builtin:clock", size, "nonexistent-theme").unwrap();
             let shelf = find("builtin:shelf", size, "nonexistent-theme").unwrap();
             let back = find("builtin:back", size, "nonexistent-theme").unwrap();
-            for icon in [&pin, &unpin, &archive, &trash, &close, &clock, &shelf, &back] {
+            let screenshot = find("builtin:screenshot", size, "nonexistent-theme").unwrap();
+            for icon in [
+                &pin,
+                &unpin,
+                &archive,
+                &trash,
+                &close,
+                &clock,
+                &shelf,
+                &back,
+                &screenshot,
+            ] {
                 assert_eq!((icon.width, icon.height), (size, size));
                 assert!(icon.data.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
             }

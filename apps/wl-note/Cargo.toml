@@ -18,6 +18,7 @@ wl-shell-ui.workspace = true
 clap.workspace = true
 libc.workspace = true
 nucleo-matcher.workspace = true
+png.workspace = true
 pulldown-cmark.workspace = true
 serde.workspace = true
 smithay-client-toolkit.workspace = true
