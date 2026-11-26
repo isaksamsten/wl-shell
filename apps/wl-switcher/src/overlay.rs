@@ -1242,6 +1242,9 @@ impl Overlay {
             .map(|a| self.icon_key(&a.app_id))
             .collect();
         let icon_size = self.style.icon_size as f64;
+        // Gated as a whole: without wp_alpha_modifier_v1, both labels of a
+        // crossfade would show fully.
+        let label_alphas = [0, 1].map(|k| self.gate(base * (1.0 - morph) * self.label.alpha(k)));
         let scene = &mut self.scene;
 
         if let (Some(dim), Some(buffer)) = (&mut scene.dim, &self.dim_buffer) {
@@ -1335,7 +1338,7 @@ impl Overlay {
             } else {
                 (center - w / 2.0).clamp(lo, hi - w)
             };
-            let a = sel_alpha * self.label.alpha(k);
+            let a = label_alphas[k];
             if a <= 0.0 {
                 sub.hide();
                 sub.commit();
