@@ -337,6 +337,8 @@ fn find(name: &str, size: u32, theme: &str) -> Option<Image> {
         "builtin:trash" => Some(include_bytes!("../assets/trash.svg")),
         "builtin:close" => Some(include_bytes!("../assets/close.svg")),
         "builtin:clock" => Some(include_bytes!("../assets/clock.svg")),
+        "builtin:shelf" => Some(include_bytes!("../assets/shelf.svg")),
+        "builtin:back" => Some(include_bytes!("../assets/back.svg")),
         "builtin:note-undo" => Some(include_bytes!("../assets/note-undo.svg")),
         "builtin:note-window" => Some(include_bytes!("../assets/note-window.svg")),
         "builtin:note-global" => Some(include_bytes!("../assets/note-global.svg")),
@@ -634,9 +636,9 @@ pub(crate) fn decode(path: &Path, size: u32) -> Result<Image, String> {
 }
 
 /// RGBA8 pixels with premultiplied alpha.
-struct Premultiplied(image::RgbaImage);
+pub(crate) struct Premultiplied(pub(crate) image::RgbaImage);
 
-fn premultiply_rgba(img: &mut image::RgbaImage) {
+pub(crate) fn premultiply_rgba(img: &mut image::RgbaImage) {
     for p in img.pixels_mut() {
         let a = p.0[3] as u32;
         for c in &mut p.0[..3] {
@@ -657,7 +659,7 @@ fn fit(w: u32, h: u32, size: u32) -> (u32, u32) {
     )
 }
 
-fn render_svg(data: &[u8], size: u32) -> Result<Premultiplied, String> {
+pub(crate) fn render_svg(data: &[u8], size: u32) -> Result<Premultiplied, String> {
     use resvg::{tiny_skia, usvg};
     let tree = usvg::Tree::from_data(data, &usvg::Options::default()).map_err(|e| e.to_string())?;
     let svg = tree.size();
@@ -1122,7 +1124,9 @@ mod tests {
             let trash = find("builtin:trash", size, "nonexistent-theme").unwrap();
             let close = find("builtin:close", size, "nonexistent-theme").unwrap();
             let clock = find("builtin:clock", size, "nonexistent-theme").unwrap();
-            for icon in [&pin, &unpin, &archive, &trash, &close, &clock] {
+            let shelf = find("builtin:shelf", size, "nonexistent-theme").unwrap();
+            let back = find("builtin:back", size, "nonexistent-theme").unwrap();
+            for icon in [&pin, &unpin, &archive, &trash, &close, &clock, &shelf, &back] {
                 assert_eq!((icon.width, icon.height), (size, size));
                 assert!(icon.data.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
             }

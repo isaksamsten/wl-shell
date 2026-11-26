@@ -630,6 +630,91 @@ pub fn rounded(w: i32, h: i32, r: f64, color: u32, scale: i32) -> Image {
     image
 }
 
+/// A shelf's board is this thick: a lighter top face, then its front.
+pub const BOARD: i32 = 6;
+const BOARD_TOP: f32 = 2.0;
+/// The shadow a board casts on the paper under it.
+const BOARD_SHADOW: f32 = 5.0;
+
+/// A shelf's board, `w` logical pixels long, of wood (or kraft) in
+/// `color`, turned `tilt` degrees about its middle as the sheet it is on
+/// is, at `scale`: a top face catching the light, a darker front edge
+/// and a soft shadow under it. Returns the image and where it goes from
+/// the board's top left corner (before the tilt).
+pub fn board(w: i32, color: u32, tilt: f64, scale: i32) -> (Image, shadow::Rect) {
+    let s = scale.max(1);
+    let (wf, hf) = (w.max(1) as f32, BOARD as f32);
+    let sin = tilt.to_radians().sin().abs() as f32;
+    let pad_x = (BOARD_SHADOW * sin).ceil() as i32 + 1;
+    let pad_y = (wf / 2.0 * sin + BOARD_SHADOW).ceil() as i32 + 1;
+    let rect = shadow::Rect {
+        x: -pad_x,
+        y: -pad_y,
+        w: w.max(1) + 2 * pad_x,
+        h: BOARD + 2 * pad_y,
+    };
+    let (bw, bh) = ((rect.w * s) as u32, (rect.h * s) as u32);
+    let blank = Image {
+        width: bw,
+        height: bh,
+        data: vec![0; (bw * bh * 4) as usize],
+    };
+    let Some(mut pixmap) = Pixmap::new(bw, bh) else {
+        return (blank, rect);
+    };
+    let xf = Transform::from_scale(s as f32, s as f32)
+        .pre_translate(pad_x as f32 + wf / 2.0, pad_y as f32 + hf / 2.0)
+        .pre_rotate(tilt as f32)
+        .pre_translate(-wf / 2.0, -hf / 2.0);
+    let gradient = |y0: f32, y1: f32, from: u32, to: u32| {
+        let stops = vec![
+            GradientStop::new(0.0, self::color(from)),
+            GradientStop::new(1.0, self::color(to)),
+        ];
+        let (a, b) = (Point::from_xy(0.0, y0), Point::from_xy(0.0, y1));
+        match LinearGradient::new(a, b, stops, SpreadMode::Pad, Transform::identity()) {
+            Some(shader) => Paint {
+                shader,
+                anti_alias: true,
+                ..Paint::default()
+            },
+            None => solid(from),
+        }
+    };
+    let parts = [
+        // The shadow, fading down the paper.
+        (
+            SkRect::from_xywh(1.0, hf, wf - 2.0, BOARD_SHADOW),
+            gradient(hf, hf + BOARD_SHADOW, 0x00000048, 0x00000000),
+        ),
+        (
+            SkRect::from_xywh(0.0, 0.0, wf, BOARD_TOP),
+            solid(shade(color, 0.14)),
+        ),
+        (
+            SkRect::from_xywh(0.0, BOARD_TOP, wf, hf - BOARD_TOP),
+            gradient(BOARD_TOP, hf, shade(color, -0.06), shade(color, -0.2)),
+        ),
+    ];
+    for (r, paint) in parts {
+        if let Some(r) = r {
+            pixmap.fill_rect(r, &paint, xf, None);
+        }
+    }
+    let mut data = Vec::with_capacity(blank.data.len());
+    for px in pixmap.data().as_chunks::<4>().0 {
+        data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    (
+        Image {
+            width: bw,
+            height: bh,
+            data,
+        },
+        rect,
+    )
+}
+
 /// `rgba` with its alpha times `f`.
 fn faint(rgba: u32, f: f64) -> u32 {
     let a = ((rgba & 0xff) as f64 * f).round().clamp(0.0, 255.0) as u32;
@@ -1051,5 +1136,23 @@ mod tests {
         assert!(!red(&r, 10, 30) && !red(&r, 60, 30));
         // The accent is part of what a sheet is drawn from.
         assert_ne!(with(Edge::Right, Some(accent)), with(Edge::Right, None));
+    }
+
+    #[test]
+    fn boards_turn_with_the_sheet() {
+        let (img, rect) = board(200, 0xd4b483ff, 0.0, 2);
+        assert_eq!((img.width as i32, img.height as i32), (rect.w * 2, rect.h * 2));
+        let alpha = |img: &Image, x: i32, y: i32| img.data[((y * img.width as i32 + x) * 4 + 3) as usize];
+        // Straight: the board is opaque from its top, its shadow fades under it.
+        let (x0, y0) = (-rect.x * 2, -rect.y * 2);
+        assert_eq!(alpha(&img, x0 + 200, y0 + 1), 255);
+        assert_eq!(alpha(&img, x0 + 200, y0 + BOARD * 2 - 1), 255);
+        assert!((1..255).contains(&alpha(&img, x0 + 200, y0 + BOARD * 2 + 1)));
+        assert_eq!(alpha(&img, x0 + 200, y0 - 2), 0);
+        // Turned, it needs more room, and its ends are higher or lower.
+        let (turned, r) = board(200, 0xd4b483ff, 3.0, 1);
+        assert!(r.h > rect.h);
+        let col = |x: i32| (0..turned.height as i32).find(|&y| alpha(&turned, x, y) == 255);
+        assert!(col(-r.x + 5).unwrap() < col(-r.x + 195).unwrap());
     }
 }

@@ -25,6 +25,7 @@ mod papers;
 mod reorder;
 mod row;
 mod scratch;
+mod shelf;
 mod template;
 
 use std::io::Read;

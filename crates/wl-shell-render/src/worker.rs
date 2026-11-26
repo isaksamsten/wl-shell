@@ -11,7 +11,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
+use std::time::SystemTime;
 
 use calloop::channel;
 
@@ -22,6 +24,7 @@ use crate::icons::{self, Icons};
 use crate::image::Image;
 use crate::mime::MimeDb;
 use crate::paper;
+use crate::shadow::IconShadow;
 use crate::text::{self, Text};
 use crate::ui;
 
@@ -90,6 +93,29 @@ pub struct PillRequest {
     pub max_width: i32,
     pub scale: i32,
     pub style: text::Style,
+}
+
+/// A file's preview (wl-note's shelf): fitted in a box `w`x`h` logical
+/// pixels at `scale`, as a print, in a white `border` (logical pixels)
+/// with `shadow` under it. The file's modification time is part of it,
+/// so a changed file is another preview.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PreviewKey {
+    pub path: PathBuf,
+    pub mtime: Option<SystemTime>,
+    pub w: u32,
+    pub h: u32,
+    pub scale: i32,
+    pub border: u32,
+    pub shadow: Option<IconShadow>,
+}
+
+impl PreviewKey {
+    /// How far the image reaches past the print on every side, logical
+    /// pixels.
+    pub fn pad(&self) -> i32 {
+        self.shadow.map_or(0, |s| s.pad())
+    }
 }
 
 pub enum Done {
@@ -183,17 +209,29 @@ pub enum Done {
     ImageFetched {
         src: String,
     },
+    /// A file's preview (`Assets::preview`); None if it has none (its
+    /// type icon stands in).
+    Preview {
+        key: PreviewKey,
+        image: Option<Arc<Image>>,
+    },
 }
 
 /// The worker, and what was requested from it and not received yet.
 pub struct Assets {
     jobs: mpsc::Sender<Job>,
+    /// Previews decode images, which can take a while: on a thread of
+    /// their own (started with the first), so labels and icons don't
+    /// wait for them.
+    previews: RefCell<Option<mpsc::Sender<PreviewKey>>>,
+    done: channel::Sender<Done>,
     icons: RefCell<Vec<icons::Key>>,
     /// Tiles on their way, with what they were asked for.
     tiles: RefCell<Vec<(icons::Key, ui::Request)>>,
     named: RefCell<Vec<icons::NamedIcon>>,
     labels: RefCell<Vec<LabelKey>>,
     entries: RefCell<Vec<String>>,
+    asked_previews: RefCell<Vec<PreviewKey>>,
 }
 
 impl Assets {
@@ -203,18 +241,49 @@ impl Assets {
     pub fn spawn() -> std::io::Result<(Self, channel::Channel<Done>)> {
         let (jobs, inbox) = mpsc::channel();
         let (done, results) = channel::channel();
+        let worker_done = done.clone();
         std::thread::Builder::new()
             .name(format!("{}-worker", wl_shell_log::name()))
-            .spawn(move || run(inbox, done))?;
+            .spawn(move || run(inbox, worker_done))?;
         let assets = Self {
             jobs,
+            previews: RefCell::new(None),
+            done,
             icons: RefCell::new(Vec::new()),
             tiles: RefCell::new(Vec::new()),
             named: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
             entries: RefCell::new(Vec::new()),
+            asked_previews: RefCell::new(Vec::new()),
         };
         Ok((assets, results))
+    }
+
+    /// Request the preview `key`, unless it is on its way already. It
+    /// arrives as `Done::Preview`. The previews' thread starts with the
+    /// first.
+    pub fn preview(&self, key: &PreviewKey) {
+        let mut pending = self.asked_previews.borrow_mut();
+        if pending.contains(key) {
+            return;
+        }
+        let mut thread = self.previews.borrow_mut();
+        if thread.is_none() {
+            let (jobs, inbox) = mpsc::channel();
+            let done = self.done.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("{}-previews", wl_shell_log::name()))
+                .spawn(move || run_previews(inbox, done));
+            match spawned {
+                Ok(_) => *thread = Some(jobs),
+                Err(e) => return wl_shell_log::warn!("previews: {e}"),
+            }
+        }
+        if let Some(jobs) = thread.as_ref()
+            && jobs.send(key.clone()).is_ok()
+        {
+            pending.push(key.clone());
+        }
     }
 
     /// Fire and forget: if the worker died, there are no icons or labels.
@@ -360,6 +429,7 @@ impl Assets {
                 self.tiles.borrow_mut().retain(|(k, _)| k != key);
             }
             Done::Named { key, .. } => self.named.borrow_mut().retain(|k| k != key),
+            Done::Preview { key, .. } => self.asked_previews.borrow_mut().retain(|k| k != key),
             Done::Label { key, .. } => self.labels.borrow_mut().retain(|k| k != key),
             Done::Entry { app_id, .. } => self.entries.borrow_mut().retain(|a| a != app_id),
             Done::IconsReloaded
@@ -375,6 +445,41 @@ impl Assets {
             | Done::Sheet { .. }
             | Done::Tile { .. }
             | Done::ImageFetched { .. } => {}
+        }
+    }
+}
+
+/// The previews' thread: each preview as asked, the plain images of the
+/// last few kept, as a print and its shadow may be asked for again.
+fn run_previews(inbox: mpsc::Receiver<PreviewKey>, done: channel::Sender<Done>) {
+    type Plain = (PathBuf, Option<SystemTime>, u32, u32);
+    let mut plain: Vec<(Plain, Option<Arc<Image>>)> = Vec::new();
+    while let Ok(key) = inbox.recv() {
+        let s = key.scale.max(1) as u32;
+        let border = key.border * s;
+        let (w, h) = (
+            (key.w * s).saturating_sub(2 * border).max(1),
+            (key.h * s).saturating_sub(2 * border).max(1),
+        );
+        let id = (key.path.clone(), key.mtime, w, h);
+        let image = match plain.iter().position(|(k, _)| *k == id) {
+            Some(i) => plain[i].1.clone(),
+            None => {
+                let image = files::preview(&key.path, w, h).map(Arc::new);
+                plain.insert(0, (id, image.clone()));
+                plain.truncate(32);
+                image
+            }
+        };
+        let image = image.map(|img| {
+            let print = files::print(&img, border);
+            Arc::new(match &key.shadow {
+                Some(shadow) => crate::shadow::icon(&print, shadow, key.scale),
+                None => print,
+            })
+        });
+        if done.send(Done::Preview { key, image }).is_err() {
+            return;
         }
     }
 }

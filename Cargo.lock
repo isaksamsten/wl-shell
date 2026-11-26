@@ -2937,6 +2937,7 @@ dependencies = [
  "freedesktop-desktop-entry",
  "freedesktop-icons",
  "image",
+ "png",
  "resvg",
  "svgtypes",
  "taffy",

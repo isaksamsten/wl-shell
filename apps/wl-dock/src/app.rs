@@ -4712,7 +4712,7 @@ impl WlDock {
                     d.image_arrived(&src);
                 }
             }
-            Done::Paper { .. } | Done::Doc { .. } => {}
+            Done::Paper { .. } | Done::Doc { .. } | Done::Preview { .. } => {}
         }
     }
 

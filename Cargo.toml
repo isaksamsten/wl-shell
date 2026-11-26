@@ -39,6 +39,7 @@ libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored", "send", "serialize"] }
 nucleo = "0.5"
 nucleo-matcher = "0.3"
+png = "0.18"
 pulldown-cmark = { version = "0.13", default-features = false }
 resvg = { version = "0.50", default-features = false, features = ["raster-images"] }
 rustix = { version = "1", features = ["process"] }

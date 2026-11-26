@@ -1201,9 +1201,14 @@ impl WlNote {
         };
         let content = Content::of_note(note, &list::name(path));
         let files = (bar::files(&content.links).into_iter())
-            .map(|path| FileLink {
-                exists: path.exists(),
-                path,
+            .map(|path| {
+                let meta = std::fs::metadata(&path).ok();
+                FileLink {
+                    exists: meta.is_some(),
+                    size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
+                    mtime: meta.and_then(|m| m.modified().ok()),
+                    path,
+                }
             })
             .collect();
         let (group, pin, cross) = if scratch {
@@ -2635,6 +2640,11 @@ impl WlNote {
             Done::FileIcons { path, icons } => {
                 for column in &mut self.columns {
                     column.file_icons_ready(path.clone(), icons.clone());
+                }
+            }
+            Done::Preview { key, image } => {
+                for column in &mut self.columns {
+                    column.preview_ready(&key, image.clone());
                 }
             }
             Done::Named { key, image } => {

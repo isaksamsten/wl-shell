@@ -143,7 +143,8 @@ impl WlSwitcher {
             | Done::Ui { .. }
             | Done::Sheet { .. }
             | Done::Tile { .. }
-            | Done::ImageFetched { .. } => {}
+            | Done::ImageFetched { .. }
+            | Done::Preview { .. } => {}
         }
     }
 

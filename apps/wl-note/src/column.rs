@@ -25,9 +25,13 @@
 //!   thread, and the bar's icons above the paper.
 //!
 //! The file bar's icons are subsurfaces too (thumbnails or type icons,
-//! monochrome in the note's text color until hovered), with the hovered
-//! one's name beside them, and on an open sheet the archive and pin icons
-//! at its end.
+//! monochrome in the note's text color until hovered): the shelf button
+//! first, then the newest files, with the hovered one's name beside them,
+//! and on an open sheet the controls at its end. The shelf button swaps
+//! the sheet's text for the shelf (shelf.rs): every file on boards, as
+//! previews (or type icons) standing on them, scrolled by rows. Its
+//! boards, prints and labels are subsurfaces at the tilted sheet's turned
+//! centers, the boards drawn turned with it.
 //!
 //! At header level a margin can be dragged along the column to reorder
 //! it (deck.rs, reorder.rs): a press on a margin opens it on release,
@@ -87,7 +91,7 @@ use wl_shell_render::icons::NamedIcon;
 use wl_shell_render::paper::{self, Paper};
 use wl_shell_render::shadow::IconShadow;
 use wl_shell_render::text::{self, Field, Text};
-use wl_shell_render::worker::{Assets, PillRequest};
+use wl_shell_render::worker::{Assets, PillRequest, PreviewKey};
 use wl_shell_ui::anim::Spring;
 use wl_shell_ui::cache::shm_buffer;
 use wl_shell_ui::geom::clip;
@@ -105,6 +109,7 @@ use crate::input::Field as FilterField;
 use crate::markdown::{self, Content};
 use crate::papers::{Papers, Sheet};
 use crate::row::{self, Available, Button, Mode};
+use crate::shelf::{self, Scroll};
 
 /// The text's distance from a sheet's body's sides, and from its top.
 const PAD_X: f64 = 12.0;
@@ -149,6 +154,21 @@ const PAPER_FADE: f64 = 0.5;
 const FILE_ICONS: [&str; 3] = ["text-x-generic", "application-x-generic", "unknown"];
 /// What the archive icon says it does.
 const ARCHIVE_LABEL: &str = "Archive (hide this note)";
+/// A file without a preview on the shelf: its type icon, this large.
+const SHELF_ICON: f64 = 48.0;
+/// A preview is a print: a white border, and a small shadow, which grows
+/// as it is lifted.
+const PRINT_BORDER: u32 = 2;
+const PRINT_SHADOW: IconShadow = IconShadow {
+    color: 0x00000048,
+    softness: 3,
+    offset: (0, 1),
+};
+const PRINT_LIFTED: IconShadow = IconShadow {
+    color: 0x00000050,
+    softness: 7,
+    offset: (0, 4),
+};
 
 /// The fonts on the main thread, loaded in the background.
 pub type Fonts = Rc<RefCell<Option<Text>>>;
@@ -182,6 +202,8 @@ pub struct Style {
     pub overdue: u32,
     /// The drawers' paper.
     pub drawer: u32,
+    /// The shelf's boards.
+    pub shelf: u32,
     /// The due presets' times of day.
     pub morning: TimeOfDay,
     pub evening: TimeOfDay,
@@ -226,6 +248,7 @@ impl Style {
             backdrop: theme.group_backdrop,
             overdue: theme.overdue,
             drawer: config.drawer_color(),
+            shelf: config.shelf_color(),
             morning: config.due.morning,
             evening: config.due.evening,
             palette: PRESETS.map(|name| config.paper_color(Some(&Color::Preset(name)))),
@@ -307,6 +330,9 @@ pub enum Pin {
 pub struct FileLink {
     pub path: PathBuf,
     pub exists: bool,
+    /// Its size, if it is a file, and when it was last modified.
+    pub size: Option<u64>,
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// A note to show: its card, and what is on it.
@@ -440,8 +466,8 @@ enum BarHit {
     /// The n-th file's icon.
     File(usize),
     RemoveFile(usize),
-    /// The `+n` for those that don't fit.
-    More,
+    /// The shelf button (the back button, on the shelf).
+    Shelf,
     Color,
     Swatch(Color),
     /// The clock that opens the due choices.
@@ -455,10 +481,9 @@ enum BarHit {
 
 /// Where the parts of a sheet's file bar are, on the surface.
 struct BarLayout {
-    /// The file's index and its icon's rect, for those shown.
-    icons: Vec<(usize, Rect)>,
-    /// How many more, and where the `+n` is.
-    more: Option<(usize, Rect)>,
+    /// The shelf button, and the count on it: how many files the note
+    /// has (0 on the shelf).
+    shelf: Option<(usize, Rect)>,
     color: Option<Rect>,
     swatches: Vec<(Color, Rect)>,
     clock: Option<Rect>,
@@ -477,11 +502,46 @@ struct BarLayout {
 /// A bar's subsurfaces.
 struct BarSubs {
     icons: Vec<Sub>,
-    more: Sub,
+    badge: Sub,
     name: Sub,
     archive: Sub,
     pin: Sub,
     labels: Vec<Sub>,
+    /// The shelf's boards, prints and labels, bottom first.
+    shelf: Vec<Sub>,
+}
+
+/// The shelf on the open or revealed sheet: whose, how far it is
+/// scrolled, and the item the keyboard is on (its place, newest first).
+struct ShelfView {
+    key: String,
+    scroll: Scroll,
+    cursor: Option<usize>,
+}
+
+impl ShelfView {
+    fn new(key: &str) -> Self {
+        Self {
+            key: key.into(),
+            scroll: Scroll::default(),
+            cursor: None,
+        }
+    }
+}
+
+/// A shelf's board as drawn, for its width, tilt, color and scale: the
+/// image is centered on the board's (turned) center.
+struct BoardImage {
+    key: (i32, u64, u32, i32),
+    image: Sized,
+}
+
+/// A part of the shelf: a buffer at `rect`, showing `src` of it.
+struct Piece {
+    buffer: WlBuffer,
+    rect: Rect,
+    src: Option<[f64; 4]>,
+    alpha: f64,
 }
 
 /// A press on a margin or a revealed sheet: a click, or the start of a
@@ -523,7 +583,7 @@ pub enum FileTarget {
 }
 
 /// A name label: its text, color, width and whether it is struck
-/// through.
+/// through, a tooltip, or a count on a button (smaller).
 #[derive(Clone, Debug, PartialEq)]
 struct LineKey {
     text: String,
@@ -531,6 +591,7 @@ struct LineKey {
     width: i32,
     strike: bool,
     tooltip: bool,
+    badge: bool,
 }
 
 impl LineKey {
@@ -538,6 +599,9 @@ impl LineKey {
         let mut style = style.small(self.color);
         if self.tooltip {
             style.background = 0x202020e6;
+        }
+        if self.badge {
+            style.size = (style.size * 0.75).max(7.0);
         }
         style
     }
@@ -681,8 +745,18 @@ pub struct Column {
     /// The due choices are out, since then.
     due_since: Option<Instant>,
     dots: HashMap<(u32, u32, bool), WlBuffer>,
-    /// All-files views on the open and revealed sheets, respectively.
-    all_files: [Option<(String, usize)>; 2],
+    /// The shelves on the open and revealed sheets, respectively.
+    all_files: [Option<ShelfView>; 2],
+    /// Previews asked for: None if a file has none.
+    previews: HashMap<PreviewKey, Option<Sized>>,
+    boards: Vec<BoardImage>,
+    /// The selection's and the keyboard's backdrop on the shelf, and its
+    /// size, color and scale.
+    highlight: Option<((i32, i32, u32, i32), WlBuffer)>,
+    /// The shelf item lifted under the pointer, since then; the one that
+    /// settles back, since then, from how far up it was.
+    lifted: Option<(String, usize, Instant, f64)>,
+    settling: Option<(String, usize, Instant, f64)>,
     /// The surfaces' order last applied, bottom first.
     stacking: Vec<WlSurface>,
     /// The input region last set.
@@ -714,21 +788,26 @@ impl BarSubs {
     ) -> Self {
         Self {
             icons: Vec::new(),
-            more: Sub::new(g, parent, no_input, qh),
+            badge: Sub::new(g, parent, no_input, qh),
             name: Sub::new(g, parent, no_input, qh),
             pin: Sub::new(g, parent, no_input, qh),
             archive: Sub::new(g, parent, no_input, qh),
             labels: Vec::new(),
+            shelf: Vec::new(),
         }
     }
 
     fn clear(&mut self) {
-        for s in self.icons.iter_mut().chain(&mut self.labels).chain([
-            &mut self.more,
-            &mut self.name,
-            &mut self.archive,
-            &mut self.pin,
-        ]) {
+        for s in (self.icons.iter_mut())
+            .chain(&mut self.labels)
+            .chain(&mut self.shelf)
+            .chain([
+                &mut self.badge,
+                &mut self.name,
+                &mut self.archive,
+                &mut self.pin,
+            ])
+        {
             s.clear();
         }
     }
@@ -762,7 +841,7 @@ impl BarSubs {
             Some((buffer, rect)) => sub.present(Some(buffer), *rect, plan.alpha),
             None => sub.clear(),
         };
-        one(&mut self.more, &plan.more);
+        one(&mut self.badge, &plan.badge);
         one(&mut self.name, &plan.name);
         let icon = |sub: &mut Sub, part: &Option<(Option<WlBuffer>, Rect, f64)>| match part {
             Some((buffer, rect, a)) => sub.present(buffer.as_ref(), *rect, plan.alpha * a),
@@ -770,9 +849,25 @@ impl BarSubs {
         };
         icon(&mut self.archive, &plan.archive);
         icon(&mut self.pin, &plan.pin);
-        (plan.more.iter().chain(&plan.name))
+        while self.shelf.len() < plan.shelf.len() {
+            self.shelf.push(new());
+        }
+        for (i, sub) in self.shelf.iter_mut().enumerate() {
+            match plan.shelf.get(i) {
+                Some(p) if plan.alpha * p.alpha > 0.0 => {
+                    sub.show(&p.buffer);
+                    sub.crop(p.src);
+                    sub.place(IRect::round(p.rect));
+                    sub.set_alpha(plan.alpha * p.alpha);
+                    sub.commit();
+                }
+                _ => sub.clear(),
+            }
+        }
+        (plan.badge.iter().chain(&plan.name))
             .map(|(b, _)| b.clone())
             .chain(plan.labels.iter().map(|(b, _, _)| b.clone()))
+            .chain(plan.shelf.iter().map(|p| p.buffer.clone()))
             .collect()
     }
 }
@@ -911,6 +1006,11 @@ impl Column {
             due_since: None,
             dots: HashMap::new(),
             all_files: [None, None],
+            previews: HashMap::new(),
+            boards: Vec::new(),
+            highlight: None,
+            lifted: None,
+            settling: None,
             stacking: Vec::new(),
             input: None,
             pointer: None,
@@ -1043,6 +1143,12 @@ impl Column {
         );
         self.stale.extend(self.plus_shown.take().map(|(_, b, _)| b));
         self.icons.clear();
+        self.stale.extend(
+            (self.previews.drain())
+                .filter_map(|(_, s)| s.map(|s| s.buffer))
+                .chain(self.boards.drain(..).map(|b| b.image.buffer))
+                .chain(self.highlight.take().map(|(_, b)| b)),
+        );
     }
 
     /// Show `notes`, animating the change (see deck.rs). The program keeps
@@ -1058,6 +1164,9 @@ impl Column {
                     .is_some_and(|old| !overdue(&old.due))
             })
             .map(|n| n.item.key.clone())
+            .collect();
+        let files_before: Vec<(String, usize)> = (self.all_files.iter().flatten())
+            .filter_map(|v| Some((v.key.clone(), self.notes.get(&v.key)?.files.len())))
             .collect();
         self.notes = (notes.iter())
             .map(|n| {
@@ -1081,6 +1190,31 @@ impl Column {
             self.deck.pulse(key);
         }
         self.reset_file_views();
+        // Files added (dropped, say): the shelf goes to the top, where
+        // the newest are.
+        let now = Instant::now();
+        for view in self.all_files.iter_mut().flatten() {
+            let grew = (files_before.iter().find(|(k, _)| *k == view.key))
+                .zip(self.notes.get(&view.key))
+                .is_some_and(|((_, before), n)| n.files.len() > *before);
+            if grew {
+                view.scroll.to(0, now);
+                view.cursor = None;
+            }
+        }
+        // Previews only of the files shown.
+        let shown: HashSet<&PathBuf> = (self.notes.values())
+            .flat_map(|n| n.files.iter().map(|f| &f.path))
+            .collect();
+        let mut gone = Vec::new();
+        self.previews.retain(|k, v| {
+            let keep = shown.contains(&k.path) && k.scale == self.scale;
+            if !keep {
+                gone.extend(v.take().map(|s| s.buffer));
+            }
+            keep
+        });
+        self.stale.extend(gone);
         // The open note went (removed, hidden): the keyboard goes back.
         if self.deck.open().is_none() {
             self.draft = None;
@@ -1274,13 +1408,13 @@ impl Column {
                     return Vec::new();
                 }
                 if let On::Sheet(key) = self.on_at(x, y)
-                    && let Some(area) = self.grid_area(&key)
+                    && let Some(area) = self.shelf_area(&key)
                     && area.contains(x, y)
                 {
                     let d = axis(vertical);
                     if self.showing_files(&key) {
                         if d != 0.0 {
-                            self.scroll_files(&key, d.signum(), x, y);
+                            self.scroll_shelf(&key, d.signum() as isize);
                         }
                     } else if self.deck.open() == Some(&key) {
                         self.scroll_by(d);
@@ -1305,7 +1439,7 @@ impl Column {
         if mods.ctrl && !mods.alt {
             match sym {
                 Keysym::v | Keysym::V => return vec![Act::Paste(self.paste_serial)],
-                Keysym::c | Keysym::C | Keysym::x | Keysym::X => {
+                Keysym::c | Keysym::C | Keysym::x | Keysym::X if !self.showing_files(&key) => {
                     let cut = matches!(sym, Keysym::x | Keysym::X);
                     let (text, changed) = if let Some(d) = &mut self.draft {
                         let text = if cut {
@@ -1328,6 +1462,11 @@ impl Column {
                 }
                 _ => {}
             }
+        }
+        if self.showing_files(&key)
+            && let Some(acts) = self.shelf_key(&key, event, mods)
+        {
+            return acts;
         }
         match event.keysym {
             Keysym::Escape if self.palette_since.take().is_some() => self.kick(),
@@ -1523,7 +1662,9 @@ impl Column {
         {
             self.drawer_dirty = true;
         }
-        self.all_files = [None, None];
+        // The open note's shelf stays, for the keys.
+        self.all_files[1] = None;
+        self.lifted = None;
         if self.press.take().is_some() {
             self.deck.drag_cancel();
         }
@@ -1827,7 +1968,7 @@ impl Column {
             self.kick();
         }
         let hit = self.bar_hover.clone();
-        if !matches!(hit, Some((_, BarHit::File(_) | BarHit::More)))
+        if !matches!(hit, Some((_, BarHit::File(_) | BarHit::Shelf)))
             && self.selected_files.take().is_some()
         {
             self.kick();
@@ -2009,9 +2150,11 @@ impl Column {
             BarHit::RemoveFile(i) => {
                 Some(Act::RemoveFile(key.into(), note.files.get(i)?.path.clone()))
             }
-            BarHit::More => {
+            BarHit::Shelf => {
                 let i = self.view_index(key);
-                self.all_files[i] = (!self.showing_files(key)).then(|| (key.into(), 0));
+                self.all_files[i] = (!self.showing_files(key)).then(|| ShelfView::new(key));
+                self.lifted = None;
+                self.settling = None;
                 self.kick();
                 None
             }
@@ -2086,9 +2229,49 @@ impl Column {
         if next == self.bar_hover {
             return false;
         }
+        // A shelf item rises under the pointer, the one left settles.
+        let item = |h: &Option<(String, BarHit)>| match h {
+            Some((k, BarHit::File(i) | BarHit::RemoveFile(i))) if self.showing_files(k) => {
+                Some((k.clone(), *i))
+            }
+            _ => None,
+        };
+        let (old, new) = (item(&self.bar_hover), item(&next));
+        if old != new {
+            let now = Instant::now();
+            let from = |(k, i): &(String, usize)| self.lift_of(k, *i, now);
+            let settling = old.map(|o| (from(&o), o));
+            let lifted = new.map(|n| (from(&n), n));
+            self.settling = settling.map(|(from, (k, i))| (k, i, now, from));
+            self.lifted = lifted.map(|(from, (k, i))| (k, i, now, from));
+        }
         self.trash.clear();
         self.bar_hover = next;
         true
+    }
+
+    /// How far up the shelf item `i` of `key` is at `now`, 0 to 1.
+    fn lift_of(&self, key: &str, i: usize, now: Instant) -> f64 {
+        let t = |since: Instant| {
+            let t = now.saturating_duration_since(since).as_secs_f64();
+            shelf::ease(t / shelf::LIFT_TIME.as_secs_f64())
+        };
+        match (&self.lifted, &self.settling) {
+            (Some((k, j, since, from)), _) if k == key && *j == i => {
+                from + (1.0 - from) * t(*since)
+            }
+            (_, Some((k, j, since, from))) if k == key && *j == i => from * (1.0 - t(*since)),
+            _ => 0.0,
+        }
+    }
+
+    /// Whether the shelves scroll or an item rises or settles.
+    fn shelf_moving(&self) -> bool {
+        let now = Instant::now();
+        let lifting = (self.lifted.iter().map(|(_, _, since, _)| since))
+            .chain(self.settling.iter().map(|(_, _, since, _)| since))
+            .any(|since| now.saturating_duration_since(*since) < shelf::LIFT_TIME);
+        lifting || (self.all_files.iter().flatten()).any(|v| v.scroll.moving(now))
     }
 
     fn view_index(&self, key: &str) -> usize {
@@ -2098,7 +2281,7 @@ impl Column {
     fn showing_files(&self, key: &str) -> bool {
         self.all_files[self.view_index(key)]
             .as_ref()
-            .is_some_and(|(k, _)| k == key)
+            .is_some_and(|v| v.key == key)
     }
 
     fn reset_file_views(&mut self) {
@@ -2107,60 +2290,147 @@ impl Column {
             .iter_mut()
             .zip([self.deck.open(), self.deck.revealed()])
         {
-            if view.as_ref().is_some_and(|(k, _)| {
-                Some(k.as_str()) != key || self.notes.get(k).is_none_or(|n| n.files.is_empty())
+            if view.as_ref().is_some_and(|v| {
+                Some(v.key.as_str()) != key
+                    || self.notes.get(&v.key).is_none_or(|n| n.files.is_empty())
             }) {
                 *view = None;
             }
         }
     }
 
+    /// The pointer is on `on`: a revealed sheet's shelf goes when it
+    /// leaves the sheet (the open one's stays, for the keys).
     fn leave_file_views(&mut self, on: &On) -> bool {
-        let mut changed = false;
-        for view in &mut self.all_files {
-            if view
-                .as_ref()
-                .is_some_and(|(k, _)| !matches!(on, On::Sheet(s) if s == k))
-            {
-                *view = None;
-                changed = true;
-            }
+        let view = &mut self.all_files[1];
+        if view
+            .as_ref()
+            .is_some_and(|v| !matches!(on, On::Sheet(s) if *s == v.key))
+        {
+            *view = None;
+            return true;
         }
-        changed
+        false
     }
 
-    fn grid_area(&self, key: &str) -> Option<Rect> {
+    /// Where `key`'s text is, and its shelf when it shows.
+    fn shelf_area(&self, key: &str) -> Option<Rect> {
         let face = self.face(key)?;
         let area = self.text_rect(face);
         let hit = self.slots.iter().find(|s| s.key == key)?.hit?;
         intersect(area, hit)
     }
 
-    fn file_grid(&self, key: &str) -> Option<bar::Grid> {
-        let (k, row) = self.all_files[self.view_index(key)].as_ref()?;
-        (k == key).then_some(())?;
-        Some(bar::grid(
-            self.grid_area(key)?,
-            self.notes.get(key)?.files.len(),
-            *row,
-        ))
+    /// `key`'s shelf as it is now, if it shows, before its sheet's tilt.
+    fn shelf_layout(&self, key: &str) -> Option<shelf::Shelf> {
+        let view = self.all_files[self.view_index(key)].as_ref()?;
+        (view.key == key).then_some(())?;
+        let row = view.scroll.at(Instant::now());
+        let count = self.notes.get(key)?.files.len();
+        Some(shelf::layout(self.shelf_area(key)?, count, row))
     }
 
-    fn scroll_files(&mut self, key: &str, direction: f64, x: f64, y: f64) {
-        let Some(grid) = self.file_grid(key) else {
+    /// Scroll `key`'s shelf `by` rows.
+    fn scroll_shelf(&mut self, key: &str, by: isize) {
+        let Some(shelf) = self.shelf_layout(key) else {
             return;
         };
         let i = self.view_index(key);
-        if let Some((_, row)) = &mut self.all_files[i] {
-            let old = (*row).min(grid.last_row);
-            *row = old
-                .saturating_add_signed(direction as isize)
-                .min(grid.last_row);
-            if *row != old {
-                self.update_bar_hover(x, y);
+        if let Some(view) = &mut self.all_files[i] {
+            let row = (view.scroll.row.min(shelf.last_row))
+                .saturating_add_signed(by)
+                .min(shelf.last_row);
+            if row != view.scroll.row {
+                view.scroll.to(row, Instant::now());
                 self.kick();
             }
         }
+    }
+
+    /// A key on the open note's shelf; None if it isn't the shelf's (the
+    /// rest then has it: Escape goes back to the text).
+    fn shelf_key(&mut self, key: &str, event: &KeyEvent, mods: &Modifiers) -> Option<Vec<Act>> {
+        let shelf = self.shelf_layout(key)?;
+        let files = self.notes.get(key)?.files.clone();
+        let count = files.len();
+        let now = Instant::now();
+        let view = self.all_files[0].as_mut()?;
+        let step = match event.keysym {
+            Keysym::a | Keysym::A if mods.ctrl => {
+                let all = (files.iter())
+                    .filter(|f| f.path.exists())
+                    .map(|f| f.path.clone())
+                    .collect();
+                self.selected_files = Some((key.into(), all));
+                self.kick();
+                return Some(Vec::new());
+            }
+            Keysym::Return | Keysym::KP_Enter if !mods.ctrl => {
+                let file = view.cursor.and_then(|order| {
+                    let i = count.checked_sub(order + 1)?;
+                    files.get(i).filter(|f| f.path.exists())
+                });
+                return Some(
+                    file.map(|f| Act::File(f.path.clone()))
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            Keysym::Page_Up | Keysym::KP_Page_Up | Keysym::Page_Down | Keysym::KP_Page_Down => {
+                let row = view.scroll.row.min(shelf.last_row);
+                let row = match event.keysym {
+                    Keysym::Page_Up | Keysym::KP_Page_Up => row.saturating_sub(shelf.visible),
+                    _ => (row + shelf.visible).min(shelf.last_row),
+                };
+                view.scroll.to(row, now);
+                self.kick();
+                return Some(Vec::new());
+            }
+            Keysym::Home | Keysym::KP_Home => {
+                view.scroll.to(0, now);
+                self.kick();
+                return Some(Vec::new());
+            }
+            Keysym::End | Keysym::KP_End => {
+                view.scroll.to(shelf.last_row, now);
+                self.kick();
+                return Some(Vec::new());
+            }
+            Keysym::Left | Keysym::KP_Left => shelf::Move::Left,
+            Keysym::Right | Keysym::KP_Right => shelf::Move::Right,
+            Keysym::Up | Keysym::KP_Up => shelf::Move::Up,
+            Keysym::Down | Keysym::KP_Down => shelf::Move::Down,
+            _ => return None,
+        };
+        view.cursor = shelf::step(view.cursor, step, shelf.columns, count);
+        if let Some(order) = view.cursor {
+            let row = view.scroll.row.min(shelf.last_row);
+            let row = shelf::follow(order, row, shelf.columns, shelf.visible);
+            view.scroll.to(row.min(shelf.last_row), now);
+        }
+        self.kick();
+        Some(Vec::new())
+    }
+
+    /// A tilted sheet's tilt and the point it is turned about.
+    fn sheet_turn(&self, key: &str) -> (f64, (f64, f64)) {
+        let slot = self.slots.iter().find(|s| s.key == key);
+        let tilt = (slot.and_then(|s| s.shown.as_ref())).map_or(0.0, |(p, _)| p.tilt);
+        (tilt, slot.map_or((0.0, 0.0), |s| s.paper.center()))
+    }
+
+    /// The shelf item of `key` at (`x`, `y`): its file's index, its box,
+    /// and the point, all before the sheet's tilt.
+    fn shelf_at(&self, key: &str, x: f64, y: f64) -> Option<(usize, Rect, (f64, f64))> {
+        let shelf = self.shelf_layout(key)?;
+        let (tilt, center) = self.sheet_turn(key);
+        let (x, y) = rotate((x, y), center, -tilt);
+        if !shelf.rows.contains(x, y) {
+            return None;
+        }
+        let (i, b, _) =
+            (shelf.items.into_iter()).find(|(_, b, l)| b.contains(x, y) || l.contains(x, y))?;
+        Some((i, b, (x, y)))
     }
 
     fn file_hit(&self, key: &str, i: usize, icon: Rect, x: f64, y: f64) -> BarHit {
@@ -2224,22 +2494,14 @@ impl Column {
             (layout.trash, BarHit::Trash),
             (layout.archive, BarHit::Archive),
             (layout.pin, BarHit::Pin),
-            (layout.more.map(|(_, r)| r), BarHit::More),
+            (layout.shelf.map(|(_, r)| r), BarHit::Shelf),
         ] {
             if rect.is_some_and(|r| near(&r)) {
                 return Some((key, hit));
             }
         }
-        for (i, r) in layout.icons {
-            if near(&r) {
-                let hit = self.file_hit(&key, i, r, x, y);
-                return Some((key, hit));
-            }
-        }
-        if let Some(grid) = self.file_grid(&key)
-            && let Some((i, cell)) = grid.cells.into_iter().find(|(_, cell)| cell.contains(x, y))
-        {
-            let hit = self.file_hit(&key, i, grid_icon(cell), x, y);
+        if let Some((i, b, (x, y))) = self.shelf_at(&key, x, y) {
+            let hit = self.file_hit(&key, i, shelf_icon(b), x, y);
             return Some((key, hit));
         }
         None
@@ -2439,6 +2701,67 @@ impl Column {
         (!names.is_empty()).then(|| self.named(&names))
     }
 
+    /// A file's type icon on the shelf (never its thumbnail: a preview
+    /// is the picture), at the shelf's size.
+    fn shelf_type_icon(&self, path: &PathBuf) -> NamedIcon {
+        let own = (self.file_icons.get(path).into_iter().flatten())
+            .map(String::as_str)
+            .filter(|n| !n.contains("/thumbnails/"));
+        let names: Vec<&str> = own.chain(FILE_ICONS).collect();
+        NamedIcon {
+            size: (SHELF_ICON * self.scale as f64) as u32,
+            ..self.named(&names)
+        }
+    }
+
+    /// A file's preview on the shelf, in a box `w`x`h`, lifted or not.
+    fn preview_key(&self, f: &FileLink, w: f64, h: f64, lifted: bool) -> PreviewKey {
+        PreviewKey {
+            path: f.path.clone(),
+            mtime: f.mtime,
+            w: w.floor().max(1.0) as u32,
+            h: h.floor().max(1.0) as u32,
+            scale: self.scale,
+            border: PRINT_BORDER,
+            shadow: Some(if lifted { PRINT_LIFTED } else { PRINT_SHADOW }),
+        }
+    }
+
+    /// The preview `key`: None until it is here (it is asked for), then
+    /// None inside if the file has none.
+    fn preview(&self, key: &PreviewKey) -> Option<Option<Sized>> {
+        match self.previews.get(key) {
+            Some(shown) => Some(shown.clone()),
+            None => {
+                self.assets.preview(key);
+                None
+            }
+        }
+    }
+
+    /// A preview arrived (None: the file has none).
+    pub fn preview_ready(&mut self, key: &PreviewKey, image: Option<Arc<Image>>) {
+        let shown = (self.notes.values()).any(|n| n.files.iter().any(|f| f.path == key.path));
+        if key.scale != self.scale || !shown {
+            return;
+        }
+        let s = self.scale as f64;
+        let sized = image.and_then(|img| {
+            let buffer = (shm_buffer(&self.g, &img, &self.qh))
+                .inspect_err(|e| warn!("preview buffer: {e}"))
+                .ok()?;
+            Some(Sized {
+                buffer,
+                w: img.width as f64 / s,
+                h: img.height as f64 / s,
+            })
+        });
+        if let Some(Some(old)) = self.previews.insert(key.clone(), sized) {
+            self.stale.push(old.buffer);
+        }
+        self.kick();
+    }
+
     fn ask_standard_icons(&self) {
         for key in [
             self.generic_icon(),
@@ -2448,6 +2771,8 @@ impl Column {
             self.trash_icon(),
             self.clock_icon(),
             self.named(&["builtin:close"]),
+            self.named(&["builtin:shelf"]),
+            self.named(&["builtin:back"]),
         ] {
             self.assets.named_icon(&key);
         }
@@ -2472,7 +2797,9 @@ impl Column {
     /// An icon arrived (None: there is none).
     pub fn icon_ready(&mut self, key: NamedIcon, image: Option<Arc<Image>>) {
         let scale = self.scale as u32;
-        let bar_icon = key.size == ICON as u32 * scale;
+        let bar_icon = [ICON, SHELF_ICON]
+            .iter()
+            .any(|size| key.size == (size * scale as f64) as u32);
         let row_icon = [ROW_ICON * scale, ROW_COUNT_ICON * scale].contains(&key.size)
             && Button::ALL.iter().any(|button| key.name == button.icon());
         if key.shadow.is_some() || !(bar_icon || row_icon) {
@@ -3224,7 +3551,8 @@ impl Column {
             .into_iter()
             .flatten()
             .any(|t| t.elapsed() < PALETTE_TIME);
-        if (self.deck.moving() || self.row_moving() || animating_palette) && !self.frame_pending {
+        let moving = self.deck.moving() || self.row_moving() || self.shelf_moving();
+        if (moving || animating_palette) && !self.frame_pending {
             self.request_frame();
         }
         self.layer.commit();
@@ -3457,7 +3785,7 @@ impl Column {
             },
             |r| r.x - (pitch - size),
         );
-        let (n, more) = bar::fit(note.files.len(), file_end - bar.x, size, pitch - size);
+        let count = note.files.len();
         let grid = self.showing_files(key);
         let swatches = match (color, self.palette_since) {
             (Some(dot), Some(start)) => {
@@ -3494,20 +3822,11 @@ impl Column {
             _ => Vec::new(),
         };
         let picking = !due_row.is_empty();
-        let used = n + usize::from(more.is_some());
+        let shelf = (count > 0 && !palette_open && !picking)
+            .then(|| (if grid { 0 } else { count }, slot(0)));
+        let used = usize::from(count > 0);
         let mut layout = BarLayout {
-            icons: if grid || palette_open || !due_row.is_empty() {
-                Vec::new()
-            } else {
-                (0..n).map(|i| (i, slot(i))).collect()
-            },
-            more: if palette_open || !due_row.is_empty() {
-                None
-            } else if grid {
-                Some((0, slot(more.map_or(0, |_| n))))
-            } else {
-                more.map(|count| (count, slot(n)))
-            },
+            shelf,
             // The due row takes the whole bar: the controls step aside.
             pin: control(0).filter(|_| !picking),
             archive: if note.scratch { None } else { control(1) }.filter(|_| !picking),
@@ -3517,7 +3836,7 @@ impl Column {
             clock: clock.filter(|_| !picking),
             due_row,
             hit_pad: (pitch - size) / 2.0,
-            name_x: bar.x + used.max(usize::from(grid)) as f64 * pitch,
+            name_x: bar.x + used as f64 * pitch,
             name_end: file_end,
             mid,
         };
@@ -3530,10 +3849,7 @@ impl Column {
                 let (x, y) = rotate(r.center(), (cx, cy), tilt);
                 Rect::new(x - r.w / 2.0, y - r.h / 2.0, r.w, r.h)
             };
-            for (_, r) in &mut layout.icons {
-                *r = turn(*r);
-            }
-            if let Some((_, r)) = &mut layout.more {
+            if let Some((_, r)) = &mut layout.shelf {
                 *r = turn(*r);
             }
             for (_, r) in &mut layout.swatches {
@@ -4159,6 +4475,7 @@ impl Column {
                         width: m.plus as i32,
                         strike: false,
                         tooltip: false,
+                        badge: false,
                     })
                 });
                 let size = if count.is_some() {
@@ -4255,6 +4572,7 @@ impl Column {
             width: surface.w.min(320.0) as i32,
             strike,
             tooltip: true,
+            badge: false,
         })?;
         let x = (anchor.x + (anchor.w - image.w) / 2.0)
             .clamp(surface.x, (surface.right() - image.w).max(surface.x));
@@ -4336,7 +4654,7 @@ impl Column {
         let (ink, files, pin) = (note.text, note.files.clone(), note.pin.clone());
         let (current, paper) = (note.color, note.paper);
         let due = note.due.clone();
-        let grid = self.file_grid(key);
+        let grid = self.showing_files(key);
         let armed = open && self.trash.armed(Instant::now());
         let hover = (self.bar_hover.as_ref())
             .filter(|(k, _)| k == key)
@@ -4348,72 +4666,33 @@ impl Column {
         if alpha <= 0.0 {
             return Some(plan);
         }
-        let entries = grid.as_ref().map_or_else(
-            || {
-                layout
-                    .icons
-                    .iter()
-                    .map(|(i, r)| (*i, *r, None))
-                    .collect::<Vec<_>>()
-            },
-            |g| {
-                g.cells
-                    .iter()
-                    .map(|(i, cell)| (*i, grid_icon(*cell), Some(*cell)))
-                    .collect()
-            },
-        );
-        for (i, rect, cell) in entries {
-            let f = &files[i];
-            let selected = self
-                .selected_files
-                .as_ref()
-                .is_some_and(|(k, set)| k == key && set.contains(&f.path));
-            let lit = matches!(hover, Some(BarHit::File(j) | BarHit::RemoveFile(j)) if i == j);
-            let exists = if lit { f.path.exists() } else { f.exists };
-            if selected {
-                plan.icons.push((
-                    self.dot(self.style.link, ink, false),
-                    rect.outset(3.0),
-                    0.55,
-                ));
-            }
-            let buffer = self.file_buffer(&f.path, (!(lit || selected)).then_some(ink));
+        if grid {
+            self.shelf_plan(key, &mut plan, hover);
+        }
+        if let Some((count, rect)) = layout.shelf {
+            let lit = hover == Some(BarHit::Shelf);
+            let icon = self.named(&[if grid {
+                "builtin:back"
+            } else {
+                "builtin:shelf"
+            }]);
+            let a = if lit { 1.0 } else { 0.8 };
             plan.icons
-                .push((buffer, rect, if exists { 1.0 } else { 0.4 }));
-            if !exists && lit {
-                let icon = self.named(&["builtin:close"]);
-                plan.icons
-                    .push((self.icon_buffer(&icon, None), remove_rect(rect), 1.0));
-            }
-            if let Some(cell) = cell
+                .push((self.icon_buffer(&icon, Some(ink)), rect, a));
+            // How many files there are, on the button's corner.
+            if !grid
+                && let Some(text) = bar::count(count)
                 && let Some(l) = self.line(LineKey {
-                    text: bar::name(&f.path),
+                    text,
                     color: ink,
-                    width: (cell.w - 4.0) as i32,
-                    strike: !exists,
+                    width: 24,
+                    strike: false,
                     tooltip: false,
+                    badge: true,
                 })
             {
-                let r = Rect::new(cell.x + (cell.w - l.w) / 2.0, rect.bottom() + 2.0, l.w, l.h);
-                if r.bottom() <= cell.bottom() {
-                    plan.labels.push((l.buffer, r, 1.0));
-                }
-            }
-        }
-        if let Some((count, rect)) = layout.more {
-            if count == 0 {
-                let icon = self.named(&["builtin:close"]);
-                plan.icons.push((self.icon_buffer(&icon, None), rect, 1.0));
-            } else if let Some(l) = self.line(LineKey {
-                text: format!("+{count}"),
-                color: ink,
-                width: rect.w.ceil() as i32 + 6,
-                strike: false,
-                tooltip: false,
-            }) {
-                let r = Rect::new(rect.x, rect.y + (rect.h - l.h) / 2.0, l.w, l.h);
-                plan.more = Some((l.buffer, r));
+                let r = Rect::new(rect.right() - l.w / 2.0, rect.y - l.h / 2.0 + 1.0, l.w, l.h);
+                plan.badge = Some((l.buffer, r));
             }
         }
         for &(color, rect) in &layout.swatches {
@@ -4451,6 +4730,7 @@ impl Column {
                 width: rect.w.ceil() as i32 + 8,
                 strike: false,
                 tooltip: false,
+                badge: false,
             };
             if let Some(l) = self.line(key) {
                 let r = Rect::new(
@@ -4490,20 +4770,31 @@ impl Column {
             plan.archive = Some((self.icon_buffer(&icon, tint), rect, a));
         }
         // The name of what is hovered.
+        // The name of what is hovered (on the shelf, what the keys are on).
+        let cursor = (self.all_files[self.view_index(key)].as_ref())
+            .filter(|v| grid && v.key == key)
+            .and_then(|v| v.cursor)
+            .and_then(|order| files.len().checked_sub(order + 1));
+        let shown = match hover {
+            None => cursor,
+            Some(BarHit::File(i)) => Some(i),
+            _ => None,
+        };
+        let details = (shown.filter(|_| grid).and_then(|i| files.get(i))).map(|f| {
+            let exists = f.path.exists();
+            let mtime = (f.mtime.filter(|_| exists))
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let size = f.size.filter(|_| exists);
+            let text = shelf::details(&bar::name(&f.path), size, mtime, &Local);
+            (text, !exists)
+        });
         let name = match hover {
-            Some(BarHit::File(i)) if grid.is_none() => {
-                files.get(i).map(|f| (bar::name(&f.path), !f.path.exists()))
-            }
+            _ if details.is_some() => details,
+            Some(BarHit::File(i)) => files.get(i).map(|f| (bar::name(&f.path), !f.path.exists())),
             Some(BarHit::RemoveFile(_)) => Some(("Remove missing link".into(), false)),
-            Some(BarHit::More) => Some((
-                if grid.is_some() {
-                    "Back to note"
-                } else {
-                    "Show all files"
-                }
-                .into(),
-                false,
-            )),
+            Some(BarHit::Shelf) if grid => Some(("Back to note".into(), false)),
+            Some(BarHit::Shelf) => Some((format!("All files ({})", files.len()), false)),
             Some(BarHit::Color) => Some((
                 if pin == Pin::Locked {
                     "The frontmatter doesn't parse"
@@ -4571,6 +4862,7 @@ impl Column {
                 width: width as i32,
                 strike,
                 tooltip: false,
+                badge: false,
             }) {
                 let (x, y) = if above {
                     (area.right() - l.w, area.y - l.h - 3.0)
@@ -4586,7 +4878,7 @@ impl Column {
         // With nothing hovered, the due time, beside the controls.
         if plan.name.is_none()
             && let Some(d) = &due
-            && grid.is_none()
+            && !grid
             && (!open || layout.swatches.is_empty())
             && layout.due_row.is_empty()
         {
@@ -4599,6 +4891,7 @@ impl Column {
                     width: room as i32,
                     strike: false,
                     tooltip: false,
+                    badge: false,
                 })
             {
                 let r = Rect::new(layout.name_end - l.w, layout.mid - l.h / 2.0, l.w, l.h);
@@ -4663,6 +4956,199 @@ impl Column {
         // Copied on commit; the region can go right away.
         (self.layer.wl_surface()).set_input_region(Some(region.wl_region()));
     }
+
+    // -- the shelf -----------------------------------------------------------
+
+    /// The shelf's parts on `key`'s sheet, bottom first: the caption, the
+    /// boards, and the items standing on them, each cut to the rows and
+    /// turned with the sheet.
+    fn shelf_plan(&mut self, key: &str, plan: &mut BarPlan, hover: Option<BarHit>) {
+        let Some(shelf) = self.shelf_layout(key) else {
+            return;
+        };
+        let Some(note) = self.notes.get(key) else {
+            return;
+        };
+        let (ink, files) = (note.text, note.files.clone());
+        let count = files.len();
+        let s = self.scale as f64;
+        let (tilt, center) = self.sheet_turn(key);
+        let turn = |r: Rect| {
+            let (x, y) = rotate(r.center(), center, tilt);
+            Rect::new(x - r.w / 2.0, y - r.h / 2.0, r.w, r.h)
+        };
+        let rows = turn(shelf.rows);
+        let piece = |plan: &mut BarPlan, image: &Sized, rect: Rect, bounds: Rect, alpha: f64| {
+            let px = (image.w * s, image.h * s);
+            if let Some((rect, src)) = clip(rect, px, None, bounds) {
+                plan.shelf.push(Piece {
+                    buffer: image.buffer.clone(),
+                    rect,
+                    src,
+                    alpha,
+                });
+            }
+        };
+        let missing = files.iter().filter(|f| !f.exists).count();
+        let caption = LineKey {
+            text: shelf::caption(count, missing),
+            color: (ink & !0xff) | 0x99,
+            width: shelf.caption.w as i32,
+            strike: false,
+            tooltip: false,
+            badge: false,
+        };
+        if let Some(l) = self.line(caption) {
+            let c = shelf.caption;
+            let r = Rect::new(c.x, c.y + (c.h - l.h) / 2.0, l.w, l.h);
+            piece(plan, &l, turn(r), turn(c).outset(2.0), 1.0);
+        }
+        if let Some(board) = self.board_image(shelf.rows.w, tilt, self.style.shelf) {
+            for b in &shelf.boards {
+                let (cx, cy) = turn(*b).center();
+                let r = Rect::new(cx - board.w / 2.0, cy - board.h / 2.0, board.w, board.h);
+                piece(plan, &board, r, rows, 1.0);
+            }
+        }
+        let now = Instant::now();
+        let cursor = (self.all_files[self.view_index(key)].as_ref()).and_then(|v| v.cursor);
+        for (i, b, l) in shelf.items {
+            let Some(f) = files.get(i) else {
+                continue;
+            };
+            let lit = matches!(hover, Some(BarHit::File(j) | BarHit::RemoveFile(j)) if i == j);
+            let exists = if lit { f.path.exists() } else { f.exists };
+            let selected = (self.selected_files.as_ref())
+                .is_some_and(|(k, set)| k == key && set.contains(&f.path));
+            let lift = self.lift_of(key, i, now);
+            let dy = -shelf::LIFT * lift;
+            let a = if exists { 1.0 } else { 0.4 };
+            // The selection, and the keyboard's item, behind it.
+            let keyed = cursor == Some(shelf::order(i, count));
+            let cell = Rect::new(l.x, b.y - 2.0, l.w, l.bottom() - b.y + 2.0);
+            if (selected || keyed)
+                && let Some(h) = self.highlight(cell.w, cell.h)
+            {
+                let alpha = if selected { 1.0 } else { 0.55 };
+                piece(plan, &h, turn(cell), rows, alpha);
+            }
+            // A preview standing on the board (the print's bottom on the
+            // box's), else the type icon; nothing while it is asked for.
+            let print = |this: &Self, lifted: bool| {
+                let key = this.preview_key(f, b.w, b.h, lifted);
+                let pad = key.pad() as f64;
+                let image = this.preview(&key)?;
+                Some(image.map(|img| {
+                    let (cx, bottom) = (b.center().0, b.bottom() + dy + pad);
+                    let r = Rect::new(cx - img.w / 2.0, bottom - img.h, img.w, img.h);
+                    (img, r)
+                }))
+            };
+            let shown = if exists {
+                print(self, false)
+            } else {
+                Some(None)
+            };
+            match shown {
+                Some(Some((img, r))) => {
+                    piece(plan, &img, turn(r), rows, a);
+                    if lift > 0.0
+                        && let Some(Some((up, r))) = print(self, true)
+                    {
+                        piece(plan, &up, turn(r), rows, a * lift);
+                    }
+                }
+                Some(None) => {
+                    let icon = self.shelf_type_icon(&f.path);
+                    if let Some(buffer) = self.icon_buffer(&icon, None) {
+                        let r = shelf_icon(b);
+                        let r = Rect::new(r.x, r.y + dy, r.w, r.h);
+                        let image = Sized {
+                            buffer,
+                            w: SHELF_ICON,
+                            h: SHELF_ICON,
+                        };
+                        piece(plan, &image, turn(r), rows, a);
+                    }
+                }
+                None => {}
+            }
+            if !exists && lit {
+                let close = self.named(&["builtin:close"]);
+                if let Some(buffer) = self.icon_buffer(&close, None) {
+                    let image = Sized {
+                        buffer,
+                        w: ICON,
+                        h: ICON,
+                    };
+                    let r = remove_rect(shelf_icon(b));
+                    piece(plan, &image, turn(r), rows, 1.0);
+                }
+            }
+            let label = LineKey {
+                text: bar::name(&f.path),
+                color: ink,
+                width: l.w as i32,
+                strike: !exists,
+                tooltip: false,
+                badge: false,
+            };
+            if let Some(line) = self.line(label) {
+                let r = Rect::new(l.x + (l.w - line.w) / 2.0, l.y, line.w, line.h);
+                piece(plan, &line, turn(r), rows, if exists { 1.0 } else { 0.6 });
+            }
+        }
+    }
+
+    /// A shelf's board `w` long, turned `tilt`, in `color`: drawn once.
+    fn board_image(&mut self, w: f64, tilt: f64, color: u32) -> Option<Sized> {
+        let key = (w.round() as i32, tilt.to_bits(), color, self.scale);
+        if let Some(b) = self.boards.iter().find(|b| b.key == key) {
+            return Some(b.image.clone());
+        }
+        let (image, rect) = paper::board(key.0, color, tilt, self.scale);
+        let buffer = (shm_buffer(&self.g, &image, &self.qh))
+            .inspect_err(|e| warn!("board buffer: {e}"))
+            .ok()?;
+        let image = Sized {
+            buffer,
+            w: rect.w as f64,
+            h: rect.h as f64,
+        };
+        // The open sheet's and a few revealed ones'.
+        if self.boards.len() >= 4 {
+            let old = self.boards.remove(0);
+            self.stale.push(old.image.buffer);
+        }
+        self.boards.push(BoardImage {
+            key,
+            image: image.clone(),
+        });
+        Some(image)
+    }
+
+    /// The backdrop of a selected shelf item, `w`x`h`.
+    fn highlight(&mut self, w: f64, h: f64) -> Option<Sized> {
+        let color = (self.style.link & !0xff) | 0x38;
+        let key = (w.round() as i32, h.round() as i32, color, self.scale);
+        let sized = |buffer: WlBuffer| Sized {
+            buffer,
+            w: key.0 as f64,
+            h: key.1 as f64,
+        };
+        if let Some((k, b)) = &self.highlight
+            && *k == key
+        {
+            return Some(sized(b.clone()));
+        }
+        let image = paper::rounded(key.0, key.1, 6.0, color, self.scale);
+        let buffer = (shm_buffer(&self.g, &image, &self.qh))
+            .inspect_err(|e| warn!("highlight buffer: {e}"))
+            .ok()?;
+        let old = self.highlight.replace((key, buffer.clone()));
+        self.stale.extend(old.map(|(_, b)| b));
+        Some(sized(buffer))
+    }
 }
 
 /// What a file bar shows this frame.
@@ -4673,21 +5159,22 @@ struct BarPlan {
     icons: Vec<(Option<WlBuffer>, Rect, f64)>,
     /// Name labels and the due choices, with each one's alpha.
     labels: Vec<(WlBuffer, Rect, f64)>,
-    more: Option<(WlBuffer, Rect)>,
+    /// The count on the shelf button.
+    badge: Option<(WlBuffer, Rect)>,
     archive: Option<(Option<WlBuffer>, Rect, f64)>,
     pin: Option<(Option<WlBuffer>, Rect, f64)>,
     name: Option<(WlBuffer, Rect)>,
+    /// The shelf, when it shows.
+    shelf: Vec<Piece>,
 }
 
 impl BarSubs {
     /// Bottom first.
     fn subs(&self) -> impl Iterator<Item = &Sub> {
-        self.icons.iter().chain(&self.labels).chain([
-            &self.more,
-            &self.archive,
-            &self.pin,
-            &self.name,
-        ])
+        (self.shelf.iter())
+            .chain(&self.icons)
+            .chain(&self.labels)
+            .chain([&self.badge, &self.archive, &self.pin, &self.name])
     }
 }
 
@@ -4714,9 +5201,10 @@ fn place_image(
     Some(image.buffer.clone())
 }
 
-fn grid_icon(cell: Rect) -> Rect {
-    let size = 24.0_f64.min(cell.w).min(cell.h);
-    Rect::new(cell.x + (cell.w - size) / 2.0, cell.y, size, size)
+/// Where a type icon stands in a shelf item's box: on its bottom.
+fn shelf_icon(b: Rect) -> Rect {
+    let (cx, size) = (b.center().0, SHELF_ICON);
+    Rect::new(cx - size / 2.0, b.bottom() - size, size, size)
 }
 
 fn remove_rect(icon: Rect) -> Rect {

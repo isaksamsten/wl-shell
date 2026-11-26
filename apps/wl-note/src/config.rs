@@ -415,6 +415,13 @@ pub struct Theme {
     /// The drawers' paper: kraft, so a drawer reads as a box of notes.
     #[serde(deserialize_with = "de::color")]
     pub drawer: u32,
+    /// The shelf's boards (the file shelf); the drawers' paper if unset.
+    #[serde(deserialize_with = "opt_color")]
+    pub shelf: Option<u32>,
+}
+
+fn opt_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    de::color(d).map(Some)
 }
 
 impl Default for Theme {
@@ -445,6 +452,7 @@ impl Default for Theme {
             group_backdrop: 0x00000026,
             overdue: 0xd64541ff,
             drawer: 0xd4b483ff,
+            shelf: None,
         }
     }
 }
@@ -532,6 +540,16 @@ impl Config {
         match self.appearance.scheme {
             Scheme::Dark => dim(theme.drawer, theme.dark_dim),
             Scheme::Light => theme.drawer,
+        }
+    }
+
+    /// The shelf's boards, dimmed in dark mode like the drawers.
+    pub fn shelf_color(&self) -> u32 {
+        let theme = self.theme();
+        let color = theme.shelf.unwrap_or(theme.drawer);
+        match self.appearance.scheme {
+            Scheme::Dark => dim(color, theme.dark_dim),
+            Scheme::Light => color,
         }
     }
 
@@ -718,6 +736,11 @@ mod tests {
         assert_eq!(c.drawer_color(), 0x402010ff);
         c.apply_scheme(&mut || Scheme::Light);
         assert_eq!(c.drawer_color(), 0xd4b483ff);
+        // The shelf is the drawers' kraft unless it has its own.
+        assert_eq!(c.shelf_color(), 0xd4b483ff);
+        let mut c = parse("[appearance]\nshelf = '#8b5a2b'").unwrap();
+        c.apply_scheme(&mut || Scheme::Light);
+        assert_eq!(c.shelf_color(), 0x8b5a2bff);
         assert!(parse("[row]\nbuttons = ['drawers']").is_err());
     }
 

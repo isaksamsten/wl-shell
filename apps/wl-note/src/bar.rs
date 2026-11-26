@@ -1,7 +1,6 @@
-//! A sheet's file bar: the note's `file://` links as small icons along its
-//! bottom, in their order in the text. Pure, unit tested.
-//!
-//! Icons that don't fit leave the last slot to a `+n` for the rest.
+//! A sheet's file bar: the shelf button, with how many files the note
+//! links (`file://` links) on it, which opens the shelf (shelf.rs) of all
+//! of them; and the controls. Pure, unit tested.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,17 +24,13 @@ pub fn files(links: &[String]) -> Vec<PathBuf> {
     out
 }
 
-/// What a bar `width` wide shows of `n` files, icons `icon` wide and
-/// `gap` apart: how many icons, and the count behind a `+n` in the slot
-/// after them, if any.
-pub fn fit(n: usize, width: f64, icon: f64, gap: f64) -> (usize, Option<usize>) {
-    let slots = ((width + gap) / (icon + gap)).floor().max(0.0) as usize;
-    match n <= slots {
-        true => (n, None),
-        false => {
-            let shown = slots.saturating_sub(1);
-            (shown, Some(n - shown))
-        }
+/// The count on the shelf button: how many files the note has, `9+`
+/// past nine; None without any.
+pub fn count(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1..=9 => Some(n.to_string()),
+        _ => Some("9+".into()),
     }
 }
 
@@ -139,37 +134,6 @@ pub fn row(
     cells
 }
 
-/// Fixed-height cells; scrolling by rows makes the last file reachable
-/// without drawing or requesting labels for offscreen cells.
-pub struct Grid {
-    pub cells: Vec<(usize, Rect)>,
-    pub last_row: usize,
-}
-
-pub fn grid(area: Rect, count: usize, row: usize) -> Grid {
-    let cols = ((area.w / 80.0) as usize).clamp(1, 8);
-    let rows = ((area.h / 43.0) as usize).clamp(1, 32 / cols);
-    let last_row = count.div_ceil(cols).saturating_sub(rows);
-    let first = row.min(last_row) * cols;
-    let w = area.w / cols as f64;
-    let h = (area.h / rows as f64).min(54.0);
-    let cells = (first..count.min(first + rows * cols))
-        .map(|i| {
-            let j = i - first;
-            (
-                i,
-                Rect::new(
-                    area.x + (j % cols) as f64 * w,
-                    area.y + (j / cols) as f64 * h,
-                    w,
-                    h,
-                ),
-            )
-        })
-        .collect();
-    Grid { cells, last_row }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,20 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_can_scroll_to_every_file() {
-        let area = Rect::new(12.0, 25.0, 245.0, 115.0);
-        assert_eq!(grid(area, 17, 0).cells[0].0, 0);
-        let end = grid(area, 17, usize::MAX);
-        assert_eq!(end.last_row, 4);
-        assert_eq!(end.cells.last().unwrap().0, 16);
-        assert!(
-            end.cells
-                .iter()
-                .all(|(_, r)| r.right() <= area.right() && r.bottom() <= area.bottom())
-        );
-    }
-
-    #[test]
     fn local_files_once() {
         let links = [
             "file:///home/a/report.pdf".to_string(),
@@ -235,13 +185,11 @@ mod tests {
     }
 
     #[test]
-    fn fitting() {
-        // 16 px icons 8 apart: 100 px hold 4.
-        assert_eq!(fit(3, 100.0, 16.0, 8.0), (3, None));
-        assert_eq!(fit(4, 100.0, 16.0, 8.0), (4, None));
-        assert_eq!(fit(5, 100.0, 16.0, 8.0), (3, Some(2)));
-        assert_eq!(fit(0, 100.0, 16.0, 8.0), (0, None));
-        assert_eq!(fit(2, 10.0, 16.0, 8.0), (0, Some(2)));
+    fn the_count_on_the_button() {
+        assert_eq!(count(0), None);
+        assert_eq!(count(3).as_deref(), Some("3"));
+        assert_eq!(count(9).as_deref(), Some("9"));
+        assert_eq!(count(10).as_deref(), Some("9+"));
     }
 
     #[test]
